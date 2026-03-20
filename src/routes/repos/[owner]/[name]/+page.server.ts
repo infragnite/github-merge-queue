@@ -1,0 +1,90 @@
+import { redirect, error, fail } from '@sveltejs/kit';
+import { getRepoByOwnerName, getQueueItems, getRepoHistory, getUserById, addToQueue, removeFromQueue } from '$lib/server/db';
+import { getOpenPRs } from '$lib/server/github';
+import type { PageServerLoad, Actions } from './$types';
+
+export const load: PageServerLoad = async ({ params, locals }) => {
+	if (!locals.user) redirect(302, '/login');
+
+	const repo = getRepoByOwnerName(params.owner, params.name);
+	if (!repo) error(404, 'Repository not found');
+
+	const user = getUserById(locals.user.id);
+	if (!user) redirect(302, '/login');
+
+	const queueItems = getQueueItems(repo.id);
+
+	let openPrs: Array<{
+		number: number;
+		title: string;
+		html_url: string;
+		user: { login: string; avatar_url: string };
+		draft: boolean;
+	}> = [];
+	try {
+		openPrs = await getOpenPRs(user.access_token, params.owner, params.name);
+	} catch (e) {
+		console.error('Failed to fetch open PRs:', e);
+	}
+
+	// Filter out PRs already in queue
+	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
+	const availablePrs = openPrs
+		.filter((pr) => !queuedNumbers.has(pr.number))
+		.map((pr) => ({
+			number: pr.number,
+			title: pr.title,
+			url: pr.html_url,
+			author: pr.user.login,
+			authorAvatar: pr.user.avatar_url,
+			draft: pr.draft
+		}));
+
+	return {
+		repo,
+		queueItems,
+		openPrs: availablePrs,
+		history: getRepoHistory(repo.id)
+	};
+};
+
+export const actions: Actions = {
+	addToQueue: async ({ request, params, locals }) => {
+		if (!locals.user) return fail(401);
+
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+
+		const formData = await request.formData();
+		const prNumber = parseInt(formData.get('pr_number') as string, 10);
+		const prTitle = formData.get('pr_title') as string;
+		const prUrl = formData.get('pr_url') as string;
+		const authorLogin = formData.get('author_login') as string;
+		const authorAvatar = formData.get('author_avatar') as string;
+
+		if (!prNumber || !prTitle) return fail(400, { error: 'Missing required fields' });
+
+		try {
+			addToQueue(repo.id, prNumber, prTitle, prUrl, authorLogin, authorAvatar, locals.user.login);
+		} catch (e: unknown) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (msg.includes('UNIQUE')) {
+				return fail(409, { error: 'PR is already in the queue' });
+			}
+			return fail(500, { error: msg });
+		}
+
+		return { success: true };
+	},
+
+	removeFromQueue: async ({ request, locals }) => {
+		if (!locals.user) return fail(401);
+
+		const formData = await request.formData();
+		const itemId = parseInt(formData.get('item_id') as string, 10);
+		if (!itemId) return fail(400);
+
+		removeFromQueue(itemId);
+		return { success: true };
+	}
+};

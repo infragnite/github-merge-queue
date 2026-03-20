@@ -1,0 +1,94 @@
+import { json } from '@sveltejs/kit';
+import { createHmac } from 'crypto';
+import { getRepoByOwnerName, getQueueItems, updateQueueItemStatus, updateQueueItemHeadSha } from '$lib/server/db';
+import type { RequestHandler } from './$types';
+
+function verifySignature(payload: string, signature: string | null, secret: string): boolean {
+	if (!signature) return false;
+	const expected = 'sha256=' + createHmac('sha256', secret).update(payload).digest('hex');
+	if (signature.length !== expected.length) return false;
+	let diff = 0;
+	for (let i = 0; i < signature.length; i++) {
+		diff |= signature.charCodeAt(i) ^ expected.charCodeAt(i);
+	}
+	return diff === 0;
+}
+
+export const POST: RequestHandler = async ({ request }) => {
+	const body = await request.text();
+	const event = request.headers.get('x-github-event');
+	const signature = request.headers.get('x-hub-signature-256');
+
+	let payload: Record<string, unknown>;
+	try {
+		payload = JSON.parse(body);
+	} catch {
+		return json({ error: 'Invalid JSON' }, { status: 400 });
+	}
+
+	// Extract repo info
+	const repository = payload.repository as { full_name?: string } | undefined;
+	if (!repository?.full_name) return json({ ok: true });
+
+	const [owner, name] = repository.full_name.split('/');
+	const repo = getRepoByOwnerName(owner, name);
+	if (!repo) return json({ ok: true });
+
+	// Verify webhook signature if secret is configured
+	if (repo.webhook_secret) {
+		if (!verifySignature(body, signature, repo.webhook_secret)) {
+			return json({ error: 'Invalid signature' }, { status: 401 });
+		}
+	}
+
+	const queueItems = getQueueItems(repo.id);
+	if (queueItems.length === 0) return json({ ok: true });
+
+	switch (event) {
+		case 'check_suite':
+		case 'check_run': {
+			// A check completed - if it's for a PR in our queue, update status
+			const headSha = (payload as { check_suite?: { head_sha: string }; check_run?: { head_sha: string } })
+				.check_suite?.head_sha || (payload as { check_run?: { head_sha: string } }).check_run?.head_sha;
+			if (headSha) {
+				const item = queueItems.find((i) => i.head_sha === headSha && i.status === 'checking');
+				if (item) {
+					// Processor will handle the actual check on next tick
+					console.log(`[webhook] Check event for ${owner}/${name}#${item.pr_number}`);
+				}
+			}
+			break;
+		}
+
+		case 'pull_request': {
+			const action = (payload as { action: string }).action;
+			const prNumber = (payload as { pull_request: { number: number } }).pull_request.number;
+			const item = queueItems.find((i) => i.pr_number === prNumber);
+
+			if (item) {
+				if (action === 'closed') {
+					updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
+					console.log(`[webhook] PR #${prNumber} closed, removing from queue`);
+				} else if (action === 'synchronize') {
+					// Head SHA changed (new push or branch update)
+					const newSha = (payload as { pull_request: { head: { sha: string } } }).pull_request.head.sha;
+					updateQueueItemHeadSha(item.id, newSha);
+					console.log(`[webhook] PR #${prNumber} updated, new SHA: ${newSha.slice(0, 8)}`);
+				}
+			}
+			break;
+		}
+
+		case 'status': {
+			// Legacy status API event
+			const sha = (payload as { sha: string }).sha;
+			const item = queueItems.find((i) => i.head_sha === sha && i.status === 'checking');
+			if (item) {
+				console.log(`[webhook] Status event for ${owner}/${name}#${item.pr_number}`);
+			}
+			break;
+		}
+	}
+
+	return json({ ok: true });
+};

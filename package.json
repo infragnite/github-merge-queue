@@ -1,0 +1,34 @@
+{
+  "name": "merge-queue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --port 3000",
+    "build": "vite build",
+    "preview": "vite preview --port 3000",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.0",
+    "@octokit/rest": "^21.1.1"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-node": "^5.2.12",
+    "@sveltejs/kit": "^2.16.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/better-sqlite3": "^7.6.12",
+    "svelte": "^5.16.0",
+    "svelte-check": "^4.1.4",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^5.7.0",
+    "vite": "^6.3.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}
