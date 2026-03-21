@@ -220,7 +220,10 @@ async function handleChecking(
 
 	const checks = await github.getCheckStatus(repo.owner, repo.name, item.head_sha);
 
-	if (checks.anyPending) return;
+	if (checks.anyPending) {
+		console.log(`[merge-queue] PR #${item.pr_number} checks still pending`);
+		return;
+	}
 
 	if (checks.anyFailed) {
 		db.updateQueueItemStatus(item.id, 'failed', 'CI checks failed');
