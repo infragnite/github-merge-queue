@@ -5,7 +5,9 @@ import {
 	getRepoByOwnerName,
 	getQueueItems,
 	updateQueueItemStatus,
-	updateQueueItemHeadSha
+	updateQueueItemHeadSha,
+	addToHistory,
+	removeFromQueue
 } from '$lib/server/db';
 import type { RequestHandler } from './$types';
 
@@ -68,19 +70,37 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		case 'pull_request': {
 			const action = (payload as { action: string }).action;
-			const prNumber = (payload as { pull_request: { number: number } }).pull_request.number;
-			const item = queueItems.find((i) => i.pr_number === prNumber);
+			const pr = (payload as { pull_request: { number: number; merged: boolean; merge_commit_sha: string | null } }).pull_request;
+			const item = queueItems.find((i) => i.pr_number === pr.number);
 
 			if (item) {
-				if (action === 'closed') {
+				if (action === 'closed' && pr.merged) {
+					updateQueueItemStatus(item.id, 'merged');
+					addToHistory(
+						repo.id,
+						item.pr_number,
+						item.pr_title,
+						item.pr_url,
+						item.author_login,
+						pr.merge_commit_sha,
+						'merged',
+						null,
+						item.created_at
+					);
+					removeFromQueue(item.id);
+					console.log(`[webhook] PR #${pr.number} merged externally, removed from queue`);
+				} else if (action === 'closed') {
 					updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
-					console.log(`[webhook] PR #${prNumber} closed, removing from queue`);
+					console.log(`[webhook] PR #${pr.number} closed, removed from queue`);
 				} else if (action === 'synchronize') {
 					const newSha = (
 						payload as { pull_request: { head: { sha: string } } }
 					).pull_request.head.sha;
 					updateQueueItemHeadSha(item.id, newSha);
-					console.log(`[webhook] PR #${prNumber} updated, new SHA: ${newSha.slice(0, 8)}`);
+					if (item.status === 'checking') {
+						updateQueueItemStatus(item.id, 'queued');
+					}
+					console.log(`[webhook] PR #${pr.number} updated, new SHA: ${newSha.slice(0, 8)}`);
 				}
 			}
 			break;

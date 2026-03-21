@@ -78,17 +78,44 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	}
 }
 
+// Returns true if the PR was closed/merged externally and the item was handled
+function reconcilePR(
+	pr: { state: string; merged: boolean; merge_commit_sha: string | null },
+	repo: { id: number; owner: string; name: string },
+	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; created_at: string }
+): boolean {
+	if (pr.state === 'open') return false;
+
+	if (pr.merged) {
+		console.log(`[merge-queue] PR #${item.pr_number} was merged externally`);
+		db.updateQueueItemStatus(item.id, 'merged');
+		db.addToHistory(
+			repo.id,
+			item.pr_number,
+			item.pr_title,
+			item.pr_url,
+			item.author_login,
+			pr.merge_commit_sha,
+			'merged',
+			null,
+			item.created_at
+		);
+		db.removeFromQueue(item.id);
+	} else {
+		db.updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
+	}
+
+	return true;
+}
+
 async function handleQueued(
-	repo: { owner: string; name: string },
-	item: { id: number; pr_number: number; head_sha: string | null }
+	repo: { id: number; owner: string; name: string },
+	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; head_sha: string | null; created_at: string }
 ) {
 	console.log(`[merge-queue] Processing ${repo.owner}/${repo.name}#${item.pr_number}`);
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
 
-	if (pr.state !== 'open') {
-		db.updateQueueItemStatus(item.id, 'cancelled', `PR is ${pr.state}`);
-		return;
-	}
+	if (reconcilePR(pr, repo, item)) return;
 
 	if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
 		db.updateQueueItemStatus(item.id, 'conflict', 'Branch has merge conflicts — resolve them on GitHub');
@@ -111,7 +138,7 @@ async function handleQueued(
 }
 
 async function handleUpdating(
-	repo: { owner: string; name: string },
+	repo: { id: number; owner: string; name: string },
 	item: {
 		id: number;
 		pr_number: number;
@@ -122,6 +149,8 @@ async function handleUpdating(
 	}
 ) {
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
+
+	if (reconcilePR(pr, repo, item)) return;
 
 	if (pr.mergeable === null) return;
 
@@ -135,15 +164,12 @@ async function handleUpdating(
 }
 
 async function handleConflict(
-	repo: { owner: string; name: string },
-	item: { id: number; pr_number: number }
+	repo: { id: number; owner: string; name: string },
+	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; created_at: string }
 ) {
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
 
-	if (pr.state !== 'open') {
-		db.updateQueueItemStatus(item.id, 'cancelled', `PR is ${pr.state}`);
-		return;
-	}
+	if (reconcilePR(pr, repo, item)) return;
 
 	// mergeable is null while GitHub is computing — wait for next cycle
 	if (pr.mergeable === null) return;
@@ -168,9 +194,14 @@ async function handleChecking(
 ) {
 	if (!item.head_sha) {
 		const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
+		if (reconcilePR(pr, repo, item)) return;
 		db.updateQueueItemHeadSha(item.id, pr.head.sha);
 		return;
 	}
+
+	// Check if PR was merged/closed externally
+	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
+	if (reconcilePR(pr, repo, item)) return;
 
 	const checks = await github.getCheckStatus(repo.owner, repo.name, item.head_sha);
 
