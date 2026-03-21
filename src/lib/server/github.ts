@@ -74,12 +74,13 @@ export async function getUser(token: string) {
 	return ghFetch(token, '/user');
 }
 
-export async function checkOrgMembership(userToken: string, org: string): Promise<boolean> {
+export async function checkOrgMembership(username: string, org: string): Promise<boolean> {
 	try {
-		const orgs = await ghFetch(userToken, '/user/orgs?per_page=100');
-		return orgs.some(
-			(o: { login: string }) => o.login.toLowerCase() === org.toLowerCase()
-		);
+		const token = await getInstallationToken();
+		const res = await fetch(`${API}/orgs/${org}/members/${username}`, {
+			headers: headers(token)
+		});
+		return res.status === 204;
 	} catch {
 		return false;
 	}
