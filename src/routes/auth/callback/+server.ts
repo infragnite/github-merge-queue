@@ -18,18 +18,23 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		redirect(302, '/login?error=invalid_state');
 	}
 
+	const publicUrl = env.APP_URL || 'http://localhost:3000';
+	const redirectUri = `${publicUrl}/auth/callback`;
+
 	const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
 		method: 'POST',
 		headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
 		body: JSON.stringify({
 			client_id: env.GITHUB_CLIENT_ID,
 			client_secret: env.GITHUB_CLIENT_SECRET,
-			code
+			code,
+			redirect_uri: redirectUri
 		})
 	});
 
 	const tokenData = await tokenRes.json();
 	if (!tokenData.access_token) {
+		console.error('[auth] Token exchange failed:', tokenData.error, tokenData.error_description);
 		redirect(302, '/login?error=auth_failed');
 	}
 
