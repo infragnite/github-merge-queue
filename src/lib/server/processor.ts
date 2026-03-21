@@ -81,17 +81,6 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 			`[merge-queue] Error processing ${repo.owner}/${repo.name}#${item.pr_number}: ${msg}`
 		);
 		db.updateQueueItemStatus(item.id, 'failed', msg);
-		db.addToHistory(
-			repo.id,
-			item.pr_number,
-			item.pr_title,
-			item.pr_url,
-			item.author_login,
-			null,
-			'failed',
-			msg,
-			item.created_at
-		);
 	}
 }
 
@@ -229,17 +218,6 @@ async function handleChecking(
 
 	if (checks.anyFailed) {
 		db.updateQueueItemStatus(item.id, 'failed', 'CI checks failed');
-		db.addToHistory(
-			repo.id,
-			item.pr_number,
-			item.pr_title,
-			item.pr_url,
-			item.author_login,
-			null,
-			'failed',
-			'CI checks failed',
-			item.created_at
-		);
 		return;
 	}
 

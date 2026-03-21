@@ -5,7 +5,8 @@ import {
 	getRepoHistory,
 	addToQueue,
 	removeFromQueue,
-	reorderQueue
+	reorderQueue,
+	updateQueueItemStatus
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
 import type { PageServerLoad, Actions } from './$types';
@@ -138,6 +139,25 @@ export const actions: Actions = {
 		}
 
 		reorderQueue(repo.id, orderedIds);
+		return { success: true };
+	},
+
+	retry: async ({ request, params, locals }) => {
+		if (!locals.user) return fail(401);
+
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+
+		const formData = await request.formData();
+		const itemId = parseInt(formData.get('item_id') as string, 10);
+		if (!itemId) return fail(400);
+
+		const items = getQueueItems(repo.id);
+		const item = items.find((i) => i.id === itemId);
+		if (!item) return fail(403);
+		if (item.status !== 'failed') return fail(400, { error: 'Only failed items can be retried' });
+
+		updateQueueItemStatus(itemId, 'queued');
 		return { success: true };
 	}
 };

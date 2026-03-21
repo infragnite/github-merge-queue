@@ -92,19 +92,35 @@
 		</div>
 
 		<!-- Actions -->
-		{#if canRemove}
-			<form method="POST" action="/repos/{repoOwner}/{repoName}?/removeFromQueue" use:enhance>
-				<input type="hidden" name="item_id" value={item.id} />
-				<button
-					type="submit"
-					class="rounded-lg p-2 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600"
-					title="Remove from queue"
-				>
-					<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-						<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-					</svg>
-				</button>
-			</form>
-		{/if}
+		<div class="flex shrink-0 items-center gap-1">
+			{#if item.status === 'failed'}
+				<form method="POST" action="/repos/{repoOwner}/{repoName}?/retry" use:enhance>
+					<input type="hidden" name="item_id" value={item.id} />
+					<button
+						type="submit"
+						class="rounded-lg p-2 text-gray-400 transition-colors hover:bg-indigo-50 hover:text-indigo-600"
+						title="Retry"
+					>
+						<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+							<path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+						</svg>
+					</button>
+				</form>
+			{/if}
+			{#if canRemove}
+				<form method="POST" action="/repos/{repoOwner}/{repoName}?/removeFromQueue" use:enhance>
+					<input type="hidden" name="item_id" value={item.id} />
+					<button
+						type="submit"
+						class="rounded-lg p-2 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600"
+						title="Remove from queue"
+					>
+						<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+							<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+						</svg>
+					</button>
+				</form>
+			{/if}
+		</div>
 	</div>
 </div>

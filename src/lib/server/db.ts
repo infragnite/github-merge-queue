@@ -149,7 +149,7 @@ export function getQueueItems(repoId: number): QueueItem[] {
 	return getDb()
 		.prepare(
 			`SELECT * FROM queue_items
-		 WHERE repo_id = ? AND status NOT IN ('merged', 'failed', 'cancelled')
+		 WHERE repo_id = ? AND status NOT IN ('merged', 'cancelled')
 		 ORDER BY position`
 		)
 		.all(repoId) as QueueItem[];
