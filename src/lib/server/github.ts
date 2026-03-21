@@ -144,7 +144,7 @@ export async function getCheckStatus(owner: string, repo: string, ref: string) {
 
 	const allPassed = statusOk && checksComplete && checksOk;
 	const anyPending =
-		status.state === 'pending' ||
+		(status.state === 'pending' && status.statuses.length > 0) ||
 		checks.check_runs.some((c: { status: string }) => c.status !== 'completed');
 	const anyFailed =
 		status.state === 'failure' ||
