@@ -37,6 +37,18 @@ async function processAll() {
 }
 
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
+	// Reconcile ALL queued items (not just head) to detect externally merged/closed PRs
+	const allItems = db.getQueueItems(repo.id);
+	for (const item of allItems) {
+		try {
+			const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
+			reconcilePR(pr, repo, item);
+		} catch {
+			// PR fetch failed — skip reconciliation for this item
+		}
+	}
+
+	// Now process the head of the queue
 	const item = db.getActiveQueueItem(repo.id);
 	if (!item) return;
 
