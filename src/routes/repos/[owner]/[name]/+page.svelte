@@ -7,6 +7,9 @@
 	let { data } = $props();
 	let showAddDialog = $state(false);
 	let refreshing = $state(false);
+	let dragIndex = $state<number | null>(null);
+	let dragOverIndex = $state<number | null>(null);
+	let reordering = $state(false);
 
 	async function refresh() {
 		refreshing = true;
@@ -24,6 +27,47 @@
 		const id = setInterval(refresh, 10_000);
 		return () => clearInterval(id);
 	});
+
+	function handleDragStart(index: number) {
+		dragIndex = index;
+	}
+
+	function handleDragOver(e: DragEvent, index: number) {
+		e.preventDefault();
+		dragOverIndex = index;
+	}
+
+	function handleDragEnd() {
+		dragIndex = null;
+		dragOverIndex = null;
+	}
+
+	async function handleDrop(e: DragEvent, dropIndex: number) {
+		e.preventDefault();
+		if (dragIndex === null || dragIndex === dropIndex) {
+			handleDragEnd();
+			return;
+		}
+
+		const items = [...data.queueItems];
+		const [moved] = items.splice(dragIndex, 1);
+		items.splice(dropIndex, 0, moved);
+
+		const orderedIds = items.map((i) => i.id);
+		reordering = true;
+
+		const formData = new FormData();
+		formData.set('order', JSON.stringify(orderedIds));
+
+		await fetch(`?/reorder`, {
+			method: 'POST',
+			body: formData
+		});
+
+		await invalidateAll();
+		reordering = false;
+		handleDragEnd();
+	}
 </script>
 
 <svelte:head>
@@ -86,7 +130,17 @@
 	{:else}
 		<div class="space-y-3">
 			{#each data.queueItems as item, index (item.id)}
-				<QueueItem {item} position={index + 1} repoOwner={data.repo.owner} repoName={data.repo.name} />
+				<div
+					draggable="true"
+					ondragstart={() => handleDragStart(index)}
+					ondragover={(e) => handleDragOver(e, index)}
+					ondrop={(e) => handleDrop(e, index)}
+					ondragend={handleDragEnd}
+					class="transition-transform {dragOverIndex === index && dragIndex !== index ? 'translate-y-1 border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''}"
+					role="listitem"
+				>
+					<QueueItem {item} position={index + 1} repoOwner={data.repo.owner} repoName={data.repo.name} />
+				</div>
 			{/each}
 		</div>
 	{/if}

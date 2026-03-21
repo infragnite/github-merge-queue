@@ -4,7 +4,8 @@ import {
 	getQueueItems,
 	getRepoHistory,
 	addToQueue,
-	removeFromQueue
+	removeFromQueue,
+	reorderQueue
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
 import type { PageServerLoad, Actions } from './$types';
@@ -64,7 +65,12 @@ export const actions: Actions = {
 		const authorLogin = formData.get('author_login') as string;
 		const authorAvatar = formData.get('author_avatar') as string;
 
-		if (!prNumber || !prTitle) return fail(400, { error: 'Missing required fields' });
+		if (!prNumber || !prTitle || !prUrl || !authorLogin) {
+			return fail(400, { error: 'Missing required fields' });
+		}
+		if (prTitle.length > 500 || prUrl.length > 2000 || authorLogin.length > 100) {
+			return fail(400, { error: 'Invalid field values' });
+		}
 
 		try {
 			addToQueue(
@@ -101,6 +107,37 @@ export const actions: Actions = {
 		if (!items.some((i) => i.id === itemId)) return fail(403);
 
 		removeFromQueue(itemId);
+		return { success: true };
+	},
+
+	reorder: async ({ request, params, locals }) => {
+		if (!locals.user) return fail(401);
+
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+
+		const formData = await request.formData();
+		const orderJson = formData.get('order') as string;
+		if (!orderJson) return fail(400);
+
+		let orderedIds: number[];
+		try {
+			orderedIds = JSON.parse(orderJson);
+		} catch {
+			return fail(400);
+		}
+
+		if (!Array.isArray(orderedIds) || orderedIds.some((id) => typeof id !== 'number')) {
+			return fail(400);
+		}
+
+		const items = getQueueItems(repo.id);
+		const validIds = new Set(items.map((i) => i.id));
+		if (orderedIds.length !== validIds.size || !orderedIds.every((id) => validIds.has(id))) {
+			return fail(400, { error: 'Invalid item order' });
+		}
+
+		reorderQueue(repo.id, orderedIds);
 		return { success: true };
 	}
 };

@@ -2,6 +2,15 @@
 	import { page } from '$app/state';
 
 	const error = $derived(page.url.searchParams.get('error'));
+
+	const errorMessages: Record<string, string> = {
+		not_member: 'You must be a member of the infragnite organization.',
+		auth_failed: 'Authentication failed. Please try again.',
+		invalid_state: 'Session expired. Please try again.',
+		no_code: 'Authentication was cancelled.'
+	};
+
+	const errorMessage = $derived(error ? errorMessages[error] || 'Something went wrong. Please try again.' : null);
 </script>
 
 <svelte:head>
@@ -23,9 +32,9 @@
 				</p>
 			</div>
 
-			{#if error}
+			{#if errorMessage}
 				<div class="mb-4 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700">
-					Authentication failed. Please try again.
+					{errorMessage}
 				</div>
 			{/if}
 
@@ -43,7 +52,7 @@
 		</div>
 
 		<p class="mt-6 text-center text-xs text-gray-400">
-			Requires <code class="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600">repo</code> scope to manage pull requests
+			Restricted to infragnite organization members
 		</p>
 	</div>
 </div>

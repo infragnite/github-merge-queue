@@ -31,7 +31,7 @@ export interface QueueItem {
 	author_login: string;
 	author_avatar: string;
 	head_sha: string | null;
-	status: 'queued' | 'updating' | 'checking' | 'merging' | 'merged' | 'failed' | 'cancelled';
+	status: 'queued' | 'updating' | 'checking' | 'merging' | 'merged' | 'failed' | 'cancelled' | 'conflict';
 	position: number;
 	error_message: string | null;
 	queued_by: string;

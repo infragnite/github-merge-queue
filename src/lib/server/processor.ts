@@ -54,6 +54,9 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 			case 'merging':
 				await handleMerging(repo, item);
 				break;
+			case 'conflict':
+				await handleConflict(repo, item);
+				break;
 		}
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -84,6 +87,11 @@ async function handleQueued(
 
 	if (pr.state !== 'open') {
 		db.updateQueueItemStatus(item.id, 'cancelled', `PR is ${pr.state}`);
+		return;
+	}
+
+	if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+		db.updateQueueItemStatus(item.id, 'conflict', 'Branch has merge conflicts — resolve them on GitHub');
 		return;
 	}
 
@@ -118,23 +126,32 @@ async function handleUpdating(
 	if (pr.mergeable === null) return;
 
 	if (pr.mergeable === false) {
-		db.updateQueueItemStatus(item.id, 'failed', 'Merge conflicts detected');
-		db.addToHistory(
-			repo.id as number,
-			item.pr_number,
-			item.pr_title,
-			item.pr_url,
-			item.author_login,
-			null,
-			'failed',
-			'Merge conflicts',
-			item.created_at
-		);
+		db.updateQueueItemStatus(item.id, 'conflict', 'Branch has merge conflicts — resolve them on GitHub');
 		return;
 	}
 
 	db.updateQueueItemHeadSha(item.id, pr.head.sha);
 	db.updateQueueItemStatus(item.id, 'checking');
+}
+
+async function handleConflict(
+	repo: { owner: string; name: string },
+	item: { id: number; pr_number: number }
+) {
+	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
+
+	if (pr.state !== 'open') {
+		db.updateQueueItemStatus(item.id, 'cancelled', `PR is ${pr.state}`);
+		return;
+	}
+
+	// mergeable is null while GitHub is computing — wait for next cycle
+	if (pr.mergeable === null) return;
+
+	if (pr.mergeable === true) {
+		console.log(`[merge-queue] Conflict resolved for ${repo.owner}/${repo.name}#${item.pr_number}`);
+		db.updateQueueItemStatus(item.id, 'queued');
+	}
 }
 
 async function handleChecking(

@@ -224,6 +224,17 @@ export function updateQueueItemHeadSha(itemId: number, headSha: string) {
 	getDb().prepare('UPDATE queue_items SET head_sha = ? WHERE id = ?').run(headSha, itemId);
 }
 
+export function reorderQueue(repoId: number, orderedItemIds: number[]) {
+	const database = getDb();
+	const update = database.prepare('UPDATE queue_items SET position = ? WHERE id = ? AND repo_id = ?');
+	const txn = database.transaction(() => {
+		for (let i = 0; i < orderedItemIds.length; i++) {
+			update.run(i + 1, orderedItemIds[i], repoId);
+		}
+	});
+	txn();
+}
+
 // --- History ---
 
 export function addToHistory(

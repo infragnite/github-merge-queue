@@ -17,14 +17,27 @@
 <div
 	class="rounded-xl border bg-surface-raised p-4 transition-all {isActive
 		? 'border-indigo-200 shadow-sm'
-		: 'border-border-subtle'}"
+		: item.status === 'conflict'
+			? 'border-orange-200 shadow-sm'
+			: 'border-border-subtle'}"
 >
 	<div class="flex items-start gap-4">
+		<!-- Drag handle -->
+		<div class="flex shrink-0 cursor-grab items-center text-gray-300 hover:text-gray-500 active:cursor-grabbing" title="Drag to reorder">
+			<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
+				<circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
+				<circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
+				<circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
+			</svg>
+		</div>
+
 		<!-- Position -->
 		<div
 			class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold {isActive
 				? 'bg-indigo-100 text-indigo-700'
-				: 'bg-gray-100 text-gray-500'}"
+				: item.status === 'conflict'
+					? 'bg-orange-100 text-orange-700'
+					: 'bg-gray-100 text-gray-500'}"
 		>
 			{position}
 		</div>
@@ -57,7 +70,21 @@
 				{/if}
 			</div>
 
-			{#if item.error_message}
+			{#if item.status === 'conflict'}
+				<div class="mt-2 flex items-center gap-2 rounded-lg bg-orange-50 px-3 py-2 text-xs text-orange-700">
+					<svg class="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+					</svg>
+					<span>Merge conflicts detected.</span>
+					<a
+						href="{item.pr_url}/conflicts"
+						target="_blank"
+						rel="noopener"
+						class="font-medium underline hover:text-orange-900"
+					>Resolve on GitHub</a>
+					<span class="text-orange-400">&middot; Will retry automatically</span>
+				</div>
+			{:else if item.error_message}
 				<div class="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700">
 					{item.error_message}
 				</div>
