@@ -87,12 +87,18 @@ export const actions: Actions = {
 		return { success: true };
 	},
 
-	removeFromQueue: async ({ request, locals }) => {
+	removeFromQueue: async ({ request, params, locals }) => {
 		if (!locals.user) return fail(401);
+
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
 
 		const formData = await request.formData();
 		const itemId = parseInt(formData.get('item_id') as string, 10);
 		if (!itemId) return fail(400);
+
+		const items = getQueueItems(repo.id);
+		if (!items.some((i) => i.id === itemId)) return fail(403);
 
 		removeFromQueue(itemId);
 		return { success: true };

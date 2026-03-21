@@ -1,5 +1,5 @@
 import { redirect, fail } from '@sveltejs/kit';
-import { getRepos, addRepo, removeRepo } from '$lib/server/db';
+import { getRepos, getRepoById, addRepo, removeRepo } from '$lib/server/db';
 import { listInstallationRepos, getRepo as getGhRepo } from '$lib/server/github';
 import type { PageServerLoad, Actions } from './$types';
 
@@ -58,6 +58,9 @@ export const actions: Actions = {
 		const formData = await request.formData();
 		const repoId = parseInt(formData.get('repo_id') as string, 10);
 		if (!repoId) return fail(400);
+
+		const repo = getRepoById(repoId);
+		if (!repo || repo.added_by !== locals.user.id) return fail(403);
 
 		removeRepo(repoId);
 		return { success: true };

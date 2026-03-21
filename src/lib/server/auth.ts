@@ -2,7 +2,8 @@ import { createHmac } from 'crypto';
 import { env } from '$env/dynamic/private';
 
 function secret() {
-	return env.SESSION_SECRET || 'merge-queue-dev-secret';
+	if (!env.SESSION_SECRET) throw new Error('SESSION_SECRET environment variable is required');
+	return env.SESSION_SECRET;
 }
 
 export function createSessionToken(userId: number): string {
