@@ -72,6 +72,11 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		}
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
+		// Don't fail permanently on transient GitHub API errors — retry next cycle
+		if (/GitHub API (5\d\d|timeout)/i.test(msg)) {
+			console.warn(`[merge-queue] Transient error for #${item.pr_number}, will retry: ${msg}`);
+			return;
+		}
 		console.error(
 			`[merge-queue] Error processing ${repo.owner}/${repo.name}#${item.pr_number}: ${msg}`
 		);
