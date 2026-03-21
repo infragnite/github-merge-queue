@@ -205,12 +205,12 @@ export function updateQueueItemStatus(itemId: number, status: string, errorMessa
 	const database = getDb();
 	if (status === 'updating') {
 		database
-			.prepare('UPDATE queue_items SET status = ?, started_at = datetime("now") WHERE id = ?')
+			.prepare(`UPDATE queue_items SET status = ?, started_at = datetime('now') WHERE id = ?`)
 			.run(status, itemId);
 	} else if (['merged', 'failed', 'cancelled'].includes(status)) {
 		database
 			.prepare(
-				'UPDATE queue_items SET status = ?, error_message = ?, completed_at = datetime("now") WHERE id = ?'
+				`UPDATE queue_items SET status = ?, error_message = ?, completed_at = datetime('now') WHERE id = ?`
 			)
 			.run(status, errorMessage ?? null, itemId);
 	} else {
