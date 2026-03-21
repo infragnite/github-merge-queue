@@ -10,8 +10,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.0",
-    "@octokit/rest": "^21.1.1"
+    "better-sqlite3": "^11.8.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.2.12",

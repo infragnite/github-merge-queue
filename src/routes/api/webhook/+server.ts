@@ -1,6 +1,12 @@
 import { json } from '@sveltejs/kit';
 import { createHmac } from 'crypto';
-import { getRepoByOwnerName, getQueueItems, updateQueueItemStatus, updateQueueItemHeadSha } from '$lib/server/db';
+import { env } from '$env/dynamic/private';
+import {
+	getRepoByOwnerName,
+	getQueueItems,
+	updateQueueItemStatus,
+	updateQueueItemHeadSha
+} from '$lib/server/db';
 import type { RequestHandler } from './$types';
 
 function verifySignature(payload: string, signature: string | null, secret: string): boolean {
@@ -15,9 +21,17 @@ function verifySignature(payload: string, signature: string | null, secret: stri
 }
 
 export const POST: RequestHandler = async ({ request }) => {
+	const webhookSecret = env.GITHUB_WEBHOOK_SECRET;
+	if (!webhookSecret) return json({ error: 'Webhook secret not configured' }, { status: 500 });
+
 	const body = await request.text();
 	const event = request.headers.get('x-github-event');
 	const signature = request.headers.get('x-hub-signature-256');
+
+	// Mandatory signature verification
+	if (!verifySignature(body, signature, webhookSecret)) {
+		return json({ error: 'Invalid signature' }, { status: 401 });
+	}
 
 	let payload: Record<string, unknown>;
 	try {
@@ -26,7 +40,6 @@ export const POST: RequestHandler = async ({ request }) => {
 		return json({ error: 'Invalid JSON' }, { status: 400 });
 	}
 
-	// Extract repo info
 	const repository = payload.repository as { full_name?: string } | undefined;
 	if (!repository?.full_name) return json({ ok: true });
 
@@ -34,26 +47,19 @@ export const POST: RequestHandler = async ({ request }) => {
 	const repo = getRepoByOwnerName(owner, name);
 	if (!repo) return json({ ok: true });
 
-	// Verify webhook signature if secret is configured
-	if (repo.webhook_secret) {
-		if (!verifySignature(body, signature, repo.webhook_secret)) {
-			return json({ error: 'Invalid signature' }, { status: 401 });
-		}
-	}
-
 	const queueItems = getQueueItems(repo.id);
 	if (queueItems.length === 0) return json({ ok: true });
 
 	switch (event) {
 		case 'check_suite':
 		case 'check_run': {
-			// A check completed - if it's for a PR in our queue, update status
-			const headSha = (payload as { check_suite?: { head_sha: string }; check_run?: { head_sha: string } })
-				.check_suite?.head_sha || (payload as { check_run?: { head_sha: string } }).check_run?.head_sha;
+			const headSha =
+				(payload as { check_suite?: { head_sha: string }; check_run?: { head_sha: string } })
+					.check_suite?.head_sha ||
+				(payload as { check_run?: { head_sha: string } }).check_run?.head_sha;
 			if (headSha) {
 				const item = queueItems.find((i) => i.head_sha === headSha && i.status === 'checking');
 				if (item) {
-					// Processor will handle the actual check on next tick
 					console.log(`[webhook] Check event for ${owner}/${name}#${item.pr_number}`);
 				}
 			}
@@ -70,8 +76,9 @@ export const POST: RequestHandler = async ({ request }) => {
 					updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
 					console.log(`[webhook] PR #${prNumber} closed, removing from queue`);
 				} else if (action === 'synchronize') {
-					// Head SHA changed (new push or branch update)
-					const newSha = (payload as { pull_request: { head: { sha: string } } }).pull_request.head.sha;
+					const newSha = (
+						payload as { pull_request: { head: { sha: string } } }
+					).pull_request.head.sha;
 					updateQueueItemHeadSha(item.id, newSha);
 					console.log(`[webhook] PR #${prNumber} updated, new SHA: ${newSha.slice(0, 8)}`);
 				}
@@ -80,7 +87,6 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		case 'status': {
-			// Legacy status API event
 			const sha = (payload as { sha: string }).sha;
 			const item = queueItems.find((i) => i.head_sha === sha && i.status === 'checking');
 			if (item) {

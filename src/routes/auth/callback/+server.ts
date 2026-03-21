@@ -2,14 +2,22 @@ import { redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import { createSessionToken } from '$lib/server/auth';
 import { upsertUser } from '$lib/server/db';
-import { getUser } from '$lib/server/github';
+import { getUser, checkOrgMembership } from '$lib/server/github';
 import type { RequestHandler } from './$types';
+
+const ALLOWED_ORG = 'infragnite';
 
 export const GET: RequestHandler = async ({ url, cookies }) => {
 	const code = url.searchParams.get('code');
-	if (!code) redirect(302, '/login?error=no_code');
+	const state = url.searchParams.get('state');
+	const savedState = cookies.get('oauth_state');
+	cookies.delete('oauth_state', { path: '/' });
 
-	// Exchange code for access token
+	if (!code) redirect(302, '/login?error=no_code');
+	if (!state || !savedState || state !== savedState) {
+		redirect(302, '/login?error=invalid_state');
+	}
+
 	const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
 		method: 'POST',
 		headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
@@ -22,23 +30,19 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 
 	const tokenData = await tokenRes.json();
 	if (!tokenData.access_token) {
-		console.error('OAuth token exchange failed:', tokenData);
 		redirect(302, '/login?error=auth_failed');
 	}
 
-	// Fetch GitHub user profile
+	// Use the temporary OAuth token for identity and org check, then discard it
 	const ghUser = await getUser(tokenData.access_token);
+	const isMember = await checkOrgMembership(tokenData.access_token, ALLOWED_ORG);
+	if (!isMember) {
+		redirect(302, '/login?error=not_member');
+	}
 
-	// Create or update user in database
-	const userId = upsertUser(
-		ghUser.id,
-		ghUser.login,
-		ghUser.name,
-		ghUser.avatar_url,
-		tokenData.access_token
-	);
+	// Token is NOT stored — only user identity is persisted
+	const userId = upsertUser(ghUser.id, ghUser.login, ghUser.name, ghUser.avatar_url);
 
-	// Set session cookie
 	const token = createSessionToken(userId);
 	cookies.set('session', token, {
 		path: '/',

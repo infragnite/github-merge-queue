@@ -23,7 +23,7 @@ function migrate(database: Database.Database) {
 			login TEXT NOT NULL,
 			name TEXT,
 			avatar_url TEXT,
-			access_token TEXT NOT NULL,
+			access_token TEXT NOT NULL DEFAULT '',
 			created_at TEXT DEFAULT (datetime('now'))
 		);
 
@@ -71,6 +71,9 @@ function migrate(database: Database.Database) {
 			completed_at TEXT DEFAULT (datetime('now'))
 		);
 	`);
+
+	// Clear any stored access tokens from before the security hardening
+	database.exec(`UPDATE users SET access_token = '' WHERE access_token != ''`);
 }
 
 // --- Users ---
@@ -79,21 +82,20 @@ export function upsertUser(
 	githubId: number,
 	login: string,
 	name: string | null,
-	avatarUrl: string | null,
-	accessToken: string
+	avatarUrl: string | null
 ): number {
 	const database = getDb();
 	database
 		.prepare(
 			`INSERT INTO users (github_id, login, name, avatar_url, access_token)
-		 VALUES (?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, '')
 		 ON CONFLICT(github_id) DO UPDATE SET
 			 login = excluded.login,
 			 name = excluded.name,
 			 avatar_url = excluded.avatar_url,
-			 access_token = excluded.access_token`
+			 access_token = ''`
 		)
-		.run(githubId, login, name, avatarUrl, accessToken);
+		.run(githubId, login, name, avatarUrl);
 	const user = database
 		.prepare('SELECT id FROM users WHERE github_id = ?')
 		.get(githubId) as { id: number };

@@ -2,8 +2,13 @@
 	import { enhance } from '$app/forms';
 
 	let { data, form } = $props();
-	let repoInput = $state('');
 	let adding = $state(false);
+	let selectedRepo = $state('');
+
+	const addedRepoNames = $derived(new Set(data.repos.map((r) => `${r.owner}/${r.name}`)));
+	const filteredRepos = $derived(
+		data.availableRepos.filter((r) => !addedRepoNames.has(r.full_name))
+	);
 </script>
 
 <svelte:head>
@@ -30,22 +35,31 @@
 				adding = true;
 				return async ({ update }) => {
 					adding = false;
-					repoInput = '';
+					selectedRepo = '';
 					await update();
 				};
 			}}
 		>
 			<div class="flex gap-3">
-				<input
-					type="text"
-					name="repo"
-					bind:value={repoInput}
-					placeholder="owner/repository"
-					class="flex-1 rounded-lg border border-border-subtle bg-surface px-4 py-2.5 text-sm text-gray-900 placeholder:text-gray-400 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none"
-				/>
+				{#if filteredRepos.length > 0}
+					<select
+						name="repo"
+						bind:value={selectedRepo}
+						class="flex-1 rounded-lg border border-border-subtle bg-surface px-4 py-2.5 text-sm text-gray-900 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none"
+					>
+						<option value="" disabled>Select a repository...</option>
+						{#each filteredRepos as repo}
+							<option value={repo.full_name}>{repo.full_name}</option>
+						{/each}
+					</select>
+				{:else}
+					<p class="flex-1 py-2.5 text-sm text-gray-500">
+						No additional repositories available. Install the GitHub App on more repos to see them here.
+					</p>
+				{/if}
 				<button
 					type="submit"
-					disabled={!repoInput.includes('/') || adding}
+					disabled={!selectedRepo || adding}
 					class="rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
 				>
 					{adding ? 'Adding...' : 'Add'}

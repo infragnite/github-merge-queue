@@ -1,5 +1,11 @@
 import { redirect, error, fail } from '@sveltejs/kit';
-import { getRepoByOwnerName, getQueueItems, getRepoHistory, getUserById, addToQueue, removeFromQueue } from '$lib/server/db';
+import {
+	getRepoByOwnerName,
+	getQueueItems,
+	getRepoHistory,
+	addToQueue,
+	removeFromQueue
+} from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
 import type { PageServerLoad, Actions } from './$types';
 
@@ -8,9 +14,6 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 
 	const repo = getRepoByOwnerName(params.owner, params.name);
 	if (!repo) error(404, 'Repository not found');
-
-	const user = getUserById(locals.user.id);
-	if (!user) redirect(302, '/login');
 
 	const queueItems = getQueueItems(repo.id);
 
@@ -22,12 +25,11 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		draft: boolean;
 	}> = [];
 	try {
-		openPrs = await getOpenPRs(user.access_token, params.owner, params.name);
+		openPrs = await getOpenPRs(params.owner, params.name);
 	} catch (e) {
 		console.error('Failed to fetch open PRs:', e);
 	}
 
-	// Filter out PRs already in queue
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
 	const availablePrs = openPrs
 		.filter((pr) => !queuedNumbers.has(pr.number))
@@ -65,7 +67,15 @@ export const actions: Actions = {
 		if (!prNumber || !prTitle) return fail(400, { error: 'Missing required fields' });
 
 		try {
-			addToQueue(repo.id, prNumber, prTitle, prUrl, authorLogin, authorAvatar, locals.user.login);
+			addToQueue(
+				repo.id,
+				prNumber,
+				prTitle,
+				prUrl,
+				authorLogin,
+				authorAvatar,
+				locals.user.login
+			);
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
 			if (msg.includes('UNIQUE')) {

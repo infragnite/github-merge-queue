@@ -1,11 +1,19 @@
 import { redirect, fail } from '@sveltejs/kit';
-import { getRepos, addRepo, removeRepo, getUserById } from '$lib/server/db';
-import { getRepo as getGhRepo } from '$lib/server/github';
+import { getRepos, addRepo, removeRepo } from '$lib/server/db';
+import { listInstallationRepos, getRepo as getGhRepo } from '$lib/server/github';
 import type { PageServerLoad, Actions } from './$types';
 
-export const load: PageServerLoad = ({ locals }) => {
+export const load: PageServerLoad = async ({ locals }) => {
 	if (!locals.user) redirect(302, '/login');
-	return { repos: getRepos() };
+
+	let availableRepos: Array<{ full_name: string; default_branch: string }> = [];
+	try {
+		availableRepos = await listInstallationRepos();
+	} catch (err) {
+		console.error('Failed to list installation repos:', err);
+	}
+
+	return { repos: getRepos(), availableRepos };
 };
 
 export const actions: Actions = {
@@ -16,21 +24,19 @@ export const actions: Actions = {
 		const fullName = (formData.get('repo') as string)?.trim();
 
 		if (!fullName || !fullName.includes('/')) {
-			return fail(400, { error: 'Enter a repository in owner/name format' });
+			return fail(400, { error: 'Select a repository' });
 		}
 
 		const [owner, name] = fullName.split('/');
 
-		// Verify the repo exists and user has access
-		const user = getUserById(locals.user.id);
-		if (!user) return fail(401);
-
 		let defaultBranch = 'main';
 		try {
-			const ghRepo = await getGhRepo(user.access_token, owner, name);
+			const ghRepo = await getGhRepo(owner, name);
 			defaultBranch = ghRepo.default_branch;
 		} catch {
-			return fail(400, { error: `Cannot access ${fullName}. Check the name and your permissions.` });
+			return fail(400, {
+				error: `Cannot access ${fullName}. Is the GitHub App installed on this repo?`
+			});
 		}
 
 		try {

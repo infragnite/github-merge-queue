@@ -4,7 +4,6 @@ export interface User {
 	login: string;
 	name: string | null;
 	avatar_url: string | null;
-	access_token: string;
 	created_at: string;
 }
 
