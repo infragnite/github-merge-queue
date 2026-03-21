@@ -74,14 +74,17 @@ export async function getUser(token: string) {
 	return ghFetch(token, '/user');
 }
 
-export async function checkOrgMembership(userToken: string, org: string): Promise<boolean> {
+export async function checkOrgMembership(userToken: string): Promise<boolean> {
+	const installationId = env.GITHUB_INSTALLATION_ID;
+	if (!installationId) return false;
 	try {
-		const res = await fetch(`${API}/user/memberships/orgs/${org}`, {
-			headers: headers(userToken)
-		});
+		const res = await fetch(
+			`${API}/user/installations/${installationId}/repositories?per_page=1`,
+			{ headers: headers(userToken) }
+		);
 		if (!res.ok) return false;
 		const data = await res.json();
-		return data.state === 'active';
+		return data.total_count > 0;
 	} catch {
 		return false;
 	}

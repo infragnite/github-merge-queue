@@ -40,7 +40,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 
 	// Use the temporary OAuth token for identity and org check, then discard it
 	const ghUser = await getUser(tokenData.access_token);
-	const isMember = await checkOrgMembership(tokenData.access_token, ALLOWED_ORG);
+	const isMember = await checkOrgMembership(tokenData.access_token);
 	if (!isMember) {
 		redirect(302, '/login?error=not_member');
 	}
