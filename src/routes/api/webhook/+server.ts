@@ -7,7 +7,8 @@ import {
 	updateQueueItemStatus,
 	updateQueueItemHeadSha,
 	addToHistory,
-	removeFromQueue
+	removeFromQueue,
+	addToQueue
 } from '$lib/server/db';
 import type { RequestHandler } from './$types';
 
@@ -50,11 +51,11 @@ export const POST: RequestHandler = async ({ request }) => {
 	if (!repo) return json({ ok: true });
 
 	const queueItems = getQueueItems(repo.id);
-	if (queueItems.length === 0) return json({ ok: true });
 
 	switch (event) {
 		case 'check_suite':
 		case 'check_run': {
+			if (queueItems.length === 0) break;
 			const headSha =
 				(payload as { check_suite?: { head_sha: string }; check_run?: { head_sha: string } })
 					.check_suite?.head_sha ||
@@ -70,7 +71,22 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		case 'pull_request': {
 			const action = (payload as { action: string }).action;
-			const pr = (payload as { pull_request: { number: number; merged: boolean; merge_commit_sha: string | null } }).pull_request;
+			const pr = (payload as { pull_request: { number: number; merged: boolean; merge_commit_sha: string | null; title: string; html_url: string; draft: boolean; user: { login: string; avatar_url: string } } }).pull_request;
+
+			// Auto-add dependabot PRs to the queue
+			if (action === 'opened' && pr.user.login === 'dependabot[bot]' && !pr.draft) {
+				const alreadyQueued = queueItems.some((i) => i.pr_number === pr.number);
+				if (!alreadyQueued) {
+					try {
+						addToQueue(repo.id, pr.number, pr.title, pr.html_url, pr.user.login, pr.user.avatar_url, 'auto (dependabot)');
+						console.log(`[webhook] Auto-queued dependabot PR #${pr.number}: ${pr.title}`);
+					} catch (err) {
+						console.error(`[webhook] Failed to auto-queue dependabot PR #${pr.number}:`, err instanceof Error ? err.message : err);
+					}
+				}
+				break;
+			}
+
 			const item = queueItems.find((i) => i.pr_number === pr.number);
 
 			if (item) {
@@ -107,6 +123,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		case 'status': {
+			if (queueItems.length === 0) break;
 			const sha = (payload as { sha: string }).sha;
 			const item = queueItems.find((i) => i.head_sha === sha && i.status === 'checking');
 			if (item) {

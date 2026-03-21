@@ -160,6 +160,15 @@ export async function getCheckStatus(owner: string, repo: string, ref: string) {
 	return { allPassed, anyPending, anyFailed };
 }
 
+export async function commentOnPR(owner: string, repo: string, prNumber: number, body: string) {
+	const token = await getInstallationToken();
+	return ghFetch(token, `/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ body })
+	});
+}
+
 export async function mergePR(
 	owner: string,
 	repo: string,
