@@ -70,54 +70,67 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		case 'pull_request': {
-			const action = (payload as { action: string }).action;
-			const pr = (payload as { pull_request: { number: number; merged: boolean; merge_commit_sha: string | null; title: string; html_url: string; draft: boolean; user: { login: string; avatar_url: string } } }).pull_request;
+			try {
+				const action = (payload as { action: string }).action;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const pullRequest = (payload as any).pull_request;
+				const prNumber = pullRequest?.number as number;
+				const prUser = pullRequest?.user;
 
-			// Auto-add dependabot PRs to the queue
-			if (action === 'opened' && pr.user.login === 'dependabot[bot]' && !pr.draft) {
-				const alreadyQueued = queueItems.some((i) => i.pr_number === pr.number);
-				if (!alreadyQueued) {
-					try {
-						addToQueue(repo.id, pr.number, pr.title, pr.html_url, pr.user.login, pr.user.avatar_url, 'auto (dependabot)');
-						console.log(`[webhook] Auto-queued dependabot PR #${pr.number}: ${pr.title}`);
-					} catch (err) {
-						console.error(`[webhook] Failed to auto-queue dependabot PR #${pr.number}:`, err instanceof Error ? err.message : err);
+				if (!prNumber) break;
+
+				// Auto-add dependabot PRs to the queue
+				if (action === 'opened' && prUser?.login === 'dependabot[bot]' && !pullRequest.draft) {
+					const alreadyQueued = queueItems.some((i) => i.pr_number === prNumber);
+					if (!alreadyQueued) {
+						addToQueue(
+							repo.id,
+							prNumber,
+							pullRequest.title || `Dependabot PR #${prNumber}`,
+							pullRequest.html_url || `https://github.com/${owner}/${name}/pull/${prNumber}`,
+							prUser.login,
+							prUser.avatar_url || '',
+							'auto (dependabot)'
+						);
+						console.log(`[webhook] Auto-queued dependabot PR #${prNumber}: ${pullRequest.title}`);
+					}
+					break;
+				}
+
+				const item = queueItems.find((i) => i.pr_number === prNumber);
+
+				if (item) {
+					if (action === 'closed' && pullRequest.merged) {
+						updateQueueItemStatus(item.id, 'merged');
+						addToHistory(
+							repo.id,
+							item.pr_number,
+							item.pr_title,
+							item.pr_url,
+							item.author_login,
+							pullRequest.merge_commit_sha,
+							'merged',
+							null,
+							item.created_at
+						);
+						removeFromQueue(item.id);
+						console.log(`[webhook] PR #${prNumber} merged externally, removed from queue`);
+					} else if (action === 'closed') {
+						updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
+						console.log(`[webhook] PR #${prNumber} closed, removed from queue`);
+					} else if (action === 'synchronize') {
+						const newSha = pullRequest.head?.sha;
+						if (newSha) {
+							updateQueueItemHeadSha(item.id, newSha);
+							if (item.status === 'checking') {
+								updateQueueItemStatus(item.id, 'queued');
+							}
+							console.log(`[webhook] PR #${prNumber} updated, new SHA: ${newSha.slice(0, 8)}`);
+						}
 					}
 				}
-				break;
-			}
-
-			const item = queueItems.find((i) => i.pr_number === pr.number);
-
-			if (item) {
-				if (action === 'closed' && pr.merged) {
-					updateQueueItemStatus(item.id, 'merged');
-					addToHistory(
-						repo.id,
-						item.pr_number,
-						item.pr_title,
-						item.pr_url,
-						item.author_login,
-						pr.merge_commit_sha,
-						'merged',
-						null,
-						item.created_at
-					);
-					removeFromQueue(item.id);
-					console.log(`[webhook] PR #${pr.number} merged externally, removed from queue`);
-				} else if (action === 'closed') {
-					updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
-					console.log(`[webhook] PR #${pr.number} closed, removed from queue`);
-				} else if (action === 'synchronize') {
-					const newSha = (
-						payload as { pull_request: { head: { sha: string } } }
-					).pull_request.head.sha;
-					updateQueueItemHeadSha(item.id, newSha);
-					if (item.status === 'checking') {
-						updateQueueItemStatus(item.id, 'queued');
-					}
-					console.log(`[webhook] PR #${pr.number} updated, new SHA: ${newSha.slice(0, 8)}`);
-				}
+			} catch (err) {
+				console.error(`[webhook] Error handling pull_request event:`, err instanceof Error ? err.message : err);
 			}
 			break;
 		}
