@@ -38,9 +38,10 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		redirect(302, '/login?error=auth_failed');
 	}
 
-	// Use the temporary OAuth token for identity and org check, then discard it
+	// Use the temporary OAuth token for identity, then discard it
 	const ghUser = await getUser(tokenData.access_token);
-	const isMember = await checkOrgMembership(tokenData.access_token);
+	// Check org membership via installation token (requires members:read on app)
+	const isMember = await checkOrgMembership(ghUser.login, ALLOWED_ORG);
 	if (!isMember) {
 		redirect(302, '/login?error=not_member');
 	}
