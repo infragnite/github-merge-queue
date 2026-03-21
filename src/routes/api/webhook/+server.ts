@@ -41,7 +41,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	const repository = payload.repository as { full_name?: string } | undefined;
-	if (!repository?.full_name) return json({ ok: true });
+	if (!repository?.full_name || !repository.full_name.includes('/')) return json({ ok: true });
 
 	const [owner, name] = repository.full_name.split('/');
 	const repo = getRepoByOwnerName(owner, name);

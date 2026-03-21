@@ -26,8 +26,8 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	}> = [];
 	try {
 		openPrs = await getOpenPRs(params.owner, params.name);
-	} catch (e) {
-		console.error('Failed to fetch open PRs:', e);
+	} catch {
+		// GitHub API error — user sees empty PR list
 	}
 
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
@@ -81,7 +81,7 @@ export const actions: Actions = {
 			if (msg.includes('UNIQUE')) {
 				return fail(409, { error: 'PR is already in the queue' });
 			}
-			return fail(500, { error: msg });
+			return fail(500, { error: 'Failed to add PR to queue' });
 		}
 
 		return { success: true };

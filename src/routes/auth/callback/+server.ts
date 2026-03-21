@@ -34,7 +34,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 
 	const tokenData = await tokenRes.json();
 	if (!tokenData.access_token) {
-		console.error('[auth] Token exchange failed:', tokenData.error, tokenData.error_description);
+		console.error('[auth] Token exchange failed');
 		redirect(302, '/login?error=auth_failed');
 	}
 
@@ -50,11 +50,12 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 	const userId = upsertUser(ghUser.id, ghUser.login, ghUser.name, ghUser.avatar_url);
 
 	const token = createSessionToken(userId);
+	const isSecure = (env.APP_URL || '').startsWith('https');
 	cookies.set('session', token, {
 		path: '/',
 		httpOnly: true,
 		sameSite: 'lax',
-		secure: env.NODE_ENV === 'production',
+		secure: isSecure,
 		maxAge: 60 * 60 * 24 * 30
 	});
 

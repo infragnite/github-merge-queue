@@ -8,12 +8,13 @@ export const GET: RequestHandler = ({ cookies }) => {
 	const publicUrl = env.APP_URL || 'http://localhost:3000';
 	const redirectUri = `${publicUrl}/auth/callback`;
 
+	const isSecure = publicUrl.startsWith('https');
 	const state = randomBytes(32).toString('hex');
 	cookies.set('oauth_state', state, {
 		path: '/',
 		httpOnly: true,
 		sameSite: 'lax',
-		secure: env.NODE_ENV === 'production',
+		secure: isSecure,
 		maxAge: 600
 	});
 

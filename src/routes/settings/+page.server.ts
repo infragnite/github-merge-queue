@@ -9,8 +9,8 @@ export const load: PageServerLoad = async ({ locals }) => {
 	let availableRepos: Array<{ full_name: string; default_branch: string }> = [];
 	try {
 		availableRepos = await listInstallationRepos();
-	} catch (err) {
-		console.error('Failed to list installation repos:', err);
+	} catch {
+		// GitHub API error — user sees empty list
 	}
 
 	return { repos: getRepos(), availableRepos };
@@ -23,11 +23,14 @@ export const actions: Actions = {
 		const formData = await request.formData();
 		const fullName = (formData.get('repo') as string)?.trim();
 
-		if (!fullName || !fullName.includes('/')) {
+		if (!fullName || !fullName.includes('/') || fullName.length > 255) {
 			return fail(400, { error: 'Select a repository' });
 		}
 
 		const [owner, name] = fullName.split('/');
+		if (!owner || !name || !/^[a-zA-Z0-9._-]+$/.test(owner) || !/^[a-zA-Z0-9._-]+$/.test(name)) {
+			return fail(400, { error: 'Invalid repository name' });
+		}
 
 		let defaultBranch = 'main';
 		try {
@@ -46,7 +49,7 @@ export const actions: Actions = {
 			if (msg.includes('UNIQUE')) {
 				return fail(409, { error: 'Repository already added' });
 			}
-			return fail(500, { error: msg });
+			return fail(500, { error: 'Failed to add repository' });
 		}
 
 		return { success: true };
