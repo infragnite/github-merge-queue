@@ -43,8 +43,8 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		try {
 			const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
 			reconcilePR(pr, repo, item);
-		} catch {
-			// PR fetch failed — skip reconciliation for this item
+		} catch (err) {
+			console.error(`[merge-queue] Reconcile error for #${item.pr_number}:`, err instanceof Error ? err.message : err);
 		}
 	}
 
@@ -100,19 +100,22 @@ function reconcilePR(
 
 	if (pr.merged) {
 		console.log(`[merge-queue] PR #${item.pr_number} was merged externally`);
-		db.updateQueueItemStatus(item.id, 'merged');
-		db.addToHistory(
-			repo.id,
-			item.pr_number,
-			item.pr_title,
-			item.pr_url,
-			item.author_login,
-			pr.merge_commit_sha,
-			'merged',
-			null,
-			item.created_at
-		);
 		db.removeFromQueue(item.id);
+		try {
+			db.addToHistory(
+				repo.id,
+				item.pr_number,
+				item.pr_title,
+				item.pr_url,
+				item.author_login,
+				pr.merge_commit_sha,
+				'merged',
+				null,
+				item.created_at
+			);
+		} catch (err) {
+			console.error(`[merge-queue] Failed to add history for #${item.pr_number}:`, err instanceof Error ? err.message : err);
+		}
 	} else {
 		db.updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
 	}
