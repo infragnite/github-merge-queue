@@ -126,16 +126,8 @@ async function handleQueued(
 
 	if (reconcilePR(pr, repo, item)) return;
 
-	const isDependabot = item.author_login === 'dependabot[bot]';
-
 	if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
-		if (isDependabot) {
-			console.log(`[merge-queue] Requesting @dependabot recreate for #${item.pr_number}`);
-			await github.commentOnPR(repo.owner, repo.name, item.pr_number, '@dependabot recreate');
-			db.updateQueueItemStatus(item.id, 'updating');
-		} else {
-			db.updateQueueItemStatus(item.id, 'conflict', 'Branch has merge conflicts — resolve them on GitHub');
-		}
+		db.updateQueueItemStatus(item.id, 'conflict', 'Branch has merge conflicts — resolve them on GitHub');
 		return;
 	}
 
@@ -145,18 +137,12 @@ async function handleQueued(
 		return;
 	}
 
-	if (isDependabot) {
-		console.log(`[merge-queue] Requesting @dependabot recreate for #${item.pr_number}`);
-		await github.commentOnPR(repo.owner, repo.name, item.pr_number, '@dependabot recreate');
+	try {
+		await github.updateBranch(repo.owner, repo.name, item.pr_number);
 		db.updateQueueItemStatus(item.id, 'updating');
-	} else {
-		try {
-			await github.updateBranch(repo.owner, repo.name, item.pr_number);
-			db.updateQueueItemStatus(item.id, 'updating');
-		} catch {
-			db.updateQueueItemHeadSha(item.id, pr.head.sha);
-			db.updateQueueItemStatus(item.id, 'checking');
-		}
+	} catch {
+		db.updateQueueItemHeadSha(item.id, pr.head.sha);
+		db.updateQueueItemStatus(item.id, 'checking');
 	}
 }
 
@@ -178,8 +164,6 @@ async function handleUpdating(
 	if (pr.mergeable === null) return;
 
 	if (pr.mergeable === false) {
-		// Dependabot PRs in 'updating' are waiting for recreate — don't move to conflict
-		if (item.author_login === 'dependabot[bot]') return;
 		db.updateQueueItemStatus(item.id, 'conflict', 'Branch has merge conflicts — resolve them on GitHub');
 		return;
 	}
