@@ -271,16 +271,5 @@ async function handleMerging(
 		console.log(`[merge-queue] Merged ${repo.owner}/${repo.name}#${item.pr_number}`);
 	} else {
 		db.updateQueueItemStatus(item.id, 'failed', result.message || 'Merge failed');
-		db.addToHistory(
-			repo.id,
-			item.pr_number,
-			item.pr_title,
-			item.pr_url,
-			item.author_login,
-			null,
-			'failed',
-			result.message,
-			item.created_at
-		);
 	}
 }
