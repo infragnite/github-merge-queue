@@ -18,7 +18,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		redirect(302, '/login?error=invalid_state');
 	}
 
-	const publicUrl = env.APP_URL || 'http://localhost:3000';
+	const publicUrl = env.PUBLIC_URL || 'http://localhost:3000';
 	const redirectUri = `${publicUrl}/auth/callback`;
 
 	const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
@@ -50,7 +50,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 	const userId = upsertUser(ghUser.id, ghUser.login, ghUser.name, ghUser.avatar_url);
 
 	const token = createSessionToken(userId);
-	const isSecure = (env.APP_URL || '').startsWith('https');
+	const isSecure = (env.PUBLIC_URL || '').startsWith('https');
 	cookies.set('session', token, {
 		path: '/',
 		httpOnly: true,

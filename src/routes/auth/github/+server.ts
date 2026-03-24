@@ -5,7 +5,7 @@ import type { RequestHandler } from './$types';
 
 export const GET: RequestHandler = ({ cookies }) => {
 	const clientId = env.GITHUB_CLIENT_ID;
-	const publicUrl = env.APP_URL || 'http://localhost:3000';
+	const publicUrl = env.PUBLIC_URL || 'http://localhost:3000';
 	const redirectUri = `${publicUrl}/auth/callback`;
 
 	const isSecure = publicUrl.startsWith('https');
