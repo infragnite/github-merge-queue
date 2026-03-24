@@ -15,6 +15,8 @@ export function createSessionToken(userId: number): string {
 }
 
 export function verifySessionToken(token: string): number | null {
+	if (!env.SESSION_SECRET) return null;
+
 	const lastDot = token.lastIndexOf('.');
 	if (lastDot === -1) return null;
 
