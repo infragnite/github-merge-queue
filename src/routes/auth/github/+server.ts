@@ -5,10 +5,10 @@ import type { RequestHandler } from './$types';
 
 export const GET: RequestHandler = ({ cookies }) => {
 	const clientId = env.GITHUB_CLIENT_ID;
-	const publicUrl = env.PUBLIC_URL || 'http://localhost:3000';
-	const redirectUri = `${publicUrl}/auth/callback`;
+	const appUrl = env.APP_URL || 'http://localhost:3000';
+	const redirectUri = `${appUrl}/auth/callback`;
 
-	const isSecure = publicUrl.startsWith('https');
+	const isSecure = appUrl.startsWith('https');
 	const state = randomBytes(32).toString('hex');
 	cookies.set('oauth_state', state, {
 		path: '/',
