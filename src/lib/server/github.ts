@@ -11,20 +11,36 @@ function headers(token: string) {
 	};
 }
 
+class GitHubError extends Error {
+	constructor(
+		public status: number,
+		message: string,
+		public body?: { message?: string; sha?: string; [k: string]: unknown }
+	) {
+		super(message);
+	}
+}
+
 async function ghFetch(token: string, path: string, init?: RequestInit) {
 	const res = await fetch(`${API}${path}`, {
 		...init,
 		headers: { ...headers(token), ...init?.headers }
 	});
+	if (res.status === 204) return null;
+	const body = await res.json().catch(() => ({}));
 	if (!res.ok) {
-		const body = await res.json().catch(() => ({}));
-		throw new Error(body.message || `GitHub API ${res.status}: ${path}`);
+		throw new GitHubError(res.status, body.message || `GitHub API ${res.status}: ${path}`, body);
 	}
-	return res.json();
+	return body;
 }
 
 // --- JWT and Installation Token ---
 
+// Cache for the GitHub App installation token. The 401-retry in ghFetchAsApp
+// is load-bearing: if a cached token is rejected mid-life (key rotation,
+// revocation, or a malformed expires_at that effectively caches forever),
+// every subsequent call would otherwise fail until the process restarts.
+// Do not remove the retry without replacing it with another invalidation path.
 let cachedInstallationToken: { token: string; expiresAt: number } | null = null;
 
 function createJWT(): string {
@@ -68,6 +84,24 @@ export async function getInstallationToken(): Promise<string> {
 	return data.token;
 }
 
+function isBadCredentials(e: unknown): e is GitHubError {
+	return (
+		e instanceof GitHubError && (e.status === 401 || e.body?.message === 'Bad credentials')
+	);
+}
+
+async function ghFetchAsApp(path: string, init?: RequestInit) {
+	let token = await getInstallationToken();
+	try {
+		return await ghFetch(token, path, init);
+	} catch (e) {
+		if (!isBadCredentials(e)) throw e;
+		cachedInstallationToken = null;
+		token = await getInstallationToken();
+		return await ghFetch(token, path, init);
+	}
+}
+
 // --- User-token operations (login flow only, token is discarded after) ---
 
 export async function getUser(token: string) {
@@ -76,11 +110,8 @@ export async function getUser(token: string) {
 
 export async function checkOrgMembership(username: string, org: string): Promise<boolean> {
 	try {
-		const token = await getInstallationToken();
-		const res = await fetch(`${API}/orgs/${org}/members/${username}`, {
-			headers: headers(token)
-		});
-		return res.status === 204;
+		await ghFetchAsApp(`/orgs/${org}/members/${username}`);
+		return true;
 	} catch {
 		return false;
 	}
@@ -91,8 +122,7 @@ export async function checkOrgMembership(username: string, org: string): Promise
 export async function listInstallationRepos(): Promise<
 	Array<{ full_name: string; default_branch: string }>
 > {
-	const token = await getInstallationToken();
-	const data = await ghFetch(token, '/installation/repositories?per_page=100');
+	const data = await ghFetchAsApp('/installation/repositories?per_page=100');
 	return data.repositories.map((r: { full_name: string; default_branch: string }) => ({
 		full_name: r.full_name,
 		default_branch: r.default_branch
@@ -100,26 +130,21 @@ export async function listInstallationRepos(): Promise<
 }
 
 export async function getRepo(owner: string, repo: string) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}`);
+	return ghFetchAsApp(`/repos/${owner}/${repo}`);
 }
 
 export async function getOpenPRs(owner: string, repo: string) {
-	const token = await getInstallationToken();
-	return ghFetch(
-		token,
+	return ghFetchAsApp(
 		`/repos/${owner}/${repo}/pulls?state=open&sort=created&direction=desc&per_page=100`
 	);
 }
 
 export async function getPR(owner: string, repo: string, prNumber: number) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}/pulls/${prNumber}`);
+	return ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${prNumber}`);
 }
 
 export async function updateBranch(owner: string, repo: string, prNumber: number) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}/pulls/${prNumber}/update-branch`, {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${prNumber}/update-branch`, {
 		method: 'PUT',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ expected_head_sha: undefined })
@@ -127,10 +152,9 @@ export async function updateBranch(owner: string, repo: string, prNumber: number
 }
 
 export async function getCheckStatus(owner: string, repo: string, ref: string) {
-	const token = await getInstallationToken();
 	const [status, checks] = await Promise.all([
-		ghFetch(token, `/repos/${owner}/${repo}/commits/${ref}/status`),
-		ghFetch(token, `/repos/${owner}/${repo}/commits/${ref}/check-runs`)
+		ghFetchAsApp(`/repos/${owner}/${repo}/commits/${ref}/status`),
+		ghFetchAsApp(`/repos/${owner}/${repo}/commits/${ref}/check-runs`)
 	]);
 
 	const statusOk = status.state === 'success' || status.statuses.length === 0;
@@ -161,8 +185,7 @@ export async function getCheckStatus(owner: string, repo: string, ref: string) {
 }
 
 export async function commentOnPR(owner: string, repo: string, prNumber: number, body: string) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ body })
@@ -175,12 +198,23 @@ export async function mergePR(
 	prNumber: number,
 	method: 'merge' | 'squash' | 'rebase' = 'squash'
 ) {
-	const token = await getInstallationToken();
-	const res = await fetch(`${API}/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
-		method: 'PUT',
-		headers: { ...headers(token), 'Content-Type': 'application/json' },
-		body: JSON.stringify({ merge_method: method })
-	});
-	const body = await res.json();
-	return { merged: res.ok && body.merged, sha: body.sha, message: body.message };
+	try {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ merge_method: method })
+		});
+		return {
+			merged: !!data.merged,
+			sha: (data.sha ?? null) as string | null,
+			message: data.message as string | undefined
+		};
+	} catch (e) {
+		const err = e as GitHubError;
+		return {
+			merged: false,
+			sha: (err.body?.sha ?? null) as string | null,
+			message: err.message
+		};
+	}
 }
