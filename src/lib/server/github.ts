@@ -1,5 +1,11 @@
 import { env } from '$env/dynamic/private';
 import { createSign } from 'crypto';
+import {
+	mergeResultFromData,
+	mergeResultFromError,
+	withTokenRefreshOn401,
+	GitHubError
+} from './github-retry';
 
 const API = 'https://api.github.com';
 
@@ -16,15 +22,19 @@ async function ghFetch(token: string, path: string, init?: RequestInit) {
 		...init,
 		headers: { ...headers(token), ...init?.headers }
 	});
+	if (res.status === 204) return null;
+	const body = await res.json().catch(() => ({}));
 	if (!res.ok) {
-		const body = await res.json().catch(() => ({}));
-		throw new Error(body.message || `GitHub API ${res.status}: ${path}`);
+		throw new GitHubError(res.status, body.message || `GitHub API ${res.status}: ${path}`, body);
 	}
-	return res.json();
+	return body;
 }
 
 // --- JWT and Installation Token ---
 
+// Cache for the GitHub App installation token. The 401 retry in
+// `ghFetchAsApp` / `withTokenRefreshOn401` is load-bearing — see comment
+// on `withTokenRefreshOn401` in ./github-retry.ts.
 let cachedInstallationToken: { token: string; expiresAt: number } | null = null;
 
 function createJWT(): string {
@@ -68,19 +78,30 @@ export async function getInstallationToken(): Promise<string> {
 	return data.token;
 }
 
+async function ghFetchAsApp(path: string, init?: RequestInit) {
+	return withTokenRefreshOn401(
+		getInstallationToken,
+		() => {
+			cachedInstallationToken = null;
+		},
+		(token) => ghFetch(token, path, init)
+	);
+}
+
 // --- User-token operations (login flow only, token is discarded after) ---
 
 export async function getUser(token: string) {
 	return ghFetch(token, '/user');
 }
 
+// GET /orgs/{org}/members/{username} returns 204 if member, 404 if not.
+// The 302 redirect case (requester not a public-org member) does not apply
+// under an installation token, so a successful ghFetchAsApp resolution
+// reliably indicates membership here.
 export async function checkOrgMembership(username: string, org: string): Promise<boolean> {
 	try {
-		const token = await getInstallationToken();
-		const res = await fetch(`${API}/orgs/${org}/members/${username}`, {
-			headers: headers(token)
-		});
-		return res.status === 204;
+		await ghFetchAsApp(`/orgs/${org}/members/${username}`);
+		return true;
 	} catch {
 		return false;
 	}
@@ -91,8 +112,7 @@ export async function checkOrgMembership(username: string, org: string): Promise
 export async function listInstallationRepos(): Promise<
 	Array<{ full_name: string; default_branch: string }>
 > {
-	const token = await getInstallationToken();
-	const data = await ghFetch(token, '/installation/repositories?per_page=100');
+	const data = await ghFetchAsApp('/installation/repositories?per_page=100');
 	return data.repositories.map((r: { full_name: string; default_branch: string }) => ({
 		full_name: r.full_name,
 		default_branch: r.default_branch
@@ -100,26 +120,21 @@ export async function listInstallationRepos(): Promise<
 }
 
 export async function getRepo(owner: string, repo: string) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}`);
+	return ghFetchAsApp(`/repos/${owner}/${repo}`);
 }
 
 export async function getOpenPRs(owner: string, repo: string) {
-	const token = await getInstallationToken();
-	return ghFetch(
-		token,
+	return ghFetchAsApp(
 		`/repos/${owner}/${repo}/pulls?state=open&sort=created&direction=desc&per_page=100`
 	);
 }
 
 export async function getPR(owner: string, repo: string, prNumber: number) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}/pulls/${prNumber}`);
+	return ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${prNumber}`);
 }
 
 export async function updateBranch(owner: string, repo: string, prNumber: number) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}/pulls/${prNumber}/update-branch`, {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${prNumber}/update-branch`, {
 		method: 'PUT',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ expected_head_sha: undefined })
@@ -127,10 +142,9 @@ export async function updateBranch(owner: string, repo: string, prNumber: number
 }
 
 export async function getCheckStatus(owner: string, repo: string, ref: string) {
-	const token = await getInstallationToken();
 	const [status, checks] = await Promise.all([
-		ghFetch(token, `/repos/${owner}/${repo}/commits/${ref}/status`),
-		ghFetch(token, `/repos/${owner}/${repo}/commits/${ref}/check-runs`)
+		ghFetchAsApp(`/repos/${owner}/${repo}/commits/${ref}/status`),
+		ghFetchAsApp(`/repos/${owner}/${repo}/commits/${ref}/check-runs`)
 	]);
 
 	const statusOk = status.state === 'success' || status.statuses.length === 0;
@@ -161,8 +175,7 @@ export async function getCheckStatus(owner: string, repo: string, ref: string) {
 }
 
 export async function commentOnPR(owner: string, repo: string, prNumber: number, body: string) {
-	const token = await getInstallationToken();
-	return ghFetch(token, `/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ body })
@@ -175,12 +188,14 @@ export async function mergePR(
 	prNumber: number,
 	method: 'merge' | 'squash' | 'rebase' = 'squash'
 ) {
-	const token = await getInstallationToken();
-	const res = await fetch(`${API}/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
-		method: 'PUT',
-		headers: { ...headers(token), 'Content-Type': 'application/json' },
-		body: JSON.stringify({ merge_method: method })
-	});
-	const body = await res.json();
-	return { merged: res.ok && body.merged, sha: body.sha, message: body.message };
+	try {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ merge_method: method })
+		});
+		return mergeResultFromData(data);
+	} catch (e) {
+		return mergeResultFromError(e);
+	}
 }
