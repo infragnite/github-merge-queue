@@ -1,6 +1,11 @@
 import { env } from '$env/dynamic/private';
 import { createSign } from 'crypto';
-import { GitHubError, withTokenRefreshOn401 } from './github-retry';
+import {
+	mergeResultFromData,
+	mergeResultFromError,
+	withTokenRefreshOn401,
+	GitHubError
+} from './github-retry';
 
 const API = 'https://api.github.com';
 
@@ -89,6 +94,10 @@ export async function getUser(token: string) {
 	return ghFetch(token, '/user');
 }
 
+// GET /orgs/{org}/members/{username} returns 204 if member, 404 if not.
+// The 302 redirect case (requester not a public-org member) does not apply
+// under an installation token, so a successful ghFetchAsApp resolution
+// reliably indicates membership here.
 export async function checkOrgMembership(username: string, org: string): Promise<boolean> {
 	try {
 		await ghFetchAsApp(`/orgs/${org}/members/${username}`);
@@ -185,17 +194,8 @@ export async function mergePR(
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ merge_method: method })
 		});
-		return {
-			merged: !!data.merged,
-			sha: (data.sha ?? null) as string | null,
-			message: data.message as string | undefined
-		};
+		return mergeResultFromData(data);
 	} catch (e) {
-		const err = e as GitHubError;
-		return {
-			merged: false,
-			sha: (err.body?.sha ?? null) as string | null,
-			message: err.message
-		};
+		return mergeResultFromError(e);
 	}
 }
