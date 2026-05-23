@@ -1,5 +1,6 @@
 import { env } from '$env/dynamic/private';
 import { createSign } from 'crypto';
+import { GitHubError, withTokenRefreshOn401 } from './github-retry';
 
 const API = 'https://api.github.com';
 
@@ -9,16 +10,6 @@ function headers(token: string) {
 		Accept: 'application/vnd.github.v3+json',
 		'X-GitHub-Api-Version': '2022-11-28'
 	};
-}
-
-class GitHubError extends Error {
-	constructor(
-		public status: number,
-		message: string,
-		public body?: { message?: string; sha?: string; [k: string]: unknown }
-	) {
-		super(message);
-	}
 }
 
 async function ghFetch(token: string, path: string, init?: RequestInit) {
@@ -36,11 +27,9 @@ async function ghFetch(token: string, path: string, init?: RequestInit) {
 
 // --- JWT and Installation Token ---
 
-// Cache for the GitHub App installation token. The 401-retry in ghFetchAsApp
-// is load-bearing: if a cached token is rejected mid-life (key rotation,
-// revocation, or a malformed expires_at that effectively caches forever),
-// every subsequent call would otherwise fail until the process restarts.
-// Do not remove the retry without replacing it with another invalidation path.
+// Cache for the GitHub App installation token. The 401 retry in
+// `ghFetchAsApp` / `withTokenRefreshOn401` is load-bearing — see comment
+// on `withTokenRefreshOn401` in ./github-retry.ts.
 let cachedInstallationToken: { token: string; expiresAt: number } | null = null;
 
 function createJWT(): string {
@@ -84,22 +73,14 @@ export async function getInstallationToken(): Promise<string> {
 	return data.token;
 }
 
-function isBadCredentials(e: unknown): e is GitHubError {
-	return (
-		e instanceof GitHubError && (e.status === 401 || e.body?.message === 'Bad credentials')
-	);
-}
-
 async function ghFetchAsApp(path: string, init?: RequestInit) {
-	let token = await getInstallationToken();
-	try {
-		return await ghFetch(token, path, init);
-	} catch (e) {
-		if (!isBadCredentials(e)) throw e;
-		cachedInstallationToken = null;
-		token = await getInstallationToken();
-		return await ghFetch(token, path, init);
-	}
+	return withTokenRefreshOn401(
+		getInstallationToken,
+		() => {
+			cachedInstallationToken = null;
+		},
+		(token) => ghFetch(token, path, init)
+	);
 }
 
 // --- User-token operations (login flow only, token is discarded after) ---
