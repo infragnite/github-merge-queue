@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { env } from '$env/dynamic/private';
 import type { User, Repo, RepoWithStats, QueueItem, HistoryItem } from '$lib/types';
+import type { StackStore } from './stack-source';
 
 let db: Database.Database;
 
@@ -68,6 +69,25 @@ function migrate(database: Database.Database) {
 			error_message TEXT,
 			queued_at TEXT,
 			completed_at TEXT DEFAULT (datetime('now'))
+		);
+
+		-- Every head SHA seen per PR, so stack detection can tell that a
+		-- child still sits on a parent's pre-rebase commits.
+		CREATE TABLE IF NOT EXISTS pr_heads (
+			repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+			pr_number INTEGER NOT NULL,
+			head_sha TEXT NOT NULL,
+			seen_at TEXT DEFAULT (datetime('now')),
+			PRIMARY KEY (repo_id, pr_number, head_sha)
+		);
+
+		-- Branch deletions from the \`delete\` webhook, to recognise PRs GitHub
+		-- closes because their base branch went away.
+		CREATE TABLE IF NOT EXISTS deleted_branches (
+			repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+			ref TEXT NOT NULL,
+			deleted_at TEXT DEFAULT (datetime('now')),
+			PRIMARY KEY (repo_id, ref)
 		);
 	`);
 
@@ -278,4 +298,59 @@ export function getHistory(limit = 50): HistoryItem[] {
 		 ORDER BY mh.completed_at DESC LIMIT ?`
 		)
 		.all(limit) as HistoryItem[];
+}
+
+// --- Stack detection ---
+
+// SQLite's datetime('now') is UTC without a zone marker.
+function sqliteToIso(ts: string): string {
+	return ts.includes('T') ? ts : `${ts.replace(' ', 'T')}Z`;
+}
+
+export function recordPRHead(repoId: number, prNumber: number, headSha: string) {
+	getDb()
+		.prepare('INSERT OR IGNORE INTO pr_heads (repo_id, pr_number, head_sha) VALUES (?, ?, ?)')
+		.run(repoId, prNumber, headSha);
+}
+
+export function getKnownPRHeads(repoId: number): Map<number, string[]> {
+	const rows = getDb()
+		.prepare('SELECT pr_number, head_sha FROM pr_heads WHERE repo_id = ?')
+		.all(repoId) as Array<{ pr_number: number; head_sha: string }>;
+	const heads = new Map<number, string[]>();
+	for (const r of rows) {
+		const list = heads.get(r.pr_number) ?? [];
+		list.push(r.head_sha);
+		heads.set(r.pr_number, list);
+	}
+	return heads;
+}
+
+export function recordBranchDeleted(repoId: number, ref: string) {
+	getDb()
+		.prepare(
+			`INSERT INTO deleted_branches (repo_id, ref) VALUES (?, ?)
+		 ON CONFLICT(repo_id, ref) DO UPDATE SET deleted_at = datetime('now')`
+		)
+		.run(repoId, ref);
+}
+
+export function getDeletedBranches(repoId: number): Map<string, string> {
+	const rows = getDb()
+		.prepare('SELECT ref, deleted_at FROM deleted_branches WHERE repo_id = ?')
+		.all(repoId) as Array<{ ref: string; deleted_at: string }>;
+	return new Map(rows.map((r) => [r.ref, sqliteToIso(r.deleted_at)]));
+}
+
+export function stackStore(repoId: number): StackStore {
+	return {
+		recordHeads: (heads) => {
+			const txn = getDb().transaction(() => {
+				for (const h of heads) recordPRHead(repoId, h.pr, h.sha);
+			});
+			txn();
+		},
+		knownHeads: () => getKnownPRHeads(repoId),
+		deletedBranches: () => getDeletedBranches(repoId)
+	};
 }
