@@ -28,7 +28,13 @@
 		return () => clearInterval(id);
 	});
 
-	function handleDragStart(index: number) {
+	function handleDragStart(e: DragEvent, index: number) {
+		// Some mobile browsers start a native drag on long press; touch drags
+		// are handled with pointer events instead.
+		if (touchDragging) {
+			e.preventDefault();
+			return;
+		}
 		dragIndex = index;
 	}
 
@@ -73,19 +79,70 @@
 		handleDragEnd();
 	}
 
-	// Touch/pen devices don't fire HTML5 drag events, so dragging by the handle
-	// is driven by pointer events instead.
-	function handlePointerDown(e: PointerEvent, index: number) {
-		if (e.pointerType === 'mouse') return;
-		if (!(e.target as Element).closest('[data-drag-handle]')) return;
-		e.preventDefault();
-		(e.currentTarget as Element).setPointerCapture(e.pointerId);
+	// Touch/pen devices don't fire HTML5 drag events, so touch drags are driven
+	// by pointer events: the handle drags immediately, the rest of the card
+	// after a long press so a normal swipe still scrolls the page.
+	const LONG_PRESS_MS = 300;
+	const LONG_PRESS_SLOP_PX = 8;
+	let touchDragging = false;
+	let longPress: { timer: ReturnType<typeof setTimeout>; x: number; y: number } | null = null;
+
+	// Once a touch drag has started, keep the page from scrolling under it.
+	// Needs a non-passive listener, which Svelte's ontouchmove isn't.
+	$effect(() => {
+		const block = (e: TouchEvent) => {
+			if (touchDragging) e.preventDefault();
+		};
+		document.addEventListener('touchmove', block, { passive: false });
+		return () => document.removeEventListener('touchmove', block);
+	});
+
+	function startTouchDrag(el: Element, pointerId: number, index: number) {
+		cancelLongPress();
+		try {
+			el.setPointerCapture(pointerId);
+		} catch {
+			// Pointer already gone
+			return;
+		}
+		touchDragging = true;
 		dragIndex = index;
 		dragOverIndex = index;
+		navigator.vibrate?.(10);
+	}
+
+	function cancelLongPress() {
+		if (longPress) clearTimeout(longPress.timer);
+		longPress = null;
+	}
+
+	function handlePointerDown(e: PointerEvent, index: number) {
+		if (e.pointerType === 'mouse') return;
+		const target = e.target as Element;
+		const el = e.currentTarget as Element;
+		if (target.closest('[data-drag-handle]')) {
+			e.preventDefault();
+			startTouchDrag(el, e.pointerId, index);
+			return;
+		}
+		if (target.closest('a, button')) return;
+		cancelLongPress();
+		longPress = {
+			timer: setTimeout(() => startTouchDrag(el, e.pointerId, index), LONG_PRESS_MS),
+			x: e.clientX,
+			y: e.clientY
+		};
 	}
 
 	function handlePointerMove(e: PointerEvent) {
-		if (dragIndex === null || e.pointerType === 'mouse') return;
+		if (e.pointerType === 'mouse') return;
+		if (longPress) {
+			if (Math.hypot(e.clientX - longPress.x, e.clientY - longPress.y) > LONG_PRESS_SLOP_PX) {
+				cancelLongPress();
+			}
+			return;
+		}
+		if (!touchDragging) return;
 		const el = document
 			.elementFromPoint(e.clientX, e.clientY)
 			?.closest<HTMLElement>('[data-queue-index]');
@@ -93,14 +150,25 @@
 	}
 
 	async function handlePointerUp(e: PointerEvent) {
-		if (dragIndex === null || e.pointerType === 'mouse') return;
+		if (e.pointerType === 'mouse') return;
+		cancelLongPress();
+		if (!touchDragging) return;
+		touchDragging = false;
 		await reorder(dragIndex, dragOverIndex);
 	}
 
 	function handlePointerCancel(e: PointerEvent) {
 		// A mouse drag fires pointercancel when the HTML5 drag takes over.
 		if (e.pointerType === 'mouse') return;
+		cancelLongPress();
+		if (!touchDragging) return;
+		touchDragging = false;
 		handleDragEnd();
+	}
+
+	function handleContextMenu(e: Event) {
+		// Long press would otherwise open the link/text menu mid-drag.
+		if (longPress || touchDragging) e.preventDefault();
 	}
 </script>
 
@@ -166,7 +234,7 @@
 			{#each data.queueItems as item, index (item.id)}
 				<div
 					draggable="true"
-					ondragstart={() => handleDragStart(index)}
+					ondragstart={(e) => handleDragStart(e, index)}
 					ondragover={(e) => handleDragOver(e, index)}
 					ondrop={(e) => handleDrop(e, index)}
 					ondragend={handleDragEnd}
@@ -174,8 +242,9 @@
 					onpointermove={handlePointerMove}
 					onpointerup={handlePointerUp}
 					onpointercancel={handlePointerCancel}
+					oncontextmenu={handleContextMenu}
 					data-queue-index={index}
-					class="transition-transform {dragOverIndex === index && dragIndex !== index ? 'translate-y-1 border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''}"
+					class="transition-transform pointer-coarse:select-none pointer-coarse:[-webkit-touch-callout:none] {dragOverIndex === index && dragIndex !== index ? 'translate-y-1 border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''}"
 					role="listitem"
 				>
 					<QueueItem {item} position={index + 1} repoOwner={data.repo.owner} repoName={data.repo.name} />
