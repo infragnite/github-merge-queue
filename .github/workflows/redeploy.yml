@@ -1,0 +1,57 @@
+name: Redeploy
+
+# Tests every push to main, then asks infragnite/infragnite to redeploy the
+# merge-queue instance (Infra GitOps workflow, `redeploy` dispatch). The
+# deploy itself pulls main on the server and rebuilds with docker compose.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: redeploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec svelte-kit sync
+      - run: pnpm test
+
+  redeploy:
+    name: Trigger redeploy
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get a token for infragnite/infragnite
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DEPLOY_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          owner: infragnite
+          repositories: infragnite
+
+      - name: Dispatch redeploy
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/infragnite/infragnite/dispatches \
+            -f event_type=redeploy \
+            -f 'client_payload[instance]=merge-queue' \
+            -f "client_payload[sha]=$GITHUB_SHA"
