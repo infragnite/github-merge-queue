@@ -12,6 +12,15 @@
 
 	const isActive = $derived(['updating', 'checking', 'merging'].includes(item.status));
 	const canRemove = $derived(!['merging', 'merged'].includes(item.status));
+
+	// Svelte registers touchstart as passive, so add a non-passive listener to
+	// stop a long press on the handle from selecting text or opening the callout.
+	let handle: HTMLDivElement;
+	$effect(() => {
+		const prevent = (e: TouchEvent) => e.preventDefault();
+		handle.addEventListener('touchstart', prevent, { passive: false });
+		return () => handle.removeEventListener('touchstart', prevent);
+	});
 </script>
 
 <div
@@ -23,7 +32,12 @@
 >
 	<div class="flex items-start gap-4">
 		<!-- Drag handle -->
-		<div class="flex shrink-0 cursor-grab items-center text-gray-300 hover:text-gray-500 active:cursor-grabbing" title="Drag to reorder">
+		<div
+			bind:this={handle}
+			data-drag-handle
+			class="flex shrink-0 cursor-grab touch-none items-center text-gray-300 select-none hover:text-gray-500 active:cursor-grabbing [-webkit-touch-callout:none]"
+			title="Drag to reorder"
+		>
 			<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
 				<circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
 				<circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
