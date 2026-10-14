@@ -8,8 +8,11 @@ import {
 	updateQueueItemHeadSha,
 	addToHistory,
 	removeFromQueue,
-	addToQueue
+	addToQueue,
+	recordPRHead,
+	recordBranchDeleted
 } from '$lib/server/db';
+import { closedPRReason } from '$lib/server/stack-runtime';
 import type { RequestHandler } from './$types';
 
 function verifySignature(payload: string, signature: string | null, secret: string): boolean {
@@ -79,6 +82,12 @@ export const POST: RequestHandler = async ({ request }) => {
 
 				if (!prNumber) break;
 
+				// Head history for stack detection: `before` is the pre-push head
+				// on synchronize, which is what a child of this PR still sits on.
+				if (pullRequest.head?.sha) recordPRHead(repo.id, prNumber, pullRequest.head.sha);
+				const before = (payload as { before?: string }).before;
+				if (action === 'synchronize' && before) recordPRHead(repo.id, prNumber, before);
+
 				// Auto-add dependabot PRs to the queue
 				if (action === 'opened' && prUser?.login === 'dependabot[bot]' && !pullRequest.draft) {
 					const alreadyQueued = queueItems.some((i) => i.pr_number === prNumber);
@@ -116,8 +125,9 @@ export const POST: RequestHandler = async ({ request }) => {
 						removeFromQueue(item.id);
 						console.log(`[webhook] PR #${prNumber} merged externally, removed from queue`);
 					} else if (action === 'closed') {
-						updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
-						console.log(`[webhook] PR #${prNumber} closed, removed from queue`);
+						const reason = await closedPRReason(repo, pullRequest);
+						updateQueueItemStatus(item.id, 'cancelled', reason);
+						console.log(`[webhook] PR #${prNumber} closed, removed from queue: ${reason}`);
 					} else if (action === 'synchronize') {
 						const newSha = pullRequest.head?.sha;
 						if (newSha) {
@@ -132,6 +142,14 @@ export const POST: RequestHandler = async ({ request }) => {
 			} catch (err) {
 				console.error(`[webhook] Error handling pull_request event:`, err instanceof Error ? err.message : err);
 			}
+			break;
+		}
+
+		case 'delete': {
+			// A deleted branch closes every PR based on it (unless GitHub
+			// retargets them after a merge); remember when, to explain it.
+			const { ref, ref_type } = payload as { ref?: string; ref_type?: string };
+			if (ref_type === 'branch' && ref) recordBranchDeleted(repo.id, ref);
 			break;
 		}
 

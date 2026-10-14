@@ -1,6 +1,9 @@
 import { env } from '$env/dynamic/private';
 import * as db from './db';
 import * as github from './github';
+import { closedPRReason, stackMergeBlocker } from './stack-runtime';
+
+type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
 let running = false;
@@ -36,13 +39,32 @@ async function processAll() {
 	}
 }
 
+// Head SHAs are recorded from webhooks too; polling covers missed deliveries
+// so a later rebase of a lower PR is still recognisable.
+const HEAD_POLL_MS = 60_000;
+const lastHeadPoll = new Map<number, number>();
+
+async function recordOpenPRHeads(repo: RepoRef) {
+	const last = lastHeadPoll.get(repo.id) ?? 0;
+	if (Date.now() - last < HEAD_POLL_MS) return;
+	lastHeadPoll.set(repo.id, Date.now());
+	try {
+		const prs: Array<{ number: number; head: { sha: string } }> = await github.getOpenPRs(repo.owner, repo.name);
+		db.stackStore(repo.id).recordHeads(prs.map((p) => ({ pr: p.number, sha: p.head.sha })));
+	} catch (err) {
+		console.error(`[merge-queue] Head polling failed for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
+	}
+}
+
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
+	await recordOpenPRHeads(repo);
+
 	// Reconcile ALL queued items (not just head) to detect externally merged/closed PRs
 	const allItems = db.getQueueItems(repo.id);
 	for (const item of allItems) {
 		try {
 			const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
-			reconcilePR(pr, repo, item);
+			await reconcilePR(pr, repo, item);
 		} catch (err) {
 			console.error(`[merge-queue] Reconcile error for #${item.pr_number}:`, err instanceof Error ? err.message : err);
 		}
@@ -85,11 +107,19 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 }
 
 // Returns true if the PR was closed/merged externally and the item was handled
-function reconcilePR(
-	pr: { state: string; merged: boolean; merge_commit_sha: string | null },
-	repo: { id: number; owner: string; name: string },
+async function reconcilePR(
+	pr: {
+		number: number;
+		state: string;
+		merged: boolean;
+		merge_commit_sha: string | null;
+		closed_at: string | null;
+		head: { ref: string; sha: string };
+		base: { ref: string };
+	},
+	repo: RepoRef,
 	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; created_at: string }
-): boolean {
+): Promise<boolean> {
 	if (pr.state === 'open') return false;
 
 	if (pr.merged) {
@@ -111,20 +141,28 @@ function reconcilePR(
 			console.error(`[merge-queue] Failed to add history for #${item.pr_number}:`, err instanceof Error ? err.message : err);
 		}
 	} else {
-		db.updateQueueItemStatus(item.id, 'cancelled', 'PR was closed');
+		db.updateQueueItemStatus(item.id, 'cancelled', await closedPRReason(repo, pr));
 	}
 
 	return true;
 }
 
 async function handleQueued(
-	repo: { id: number; owner: string; name: string },
+	repo: RepoRef,
 	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; head_sha: string | null; created_at: string }
 ) {
 	console.log(`[merge-queue] Processing ${repo.owner}/${repo.name}#${item.pr_number}`);
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
 
-	if (reconcilePR(pr, repo, item)) return;
+	if (await reconcilePR(pr, repo, item)) return;
+
+	// GitHub's base field can't be trusted for stacks, so check ancestry:
+	// a PR sitting on an unmerged or rewritten PR must not be merged.
+	const stackBlocker = await stackMergeBlocker(repo, item.pr_number);
+	if (stackBlocker) {
+		db.updateQueueItemStatus(item.id, 'failed', `Stacked PR: ${stackBlocker}`);
+		return;
+	}
 
 	if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
 		db.updateQueueItemStatus(item.id, 'conflict', 'Branch has merge conflicts — resolve them on GitHub');
@@ -147,7 +185,7 @@ async function handleQueued(
 }
 
 async function handleUpdating(
-	repo: { id: number; owner: string; name: string },
+	repo: RepoRef,
 	item: {
 		id: number;
 		pr_number: number;
@@ -159,7 +197,7 @@ async function handleUpdating(
 ) {
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
 
-	if (reconcilePR(pr, repo, item)) return;
+	if (await reconcilePR(pr, repo, item)) return;
 
 	if (pr.mergeable === null) return;
 
@@ -173,12 +211,12 @@ async function handleUpdating(
 }
 
 async function handleConflict(
-	repo: { id: number; owner: string; name: string },
+	repo: RepoRef,
 	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; created_at: string }
 ) {
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
 
-	if (reconcilePR(pr, repo, item)) return;
+	if (await reconcilePR(pr, repo, item)) return;
 
 	// mergeable is null while GitHub is computing — wait for next cycle
 	if (pr.mergeable === null) return;
@@ -190,7 +228,7 @@ async function handleConflict(
 }
 
 async function handleChecking(
-	repo: { id: number; owner: string; name: string },
+	repo: RepoRef,
 	item: {
 		id: number;
 		pr_number: number;
@@ -203,14 +241,14 @@ async function handleChecking(
 ) {
 	if (!item.head_sha) {
 		const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
-		if (reconcilePR(pr, repo, item)) return;
+		if (await reconcilePR(pr, repo, item)) return;
 		db.updateQueueItemHeadSha(item.id, pr.head.sha);
 		return;
 	}
 
 	// Check if PR was merged/closed externally
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
-	if (reconcilePR(pr, repo, item)) return;
+	if (await reconcilePR(pr, repo, item)) return;
 
 	const checks = await github.getCheckStatus(repo.owner, repo.name, item.head_sha);
 
@@ -225,7 +263,7 @@ async function handleChecking(
 }
 
 async function handleMerging(
-	repo: { id: number; owner: string; name: string },
+	repo: RepoRef,
 	item: {
 		id: number;
 		pr_number: number;
