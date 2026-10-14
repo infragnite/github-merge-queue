@@ -44,14 +44,18 @@
 
 	async function handleDrop(e: DragEvent, dropIndex: number) {
 		e.preventDefault();
-		if (dragIndex === null || dragIndex === dropIndex) {
+		await reorder(dragIndex, dropIndex);
+	}
+
+	async function reorder(fromIndex: number | null, toIndex: number | null) {
+		if (fromIndex === null || toIndex === null || fromIndex === toIndex) {
 			handleDragEnd();
 			return;
 		}
 
 		const items = [...data.queueItems];
-		const [moved] = items.splice(dragIndex, 1);
-		items.splice(dropIndex, 0, moved);
+		const [moved] = items.splice(fromIndex, 1);
+		items.splice(toIndex, 0, moved);
 
 		const orderedIds = items.map((i) => i.id);
 		reordering = true;
@@ -66,6 +70,36 @@
 
 		await invalidateAll();
 		reordering = false;
+		handleDragEnd();
+	}
+
+	// Touch/pen devices don't fire HTML5 drag events, so dragging by the handle
+	// is driven by pointer events instead.
+	function handlePointerDown(e: PointerEvent, index: number) {
+		if (e.pointerType === 'mouse') return;
+		if (!(e.target as Element).closest('[data-drag-handle]')) return;
+		e.preventDefault();
+		(e.currentTarget as Element).setPointerCapture(e.pointerId);
+		dragIndex = index;
+		dragOverIndex = index;
+	}
+
+	function handlePointerMove(e: PointerEvent) {
+		if (dragIndex === null || e.pointerType === 'mouse') return;
+		const el = document
+			.elementFromPoint(e.clientX, e.clientY)
+			?.closest<HTMLElement>('[data-queue-index]');
+		if (el) dragOverIndex = Number(el.dataset.queueIndex);
+	}
+
+	async function handlePointerUp(e: PointerEvent) {
+		if (dragIndex === null || e.pointerType === 'mouse') return;
+		await reorder(dragIndex, dragOverIndex);
+	}
+
+	function handlePointerCancel(e: PointerEvent) {
+		// A mouse drag fires pointercancel when the HTML5 drag takes over.
+		if (e.pointerType === 'mouse') return;
 		handleDragEnd();
 	}
 </script>
@@ -136,6 +170,11 @@
 					ondragover={(e) => handleDragOver(e, index)}
 					ondrop={(e) => handleDrop(e, index)}
 					ondragend={handleDragEnd}
+					onpointerdown={(e) => handlePointerDown(e, index)}
+					onpointermove={handlePointerMove}
+					onpointerup={handlePointerUp}
+					onpointercancel={handlePointerCancel}
+					data-queue-index={index}
 					class="transition-transform {dragOverIndex === index && dragIndex !== index ? 'translate-y-1 border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''}"
 					role="listitem"
 				>
