@@ -9,6 +9,7 @@ import { buildBatch, GitRunner } from './batch-builder';
 import { replay } from './rebase';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { analyzeRepoStacks } from './stack-runtime';
+import { bumpGeneration, memoByGeneration } from './wake';
 import type { LivePR, QueueDeps, Readiness } from './batch-queue';
 import type { GhReview } from './github';
 
@@ -114,6 +115,11 @@ export class Mirror {
 	}
 }
 
+// Stack analysis and reviews cost a call per open PR; webhooks bump the repo's generation when
+// PRs change, and the queue's own merges and pushes do too.
+const analysisMemo = memoByGeneration<Awaited<ReturnType<typeof analyzeRepoStacks>>>(5 * 60 * 1000);
+const reviewsMemo = memoByGeneration<GhReview[]>(10 * 60 * 1000);
+
 const ROLE_TTL_MS = 10 * 60 * 1000;
 const roleCache = new Map<string, { role: string; until: number }>();
 
@@ -136,7 +142,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 	return {
 		repo,
 		now: () => Date.now(),
-		analysis: () => analyzeRepoStacks(repo),
+		analysis: () => analysisMemo(repo.id, 'stacks', () => analyzeRepoStacks(repo)),
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
@@ -155,11 +161,19 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);
 				for (const r of runs.filter((r) => r.status !== 'completed')) await github.cancelWorkflowRun(owner, name, r.id);
 			},
+			// Re-runs the workflow runs behind the required check's failed (or cancelled, timed-out) runs,
+			// not whatever else failed on the commit.
 			rerunFailed: async (headSha) => {
-				const runs = await github.workflowRunsForSha(owner, name, headSha);
-				const failed = runs.filter((r) => r.status === 'completed' && r.conclusion === 'failure');
-				for (const r of failed) await github.rerunFailedJobs(owner, name, r.id);
-				return failed.length > 0;
+				const checks = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
+				const suites = new Set(
+					checks.filter((c) => c.status === 'completed' && c.conclusion !== 'success').flatMap((c) => (c.check_suite ? [c.check_suite.id] : []))
+				);
+				if (suites.size === 0) return false;
+				const runs = (await github.workflowRunsForSha(owner, name, headSha)).filter(
+					(r) => suites.has(r.check_suite_id) && r.status === 'completed'
+				);
+				for (const r of runs) await github.rerunFailedJobs(owner, name, r.id);
+				return runs.length > 0;
 			}
 		},
 		github: {
@@ -184,10 +198,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					merged: !!p.merged
 				};
 			},
-			readiness: async (n, headSha, author): Promise<Readiness> => {
+			readiness: async (n, headSha, author, needApprovals): Promise<Readiness> => {
 				const settings = getQueueSettings(repo.id);
 				const [reviews, checks] = await Promise.all([
-					settings.config.requireApproval ? github.listReviews(owner, name, n) : Promise.resolve([]),
+					settings.config.requireApproval || needApprovals
+						? reviewsMemo(repo.id, `${n}:${headSha}`, () => github.listReviews(owner, name, n))
+						: Promise.resolve([]),
 					settings.config.requirePRChecks
 						? github.checkRunsNamed(owner, name, headSha, ci().requiredCheck)
 						: Promise.resolve([])
@@ -203,13 +219,18 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				};
 			},
 			pushBranch: (branch, sha) => mirror.push(branch, sha),
-			pushHead: (branch, sha, expected) => mirror.pushLease(branch, sha, expected),
+			pushHead: async (branch, sha, expected) => {
+				bumpGeneration(repo.id);
+				await mirror.pushLease(branch, sha, expected);
+			},
 			deleteBranch: (branch) => github.deleteBranch(owner, name, branch),
 			retargetBase: async (n, base) => {
+				bumpGeneration(repo.id);
 				await github.setPRBase(owner, name, n, base);
 			},
 			squashMerge: async (n, title, sha) => {
-				const r = await github.squashMergeAt(owner, name, n, title, sha, await github.commitAuthorEmail(owner, name, sha));
+				bumpGeneration(repo.id);
+				const r = await github.squashMergeAt(owner, name, n, title, sha);
 				return { merged: r.merged, sha: r.sha, message: r.message };
 			},
 			setStatus: async (sha, state, description) => {

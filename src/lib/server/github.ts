@@ -300,18 +300,11 @@ export async function setPRBase(owner: string, repo: string, n: number, base: st
 }
 
 /**
- * Squash-merges PR `n` at exactly `sha`, with an empty body and `authorEmail` as the commit's
- * author. REST can set neither: its default body lists every commit message of the PR, and it
- * credits whoever opened the PR. GraphQL `mergePullRequest` can.
+ * Squash-merges PR `n` at exactly `sha` with an empty body. REST can't send an empty body (its
+ * default lists every commit message of the PR); GraphQL `mergePullRequest` can. GitHub credits
+ * the squash to whoever opened the PR, which is the author a repo's rules expect.
  */
-export async function squashMergeAt(
-	owner: string,
-	repo: string,
-	n: number,
-	title: string,
-	sha: string,
-	authorEmail?: string | null
-) {
+export async function squashMergeAt(owner: string, repo: string, n: number, title: string, sha: string) {
 	try {
 		const pr = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}`);
 		const data = await ghFetchAsApp('/graphql', {
@@ -327,8 +320,7 @@ export async function squashMergeAt(
 						mergeMethod: 'SQUASH',
 						commitHeadline: title,
 						commitBody: '',
-						expectedHeadOid: sha,
-						...(authorEmail ? { authorEmail } : {})
+						expectedHeadOid: sha
 					}
 				}
 			})
@@ -368,16 +360,25 @@ export async function dispatchWorkflow(
 	});
 }
 
+/** GitHub Actions' app: only its check runs count, so no other app (or job) can fake the required check. */
+const ACTIONS_APP_ID = 15368;
+
 export async function checkRunsNamed(owner: string, repo: string, sha: string, name: string) {
 	const data = await ghFetchAsApp(
-		`/repos/${owner}/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest`
+		`/repos/${owner}/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&app_id=${ACTIONS_APP_ID}`
 	);
-	return data.check_runs as Array<{ status: string; conclusion: string | null; html_url: string; completed_at: string | null }>;
+	return data.check_runs as Array<{
+		status: string;
+		conclusion: string | null;
+		html_url: string;
+		completed_at: string | null;
+		check_suite?: { id: number };
+	}>;
 }
 
 export async function workflowRunsForSha(owner: string, repo: string, sha: string) {
 	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=20`);
-	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string }>;
+	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string; check_suite_id: number }>;
 }
 
 export async function cancelWorkflowRun(owner: string, repo: string, runId: number) {
@@ -388,12 +389,6 @@ export async function cancelWorkflowRun(owner: string, repo: string, runId: numb
 		if (e instanceof GitHubError && e.status === 409) return;
 		throw e;
 	}
-}
-
-/** The email of a commit's author (the PR's head commit credits the squash). */
-export async function commitAuthorEmail(owner: string, repo: string, sha: string): Promise<string | null> {
-	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/commits/${sha}`);
-	return data.commit?.author?.email ?? null;
 }
 
 export async function addLabel(owner: string, repo: string, n: number, label: string) {
@@ -442,11 +437,14 @@ export async function collaboratorRole(owner: string, repo: string, login: strin
 	}
 }
 
+/**
+ * The repo as the caller's token sees it, with the token's OAuth scopes (`X-OAuth-Scopes`, sent
+ * for classic and OAuth-app tokens only; null otherwise). Null when the token can't see the repo.
+ */
 export async function repoForToken(token: string, owner: string, repo: string) {
-	try {
-		return await ghFetch(token, `/repos/${owner}/${repo}`);
-	} catch (e) {
-		if (e instanceof GitHubError && (e.status === 401 || e.status === 403 || e.status === 404)) return null;
-		throw e;
-	}
+	const res = await fetch(`${API}/repos/${owner}/${repo}`, { headers: headers(token) });
+	if (res.status === 401 || res.status === 403 || res.status === 404) return null;
+	const body = await res.json().catch(() => ({}));
+	if (!res.ok) throw new GitHubError(res.status, body.message || `GitHub API ${res.status}`, body);
+	return { permissions: body.permissions as Record<string, boolean> | undefined, scopes: res.headers.get('x-oauth-scopes') };
 }

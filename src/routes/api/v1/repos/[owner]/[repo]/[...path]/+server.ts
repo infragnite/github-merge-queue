@@ -23,6 +23,7 @@ import * as github from '$lib/server/github';
 import { getRepoByOwnerName } from '$lib/server/db';
 import { getQueueSettings, getRecentBatches } from '$lib/server/batch-store';
 import { retireBatches, startTry } from '$lib/server/batch-queue';
+import { withRepoLock } from '$lib/server/repo-lock';
 import { liveDeps } from '$lib/server/batch-live';
 import { requireRole } from '$lib/server/api-auth';
 import { analyzeRepoStacks } from '$lib/server/stack-runtime';
@@ -71,11 +72,15 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 			case 'GET queue/config':
 				return json(api.getConfig(repo));
 			case 'PATCH queue/config': {
-				const was = getQueueSettings(repo.id).mode;
-				const r = api.patchConfig(repo, caller, await body());
-				if (was === 'batch' && getQueueSettings(repo.id).mode !== 'batch') {
-					await retireBatches(liveDeps(repo));
-				}
+				const b = await body();
+				// Under the repo lock, so a running tick finishes before the mode flips and none
+				// starts a batch after the retire.
+				const r = await withRepoLock(repo.id, async () => {
+					const was = getQueueSettings(repo.id).mode;
+					const out = api.patchConfig(repo, caller, b);
+					if (was === 'batch' && getQueueSettings(repo.id).mode !== 'batch') await retireBatches(liveDeps(repo));
+					return out;
+				});
 				return json(r);
 			}
 			case 'POST queue/pause':
@@ -104,7 +109,7 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 				requireRole(caller, 'write', 'Starting a try run');
 				if (getQueueSettings(repo.id).mode !== 'batch') throw new api.ApiError(409, 'Try runs need the queue in batch mode');
 				try {
-					return json(api.tryRunState(await startTry(liveDeps(repo), n)), { status: 201 });
+					return json(api.tryRunState(await withRepoLock(repo.id, () => startTry(liveDeps(repo), n))), { status: 201 });
 				} catch (e) {
 					if (e instanceof Error && /is not open|does not apply/.test(e.message)) throw new api.ApiError(409, e.message);
 					throw e;

@@ -489,6 +489,48 @@ describe('batch queue runtime', () => {
 		expect(world.cacheRefreshes).toBe(0);
 	});
 
+	test('a deferred PR is not held forever by a PR ahead that is itself held back', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		await tickBatchQueue(world.deps());
+		expect(world.started.map((x) => x.prs)).toEqual([[1]]);
+		// #1's batch is dropped (master moved) and #1 loses its approval: #2 must go on without it
+		git.commit('main', 'hotfix pushed by hand');
+		world.approved.delete(1);
+		await run();
+		expect(world.merged).toEqual([2]);
+	});
+
+	test('a PR whose changes are already on the default branch leaves the queue instead of an empty batch', async () => {
+		git.branch('pr1', 'main');
+		git.commit('pr1', 'pr1', 'pr1.txt');
+		git.openPR(1, 'pr1', 'main');
+		world.approved.add(1);
+		git.git('checkout', '-q', 'main');
+		git.git('cherry-pick', 'pr1');
+		db.addToQueue(repo.id, 1, 'PR 1', 'u', 'dev', '', 'dev');
+		await run(3);
+		expect(world.started).toEqual([]);
+		expect(db.getQueueItems(repo.id)).toEqual([]);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/no changes left against main/) }]);
+	});
+
+	test('a fork PR stacked on another PR is not admitted', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		world.forks.add(2);
+		await run();
+		expect(world.merged).toEqual([1]);
+		expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.error_message).toMatch(/stacked on another PR from a fork/);
+	});
+
+	test('a PR left updating by serial mode goes back in line in batch mode', async () => {
+		pr(1);
+		db.updateQueueItemStatus(db.getQueueItems(repo.id)[0].id, 'merging');
+		await run();
+		expect(world.merged).toEqual([1]);
+	});
+
 	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {
 		pr(1);
 		world.refuseMerge.add(1);

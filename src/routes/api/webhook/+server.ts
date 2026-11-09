@@ -14,7 +14,7 @@ import {
 } from '$lib/server/db';
 import { closedPRReason } from '$lib/server/stack-runtime';
 import { getQueueSettings } from '$lib/server/batch-store';
-import { markDirty } from '$lib/server/wake';
+import { bumpGeneration, markDirty } from '$lib/server/wake';
 import type { RequestHandler } from './$types';
 
 function verifySignature(payload: string, signature: string | null, secret: string): boolean {
@@ -28,18 +28,35 @@ function verifySignature(payload: string, signature: string | null, secret: stri
 	return diff === 0;
 }
 
-/** Events that can change what the batch queue should do next; check_run fires per job, so only suites count. */
+/**
+ * Events that can change what the batch queue should do next. Not the queue's own `mq/*` pushes
+ * and branch deletions, nor each job's check_run: a PR change, a review, master moving, or a
+ * queue branch's checks finishing.
+ */
 function wakesQueue(event: string | null, payload: Record<string, unknown>): boolean {
+	const defaultBranch = (payload.repository as { default_branch?: string } | undefined)?.default_branch;
 	switch (event) {
 		case 'pull_request':
 		case 'pull_request_review':
-		case 'push':
 			return true;
-		case 'check_suite':
-			return payload.action === 'completed';
+		case 'push':
+			return !!defaultBranch && payload.ref === `refs/heads/${defaultBranch}`;
+		case 'check_suite': {
+			const branch = (payload.check_suite as { head_branch?: string | null } | undefined)?.head_branch ?? '';
+			return payload.action === 'completed' && branch.startsWith('mq/');
+		}
 		default:
 			return false;
 	}
+}
+
+/** Events after which PR state derived earlier (stacks, reviews) is stale. */
+function changesPRs(event: string | null, payload: Record<string, unknown>): boolean {
+	if (event === 'push' || event === 'delete') {
+		const ref = String(payload.ref ?? '');
+		return !ref.startsWith('refs/heads/mq/') && !ref.startsWith('mq/');
+	}
+	return event === 'pull_request' || event === 'pull_request_review';
 }
 
 export const POST: RequestHandler = async ({ request }) => {
@@ -68,6 +85,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	const [owner, name] = repository.full_name.split('/');
 	const repo = getRepoByOwnerName(owner, name);
 	if (!repo) return json({ ok: true });
+	if (changesPRs(event, payload)) bumpGeneration(repo.id);
 	if (wakesQueue(event, payload)) markDirty(repo.id);
 
 	const queueItems = getQueueItems(repo.id);

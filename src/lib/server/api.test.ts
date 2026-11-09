@@ -14,18 +14,21 @@ describe('auth with the caller’s gh token', () => {
 	const gh = (over: Partial<AuthGitHub> = {}): AuthGitHub => ({
 		user: async (t) => {
 			calls.push(`user:${t}`);
-			return t.startsWith('ghs_') ? null : t === 'bad' ? null : { login: t === 'maint' ? 'mia' : 'agent' };
+			return t.startsWith('ghs_') ? null : t === 'bad' ? null : { login: t === 'gho_maint' ? 'mia' : 'agent' };
 		},
 		permission: async (_o, _r, login) => {
 			calls.push(`perm:${login}`);
 			return login === 'mia' ? 'maintain' : 'write';
 		},
-		repoAsCaller: async (t): Promise<{ permissions?: Record<string, boolean> } | null> => {
+		repoAsCaller: async (t): Promise<{ permissions?: Record<string, boolean>; scopes?: string | null } | null> => {
 			calls.push(`repo:${t}`);
 			if (t === 'ghs_ok') return { permissions: { push: true } };
-			if (t === 'bad' || t === 'other-repos') return null;
-			if (t === 'readonly-token') return { permissions: { pull: true } };
-			return { permissions: { admin: true, maintain: true, push: true, pull: true } };
+			if (t === 'bad' || t === 'gho_other-repos') return null;
+			if (t === 'gho_readonly') return { permissions: { pull: true }, scopes: 'repo' };
+			const all = { admin: true, maintain: true, push: true, pull: true };
+			if (t === 'gho_noscope') return { permissions: all, scopes: 'read:user' };
+			if (t.startsWith('github_pat_')) return { permissions: all, scopes: null };
+			return { permissions: all, scopes: 'repo, read:org, gist' };
 		},
 		...over
 	});
@@ -37,7 +40,7 @@ describe('auth with the caller’s gh token', () => {
 
 	test('maps the token to the user and their repo role', async () => {
 		expect(await resolveCaller(gh(), 'Bearer gho_x', 'acme', 'r')).toEqual({ login: 'agent', role: 'write', app: false });
-		expect((await resolveCaller(gh(), 'token maint', 'acme', 'r')).role).toBe('maintain');
+		expect((await resolveCaller(gh(), 'token gho_maint', 'acme', 'r')).role).toBe('maintain');
 	});
 
 	test('caches per token and repo, so GitHub is asked once', async () => {
@@ -53,8 +56,14 @@ describe('auth with the caller’s gh token', () => {
 	});
 
 	test('the token itself must see the repo, and its permissions bound the role', async () => {
-		await expect(resolveCaller(gh(), 'Bearer other-repos', 'acme', 'r')).rejects.toMatchObject({ status: 403 });
-		expect((await resolveCaller(gh(), 'Bearer readonly-token', 'acme', 'r')).role).toBe('read');
+		await expect(resolveCaller(gh(), 'Bearer gho_other-repos', 'acme', 'r')).rejects.toMatchObject({ status: 403 });
+		expect((await resolveCaller(gh(), 'Bearer gho_readonly', 'acme', 'r')).role).toBe('read');
+	});
+
+	test('a token not shown to carry repo scope only reads, whatever its user may do', async () => {
+		// e.g. a "Sign in with GitHub" token of some other app: GitHub still reports its user's permissions
+		expect((await resolveCaller(gh(), 'Bearer gho_noscope', 'acme', 'r')).role).toBe('read');
+		expect((await resolveCaller(gh(), 'Bearer github_pat_x', 'acme', 'r')).role).toBe('read');
 	});
 
 	test('denials are cached, so a stranger costs one lookup', async () => {

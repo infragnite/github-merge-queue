@@ -166,6 +166,10 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 		// Only the default branch is batched; a PR into another branch is merged some other way.
 		return { ok: false, code: 'wrong-base', reason: `#${n} does not target the default branch`, wait: false };
 	}
+	if (state.fromFork && (info?.parent ?? null) !== null) {
+		// Landing a stacked child restacks and pushes its branch, which the queue can't do in a fork.
+		return { ok: false, code: 'wrong-base', reason: `#${n} is stacked on another PR from a fork; retarget it to the default branch once its parent lands`, wait: false };
+	}
 	if (info) {
 		const own = stopper(info);
 		if (own) return { ok: false, code: 'stack-broken', reason: own, wait: false };

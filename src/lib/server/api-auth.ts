@@ -27,7 +27,11 @@ export interface AuthGitHub {
 	/** The user's permission on the repo, looked up with the app's own token. */
 	permission(owner: string, repo: string, login: string): Promise<string>;
 	/** GET /repos/{owner}/{repo} with the caller's token; null when it can't see the repo. */
-	repoAsCaller(token: string, owner: string, repo: string): Promise<{ permissions?: Record<string, boolean> } | null>;
+	repoAsCaller(
+		token: string,
+		owner: string,
+		repo: string
+	): Promise<{ permissions?: Record<string, boolean>; scopes?: string | null } | null>;
 }
 
 export class AuthError extends Error {
@@ -103,7 +107,9 @@ export async function resolveCaller(
 	const asCaller = await gh.repoAsCaller(token, owner, repo);
 	const user = await gh.user(token);
 	if (!asCaller) return deny(new AuthError(user ? 403 : 401, user ? `This token can't see ${owner}/${repo}` : 'GitHub did not accept this token'));
-	const tokenRole = roleFromPermissions(asCaller.permissions);
+	// GitHub reports the user's permissions on the repo whatever the token may do, so they bound
+	// nothing by themselves. Only a token shown to carry repo access acts with them beyond read.
+	const tokenRole = minRole(roleFromPermissions(asCaller.permissions), tokenCeiling(token, asCaller.scopes));
 	if (user) {
 		const userRole = roleFrom(await gh.permission(owner, repo, user.login));
 		caller = { login: user.login, role: minRole(userRole, tokenRole), app: false };
@@ -114,6 +120,21 @@ export async function resolveCaller(
 	if (caller.role === 'none') return deny(new AuthError(403, `${caller.login} has no access to ${owner}/${repo}`));
 	cache.set(key, { caller, until: now + TTL_MS });
 	return caller;
+}
+
+/**
+ * The most a token may do: a classic or OAuth token (`ghp_`, `gho_`, what `gh auth token` gives)
+ * with `repo` or `public_repo` scope acts with its user's role; an installation token (`ghs_`)
+ * with its repo permissions. Any other (fine-grained `github_pat_`, another app's `ghu_`, or a
+ * classic token without repo scope) only reads: their permissions can't be checked here.
+ */
+function tokenCeiling(token: string, scopes: string | null | undefined): Role {
+	if (token.startsWith('ghs_')) return 'admin';
+	if (token.startsWith('ghp_') || token.startsWith('gho_')) {
+		const s = (scopes ?? '').split(',').map((x) => x.trim());
+		return s.includes('repo') || s.includes('public_repo') ? 'admin' : 'read';
+	}
+	return 'read';
 }
 
 function roleFromPermissions(p: Record<string, boolean> | undefined): Role {
