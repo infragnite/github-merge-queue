@@ -11,6 +11,8 @@
 //   PATCH  queue/config        {mode?, config?, ci?}            (admin)
 //   POST   queue/pause         {reason?}                         (maintain)
 //   POST   queue/resume                                          (maintain)
+//                                 lifts a pause; on an unpaused queue whose default branch is
+//                                 red, vouches for the branch (it is treated as green)
 //   GET    batches             recent batches
 //   GET    batches/{id}        one batch with its bisection runs
 //   GET    history?limit=      merged and bounced PRs

@@ -644,7 +644,8 @@ describe('batch queue runtime', () => {
 		store.setQueuePriority(repo.id, 1, 'urgent');
 		store.setQueuePriority(repo.id, 2, 'urgent');
 		await run(40);
-		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [1], [2]]);
+		// urgent ones go alone: one try each
+		expect(world.started.map((x) => x.prs)).toEqual([[1], [2]]);
 		expect(world.comments).toEqual([]);
 	});
 
@@ -664,7 +665,41 @@ describe('batch queue runtime', () => {
 		pr(2);
 		pr(3, { from: 'pr2', base: 'pr2' });
 		await run(40);
-		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [2, 3], [1], [2]]);
+		// in batches, then each stack on its own: #3 only ever with #2 under it
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [2, 3], [1], [2], [2, 3]]);
+	});
+
+	/** A PR stacked on `from` that deletes main's breaking file. */
+	function stackedFix(n: number, from: string) {
+		git.branch(`pr${n}`, from);
+		git.git('checkout', '-q', `pr${n}`);
+		git.git('rm', '-q', 'x-breaks-master.txt');
+		git.git('commit', '-qm', `fix ${n}`);
+		git.openPR(n, `pr${n}`, from);
+		world.approved.add(n);
+		db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+	}
+
+	test('on a red default branch a fix stacked on an urgent, already tried parent still lands', async () => {
+		redMain();
+		pr(1);
+		store.setQueuePriority(repo.id, 1, 'urgent');
+		await run(5);
+		expect(world.started.map((x) => x.prs)).toEqual([[1]]);
+		stackedFix(2, 'pr1');
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('on a red default branch a fix deep in a stack is reached', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 2 } });
+		redMain();
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		await run(10);
+		stackedFix(3, 'pr2');
+		await run();
+		expect(world.merged).toEqual([1, 2, 3]);
 	});
 
 	test('an urgent fix is tried first, alone, on a red default branch', async () => {

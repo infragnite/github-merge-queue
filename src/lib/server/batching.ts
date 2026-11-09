@@ -546,3 +546,72 @@ function dedupe(groups: TestGroup[]): TestGroup[] {
 		return true;
 	});
 }
+
+/**
+ * The next batch on a red default branch, where a batch that passes carries a fix. Each queued
+ * PR goes with its queued ancestors (a child is never tested without them). First, PRs not yet
+ * tried there (`tried(n, false)`), packed up to `maxBatch` (an urgent one alone with its stack);
+ * once none is left, each PR's stack once more on its own (`tried(n, true)`). Every batch holds
+ * a PR not tried that way, so the tries run out.
+ */
+export function planRedBatch(input: {
+	queue: QueueEntry[];
+	states: Map<number, PRState>;
+	analysis: StackAnalysis;
+	config: BatchConfig;
+	tried: (n: number, alone: boolean) => boolean;
+}): Pick<Plan, 'batch' | 'express' | 'held'> {
+	const { queue, states, analysis, config, tried } = input;
+	const held: Plan['held'] = [];
+	const ok = new Map<number, QueueEntry>();
+	for (const e of queue) {
+		const a = admit(states.get(e.pr)!, analysis, config);
+		if (a.ok) ok.set(e.pr, e);
+		else held.push({ pr: e.pr, admission: a });
+	}
+	const queued = new Set(queue.map((e) => e.pr));
+	const chainOf = (n: number): number[] | null => {
+		const out = [n];
+		for (let p = openParent(analysis, n); p !== null; p = openParent(analysis, p)) {
+			if (!ok.has(p)) {
+				held.push({
+					pr: n,
+					admission: {
+						ok: false,
+						code: 'parent-not-ready',
+						reason: queued.has(p) ? `Stacked on #${p}, which can't be batched yet` : `Stacked on #${p}, which isn't merged or queued; queue #${p} first`,
+						wait: true
+					}
+				});
+				return null;
+			}
+			out.unshift(p);
+		}
+		return out;
+	};
+	const ordered = [...ok.values()].sort(
+		(a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority] || a.enqueuedAt - b.enqueuedAt || a.pr - b.pr
+	);
+	const chains = (alone: boolean) =>
+		ordered.filter((e) => !tried(e.pr, alone)).flatMap((e) => {
+			const c = chainOf(e.pr);
+			return c ? [{ tip: e, chain: c }] : [];
+		});
+
+	let cands = chains(false);
+	if (cands.length) {
+		const first = cands[0];
+		if (first.tip.priority === 'urgent') return { batch: first.chain, express: true, held };
+		const batch: number[] = [];
+		for (const { chain } of cands) {
+			const add = chain.filter((n) => !batch.includes(n));
+			if (batch.length && batch.length + add.length > config.maxBatch) continue;
+			batch.push(...add);
+			if (batch.length >= config.maxBatch) break;
+		}
+		return { batch, express: false, held };
+	}
+	cands = chains(true);
+	if (cands.length) return { batch: cands[0].chain, express: cands[0].tip.priority === 'urgent', held };
+	return { batch: null, express: false, held };
+}
