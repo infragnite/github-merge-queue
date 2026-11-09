@@ -580,7 +580,9 @@ class Tick {
 		this.log(`batch ${batch.id} landed: ${prs.map((n) => `#${n}`).join(' ')}`);
 		// The tree on master passed CI. The default-branch run started now confirms it in that
 		// branch's environment; until it does, failures on top of it wait rather than eject.
-		const verifying = await this.maybeRefreshCaches();
+		// (Only a run on the default branch itself reports on this commit.)
+		const ref = this.settings().ci.dispatchRef;
+		const verifying = (await this.maybeRefreshCaches()) && (!ref || ref === this.d.repo.default_branch);
 		store.setMasterHealth(this.repoId, { sha: master, tree: expected, state: verifying ? 'verifying' : 'green', since: this.d.now() });
 		// What this tick read before the landing (stacks, PR bases and heads) is stale now.
 		this.analysisCache = null;
