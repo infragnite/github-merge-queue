@@ -14,11 +14,17 @@
 //   GET    batches             recent batches
 //   GET    batches/{id}        one batch with its bisection runs
 //   GET    history?limit=      merged and bounced PRs
+//   GET    events?after=&pr=&wait=   queue events after a cursor; waits up to `wait` s (max 60)
+//                                    for the first one (long poll). No `after`: recent events + cursor.
+//   POST   pulls/{n}/try       one CI run of the PR on top of the default branch   (write)
 
 import { json, type RequestHandler } from '@sveltejs/kit';
 import * as github from '$lib/server/github';
 import { getRepoByOwnerName } from '$lib/server/db';
-import { getRecentBatches } from '$lib/server/batch-store';
+import { getQueueSettings, getRecentBatches } from '$lib/server/batch-store';
+import { startTry } from '$lib/server/batch-queue';
+import { liveDeps } from '$lib/server/batch-live';
+import { requireRole } from '$lib/server/api-auth';
 import { analyzeRepoStacks } from '$lib/server/stack-runtime';
 import { AuthError, resolveCaller, type AuthGitHub } from '$lib/server/api-auth';
 import * as api from '$lib/server/api-service';
@@ -31,12 +37,17 @@ const authGitHub: AuthGitHub = {
 
 const handle: RequestHandler = async ({ params, request, url }) => {
 	try {
+		// Authenticate first, so callers without access can't tell which repos the queue manages.
+		const caller = await resolveCaller(authGitHub, request.headers.get('authorization'), params.owner!, params.repo!);
 		const repo = getRepoByOwnerName(params.owner!, params.repo!);
 		if (!repo) return json({ error: `${params.owner}/${params.repo} is not managed by this queue` }, { status: 404 });
-		const caller = await resolveCaller(authGitHub, request.headers.get('authorization'), repo.owner, repo.name);
 		const parts = (params.path ?? '').split('/').filter(Boolean);
 		const m = request.method;
-		const body = async () => (m === 'GET' || m === 'DELETE' ? {} : await request.json().catch(() => ({})));
+		const body = async (): Promise<Record<string, unknown>> => {
+			if (m === 'GET' || m === 'DELETE') return {};
+			const b = await request.json().catch(() => ({}));
+			return b && typeof b === 'object' && !Array.isArray(b) ? b : {};
+		};
 		const route = `${m} ${parts.map((p) => (/^\d+$/.test(p) ? ':n' : p)).join('/')}`;
 		const n = Number(parts.find((p) => /^\d+$/.test(p)));
 
@@ -68,7 +79,29 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 			case 'GET batches/:n':
 				return json(api.batchDetail(repo, n));
 			case 'GET history':
-				return json(api.history(repo, Number(url.searchParams.get('limit') ?? 50)));
+				return json(api.history(repo, api.intParam(url.searchParams.get('limit'), 'limit', 50)!));
+			case 'GET events':
+				return json(
+					await api.events(
+						repo,
+						{
+							after: api.intParam(url.searchParams.get('after'), 'after', null),
+							pr: api.intParam(url.searchParams.get('pr'), 'pr', null),
+							waitSec: api.intParam(url.searchParams.get('wait'), 'wait', 0)
+						},
+						request.signal
+					)
+				);
+			case 'POST pulls/:n/try': {
+				requireRole(caller, 'write', 'Starting a try run');
+				if (getQueueSettings(repo.id).mode !== 'batch') throw new api.ApiError(409, 'Try runs need the queue in batch mode');
+				try {
+					return json(api.tryRunState(await startTry(liveDeps(repo), n)), { status: 201 });
+				} catch (e) {
+					if (e instanceof Error && /is not open|does not apply/.test(e.message)) throw new api.ApiError(409, e.message);
+					throw e;
+				}
+			}
 			default:
 				return json({ error: `No endpoint ${m} ${parts.join('/')}` }, { status: 404 });
 		}

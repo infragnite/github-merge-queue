@@ -5,8 +5,10 @@ const db = await import('./db');
 const store = await import('./batch-store');
 const { tickBatchQueue } = await import('./batch-queue');
 const { buildBatch, GitRunner } = await import('./batch-builder');
+const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
 import { GitSandbox } from './testing/git-sandbox';
+import { writeFileSync } from 'node:fs';
 import type { LivePR, QueueDeps } from './batch-queue';
 
 let git: GitSandbox;
@@ -29,6 +31,13 @@ class World {
 	comments: { pr: number; body: string }[] = [];
 	merged: number[] = [];
 	ciPendingOnce = new Set<string>();
+	prStatuses: { sha: string; state: string; description: string; context: string }[] = [];
+	labels = new Map<number, Set<string>>();
+	pushedHeads: { branch: string; sha: string }[] = [];
+	changesRequested = new Set<number>();
+	/** Approval given on one specific head SHA only. */
+	approvedOn = new Map<number, string>();
+	cacheRefreshes = 0;
 
 	files(sha: string) {
 		return new Set(git.git('ls-tree', '-r', '--name-only', sha).split('\n'));
@@ -50,7 +59,8 @@ class World {
 			git: {
 				fetch: async () => {},
 				tree: async (sha) => git.git('rev-parse', `${sha}^{tree}`),
-				build: async (base, members) => buildBatch(runner, base, members)
+				build: async (base, members) => buildBatch(runner, base, members),
+				restack: async (head, upstream, onto) => replay(runner, { head, upstream, onto })
 			},
 			ci: {
 				start: async (branch, _base, head, prs) => {
@@ -61,6 +71,9 @@ class World {
 					if (this.ciPendingOnce.delete(head)) return 'pending';
 					const flakeNow = this.flaky.has(head) && !this.reruns.has(head);
 					return flakeNow || this.ciFails(head) ? 'failure' : 'success';
+				},
+				refreshCaches: async () => {
+					this.cacheRefreshes++;
 				},
 				rerunFailed: async (head) => {
 					this.reruns.set(head, (this.reruns.get(head) ?? 0) + 1);
@@ -76,10 +89,9 @@ class World {
 					return {
 						pr: n,
 						headSha: head,
+						headRef: p.headRef,
+						sameRepo: true,
 						draft: false,
-						ciGreen: !this.ciRed.has(n),
-						approvedShas: this.approved.has(n) ? [head] : [],
-						changesRequested: false,
 						title: `PR ${n}`,
 						url: `https://example.test/pull/${n}`,
 						authorLogin: 'dev',
@@ -88,17 +100,42 @@ class World {
 						merged: p.merged
 					};
 				},
+				readiness: async (n, head) => ({
+					ciGreen: !this.ciRed.has(n),
+					approvedShas: this.approved.has(n) ? [head] : this.approvedOn.has(n) ? [this.approvedOn.get(n)!] : [],
+					changesRequested: this.changesRequested.has(n)
+				}),
 				pushBranch: async (branch, sha) => {
 					git.git('branch', '-f', branch, sha);
+				},
+				pushHead: async (branch, sha, expected) => {
+					if (git.sha(branch) !== expected) throw new Error('stale info');
+					git.git('branch', '-f', branch, sha);
+					this.pushedHeads.push({ branch, sha });
+				},
+				setPRStatus: async (sha, state, description, opts) => {
+					this.prStatuses.push({ sha, state, description, context: `merge-queue${opts?.suffix ?? ''}` });
+				},
+				label: async (n, name, on) => {
+					const set = this.labels.get(n) ?? new Set();
+					if (on) set.add(name);
+					else set.delete(name);
+					this.labels.set(n, set);
 				},
 				deleteBranch: async (branch) => {
 					git.git('branch', '-D', branch);
 				},
 				retargetBase: async (n, base) => git.retarget(n, base),
-				squashMerge: async (n) => {
-					git.merge(n, 'squash');
+				squashMerge: async (n, _title, expected) => {
+					if (git.sha(git.pr(n).headRef) !== expected) return { merged: false, message: 'Head branch was modified' };
+					try {
+						git.merge(n, 'squash');
+					} catch (e) {
+						git.git('merge', '--abort');
+						return { merged: false, message: 'Merge conflict' };
+					}
 					this.merged.push(n);
-					return { merged: true };
+					return { merged: true, sha: git.sha('main') };
 				},
 				setStatus: async (sha, state) => {
 					this.statuses.push({ sha, state });
@@ -194,7 +231,8 @@ describe('batch queue runtime', () => {
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr4.txt']);
 		expect(db.getRepoHistory(repo.id).find((h) => h.pr_number === 3)?.status).toBe('failed');
 		// the batch, the failed-job re-run, then bisection runs and the survivors together
-		expect(world.reruns.size).toBe(1);
+		// (bisection runs that fail are re-run once too, so a flake can't eject an innocent PR)
+		expect(world.reruns.size).toBeGreaterThanOrEqual(1);
 		expect(world.started.length).toBeGreaterThanOrEqual(4);
 		expect(world.started.at(-1)!.prs).toEqual([1, 2, 4]);
 	});
@@ -209,14 +247,27 @@ describe('batch queue runtime', () => {
 		expect(world.comments[0]).toMatchObject({ pr: 3, body: expect.stringMatching(/combined with/) });
 	});
 
-	test('a PR that conflicts textually is ejected at build time, without CI', async () => {
+	test('a PR that conflicts with one ahead of it waits for it, then gets a conflict notice', async () => {
 		pr(1, { file: 'same.txt' });
 		pr(2, { file: 'same.txt' });
 		pr(3);
 		await run();
-		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/conflicts with the batch.*same.txt/) }]);
+		// no CI was spent on #2: it was set aside at build time
 		expect(world.started.map((s) => s.prs)).toEqual([[1, 3]]);
 		expect(world.merged).toEqual([1, 3]);
+		// once #1 is on master, #2 conflicts with master itself: its author is told, and it stays queued
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/can't apply this PR[\s\S]*same.txt[\s\S]*git rebase origin\/main/) }]);
+		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
+		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'failure', description: expect.stringMatching(/^Conflict/) });
+
+		// the author rebases and resolves: the PR is picked up again and lands
+		git.git('checkout', '-q', 'pr2');
+		git.git('reset', '-q', '--hard', 'main');
+		git.commit('pr2', 'pr2 resolved', 'pr2.txt');
+		await run();
+		expect(world.merged).toEqual([1, 3, 2]);
+		expect(world.labels.get(2)).toEqual(new Set());
 	});
 
 	test('lands a stack parent-first and retargets the child', async () => {
@@ -228,6 +279,100 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 2, 5]);
 		expect(git.pr(2).baseRef).toBe('main');
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr5.txt']);
+	});
+
+	test('a stacked child that edits its parent\'s lines is restacked onto master to land as tested', async () => {
+		pr(1, { file: 'shared.txt' });
+		git.branch('pr2', 'pr1');
+		git.git('checkout', '-q', 'pr2');
+		writeFileSync(`${git.dir}/shared.txt`, 'child rewrote it\n');
+		git.git('commit', '-qam', 'pr2');
+		git.openPR(2, 'pr2', 'pr1');
+		world.approved.add(2);
+		db.addToQueue(repo.id, 2, 'PR 2', 'u', 'dev', '', 'dev');
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(git.git('show', 'main:shared.txt')).toBe('child rewrote it');
+		expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+	});
+
+	test('a stacked child whose parent moved on is tested with the parent\'s new commits', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		git.commit('pr1', 'p2', 'pr1-more.txt'); // the parent gets a commit the child doesn't have
+		await run();
+		expect(world.files(world.started[0].head).has('pr1-more.txt')).toBe(true);
+		expect(world.merged).toEqual([1, 2]);
+		expect(mainFiles()).toEqual(['pr1-more.txt', 'pr1.txt', 'pr2.txt']);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+	});
+
+	test('a PR into another branch is never batched or retargeted', async () => {
+		git.branch('release', 'main');
+		git.commit('release', 'rel-only', 'release-only.txt');
+		pr(1, { from: 'release', base: 'release' });
+		await run();
+		expect(world.started).toEqual([]);
+		expect(git.pr(1).baseRef).toBe('release');
+		expect(db.getQueueItems(repo.id)[0].error_message).toMatch(/does not target the default branch/);
+	});
+
+	test('a PR dequeued while its batch is being built does not land', async () => {
+		pr(1);
+		const d = world.deps();
+		const build = d.git.build;
+		d.git.build = async (b, m) => {
+			const it = db.getQueueItems(repo.id).find((i) => i.pr_number === 1);
+			if (it) db.removeFromQueue(it.id);
+			return build(b, m);
+		};
+		await tickBatchQueue(d);
+		await run();
+		expect(world.merged).toEqual([]);
+	});
+
+	test('changes requested while the batch tests keep the PR from landing', async () => {
+		pr(1);
+		pr(2);
+		await tickBatchQueue(world.deps());
+		world.changesRequested.add(2);
+		await run();
+		expect(world.merged).toEqual([1]);
+		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, '#2 has changes requested']]);
+	});
+
+	test('marks the PR head as tested right before merging it', async () => {
+		pr(1);
+		const head = git.sha('pr1');
+		await run();
+		expect(world.prStatuses.filter((x) => x.sha === head).map((x) => x.state)).toEqual(['pending', 'success']);
+	});
+
+	test('without PR checks required, a PR with red own checks is still batched', async () => {
+		store.updateQueueSettings(repo.id, { config: { requirePRChecks: false } });
+		pr(1);
+		world.ciRed.add(1);
+		await run();
+		expect(world.merged).toEqual([1]);
+	});
+
+	test('restacks a queued child whose parent was rebased, and carries its approval over', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		git.commit('main', 'm1', 'x-main.txt');
+		git.rebase('pr1', 'main'); // the parent is rebased: the child still has its old commits
+		world.approved.delete(2); // approval on the old head only...
+		const oldHead = git.sha('pr2');
+		world.approvedOn.set(2, oldHead);
+		await run();
+		expect(world.pushedHeads[0]).toMatchObject({ branch: 'pr2' });
+		expect(world.comments.find((c) => c.pr === 2)?.body).toMatch(/restacked this PR onto #1/);
+		// the restacked head sits on the parent's rebased head (throws if not)
+		git.git('merge-base', '--is-ancestor', 'pr1', world.pushedHeads[0].sha);
+		expect(world.merged).toEqual([1, 2]);
+		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
 	});
 
 	test('a failing stack parent takes its child out of the queue too', async () => {

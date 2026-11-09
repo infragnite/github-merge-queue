@@ -5,6 +5,7 @@ import { closedPRReason, stackMergeBlocker } from './stack-runtime';
 import { getQueueSettings } from './batch-store';
 import { tickBatchQueue } from './batch-queue';
 import { liveDeps } from './batch-live';
+import { takeDirty } from './wake';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -59,10 +60,18 @@ async function recordOpenPRHeads(repo: RepoRef) {
 	}
 }
 
+// A batch tick costs several GitHub calls per queued PR, so it runs at most
+// once a minute, or sooner when a webhook says something changed.
+const BATCH_TICK_MS = 60_000;
+const lastBatchTick = new Map<number, number>();
+
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	await recordOpenPRHeads(repo);
 
 	if (getQueueSettings(repo.id).mode === 'batch') {
+		const last = lastBatchTick.get(repo.id) ?? 0;
+		if (!takeDirty(repo.id) && Date.now() - last < BATCH_TICK_MS) return;
+		lastBatchTick.set(repo.id, Date.now());
 		try {
 			await tickBatchQueue(liveDeps(repo));
 		} catch (err) {
@@ -162,7 +171,16 @@ async function reconcilePR(
 
 async function handleQueued(
 	repo: RepoRef,
-	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; head_sha: string | null; created_at: string }
+	item: {
+		id: number;
+		pr_number: number;
+		pr_title: string;
+		pr_url: string;
+		author_login: string;
+		head_sha: string | null;
+		created_at: string;
+		error_message?: string | null;
+	}
 ) {
 	console.log(`[merge-queue] Processing ${repo.owner}/${repo.name}#${item.pr_number}`);
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
@@ -170,10 +188,21 @@ async function handleQueued(
 	if (await reconcilePR(pr, repo, item)) return;
 
 	// GitHub's base field can't be trusted for stacks, so check ancestry:
-	// a PR sitting on an unmerged or rewritten PR must not be merged.
-	const stackBlocker = await stackMergeBlocker(repo, item.pr_number);
+	// a PR sitting on an unmerged or rewritten PR must not be merged yet. It
+	// stays queued but moves to the back, so the PRs behind it go first; a
+	// failed check (rate limit, GitHub hiccup) is retried next cycle, never a failure.
+	let stackBlocker: string | null = null;
+	try {
+		stackBlocker = await stackMergeBlocker(repo, item.pr_number);
+	} catch (err) {
+		console.warn(`[merge-queue] Stack check for #${item.pr_number} failed, will retry: ${err instanceof Error ? err.message : err}`);
+		return;
+	}
 	if (stackBlocker) {
-		db.updateQueueItemStatus(item.id, 'failed', `Stacked PR: ${stackBlocker}`);
+		const msg = `Stacked PR: ${stackBlocker}`;
+		if (item.error_message !== msg) db.updateQueueItemStatus(item.id, 'queued', msg);
+		const order = db.getQueueItems(repo.id).map((i) => i.id);
+		if (order[order.length - 1] !== item.id) db.reorderQueue(repo.id, [...order.filter((id) => id !== item.id), item.id]);
 		return;
 	}
 

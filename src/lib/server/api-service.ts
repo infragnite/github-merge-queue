@@ -4,6 +4,7 @@
 
 import * as db from './db';
 import * as store from './batch-store';
+import { emitEvent, waitForEvents } from './events';
 import { requireRole, type Caller } from './api-auth';
 import { DEFAULT_BATCH_CONFIG, type BatchConfig, type Priority } from './batching';
 import type { BatchRow } from './batch-store';
@@ -24,7 +25,8 @@ export type NextAction =
 	| { do: 'retarget-base'; base: string; why: string }
 	| { do: 'wait-for'; pr: number; why: string }
 	| { do: 'queue'; pr: number; why: string }
-	| { do: 'fix'; why: string };
+	| { do: 'fix'; why: string }
+	| { do: 'resolve-conflict'; cmd: string; why: string };
 
 type Q = QueueItem & { priority?: Priority };
 
@@ -83,6 +85,20 @@ function nextActions(info: PRStackInfo, analysis: StackAnalysis, defaultBranch: 
 	return out;
 }
 
+/** What the queue itself is waiting on from the author, if anything. */
+function queueActions(repo: Repo, n: number, info: PRStackInfo): NextAction[] {
+	const it = db.getQueueItems(repo.id).find((i) => i.pr_number === n);
+	if (!it || it.status !== 'conflict') return [];
+	const onto = info.parent !== null ? `pull/${info.parent}/head` : repo.default_branch;
+	return [
+		{
+			do: 'resolve-conflict',
+			cmd: `git fetch origin ${onto} && git rebase FETCH_HEAD && git push --force-with-lease`,
+			why: it.error_message ?? 'The queue could not apply this PR'
+		}
+	];
+}
+
 /** Stack and queue state of one PR, with what to do next. */
 export function stackState(repo: Repo, n: number, analysis: StackAnalysis) {
 	const info = analysis.prs.get(n);
@@ -105,7 +121,7 @@ export function stackState(repo: Repo, n: number, analysis: StackAnalysis) {
 		stack: tree(analysis, root),
 		issues: info.issues,
 		queue: queueEntry(repo.id, n),
-		nextActions: nextActions(info, analysis, repo.default_branch, queued)
+		nextActions: [...queueActions(repo, n, info), ...nextActions(info, analysis, repo.default_branch, queued)]
 	};
 }
 
@@ -205,6 +221,7 @@ export function enqueue(
 	if (existing) db.removeFromQueue(existing.id);
 	db.addToQueue(repo.id, pr.number, pr.title, pr.html_url, pr.user.login, pr.user.avatar_url, caller.login);
 	store.setQueuePriority(repo.id, pr.number, priority);
+	emitEvent(repo.id, pr.number, 'queued', { by: caller.login, priority });
 	return queueEntry(repo.id, pr.number);
 }
 
@@ -216,6 +233,7 @@ export function dequeue(repo: Repo, caller: Caller, n: number) {
 		throw new ApiError(409, `#${n} is being tested in a batch; cancel the batch or wait for it`);
 	}
 	db.removeFromQueue(it.id);
+	emitEvent(repo.id, n, 'dequeued', { by: caller.login });
 	return { removed: n };
 }
 
@@ -261,9 +279,10 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 	if (mode !== undefined && mode !== 'serial' && mode !== 'batch') throw new ApiError(400, 'mode must be serial or batch');
 	const ci = body.ci as Record<string, unknown> | undefined;
 	if (ci) {
+		const keys = ['workflow', 'requiredCheck', 'testedStatus', 'prStatus', 'dispatchRef'];
 		for (const [k, v] of Object.entries(ci)) {
-			if (!['workflow', 'requiredCheck', 'testedStatus'].includes(k) || typeof v !== 'string' || !v) {
-				throw new ApiError(400, `ci.${k} must be a non-empty string (workflow, requiredCheck, testedStatus)`);
+			if (!keys.includes(k) || typeof v !== 'string' || (!v && k !== 'dispatchRef')) {
+				throw new ApiError(400, `ci.${k} must be a non-empty string (${keys.join(', ')})`);
 			}
 		}
 	}
@@ -279,15 +298,42 @@ export function pause(repo: Repo, caller: Caller, reason: unknown) {
 	requireRole(caller, 'maintain', 'Pausing the queue');
 	const why = typeof reason === 'string' && reason.trim() ? reason.trim() : `Paused by ${caller.login}`;
 	store.updateQueueSettings(repo.id, { pausedReason: why });
+	emitEvent(repo.id, null, 'paused', { reason: why, by: caller.login });
 	return getConfig(repo);
 }
 
 export function resume(repo: Repo, caller: Caller) {
 	requireRole(caller, 'maintain', 'Resuming the queue');
 	store.updateQueueSettings(repo.id, { pausedReason: null });
+	emitEvent(repo.id, null, 'resumed', { by: caller.login });
 	return getConfig(repo);
+}
+
+/** A positive integer query parameter, or `fallback` when missing; 400 when malformed. */
+export function intParam(v: string | null, name: string, fallback: number | null): number | null {
+	if (v === null || v === '') return fallback;
+	if (!/^\d+$/.test(v)) throw new ApiError(400, `${name} must be a non-negative integer`);
+	return Number(v);
 }
 
 export function history(repo: Repo, limit: number) {
 	return { history: db.getRepoHistory(repo.id, Math.min(Math.max(limit, 1), 200)) };
+}
+
+export async function events(
+	repo: Repo,
+	q: { after: number | null; pr: number | null; waitSec: number | null },
+	signal?: AbortSignal
+) {
+	const r = await waitForEvents(repo.id, {
+		after: q.after,
+		pr: q.pr,
+		waitMs: (q.waitSec ?? 0) * 1000,
+		signal
+	});
+	return { events: r.events, cursor: r.cursor };
+}
+
+export function tryRunState(run: store.BatchRow) {
+	return { id: run.id, branch: run.branch, status: run.status, ci: run.ci_result, headSha: run.heads[run.members[0]] };
 }

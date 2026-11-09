@@ -6,25 +6,41 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as github from './github';
 import { buildBatch, GitRunner } from './batch-builder';
+import { replay } from './rebase';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { analyzeRepoStacks } from './stack-runtime';
-import type { LivePR, QueueDeps } from './batch-queue';
+import type { LivePR, QueueDeps, Readiness } from './batch-queue';
 import type { GhReview } from './github';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
 const WRITERS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
+/** Reviewers whose association could mean write access; their actual permission is checked next. */
+export function candidateReviewers(reviews: GhReview[], author: string): string[] {
+	return [
+		...new Set(
+			reviews
+				.filter((r) => r.user?.login && r.user.login !== author && WRITERS.has(r.author_association))
+				.map((r) => r.user!.login)
+		)
+	];
+}
+
 /**
  * Approval state from a PR's reviews: the latest decisive review of each
- * reviewer with write access counts. Returns the head SHAs approvals were
- * given on, and whether anyone's latest word is "changes requested".
+ * reviewer with write access (`canApprove`) counts. Returns the head SHAs
+ * approvals were given on, and whether anyone's latest word is "changes requested".
  */
-export function approvalsFrom(reviews: GhReview[], author: string): { approvedShas: string[]; changesRequested: boolean } {
+export function approvalsFrom(
+	reviews: GhReview[],
+	author: string,
+	canApprove: (login: string) => boolean = () => true
+): { approvedShas: string[]; changesRequested: boolean } {
 	const latest = new Map<string, GhReview>();
 	for (const r of [...reviews].sort((a, b) => Date.parse(a.submitted_at) - Date.parse(b.submitted_at))) {
 		const who = r.user?.login;
-		if (!who || who === author || !WRITERS.has(r.author_association)) continue;
+		if (!who || who === author || !WRITERS.has(r.author_association) || !canApprove(who)) continue;
 		if (r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED' || r.state === 'DISMISSED') latest.set(who, r);
 	}
 	const approvedShas = [...latest.values()].filter((r) => r.state === 'APPROVED').map((r) => r.commit_id);
@@ -57,10 +73,16 @@ export class Mirror {
 		return `https://github.com/${this.repo.owner}/${this.repo.name}.git`;
 	}
 
-	private async auth(): Promise<string[]> {
+	/** The token goes in through the environment, never the command line (which errors and `ps` show). */
+	private async auth(): Promise<NodeJS.ProcessEnv> {
 		const token = await github.getInstallationTokenForGit();
 		const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
-		return ['-c', `http.extraheader=Authorization: Basic ${basic}`];
+		return {
+			GIT_CONFIG_COUNT: '1',
+			GIT_CONFIG_KEY_0: 'http.extraheader',
+			GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
+			GIT_TERMINAL_PROMPT: '0'
+		};
 	}
 
 	has(sha: string): boolean {
@@ -70,18 +92,40 @@ export class Mirror {
 	async fetch(shas: string[]) {
 		const missing = [...new Set(shas)].filter((s) => !this.has(s));
 		if (missing.length === 0) return;
-		this.git.run([...(await this.auth()), 'fetch', '-q', '--no-tags', this.url, ...missing]);
+		this.git.run(['fetch', '-q', '--no-tags', this.url, ...missing], { env: await this.auth() });
 	}
 
 	async push(branch: string, sha: string) {
-		this.git.run([...(await this.auth()), 'push', '-q', '--force', this.url, `${sha}:refs/heads/${branch}`]);
+		this.git.run(['push', '-q', '--force', this.url, `${sha}:refs/heads/${branch}`], { env: await this.auth() });
 	}
+
+	/** Force-pushes `sha` to `branch` only if the branch is still at `expected`. */
+	async pushLease(branch: string, sha: string, expected: string) {
+		this.git.run(
+			['push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`],
+			{ env: await this.auth() }
+		);
+	}
+}
+
+const ROLE_TTL_MS = 10 * 60 * 1000;
+const roleCache = new Map<string, { role: string; until: number }>();
+
+async function canWrite(owner: string, name: string, login: string): Promise<boolean> {
+	const key = `${owner}/${name}:${login}`.toLowerCase();
+	let hit = roleCache.get(key);
+	if (!hit || hit.until < Date.now()) {
+		hit = { role: await github.collaboratorRole(owner, name, login), until: Date.now() + ROLE_TTL_MS };
+		roleCache.set(key, hit);
+	}
+	return ['write', 'maintain', 'admin'].includes(hit.role);
 }
 
 export function liveDeps(repo: RepoRef): QueueDeps {
 	const { owner, name } = repo;
 	const mirror = new Mirror(repo);
 	const ci = (): CISettings => getQueueSettings(repo.id).ci;
+	const dispatchRef = () => ci().dispatchRef || repo.default_branch;
 
 	return {
 		repo,
@@ -90,15 +134,14 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
-			build: async (base, members) => buildBatch(mirror.git, base, members)
+			build: async (base, members) => buildBatch(mirror.git, base, members),
+			restack: async (head, upstream, onto) => replay(mirror.git, { head, upstream, onto })
 		},
 		ci: {
-			start: async (branch, baseSha, headSha, prs) => {
-				await github.dispatchWorkflow(owner, name, ci().workflow, branch, {
-					base_sha: baseSha,
-					head_sha: headSha,
-					batch: prs.join(',')
-				});
+			// Pushing the mq/* branch triggers the workflow; the base is in the batch commit's trailer.
+			start: async () => {},
+			refreshCaches: async () => {
+				await github.dispatchWorkflow(owner, name, ci().workflow, dispatchRef(), {});
 			},
 			result: async (headSha) => checkResult(await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck)),
 			rerunFailed: async (headSha) => {
@@ -116,17 +159,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			},
 			pr: async (n): Promise<LivePR> => {
 				const p = await github.getPR(owner, name, n);
-				const [reviews, checks] = await Promise.all([
-					github.listReviews(owner, name, n),
-					github.checkRunsNamed(owner, name, p.head.sha, ci().requiredCheck)
-				]);
-				const result = checkResult(checks);
 				return {
 					pr: n,
 					headSha: p.head.sha,
+					headRef: p.head.ref,
+					sameRepo: p.head.repo?.full_name?.toLowerCase() === `${owner}/${name}`.toLowerCase(),
 					draft: !!p.draft,
-					ciGreen: result === 'pending' ? null : result === 'success',
-					...approvalsFrom(reviews, p.user?.login ?? ''),
 					title: p.title,
 					url: p.html_url,
 					authorLogin: p.user?.login ?? '',
@@ -135,17 +173,48 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					merged: !!p.merged
 				};
 			},
+			readiness: async (n, headSha, author): Promise<Readiness> => {
+				const settings = getQueueSettings(repo.id);
+				const [reviews, checks] = await Promise.all([
+					settings.config.requireApproval ? github.listReviews(owner, name, n) : Promise.resolve([]),
+					settings.config.requirePRChecks
+						? github.checkRunsNamed(owner, name, headSha, ci().requiredCheck)
+						: Promise.resolve([])
+				]);
+				const writers = new Set<string>();
+				for (const login of candidateReviewers(reviews, author)) {
+					if (await canWrite(owner, name, login)) writers.add(login);
+				}
+				const result = checkResult(checks);
+				return {
+					ciGreen: result === 'pending' ? null : result === 'success',
+					...approvalsFrom(reviews, author, (l) => writers.has(l))
+				};
+			},
 			pushBranch: (branch, sha) => mirror.push(branch, sha),
+			pushHead: (branch, sha, expected) => mirror.pushLease(branch, sha, expected),
 			deleteBranch: (branch) => github.deleteBranch(owner, name, branch),
 			retargetBase: async (n, base) => {
 				await github.setPRBase(owner, name, n, base);
 			},
 			squashMerge: async (n, title, sha) => {
 				const r = await github.squashMergeAt(owner, name, n, title, sha);
-				return { merged: r.merged, message: r.message };
+				return { merged: r.merged, sha: r.sha, message: r.message };
 			},
 			setStatus: async (sha, state, description) => {
 				await github.createCommitStatus(owner, name, sha, { state, context: ci().testedStatus, description });
+			},
+			setPRStatus: async (sha, state, description, opts) => {
+				await github.createCommitStatus(owner, name, sha, {
+					state,
+					context: `${ci().prStatus}${opts?.suffix ?? ''}`,
+					description,
+					...(opts?.url ? { target_url: opts.url } : {})
+				});
+			},
+			label: async (n, label, on) => {
+				if (on) await github.addLabel(owner, name, n, label);
+				else await github.removeLabel(owner, name, n, label);
 			},
 			comment: async (n, body) => {
 				await github.commentOnPR(owner, name, n, body);

@@ -40,7 +40,10 @@ export class AuthError extends Error {
 }
 
 const TTL_MS = 5 * 60 * 1000;
-const cache = new Map<string, { caller: Caller; until: number }>();
+/** Denials are cached too, so a stranger's token can't make the app spend its rate limit. */
+const DENY_TTL_MS = 60 * 1000;
+const MAX_ENTRIES = 5000;
+const cache = new Map<string, { caller: Caller | null; error?: AuthError; until: number }>();
 
 export function clearAuthCache() {
 	cache.clear();
@@ -81,21 +84,49 @@ export async function resolveCaller(
 	if (!token) throw new AuthError(401, 'Send your GitHub token: Authorization: Bearer $(gh auth token)');
 	const key = `${createHash('sha256').update(token).digest('hex')}:${owner}/${repo}`.toLowerCase();
 	const hit = cache.get(key);
-	if (hit && hit.until > now) return hit.caller;
+	if (hit && hit.until > now) {
+		if (hit.caller) return hit.caller;
+		throw hit.error!;
+	}
+	if (cache.size >= MAX_ENTRIES) {
+		for (const [k, v] of cache) if (v.until <= now) cache.delete(k);
+		if (cache.size >= MAX_ENTRIES) cache.clear();
+	}
+	const deny = (error: AuthError): never => {
+		cache.set(key, { caller: null, error, until: now + DENY_TTL_MS });
+		throw error;
+	};
 
 	let caller: Caller;
+	// The token itself must be able to see the repo, and its own permissions bound the role:
+	// a token scoped to other repos, or without repo scope, doesn't carry its user's rights here.
+	const asCaller = await gh.repoAsCaller(token, owner, repo);
 	const user = await gh.user(token);
+	if (!asCaller) return deny(new AuthError(user ? 403 : 401, user ? `This token can't see ${owner}/${repo}` : 'GitHub did not accept this token'));
+	const tokenRole = roleFromPermissions(asCaller.permissions);
 	if (user) {
-		caller = { login: user.login, role: roleFrom(await gh.permission(owner, repo, user.login)), app: false };
+		const userRole = roleFrom(await gh.permission(owner, repo, user.login));
+		caller = { login: user.login, role: minRole(userRole, tokenRole), app: false };
 	} else {
 		// An installation token has no user; it either sees the repo or not, and gets at most write.
-		const r = await gh.repoAsCaller(token, owner, repo);
-		if (!r) throw new AuthError(401, 'GitHub did not accept this token');
-		caller = { login: 'github-app', role: r.permissions?.push ? 'write' : 'read', app: true };
+		caller = { login: 'github-app', role: minRole(tokenRole, 'write'), app: true };
 	}
-	if (caller.role === 'none') throw new AuthError(403, `${caller.login} has no access to ${owner}/${repo}`);
+	if (caller.role === 'none') return deny(new AuthError(403, `${caller.login} has no access to ${owner}/${repo}`));
 	cache.set(key, { caller, until: now + TTL_MS });
 	return caller;
+}
+
+function roleFromPermissions(p: Record<string, boolean> | undefined): Role {
+	if (!p) return 'read'; // a public repo seen without repo scope
+	if (p.admin) return 'admin';
+	if (p.maintain) return 'maintain';
+	if (p.push) return 'write';
+	if (p.triage || p.pull) return 'read';
+	return 'none';
+}
+
+function minRole(a: Role, b: Role): Role {
+	return RANK[a] <= RANK[b] ? a : b;
 }
 
 export function requireRole(caller: Caller, needed: Role, what: string) {

@@ -13,6 +13,8 @@ import {
 	recordBranchDeleted
 } from '$lib/server/db';
 import { closedPRReason } from '$lib/server/stack-runtime';
+import { getQueueSettings } from '$lib/server/batch-store';
+import { markDirty } from '$lib/server/wake';
 import type { RequestHandler } from './$types';
 
 function verifySignature(payload: string, signature: string | null, secret: string): boolean {
@@ -52,6 +54,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	const [owner, name] = repository.full_name.split('/');
 	const repo = getRepoByOwnerName(owner, name);
 	if (!repo) return json({ ok: true });
+	markDirty(repo.id);
 
 	const queueItems = getQueueItems(repo.id);
 
@@ -131,8 +134,11 @@ export const POST: RequestHandler = async ({ request }) => {
 					} else if (action === 'synchronize') {
 						const newSha = pullRequest.head?.sha;
 						if (newSha) {
-							updateQueueItemHeadSha(item.id, newSha);
-							if (item.status === 'checking') {
+							// In batch mode the queue itself notices a stale head when it lands
+							// (and rebuilds); resetting a batch member here could plan it twice.
+							const batchMode = getQueueSettings(repo.id).mode === 'batch';
+							if (!batchMode) updateQueueItemHeadSha(item.id, newSha);
+							if (item.status === 'checking' && !batchMode) {
 								updateQueueItemStatus(item.id, 'queued');
 							}
 							console.log(`[webhook] PR #${prNumber} updated, new SHA: ${newSha.slice(0, 8)}`);

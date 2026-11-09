@@ -125,9 +125,16 @@ export async function getRepo(owner: string, repo: string) {
 }
 
 export async function getOpenPRs(owner: string, repo: string) {
-	return ghFetchAsApp(
-		`/repos/${owner}/${repo}/pulls?state=open&sort=created&direction=desc&per_page=100`
-	);
+	// All of them: a stack's parent may be older than the newest hundred.
+	const out = [];
+	for (let page = 1; page <= 20; page++) {
+		const batch = await ghFetchAsApp(
+			`/repos/${owner}/${repo}/pulls?state=open&sort=created&direction=desc&per_page=100&page=${page}`
+		);
+		out.push(...batch);
+		if (batch.length < 100) break;
+	}
+	return out;
 }
 
 export async function getPR(owner: string, repo: string, prNumber: number) {
@@ -344,6 +351,23 @@ export async function workflowRunsForSha(owner: string, repo: string, sha: strin
 	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string }>;
 }
 
+export async function addLabel(owner: string, repo: string, n: number, label: string) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/issues/${n}/labels`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ labels: [label] })
+	});
+}
+
+export async function removeLabel(owner: string, repo: string, n: number, label: string) {
+	try {
+		await ghFetchAsApp(`/repos/${owner}/${repo}/issues/${n}/labels/${encodeURIComponent(label)}`, { method: 'DELETE' });
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return;
+		throw e;
+	}
+}
+
 export async function rerunFailedJobs(owner: string, repo: string, runId: number) {
 	return ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun-failed-jobs`, { method: 'POST' });
 }
@@ -364,7 +388,9 @@ export async function collaboratorRole(owner: string, repo: string, login: strin
 	try {
 		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
 		// role_name distinguishes maintain and triage; permission only says admin/write/read/none.
-		return data.role_name || data.permission || 'none';
+		// A custom repository role has its own name: fall back to the base permission it grants.
+		const known = ['admin', 'maintain', 'write', 'triage', 'read'];
+		return known.includes(data.role_name) ? data.role_name : data.permission || 'none';
 	} catch (e) {
 		if (e instanceof GitHubError && e.status === 404) return 'none';
 		throw e;
