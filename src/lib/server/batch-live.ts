@@ -63,7 +63,7 @@ export function checkResult(
 	return runs.every((r) => r.conclusion === 'success') ? 'success' : 'failure';
 }
 
-/** A fetch or push gives up after this long (git runs synchronously, so a hang would stall the server). */
+/** A fetch or push gives up after this long. */
 const NETWORK_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** A bare mirror per repository, fetched by SHA with the installation token. */
@@ -105,19 +105,35 @@ export class Mirror {
 	async fetch(shas: string[]) {
 		const missing = [...new Set(shas)].filter((s) => !this.has(s));
 		if (missing.length === 0) return;
-		this.git.run(['fetch', '-q', '--no-tags', this.url, ...missing], { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
+		await this.network(`fetch ${missing.map((s) => s.slice(0, 8)).join(' ')}`, [
+			'fetch', '-q', '--no-tags', this.url, ...missing
+		]);
 	}
 
 	async push(branch: string, sha: string) {
-		this.git.run(['push', '-q', '--force', this.url, `${sha}:refs/heads/${branch}`], { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
+		await this.network(`push ${sha.slice(0, 8)} to ${branch}`, [
+			'push', '-q', '--force', this.url, `${sha}:refs/heads/${branch}`
+		]);
 	}
 
 	/** Force-pushes `sha` to `branch` only if the branch is still at `expected`. */
 	async pushLease(branch: string, sha: string, expected: string) {
-		this.git.run(
-			['push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`],
-			{ env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS }
-		);
+		await this.network(`push ${sha.slice(0, 8)} to ${branch} (lease ${expected.slice(0, 8)})`, [
+			'push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`
+		]);
+	}
+
+	/** Runs a fetch or push off the event loop, logging what it did and how long it took. */
+	private async network(what: string, args: string[]) {
+		const name = `${this.repo.owner}/${this.repo.name}`;
+		const started = Date.now();
+		try {
+			await this.git.runAsync(args, { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
+			console.log(`[git] ${name}: ${what} took ${Date.now() - started} ms`);
+		} catch (err) {
+			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${err instanceof Error ? err.message : err}`);
+			throw err;
+		}
 	}
 }
 
