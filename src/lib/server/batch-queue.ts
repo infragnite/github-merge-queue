@@ -20,7 +20,7 @@ import * as store from './batch-store';
 import type { BatchRow, BatchStep } from './batch-store';
 import {
 	admit,
-	Bisection,
+	planBisection,
 	descendants,
 	planNextBatch,
 	planRedBatch,
@@ -938,85 +938,102 @@ class Tick {
 		if (head.status === 'bisecting') await this.bisect(head);
 	}
 
+	/**
+	 * Narrows down a failed batch (see `planBisection`): a run that passes on the current default
+	 * branch lands at once, failing groups are split and run again on top of it. Everything is
+	 * planned from the recorded runs, so a restart picks it up where it was.
+	 */
 	async bisect(batch: BatchRow) {
-		const parentOf = await this.parentOf();
-		const bis = new Bisection(batch.members, parentOf);
 		const runs = store.getBisectRuns(batch.id);
-		let waiting = false;
 		for (const run of runs) {
-			let res = run.ci_result;
-			if (res === 'pending') {
-				res = await this.d.ci.result(run.head_sha, run.retried_at);
-				const rerun = res === 'failure' && run.status !== 'retrying' ? await this.retry(run.head_sha) : 'none';
-				if (rerun === 'wait') res = 'pending';
-				else if (rerun === 'rerun') {
-					// A bisection step is retried once too, so a flake doesn't eject an innocent PR.
-					store.setBatchStatus(run.id, 'retrying');
-					store.setBatchRetried(run.id, this.d.now());
-					res = 'pending';
-				} else if (res !== 'pending') {
-					store.setBatchCI(run.id, res);
-					run.ci_result = res;
-				}
-				if (res === 'pending' && this.timedOut(run)) {
-					await this.retire(batch);
-					store.setBatchStatus(batch.id, 'failed');
-					this.requeue(batch.members);
-					this.pause(`Bisection run ${run.branch} got no CI result in time`);
-					return;
-				}
+			if (run.ci_result !== 'pending') continue;
+			let res = await this.d.ci.result(run.head_sha, run.retried_at);
+			const rerun = res === 'failure' && run.status !== 'retrying' ? await this.retry(run.head_sha) : 'none';
+			if (rerun === 'wait') res = 'pending';
+			else if (rerun === 'rerun') {
+				// A bisection step is retried once too, so a flake doesn't eject an innocent PR.
+				store.setBatchStatus(run.id, 'retrying');
+				store.setBatchRetried(run.id, this.d.now());
+				res = 'pending';
+			} else if (res !== 'pending') {
+				store.setBatchCI(run.id, res);
+				store.setBatchStatus(run.id, res === 'success' ? 'passed' : 'failed');
+				run.ci_result = res;
 			}
-			if (res === 'pending') waiting = true;
-			else bis.record({ context: run.context, members: run.members }, res === 'success');
+			if (res === 'pending' && this.timedOut(run)) {
+				for (const r of runs) await this.retire(r);
+				store.setBatchStatus(batch.id, 'failed');
+				this.requeue(batch.members);
+				this.pause(`Bisection run ${run.branch} got no CI result in time`);
+				return;
+			}
 		}
-		if (waiting) return;
 
-		const step = bis.next();
-		if (step.kind === 'test') {
-			const have = new Set(runs.map((r) => `${r.context.join(',')}|${r.members.join(',')}`));
-			for (const g of step.groups) {
-				if (have.has(`${g.context.join(',')}|${g.members.join(',')}`)) continue;
-				await this.startBisectRun(batch, g, runs.length);
+		const masterSha = await this.d.github.defaultBranchSha();
+		await this.d.git.fetch([masterSha]);
+		const masterTree = await this.d.git.tree(masterSha);
+		const landed = new Set(batch.landed);
+		// Still to land or eject: in the batch and in the queue (a PR removed meanwhile is just gone).
+		const remaining = batch.members.filter((n) => !landed.has(n) && this.item(n)?.status === 'checking');
+		const all = [batch, ...runs];
+		const plan = planBisection({
+			runs: all.map((r) => ({
+				context: r.context.filter((n) => !landed.has(n)),
+				members: r.members,
+				baseTree: r.base_tree,
+				result: r === batch ? 'failure' : r.ci_result
+			})),
+			remaining,
+			masterTree,
+			parentOf: await this.parentOf()
+		});
+
+		if (plan.kind === 'land') {
+			const proof = all[plan.run];
+			if (await this.land(batch, plan.prs, proof)) {
+				const sha = await this.d.github.defaultBranchSha();
+				store.recordBisectLanding(batch.id, plan.prs, sha, await this.d.git.tree(sha));
+				store.setBatchStatus(proof.id, 'landed');
+				this.log(`batch ${batch.id}: landed ${plan.prs.map((n) => `#${n}`).join(' ')} from ${proof.branch} while bisecting`);
+				if (remaining.every((n) => plan.prs.includes(n))) await this.finishBisection(batch, runs, true);
+			} else if (!this.settings().pausedReason) {
+				// It can no longer land (a PR changed or left): those PRs go back in line.
+				this.requeue(plan.prs);
 			}
 			return;
 		}
 
-		// The default branch may be what fails: decide nothing, and count nothing, until it's known.
-		if (!this.masterSettled(batch.base_tree)) return;
-		if (this.masterState(batch.base_tree) === 'red') {
-			// It turned red while bisecting: the failure is nobody's.
-			for (const r of runs) await this.retire(r);
-			await this.failedOnRed(batch);
+		if (plan.eject.length) {
+			// The default branch may be what fails: blame nobody until it is known.
+			if (!this.masterSettled(masterTree)) return;
+			if (this.masterState(masterTree) === 'red') {
+				for (const r of runs) await this.retire(r);
+				await this.failedOnRed({ ...batch, members: remaining });
+				return;
+			}
+			const culprits = [];
+			for (const e of plan.eject) {
+				const landed = batch.landed.length ? `, which landed ${batch.landed.map((n) => `#${n}`).join(', ')}` : '';
+				culprits.push({ pr: e.pr, reason: `${e.reason} (batch ${batch.id}${landed})`, link: await this.runLink(all[e.run]) });
+			}
+			await this.ejectWithStack(culprits);
+		}
+		if (plan.requeue.length) await this.requeueAfterFailure(plan.requeue, batch.id);
+		if (plan.done) {
+			await this.finishBisection(batch, runs, batch.landed.length > 0);
 			return;
 		}
-		for (const r of runs) await this.d.github.deleteBranch(r.branch).catch(this.bestEffort('github.deleteBranch'));
-		const culprits = [];
-		for (const e of step.eject) {
-			// The smallest failed run with the PR in it shows its failure most directly.
-			const failed = runs
-				.filter((r) => r.ci_result === 'failure' && r.members.includes(e.pr))
-				.sort((a, b) => a.members.length + a.context.length - (b.members.length + b.context.length))[0];
-			culprits.push({ pr: e.pr, reason: `${e.reason} (batch ${batch.id})`, link: await this.runLink(failed ?? batch) });
-		}
-		await this.ejectWithStack(culprits);
-		// A PR the bisection never got to test apart from the failure isn't counted against it.
-		const tested = new Set(runs.flatMap((r) => r.members));
-		this.requeue(step.requeue.filter((n) => !tested.has(n)));
-		await this.requeueAfterFailure(step.requeue.filter((n) => tested.has(n)), batch.id);
-		let landed = false;
-		if (step.land.length) {
-			const proof = runs.find(
-				(r) => r.context.length === 0 && r.members.join(',') === step.land.join(',') && r.ci_result === 'success'
-			);
-			if (proof && (await this.land(batch, step.land, proof))) landed = true;
-			// Not landed (or landing paused): whatever is still queued goes back to be rebuilt.
-			else this.requeue(step.land);
-		}
-		store.setBatchStatus(batch.id, landed ? 'landed' : 'failed');
+		for (const g of plan.start) await this.startBisectRun(batch, { context: [], members: g }, runs.length, masterSha, masterTree);
+	}
+
+	async finishBisection(batch: BatchRow, runs: BatchRow[], landedAny: boolean) {
+		for (const r of runs) await this.retire(r);
+		store.setBatchStatus(batch.id, landedAny ? 'landed' : 'failed');
 		await this.d.github.deleteBranch(batch.branch).catch(this.bestEffort('github.deleteBranch'));
 	}
 
-	async startBisectRun(batch: BatchRow, g: TestGroup, seq: number) {
+	/** Starts a bisection run of `g` on the default branch as it is now (`baseSha`). */
+	async startBisectRun(batch: BatchRow, g: TestGroup, seq: number, baseSha: string, baseTree: string) {
 		const prs = [...g.context, ...g.members];
 		const members = await this.members(prs, []);
 		// Bisection tests the PRs exactly as they were in the failed batch, parents included.
@@ -1026,7 +1043,7 @@ class Tick {
 			const parent = parentOf(m.pr);
 			if (m.parentHeadSha && parent !== null && batch.heads[parent]) m.parentHeadSha = batch.heads[parent];
 		}
-		const r = await this.d.git.build(batch.base_sha, members);
+		const r = await this.d.git.build(baseSha, members);
 		const branch = `${batch.branch}-bisect-${seq + 1}-${this.d.now()}`;
 		const steps: Record<number, BatchStep> = {};
 		if (r.ok) for (const c of r.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork };
@@ -1035,10 +1052,10 @@ class Tick {
 			kind: 'bisect',
 			parentBatchId: batch.id,
 			branch,
-			baseSha: batch.base_sha,
-			headSha: r.ok ? r.headSha : batch.base_sha,
+			baseSha,
+			headSha: r.ok ? r.headSha : baseSha,
 			treeSha: r.ok ? r.tree : '',
-			baseTree: batch.base_tree,
+			baseTree,
 			members: g.members,
 			context: g.context,
 			heads: batch.heads,
@@ -1051,10 +1068,17 @@ class Tick {
 		}
 		try {
 			await this.d.github.pushBranch(branch, r.headSha);
-			await this.d.ci.start(branch, batch.base_sha, r.headSha, prs);
+			await this.d.ci.start(branch, baseSha, r.headSha, prs);
 		} catch (e) {
 			store.setBatchCI(run.id, 'failure');
 			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}`);
+			return;
+		}
+		const link = this.branchRuns(branch);
+		for (const n of g.members) {
+			await this.d.github
+				.setPRStatus(batch.heads[n], 'pending', short(`Batch ${batch.id} failed; testing ${g.members.length === 1 ? `#${n} alone` : `${g.members.length} of its PRs`} in ${branch}`), { url: link })
+				.catch(this.bestEffort('github.setPRStatus'));
 		}
 	}
 
@@ -1292,7 +1316,16 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	let masterSha = await deps.github.defaultBranchSha();
 	if (active.length) {
 		await deps.git.fetch([masterSha]);
-		if (active[0].base_tree !== (await deps.git.tree(masterSha))) {
+		const tree = await deps.git.tree(masterSha);
+		if (active[0].base_tree !== tree && active[0].status === 'bisecting') {
+			// A bisection follows the default branch: its failures still point at the same PRs, and
+			// what passes is run again on top of the new commit. Batches built on it are rebuilt.
+			t.log(`master moved outside the queue; batch ${active[0].id} bisects on top of it`);
+			store.rebaseBatch(active[0].id, masterSha, tree);
+			await t.supersede(active.slice(1));
+			active = store.getActiveBatches(deps.repo.id);
+			await t.checkMaster(masterSha);
+		} else if (active[0].base_tree !== tree) {
 			t.log('master moved outside the queue; rebuilding the pipeline');
 			await t.supersede(active);
 			active = [];

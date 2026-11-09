@@ -39,7 +39,7 @@
 	const p = $derived(batch.progress);
 	// A run with a failed job will fail: say so before the remaining jobs finish.
 	const status = $derived(
-		batch.kind !== 'batch' && batch.status === 'landed'
+		(batch.kind === 'try' || batch.kind === 'baseline') && batch.status === 'landed'
 			? 'passed'
 			: batch.status === 'testing' && p && p.failed > 0
 				? 'failing'
@@ -50,18 +50,19 @@
 	const verdict = $derived.by(() => {
 		if (batch.status !== 'bisecting') return null;
 		const runs = batch.bisection;
-		const failed = runs.filter((r) => r.status === 'failed' || (r.status === 'testing' && (r.progress?.failed ?? 0) > 0));
+		const failed = runs.filter((r) => r.ci === 'failure' || (r.status === 'testing' && (r.progress?.failed ?? 0) > 0));
 		const smallest = failed.sort((a, b) => a.prs.length - b.prs.length)[0];
 		const total = batch.prs.length;
+		const landed = batch.landed.length ? `Landed ${prList(batch.landed)}. ` : '';
 		if (smallest) {
 			const n = smallest.prs.length;
-			return n === 1
-				? `Found it: #${smallest.prs[0].pr} breaks the batch`
-				: `Narrowed to ${n} of ${total} PRs: ${prList(smallest.prs.map((x) => x.pr))}`;
+			return (
+				landed +
+				(n === 1 ? `Found it: #${smallest.prs[0].pr} breaks the batch` : `Narrowed to ${n} of ${total} PRs: ${prList(smallest.prs.map((x) => x.pr))}`)
+			);
 		}
-		const passed = runs.filter((r) => r.status === 'landed' || r.status === 'passed');
-		if (passed.length) return `${prList(passed.flatMap((r) => r.prs.map((x) => x.pr)))} passed; testing the rest`;
-		return `Splitting ${total} PRs in two to find which one fails`;
+		if (landed) return `${landed}Testing the rest on top`;
+		return `Splitting ${total} PRs in two to find which one fails; a half that passes lands at once`;
 	});
 	const pct = (n: number) => (p && p.total > 0 ? (n / p.total) * 100 : 0);
 </script>
