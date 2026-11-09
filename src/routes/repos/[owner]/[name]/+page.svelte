@@ -6,6 +6,20 @@
 	import BatchCard from '$lib/components/BatchCard.svelte';
 
 	let { data } = $props();
+
+	// The streamed sections keep showing what they last loaded while a refresh is in flight,
+	// so the page doesn't empty and relayout every time it refreshes.
+	type Loaded<T> = T extends Promise<infer V> ? V : never;
+	let pipe = $state<Loaded<typeof data.pipeline> | null>(null);
+	let stacks = $state<Loaded<typeof data.stacks> | null>(null);
+	$effect(() => {
+		let current = true;
+		data.pipeline.then((v) => current && (pipe = v));
+		data.stacks.then((v) => current && (stacks = v));
+		return () => {
+			current = false;
+		};
+	});
 	let showAddDialog = $state(false);
 	let refreshing = $state(false);
 	let dragIndex = $state<number | null>(null);
@@ -120,7 +134,7 @@
 	</div>
 
 	<!-- Batches -->
-	{#await data.pipeline then pipe}
+	{#if pipe}
 		{#if pipe.mode === 'batch' || pipe.active.length > 0 || pipe.recent.length > 0}
 			<div class="space-y-3">
 				<div class="flex flex-wrap items-center gap-2">
@@ -156,7 +170,7 @@
 				{/if}
 			</div>
 		{/if}
-	{/await}
+	{/if}
 
 	<!-- Queue -->
 	{#if data.queueItems.length === 0}
@@ -188,9 +202,10 @@
 	<!-- Stacks -->
 	<div>
 		<h2 class="mb-3 text-lg font-semibold text-gray-900">Stacks</h2>
-		{#await data.stacks}
+		{#if !stacks}
 			<p class="text-sm text-gray-500">Detecting stacks…</p>
-		{:then result}
+		{:else}
+			{@const result = stacks}
 			{#if result.error}
 				<p class="text-sm text-red-600">{result.error}</p>
 			{:else if result.stacks.length === 0}
@@ -219,7 +234,7 @@
 					{/each}
 				</div>
 			{/if}
-		{/await}
+		{/if}
 	</div>
 
 	<!-- History -->
