@@ -320,6 +320,25 @@ describe('batch queue runtime', () => {
 		expect(first).toMatchObject({ status: 'landed', landed: [2, 3], left_prs: [1, 4] });
 	});
 
+	test('a PR stacked on one that leaves the bisection leaves with it, and never lands its parent as batched', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' }); // stacked on #1
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.includes(1);
+		for (let i = 0; i < 30 && !world.started.some((x) => x.prs.join() === '1,2'); i++) await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change', 'pr1-late.txt');
+		world.hold = () => false;
+		await run(60);
+		const first = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
+		expect(first).toMatchObject({ landed: [3], left_prs: expect.arrayContaining([1, 2, 4]) });
+		// #1 landed with its late change before #2, which came after it from a batch of their own
+		expect(world.merged.indexOf(1)).toBeLessThan(world.merged.indexOf(2));
+		expect(world.files('main').has('pr1-late.txt')).toBe(true);
+	});
+
 	test('a batch that failed by flake ejects nobody: its halves pass and land', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);

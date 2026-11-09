@@ -63,6 +63,8 @@ export interface BatchStep {
 	sha: string;
 	tree: string;
 	fork: string | null;
+	/** The PR this one was stacked on when it was batched (unset in rows from before it was recorded). */
+	parent?: number | null;
 }
 
 export interface CISettings {

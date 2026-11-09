@@ -467,7 +467,8 @@ class Tick {
 			return 'error';
 		}
 		const steps: Record<number, BatchStep> = {};
-		for (const c of result.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork };
+		const parentAt = await this.parentOf();
+		for (const c of result.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: parentAt(c.pr) };
 		const batch = store.insertBatch({
 			repoId: this.repoId,
 			kind: 'batch',
@@ -1074,19 +1075,20 @@ class Tick {
 		const remaining = batch.members.filter((n) => !landed.has(n) && !left.has(n) && this.item(n)?.status === 'checking');
 		// A PR that left the queue (or the batch) meanwhile is just gone from it.
 		const gone = batch.members.filter((n) => !landed.has(n) && !left.has(n) && this.item(n)?.status !== 'checking');
-		if (gone.length) store.leaveBatch(batch.id, gone);
-		// A PR its author pushed to (or closed) since the batch was built: what bisection would test
-		// is stale, and evidence against it is not evidence against the new head. It goes back in line.
+		// A PR its author pushed to (or closed, or deleted) since the batch was built: what bisection
+		// would test is stale, and evidence against it is not evidence against the new head. It goes back in line.
 		const changed: number[] = [];
 		for (const n of remaining) {
-			const p = await this.pr(n, true);
-			if (p.state !== 'open' || p.headSha !== batch.heads[n]) changed.push(n);
+			const p = await this.pr(n, true).catch((e) => {
+				if ((e as { status?: number })?.status === 404) return null;
+				throw e;
+			});
+			if (!p || p.state !== 'open' || p.headSha !== batch.heads[n]) changed.push(n);
 		}
-		if (changed.length) {
-			this.log(`batch ${batch.id}: ${changed.map((n) => `#${n}`).join(' ')} changed since it was batched; back in line`);
-			store.leaveBatch(batch.id, changed);
-			this.requeue(changed);
-			remaining.splice(0, remaining.length, ...remaining.filter((n) => !changed.includes(n)));
+		if (gone.length || changed.length) {
+			if (changed.length) this.log(`batch ${batch.id}: ${changed.map((n) => `#${n}`).join(' ')} changed since it was batched; back in line`);
+			const out = await this.leaveBisection(batch, [...gone, ...changed]);
+			remaining.splice(0, remaining.length, ...remaining.filter((n) => !out.includes(n)));
 		}
 		// A run that never started (its push failed, or its PRs did not build on the new branch) shows nothing.
 		const all = [batch, ...runs.filter((r) => r.status !== 'cancelled')];
@@ -1113,9 +1115,7 @@ class Tick {
 			} else if (!this.settings().pausedReason) {
 				// It can no longer land as tested (a PR was pushed to, closed, or lost its approval):
 				// those PRs leave the bisection and go back in line to be tested as they are now.
-				const left = plan.prs.filter((n) => !store.getBatch(batch.id)!.landed.includes(n));
-				store.leaveBatch(batch.id, left);
-				this.requeue(left);
+				await this.leaveBisection(batch, plan.prs.filter((n) => !store.getBatch(batch.id)!.landed.includes(n)));
 			}
 			return;
 		}
@@ -1139,12 +1139,43 @@ class Tick {
 		if (plan.requeue.length) {
 			store.leaveBatch(batch.id, plan.requeue);
 			await this.requeueAfterFailure(plan.requeue, batch.id);
+			await this.leaveBisection(batch, plan.requeue);
 		}
 		if (plan.done) {
 			await this.finishBisection(batch, runs, batch.landed.length > 0);
 			return;
 		}
 		for (const g of plan.start) await this.startBisectRun(batch, { context: [], members: g }, runs.length, masterSha, masterTree);
+	}
+
+	/**
+	 * `prs` leave a bisection without being ejected, and go back in line (those still in the
+	 * queue). The PRs stacked on them leave too: tested without their parent, a child would land
+	 * the parent's commits as they were when batched, around the parent's own review.
+	 */
+	async leaveBisection(batch: BatchRow, prs: number[]): Promise<number[]> {
+		const now = store.getBatch(batch.id)!;
+		const parentOf = await this.parentOf();
+		const parent = (n: number) => {
+			const recorded = now.steps[n]?.parent;
+			return recorded !== undefined ? recorded : parentOf(n);
+		};
+		const open = now.members.filter((n) => !now.landed.includes(n) && !now.left_prs.includes(n));
+		const out = new Set(prs);
+		for (let grew = true; grew; ) {
+			grew = false;
+			for (const n of open) {
+				const p = parent(n);
+				if (!out.has(n) && p !== null && out.has(p)) {
+					out.add(n);
+					grew = true;
+				}
+			}
+		}
+		const all = [...out];
+		store.leaveBatch(batch.id, all);
+		this.requeue(all);
+		return all;
 	}
 
 	async finishBisection(batch: BatchRow, runs: BatchRow[], landedAny: boolean) {
@@ -1169,14 +1200,13 @@ class Tick {
 		if (!r.ok) {
 			// They don't apply on the default branch as it is now (something landed meanwhile): not a
 			// CI failure, and no run; they go back in line, where a conflict is handled the usual way.
-			store.leaveBatch(batch.id, g.members);
-			this.requeue(g.members);
+			await this.leaveBisection(batch, g.members);
 			this.log(`batch ${batch.id}: ${g.members.map((n) => `#${n}`).join(' ')} no longer build on the default branch; back in line`);
 			return;
 		}
 		const branch = `${batch.branch}-bisect-${seq + 1}-${this.d.now()}`;
 		const steps: Record<number, BatchStep> = {};
-		for (const c of r.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork };
+		for (const c of r.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: batch.steps[c.pr]?.parent ?? parentOf(c.pr) };
 		const run = store.insertBatch({
 			repoId: this.repoId,
 			kind: 'bisect',
