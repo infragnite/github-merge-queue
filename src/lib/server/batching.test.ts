@@ -266,7 +266,8 @@ function bisect(batch: number[], fails: (tested: number[]) => boolean, parentOf:
 	/** Round in which each PR landed. */
 	const landedIn = new Map<number, number>();
 	for (let i = 0; i < 200; i++) {
-		const step = planBisection({ runs, remaining, masterTree: land.join(','), parentOf });
+		// Every base here is the batch's own or a tree the bisection landed: all known green.
+		const step = planBisection({ runs, remaining, masterTree: land.join(','), parentOf, trusted: () => true });
 		if (step.kind === 'land') {
 			expect(fails([...land, ...step.prs])).toBe(false);
 			land.push(...step.prs);
@@ -408,6 +409,15 @@ describe('bisection', () => {
 		const r = planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: () => null });
 		expect(r).toEqual({ kind: 'land', run: 1, prs: [1, 2] });
 		expect(planBisection({ runs, remaining: [3, 4], masterTree: 'm1', parentOf: () => null })).toMatchObject({ start: [[3], [4]] });
+	});
+
+	test('a PR that failed alone on a branch not known green runs alone again before it is ejected', () => {
+		const runs: BisectRun[] = [{ context: [], members: [2], baseTree: 'outside', result: 'failure' }];
+		expect(planBisection({ runs, remaining: [2], masterTree: 'm1', parentOf: () => null })).toMatchObject({ eject: [], start: [[2]] });
+		expect(planBisection({ runs, remaining: [2], masterTree: 'm1', parentOf: () => null, trusted: (t) => t === 'outside' })).toMatchObject({
+			eject: [{ pr: 2, run: 0 }],
+			start: []
+		});
 	});
 
 	test('a single-PR group with a failure only in a larger run is run alone first', () => {

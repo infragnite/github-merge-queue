@@ -5,7 +5,7 @@ import { closedPRReason, stackMergeBlocker } from './stack-runtime';
 import { getQueueSettings, updateQueueSettings } from './batch-store';
 import { GitHubError } from './github-retry';
 import { emitEvent } from './events';
-import { tickBatchQueue } from './batch-queue';
+import { recoverInterrupted, tickBatchQueue } from './batch-queue';
 import { liveDeps } from './batch-live';
 import { takeDirty } from './wake';
 import { withRepoLock } from './repo-lock';
@@ -120,6 +120,13 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 			if (took >= SLOW_TICK_MS) console.log(`[merge-queue] Batch tick for ${repo.owner}/${repo.name} took ${took} ms`);
 		}
 		return;
+	}
+
+	// A crash in batch mode may have left a landing half done, even if the repo switched mode since.
+	try {
+		await withRepoLock(repo.id, () => recoverInterrupted(liveDeps(repo)));
+	} catch (err) {
+		console.error(`[merge-queue] Recovery for ${repo.owner}/${repo.name} failed:`, err instanceof Error ? err.message : err);
 	}
 
 	// Reconcile ALL queued items (not just head) to detect externally merged/closed PRs

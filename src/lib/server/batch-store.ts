@@ -50,6 +50,8 @@ export interface BatchRow {
 	context: number[];
 	/** PRs of a bisecting batch that already landed, in landing order. */
 	landed: number[];
+	/** PRs that left a bisecting batch without landing. */
+	left_prs: number[];
 	status: BatchStatus;
 	express: boolean;
 	ci_result: 'pending' | 'success' | 'failure';
@@ -183,10 +185,16 @@ export function migrateBatches(database: Database.Database) {
 		['steps', `TEXT NOT NULL DEFAULT '{}'`],
 		['retried_at', 'INTEGER'],
 		// Bisection lands passing groups as it goes: the PRs of this batch that landed so far.
-		['landed', `TEXT NOT NULL DEFAULT '[]'`]
+		['landed', `TEXT NOT NULL DEFAULT '[]'`],
+		// PRs that left a bisecting batch without landing (ejected, or back in the queue).
+		['left_prs', `TEXT NOT NULL DEFAULT '[]'`]
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
+	// Bisection runs used to keep status 'testing' after their result came in; their status now
+	// follows the result (a run still 'testing' is still running).
+	database.exec(`UPDATE batches SET status = CASE ci_result WHEN 'success' THEN 'passed' ELSE 'failed' END
+		WHERE kind = 'bisect' AND status IN ('testing', 'retrying') AND ci_result != 'pending'`);
 	const cols = database.prepare(`PRAGMA table_info(queue_items)`).all() as Array<{ name: string }>;
 	const add = (name: string, ddl: string) => {
 		if (!cols.some((c) => c.name === name)) database.exec(`ALTER TABLE queue_items ADD COLUMN ${name} ${ddl}`);
@@ -246,9 +254,10 @@ export function setQueuePriority(repoId: number, prNumber: number, priority: Pri
 
 // --- batches ---
 
-type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed'> & {
+type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs'> & {
 	members: string;
 	landed: string | null;
+	left_prs: string | null;
 	heads: string;
 	steps: string;
 	context: string;
@@ -261,6 +270,7 @@ function parse(r: RawBatch): BatchRow {
 		members: JSON.parse(r.members),
 		context: JSON.parse(r.context),
 		landed: JSON.parse(r.landed ?? '[]'),
+		left_prs: JSON.parse(r.left_prs ?? '[]'),
 		heads: JSON.parse(r.heads),
 		steps: JSON.parse(r.steps),
 		express: !!r.express
@@ -311,6 +321,14 @@ export function recordBisectLanding(id: number, prs: number[], sha: string, tree
 	getDb()
 		.prepare('UPDATE batches SET landed = ?, base_sha = ?, base_tree = ? WHERE id = ?')
 		.run(JSON.stringify([...b.landed, ...prs]), sha, tree, id);
+}
+
+/** PRs leave a bisecting batch without landing: it no longer carries them. */
+export function leaveBatch(id: number, prs: number[]) {
+	const b = getBatch(id);
+	if (!b || !prs.length) return;
+	const left = [...new Set([...b.left_prs, ...prs])];
+	getDb().prepare('UPDATE batches SET left_prs = ? WHERE id = ?').run(JSON.stringify(left), id);
 }
 
 /** The default branch moved under a bisecting batch: it follows it. */
