@@ -6,6 +6,7 @@ import {
 	withTokenRefreshOn401,
 	GitHubError
 } from './github-retry';
+import type { StackGitHub } from './stack-source';
 
 const API = 'https://api.github.com';
 
@@ -198,4 +199,54 @@ export async function mergePR(
 	} catch (e) {
 		return mergeResultFromError(e);
 	}
+}
+
+// --- Stack detection ---
+
+export async function getRecentlyClosedPRs(owner: string, repo: string) {
+	return ghFetchAsApp(
+		`/repos/${owner}/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=50`
+	);
+}
+
+function refPath(ref: string) {
+	return ref.split('/').map(encodeURIComponent).join('/');
+}
+
+export async function getBranchSha(owner: string, repo: string, branch: string): Promise<string | null> {
+	try {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/git/ref/heads/${refPath(branch)}`);
+		return data?.object?.sha ?? null;
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return null;
+		throw e;
+	}
+}
+
+export async function compareCommits(
+	owner: string,
+	repo: string,
+	base: string,
+	head: string,
+	page: number,
+	perPage: number
+) {
+	try {
+		return await ghFetchAsApp(
+			`/repos/${owner}/${repo}/compare/${base}...${head}?page=${page}&per_page=${perPage}`
+		);
+	} catch (e) {
+		// 404: a SHA GitHub no longer has (e.g. garbage-collected after a force-push).
+		if (e instanceof GitHubError && (e.status === 404 || e.status === 422)) return null;
+		throw e;
+	}
+}
+
+export function stackClient(owner: string, repo: string): StackGitHub {
+	return {
+		listOpenPRs: () => getOpenPRs(owner, repo),
+		listRecentlyClosedPRs: () => getRecentlyClosedPRs(owner, repo),
+		getBranchSha: (branch) => getBranchSha(owner, repo, branch),
+		compare: (base, head, page, perPage) => compareCommits(owner, repo, base, head, page, perPage)
+	};
 }
