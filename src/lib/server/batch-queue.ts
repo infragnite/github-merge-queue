@@ -57,7 +57,7 @@ export interface QueueGitHub {
 	pr(n: number): Promise<LivePR>;
 	/** CI and reviews of a PR at `headSha` (the expensive part, fetched only when needed). */
 	/** `needApprovals`: fetch reviews even when the config doesn't require approval (a fork PR). */
-	readiness(n: number, headSha: string, author: string, needApprovals?: boolean): Promise<Readiness>;
+	readiness(n: number, headSha: string, author: string, opts?: { needApprovals?: boolean; fresh?: boolean }): Promise<Readiness>;
 	/** Creates or force-moves a queue branch to `sha` (the commit must be in the mirror). */
 	pushBranch(branch: string, sha: string): Promise<void>;
 	/** Moves a PR's head branch to `sha`, only if it still points at `expected`. */
@@ -101,7 +101,7 @@ export interface QueueCI {
 	/** Cancels workflow runs still going on `headSha` (a superseded batch). */
 	cancel(headSha: string): Promise<void>;
 	/** Re-runs only the failed jobs; false when there is nothing to re-run. */
-	rerunFailed(headSha: string): Promise<boolean>;
+	rerunFailed(headSha: string): Promise<RerunResult>;
 }
 
 export interface QueueGit {
@@ -127,6 +127,9 @@ export interface QueueDeps {
 
 const LIVE = ['queued', 'checking', 'updating', 'merging', 'conflict'];
 export const CONFLICT_LABEL = 'needs-rebase';
+
+/** `wait`: the failed check's workflow is still running other jobs; GitHub re-runs only finished runs. */
+export type RerunResult = 'rerun' | 'none' | 'wait';
 /** When each repo last had its caches refreshed (in memory: a restart costs one extra refresh). */
 const lastCacheRefresh = new Map<number, number>();
 /** Batch failures without a culprit after which a PR leaves the queue (a flaky test, most likely). */
@@ -179,7 +182,7 @@ class Tick {
 		const key = `${n}@${p.headSha}`;
 		let r = fresh ? undefined : this.ready.get(key);
 		if (!r) {
-			r = await this.d.github.readiness(n, p.headSha, p.authorLogin, !p.sameRepo);
+			r = await this.d.github.readiness(n, p.headSha, p.authorLogin, { needApprovals: !p.sameRepo, fresh });
 			this.ready.set(key, r);
 		}
 		// A head the queue made by restacking keeps the approval and CI of the head it replaced.
@@ -408,6 +411,14 @@ class Tick {
 			tip = c.sha;
 		}
 		if (empty.length) {
+			if (baseSha !== masterSha) {
+				// Its changes may be those of a PR in a batch ahead, which can still fail: wait for it.
+				for (const n of empty) {
+					const it = this.item(n);
+					if (it) store.setDeferredFor(it.id, below);
+				}
+				return 'conflict';
+			}
 			for (const n of empty) await this.eject(n, `#${n} has no changes left against ${this.d.repo.default_branch}`);
 			return 'conflict';
 		}
@@ -492,6 +503,11 @@ class Tick {
 		let expected = src.base_tree;
 		for (const n of prs) {
 			if (this.settings().pausedReason) return false;
+			if (!this.item(n)) {
+				// Dequeued while the PRs before it were landing: stop here; the rest is rebuilt on the new master.
+				this.log(`#${n} left the queue while batch ${batch.id} was landing; rebuilding the rest`);
+				return false;
+			}
 			if ((await this.d.git.tree(master)) !== expected) {
 				this.pause(`Master changed while batch ${batch.id} was landing (before #${n}); was something merged outside the queue?`);
 				return false;
@@ -558,8 +574,17 @@ class Tick {
 		}
 		await this.d.github.setStatus(master, 'success', `Tree tested in ${batch.branch} (${batch.head_sha.slice(0, 7)})`);
 		this.log(`batch ${batch.id} landed: ${prs.map((n) => `#${n}`).join(' ')}`);
+		// What this tick read before the landing (stacks, PR bases and heads) is stale now.
+		this.analysisCache = null;
+		this.prs.clear();
 		await this.maybeRefreshCaches();
 		return true;
+	}
+
+	/** Re-runs a failed check's jobs once, unless the repo turned flake retries off. */
+	async retry(headSha: string): Promise<RerunResult> {
+		if (!this.settings().config.retryFailed) return 'none';
+		return this.d.ci.rerunFailed(headSha);
 	}
 
 	async sleep(ms: number) {
@@ -611,11 +636,13 @@ class Tick {
 				}
 				return;
 			}
+			const rerun = r === 'failure' && head.status === 'testing' ? await this.retry(head.head_sha) : 'none';
+			if (rerun === 'wait') return;
 			store.setBatchCI(head.id, r);
 			if (r === 'success') {
 				store.setBatchStatus(head.id, 'passed');
 				head = { ...head, status: 'passed' };
-			} else if (head.status === 'testing' && (await this.d.ci.rerunFailed(head.head_sha))) {
+			} else if (rerun === 'rerun') {
 				store.setBatchStatus(head.id, 'retrying');
 				store.setBatchRetried(head.id, this.d.now());
 				this.log(`batch ${head.id} failed; re-running failed jobs`);
@@ -654,7 +681,9 @@ class Tick {
 			let res = run.ci_result;
 			if (res === 'pending') {
 				res = await this.d.ci.result(run.head_sha, run.retried_at);
-				if (res === 'failure' && run.status !== 'retrying' && (await this.d.ci.rerunFailed(run.head_sha))) {
+				const rerun = res === 'failure' && run.status !== 'retrying' ? await this.retry(run.head_sha) : 'none';
+				if (rerun === 'wait') res = 'pending';
+				else if (rerun === 'rerun') {
 					// A bisection step is retried once too, so a flake doesn't eject an innocent PR.
 					store.setBatchStatus(run.id, 'retrying');
 					store.setBatchRetried(run.id, this.d.now());
@@ -843,6 +872,7 @@ class Tick {
 	 */
 	async restack(): Promise<boolean> {
 		const def = this.d.repo.default_branch;
+		if (!this.items().some((i) => i.status === 'queued')) return false;
 		const a = await this.analysis();
 		let pushed = false;
 		for (const it of this.items()) {

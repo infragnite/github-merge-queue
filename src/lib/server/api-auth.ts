@@ -124,12 +124,13 @@ export async function resolveCaller(
 
 /**
  * The most a token may do: a classic or OAuth token (`ghp_`, `gho_`, what `gh auth token` gives)
- * with `repo` or `public_repo` scope acts with its user's role; an installation token (`ghs_`)
- * with its repo permissions. Any other (fine-grained `github_pat_`, another app's `ghu_`, or a
- * classic token without repo scope) only reads: their permissions can't be checked here.
+ * with `repo` or `public_repo` scope acts with its user's role. Any other only reads: an
+ * installation token (`ghs_`, which every Actions GITHUB_TOKEN is), a fine-grained `github_pat_`,
+ * another app's `ghu_`, or a classic token without repo scope; their rights can't be checked here.
  */
 function tokenCeiling(token: string, scopes: string | null | undefined): Role {
-	if (token.startsWith('ghs_')) return 'admin';
+	// Installation tokens include every Actions GITHUB_TOKEN, even a fork PR's workflow: read only.
+	if (token.startsWith('ghs_')) return 'read';
 	if (token.startsWith('ghp_') || token.startsWith('gho_')) {
 		const s = (scopes ?? '').split(',').map((x) => x.trim());
 		return s.includes('repo') || s.includes('public_repo') ? 'admin' : 'read';
