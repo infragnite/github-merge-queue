@@ -152,6 +152,22 @@ export function migrateBatches(database: Database.Database) {
 		-- default-branch run started after landing it hasn't finished. 'checking': a baseline run of
 		-- it alone is going (it moved outside the queue). 'red': it fails on its own; \`tried\` lists
 		-- the PR heads that failed on top of it (pr@sha in a batch, pr@sha! alone).
+		-- Queue branches about to be pushed (written before the push, removed once the batch row
+		-- that owns the branch exists): after a crash in between, the branch is an orphan to delete.
+		-- A landing in progress (written before the first merge, removed after the last): after a
+		-- crash, what was merged is recorded and green statuses on unmerged PRs are taken back.
+		CREATE TABLE IF NOT EXISTS landing_intents (
+			repo_id INTEGER PRIMARY KEY,
+			batch_id INTEGER NOT NULL,
+			src_id INTEGER NOT NULL,
+			prs TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS branch_intents (
+			repo_id INTEGER NOT NULL,
+			branch TEXT NOT NULL,
+			sha TEXT NOT NULL,
+			PRIMARY KEY (repo_id, branch)
+		);
 		CREATE TABLE IF NOT EXISTS master_health (
 			repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
 			sha TEXT NOT NULL,
@@ -300,6 +316,42 @@ export function recordBisectLanding(id: number, prs: number[], sha: string, tree
 /** The default branch moved under a bisecting batch: it follows it. */
 export function rebaseBatch(id: number, sha: string, tree: string) {
 	getDb().prepare('UPDATE batches SET base_sha = ?, base_tree = ? WHERE id = ?').run(sha, tree, id);
+}
+
+// --- crash recovery ---
+
+/** About to push queue branch `branch` at `sha`; `branchPushed` clears it once a batch row owns it. */
+export function intendBranch(repoId: number, branch: string, sha: string) {
+	getDb().prepare('INSERT OR REPLACE INTO branch_intents (repo_id, branch, sha) VALUES (?, ?, ?)').run(repoId, branch, sha);
+}
+
+export function branchPushed(repoId: number, branch: string) {
+	getDb().prepare('DELETE FROM branch_intents WHERE repo_id = ? AND branch = ?').run(repoId, branch);
+}
+
+/** Branches whose push may have happened without the queue recording what they belong to. */
+export function branchIntents(repoId: number): Array<{ branch: string; sha: string }> {
+	return getDb().prepare('SELECT branch, sha FROM branch_intents WHERE repo_id = ?').all(repoId) as Array<{ branch: string; sha: string }>;
+}
+
+export function setLandingIntent(repoId: number, i: { batchId: number; srcId: number; prs: number[] } | null) {
+	if (!i) getDb().prepare('DELETE FROM landing_intents WHERE repo_id = ?').run(repoId);
+	else
+		getDb()
+			.prepare('INSERT OR REPLACE INTO landing_intents (repo_id, batch_id, src_id, prs) VALUES (?, ?, ?, ?)')
+			.run(repoId, i.batchId, i.srcId, JSON.stringify(i.prs));
+}
+
+export function getLandingIntent(repoId: number): { batchId: number; srcId: number; prs: number[] } | null {
+	const r = getDb().prepare('SELECT batch_id, src_id, prs FROM landing_intents WHERE repo_id = ?').get(repoId) as
+		| { batch_id: number; src_id: number; prs: string }
+		| undefined;
+	return r ? { batchId: r.batch_id, srcId: r.src_id, prs: JSON.parse(r.prs) } : null;
+}
+
+export function getBatchByBranch(repoId: number, branch: string): BatchRow | undefined {
+	const r = getDb().prepare('SELECT * FROM batches WHERE repo_id = ? AND branch = ?').get(repoId, branch) as RawBatch | undefined;
+	return r ? parse(r) : undefined;
 }
 
 export function getBatch(id: number): BatchRow | undefined {

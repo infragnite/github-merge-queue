@@ -903,3 +903,113 @@ describe('batch queue runtime', () => {
 		expect(db.getQueueItems(repo.id)[0].status).toBe('queued');
 	});
 });
+
+describe('surviving a crash at any step', () => {
+	const MUTATING = {
+		github: ['pushBranch', 'pushHead', 'deleteBranch', 'retargetBase', 'squashMerge', 'setStatus', 'setPRStatus', 'label', 'comment'],
+		ci: ['start', 'refreshCaches', 'cancel', 'rerunFailed']
+	} as const;
+
+	/**
+	 * Runs ticks where the k-th call that changes something outside (GitHub, CI) never returns: the
+	 * process died there, before (`before`) or after (`after`) the change took effect. Later ticks
+	 * run normally, from what is in the database and on GitHub. Returns the number of such calls seen.
+	 */
+	const trace: string[] = [];
+	async function runCrashingAt(k: number, mode: 'before' | 'after', ticks: number): Promise<number> {
+		let calls = 0;
+		let crash: (() => void) | null = null;
+		const crashed = new Promise<void>((r) => (crash = r));
+		let dead = false;
+		for (let i = 0; i < ticks; i++) {
+			const d = world.deps();
+			if (!dead) {
+				for (const [part, names] of Object.entries(MUTATING) as [keyof typeof MUTATING, readonly string[]][]) {
+					const o = d[part] as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+					for (const name of names) {
+						const real = o[name];
+						o[name] = async (...a: unknown[]) => {
+							if (dead) return new Promise(() => {});
+							if (process.env.CRASH_TRACE) trace.push(`${calls + 1} ${part}.${name}(${a.map((x) => String(x).slice(0, 40)).join(', ')})`);
+							if (++calls === k) {
+								dead = true;
+								if (mode === 'after') await real(...a);
+								crash!();
+								return new Promise(() => {});
+							}
+							return real(...a);
+						};
+					}
+				}
+			}
+			await Promise.race([tickBatchQueue(d), crashed]);
+			if (dead && i < ticks) {
+				// The process restarts: the remaining ticks run with nothing carried over in memory.
+				for (let j = i + 1; j < ticks; j++) await tickBatchQueue(world.deps());
+				break;
+			}
+		}
+		return calls;
+	}
+
+	function scenario() {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3, { file: 'x-breaks-master.txt' });
+		pr(4);
+		world.breakingFiles.add('x-breaks-master.txt');
+	}
+
+	/** What must hold once the queue has settled, however often it was killed on the way. */
+	function settled() {
+		expect([...world.merged].sort()).toEqual([1, 2, 4]);
+		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr4.txt']);
+		expect(queued()).toEqual([]);
+		expect(db.getRepoHistory(repo.id).filter((h) => h.status === 'failed').map((h) => h.pr_number)).toEqual([3]);
+		expect(store.getActiveBatches(repo.id)).toEqual([]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		// No queue branch is left behind, and no unmerged PR carries the queue's green status.
+		expect(git.git('branch', '--list', 'mq/*').trim()).toBe('');
+		const last = new Map<string, string>();
+		for (const s of world.prStatuses.filter((x) => x.context === 'merge-queue')) last.set(s.sha, s.state);
+		expect(last.get(git.sha('pr3'))).toBe('failure');
+		for (const n of [1, 2, 3, 4]) if (!git.pr(n).merged) expect(last.get(git.sha(`pr${n}`))).not.toBe('success');
+	}
+
+	test('without a crash (the reference)', async () => {
+		scenario();
+		const calls = await runCrashingAt(0, 'before', 80);
+		if (process.env.CRASH_TRACE) console.log(trace.join('\n'));
+		settled();
+		expect(calls).toBeGreaterThan(10);
+	});
+
+	for (const mode of ['before', 'after'] as const) {
+		test(`killed ${mode} any call that changes GitHub or CI, it still settles`, { timeout: 600_000 }, async () => {
+			// Count the calls of an uninterrupted run first.
+			scenario();
+			const total = await runCrashingAt(0, mode, 80);
+			const failures: string[] = [];
+			for (let k = 1; k <= total; k++) {
+				git.cleanup();
+				git = new GitSandbox();
+				world = new World();
+				const user = db.upsertUser(1, 'dev', null, null);
+				const name = `repo${++repoSeq}`;
+				db.addRepo('acme', name, 'main', user);
+				repo = { ...db.getRepoByOwnerName('acme', name)!, default_branch: 'main' };
+				store.updateQueueSettings(repo.id, { mode: 'batch', config: { collectWindowMs: 0, depth: 1 } });
+				store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+				scenario();
+				await runCrashingAt(k, mode, 80);
+				try {
+					settled();
+				} catch (e) {
+					failures.push(`call ${k}: ${(e as Error).message.split('\n')[0]}; paused: ${store.getQueueSettings(repo.id).pausedReason}; batches: ${store.getRecentBatches(repo.id).map((b) => `${b.id}:${b.kind}:${b.status}:${b.members}`).join(' ')}`);
+				}
+			}
+			expect(failures).toEqual([]);
+		});
+	}
+});

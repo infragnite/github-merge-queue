@@ -455,6 +455,7 @@ class Tick {
 			return 'conflict';
 		}
 		const branch = `mq/batch-${this.d.now()}`;
+		store.intendBranch(this.repoId, branch, result.headSha);
 		try {
 			await this.d.github.pushBranch(branch, result.headSha);
 			await this.d.ci.start(branch, baseSha, result.headSha, prs);
@@ -479,6 +480,7 @@ class Tick {
 			steps,
 			express
 		});
+		store.branchPushed(this.repoId, branch);
 		for (const n of prs) {
 			const it = this.item(n);
 			if (it) {
@@ -529,8 +531,62 @@ class Tick {
 	 * before it, and after each merge the tree tested for that step.
 	 */
 	async land(batch: BatchRow, prs: number[], src: BatchRow): Promise<boolean> {
-		const def = this.d.repo.default_branch;
 		if (!(await this.stillLandable(batch, prs))) return false;
+		// Recorded before the first merge: a crash before it is cleared is finished by `recoverLanding`.
+		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs });
+		try {
+			return await this.landNow(batch, prs, src);
+		} finally {
+			store.setLandingIntent(this.repoId, null);
+		}
+	}
+
+	/**
+	 * After a crash in the middle of a landing: records what was merged, and takes the green
+	 * status back from what wasn't (it would let anyone merge it around the queue).
+	 */
+	async recoverLanding() {
+		const intent = store.getLandingIntent(this.repoId);
+		if (!intent) return;
+		const batch = store.getBatch(intent.batchId);
+		const src = store.getBatch(intent.srcId);
+		const merged: number[] = [];
+		for (const n of intent.prs) {
+			const p = await this.pr(n, true);
+			if (p.merged) {
+				merged.push(n);
+				const it = this.item(n);
+				if (it) {
+					db.addToHistory(this.repoId, n, it.pr_title, it.pr_url, it.author_login, null, 'merged', null, it.created_at);
+					db.removeFromQueue(it.id);
+					this.event(n, 'merged', { batch: intent.batchId });
+				}
+			} else if (p.state === 'open') {
+				await this.d.github.setPRStatus(p.headSha, 'pending', short('Waiting for the merge queue (landing was interrupted)'));
+			}
+		}
+		if (merged.length && batch && src) {
+			const master = await this.d.github.defaultBranchSha();
+			await this.d.git.fetch([master]);
+			const tree = await this.d.git.tree(master);
+			const last = intent.prs.filter((n) => merged.includes(n)).at(-1)!;
+			if (src.steps[last]?.tree === tree) {
+				// Master holds exactly the tested tree: it is the queue's landing, known green.
+				store.setMasterHealth(this.repoId, { sha: master, tree, state: 'green', since: this.d.now() });
+				if (batch.status === 'bisecting') store.recordBisectLanding(batch.id, merged.filter((n) => !batch.landed.includes(n)), master, tree);
+				else if (merged.length === intent.prs.length && batch.status === 'passed') {
+					store.setBatchStatus(batch.id, 'landed');
+					await this.retire(batch);
+				}
+			}
+			this.log(`recovered an interrupted landing of batch ${batch.id}: merged ${merged.map((n) => `#${n}`).join(' ')}`);
+		}
+		store.setLandingIntent(this.repoId, null);
+		this.prs.clear();
+	}
+
+	async landNow(batch: BatchRow, prs: number[], src: BatchRow): Promise<boolean> {
+		const def = this.d.repo.default_branch;
 
 		let master = await this.d.github.defaultBranchSha();
 		await this.d.git.fetch([master]);
@@ -750,6 +806,7 @@ class Tick {
 		}
 		const head = await this.d.git.baseline(masterSha);
 		const branch = `mq/base-${this.d.now()}`;
+		store.intendBranch(this.repoId, branch, head);
 		try {
 			await this.d.github.pushBranch(branch, head);
 			await this.d.ci.start(branch, masterSha, head, []);
@@ -769,6 +826,7 @@ class Tick {
 			members: [],
 			heads: {}
 		});
+		store.branchPushed(this.repoId, branch);
 		store.setMasterHealth(this.repoId, { sha: masterSha, tree, state: 'checking', since: this.d.now() });
 		this.log(`${this.d.repo.default_branch} moved outside the queue; checking ${masterSha.slice(0, 7)} alone in ${branch}`);
 	}
@@ -1027,9 +1085,10 @@ class Tick {
 	}
 
 	async finishBisection(batch: BatchRow, runs: BatchRow[], landedAny: boolean) {
+		// Cleaned up before it is marked done, so an interrupted finish runs again.
 		for (const r of runs) await this.retire(r);
-		store.setBatchStatus(batch.id, landedAny ? 'landed' : 'failed');
 		await this.d.github.deleteBranch(batch.branch).catch(this.bestEffort('github.deleteBranch'));
+		store.setBatchStatus(batch.id, landedAny ? 'landed' : 'failed');
 	}
 
 	/** Starts a bisection run of `g` on the default branch as it is now (`baseSha`). */
@@ -1066,9 +1125,11 @@ class Tick {
 			store.setBatchCI(run.id, 'failure');
 			return;
 		}
+		store.intendBranch(this.repoId, branch, r.headSha);
 		try {
 			await this.d.github.pushBranch(branch, r.headSha);
 			await this.d.ci.start(branch, baseSha, r.headSha, prs);
+			store.branchPushed(this.repoId, branch);
 		} catch (e) {
 			store.setBatchCI(run.id, 'failure');
 			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}`);
@@ -1099,6 +1160,7 @@ class Tick {
 		const r = await this.d.git.build(masterSha, [member]);
 		if (!r.ok) throw new Error(`#${n} does not apply on ${this.d.repo.default_branch}: ${r.reason.replace(/^#\d+ /, '')}`);
 		const branch = `mq/try-${n}-${this.d.now()}`;
+		store.intendBranch(this.repoId, branch, r.headSha);
 		await this.d.github.pushBranch(branch, r.headSha);
 		try {
 			await this.d.ci.start(branch, masterSha, r.headSha, [n]);
@@ -1117,6 +1179,7 @@ class Tick {
 			members: [n],
 			heads: { [n]: p.headSha }
 		});
+		store.branchPushed(this.repoId, branch);
 		await this.d.github
 			.setPRStatus(p.headSha, 'pending', short(`Trying on ${this.d.repo.default_branch} in ${branch}`), { suffix: '/try', url: this.branchRuns(branch) })
 			.catch(this.bestEffort('github.setPRStatus'));
@@ -1144,7 +1207,35 @@ class Tick {
 
 	// --- reconcile, restack and plan ---
 
+	/**
+	 * Finishes or undoes queue-branch pushes a crash interrupted: a branch no batch row owns is
+	 * deleted (its CI cancelled); a branch of a run still going is pushed again, and its CI started
+	 * if it never was.
+	 */
+	async sweepBranchIntents() {
+		for (const { branch, sha } of store.branchIntents(this.repoId)) {
+			const row = store.getBatchByBranch(this.repoId, branch);
+			const live = row && (row.status === 'testing' || row.status === 'retrying' || row.status === 'bisecting' || row.status === 'passed');
+			if (row && live) {
+				await this.d.github.pushBranch(branch, row.head_sha);
+				if ((await this.d.ci.runUrl(row.head_sha)) === null) await this.d.ci.start(branch, row.base_sha, row.head_sha, [...row.context, ...row.members]);
+			} else {
+				this.log(`removing ${branch}: left behind by an interrupted start`);
+				await this.d.ci.cancel(sha).catch(this.bestEffort('ci.cancel'));
+				await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
+			}
+			store.branchPushed(this.repoId, branch);
+		}
+	}
+
 	async reconcile() {
+		// A batch carries its PRs: one interrupted right after it was recorded may not have marked them.
+		for (const b of store.getActiveBatches(this.repoId)) {
+			for (const n of b.members) {
+				const it = this.item(n);
+				if (it?.status === 'queued' && !b.landed.includes(n)) db.updateQueueItemStatus(it.id, 'checking');
+			}
+		}
 		// A PR is `checking` only while a batch carries it; any other (a mode switch, a crash
 		// between steps) goes back in line rather than waiting forever.
 		const carried = new Set(store.getActiveBatches(this.repoId).flatMap((b) => b.members));
@@ -1307,6 +1398,8 @@ class Tick {
 export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	const t = new Tick(deps);
 	const settings = store.getQueueSettings(deps.repo.id);
+	await t.sweepBranchIntents();
+	await t.recoverLanding();
 	if (settings.pausedReason || settings.mode !== 'batch') return;
 	await t.reconcile();
 	await t.advanceTries();
