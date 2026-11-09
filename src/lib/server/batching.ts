@@ -64,10 +64,13 @@ export interface BatchConfig {
 	 */
 	requirePRChecks: boolean;
 	/**
-	 * After landing, dispatch the workflow on the default branch at most this often, so a run in
-	 * its cache scope refreshes the caches batch runs restore. 0 turns it off.
+	 * Dispatch the workflow on the default branch after each landed batch: the run in its scope
+	 * saves the caches that batch runs restore, and does whatever else the repo runs on it
+	 * (releases). Off for a repo whose CI needs no default-branch run.
 	 */
-	cacheRefreshMs: number;
+	masterRun: boolean;
+	/** At least this long between those runs (0: one per landed batch). */
+	masterRunMinGapMs: number;
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
@@ -80,7 +83,8 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	autoRebase: true,
 	ciTimeoutMs: 12 * 60 * 60 * 1000,
 	requirePRChecks: false,
-	cacheRefreshMs: 6 * 60 * 60 * 1000
+	masterRun: true,
+	masterRunMinGapMs: 0
 };
 
 export type AdmissionCode =

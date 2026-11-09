@@ -472,6 +472,23 @@ describe('batch queue runtime', () => {
 		expect(world.started).toEqual([]);
 	});
 
+	test('starts a master CI run after each landed batch', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 1 } });
+		pr(1);
+		pr(2);
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.cacheRefreshes).toBe(2);
+	});
+
+	test('no master runs when masterRun is off', async () => {
+		store.updateQueueSettings(repo.id, { config: { masterRun: false } });
+		pr(1);
+		await run();
+		expect(world.merged).toEqual([1]);
+		expect(world.cacheRefreshes).toBe(0);
+	});
+
 	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {
 		pr(1);
 		world.refuseMerge.add(1);
