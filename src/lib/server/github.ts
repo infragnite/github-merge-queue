@@ -347,3 +347,35 @@ export async function workflowRunsForSha(owner: string, repo: string, sha: strin
 export async function rerunFailedJobs(owner: string, repo: string, runId: number) {
 	return ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun-failed-jobs`, { method: 'POST' });
 }
+
+// --- Agent API auth ---
+
+/** The caller's own identity, from their token; null when GitHub rejects it as a user token. */
+export async function userForToken(token: string): Promise<{ login: string } | null> {
+	try {
+		return await ghFetch(token, '/user');
+	} catch (e) {
+		if (e instanceof GitHubError && (e.status === 401 || e.status === 403)) return null;
+		throw e;
+	}
+}
+
+export async function collaboratorRole(owner: string, repo: string, login: string): Promise<string> {
+	try {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
+		// role_name distinguishes maintain and triage; permission only says admin/write/read/none.
+		return data.role_name || data.permission || 'none';
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return 'none';
+		throw e;
+	}
+}
+
+export async function repoForToken(token: string, owner: string, repo: string) {
+	try {
+		return await ghFetch(token, `/repos/${owner}/${repo}`);
+	} catch (e) {
+		if (e instanceof GitHubError && (e.status === 401 || e.status === 403 || e.status === 404)) return null;
+		throw e;
+	}
+}
