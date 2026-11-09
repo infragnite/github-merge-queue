@@ -2,9 +2,9 @@
 	import BatchCard from './BatchCard.svelte';
 	import type { BatchCard as Card } from '$lib/server/batch-view';
 
-	let { batch, owner, name, nested = false }: { batch: Card; owner: string; name: string; nested?: boolean } = $props();
+	let { batch, owner, name, nested = false, step = null }: { batch: Card; owner: string; name: string; nested?: boolean; step?: number | null } = $props();
 
-	const KIND: Record<Card['kind'], string> = { batch: 'Batch', bisect: 'Bisection run', try: 'Try alone', baseline: 'Master check' };
+	const KIND: Record<Card['kind'], string> = { batch: 'Batch', bisect: 'Bisection run', try: 'Tried alone', baseline: 'Master check' };
 	const STATUS: Record<string, string> = {
 		testing: 'bg-amber-100 text-amber-800',
 		retrying: 'bg-amber-100 text-amber-800',
@@ -13,7 +13,8 @@
 		landed: 'bg-green-100 text-green-800',
 		failed: 'bg-red-100 text-red-800',
 		superseded: 'bg-gray-100 text-gray-600',
-		cancelled: 'bg-gray-100 text-gray-600'
+		cancelled: 'bg-gray-100 text-gray-600',
+		failing: 'bg-red-100 text-red-800'
 	};
 	const LABEL: Record<string, string> = {
 		testing: 'testing',
@@ -22,8 +23,9 @@
 		passed: 'passed, waiting to land',
 		landed: 'landed',
 		failed: 'failed',
-		superseded: 'superseded',
-		cancelled: 'cancelled'
+		superseded: 'rebuilt: the batch below it failed',
+		cancelled: 'cancelled',
+		failing: 'failing'
 	};
 
 	function since(sqlTime: string, end: string | null): string {
@@ -34,19 +36,49 @@
 	}
 
 	// A bisection or try run that passed is stored as landed; it landed nothing itself.
-	const status = $derived(batch.kind !== 'batch' && batch.status === 'landed' ? 'passed' : batch.status);
 	const p = $derived(batch.progress);
+	// A run with a failed job will fail: say so before the remaining jobs finish.
+	const status = $derived(
+		(batch.kind === 'try' || batch.kind === 'baseline') && batch.status === 'landed'
+			? 'passed'
+			: batch.status === 'testing' && p && p.failed > 0
+				? 'failing'
+				: batch.status
+	);
+	const prList = (ns: number[]) => ns.map((n) => `#${n}`).join(', ');
+	// Bisection's state in one line: where the failure has been narrowed to so far.
+	const verdict = $derived.by(() => {
+		if (batch.status !== 'bisecting') return null;
+		const runs = batch.bisection;
+		const failed = runs.filter((r) => r.ci === 'failure' || (r.status === 'testing' && (r.progress?.failed ?? 0) > 0));
+		const smallest = failed.sort((a, b) => a.prs.length - b.prs.length)[0];
+		const total = batch.prs.length;
+		const landed = batch.landed.length ? `Landed ${prList(batch.landed)}. ` : '';
+		if (smallest) {
+			const n = smallest.prs.length;
+			return (
+				landed +
+				(n === 1 ? `Found it: #${smallest.prs[0].pr} breaks the batch` : `Narrowed to ${n} of ${total} PRs: ${prList(smallest.prs.map((x) => x.pr))}`)
+			);
+		}
+		if (landed) return `${landed}Testing the rest on top`;
+		return `Splitting ${total} PRs in two to find which one fails; a half that passes lands at once`;
+	});
 	const pct = (n: number) => (p && p.total > 0 ? (n / p.total) * 100 : 0);
 </script>
 
-<div class="rounded-xl border border-border-subtle bg-surface-raised {nested ? 'p-3' : 'p-4'}">
+<div id={nested ? undefined : `batch-${batch.id}`} class="scroll-mt-4 rounded-xl border border-border-subtle bg-surface-raised {nested ? 'p-3' : 'p-4'}">
 	<div class="flex flex-wrap items-center gap-2 text-sm">
-		<span class="font-semibold text-gray-900">{KIND[batch.kind]} {batch.kind === 'batch' ? `#${batch.id}` : ''}</span>
+		<span class="font-semibold text-gray-900">{KIND[batch.kind]} {batch.kind === 'batch' ? `#${batch.id}` : step !== null ? step : ''}</span>
 		<span class="rounded px-1.5 py-0.5 text-xs {STATUS[status] ?? 'bg-gray-100 text-gray-600'}">{batch.kind !== 'batch' && status === 'passed' ? 'passed' : (LABEL[status] ?? status)}</span>
-		{#if batch.express}<span class="rounded bg-indigo-100 px-1.5 py-0.5 text-xs text-indigo-700">express</span>{/if}
-		<a href="https://github.com/{owner}/{name}/commit/{batch.headSha}" target="_blank" rel="noopener" class="font-mono text-xs text-gray-500 hover:text-indigo-600">{batch.branch}</a>
+		{#if batch.express}<span class="rounded bg-indigo-100 px-1.5 py-0.5 text-xs text-indigo-700" title="A small batch of urgent PRs, ahead of the rest">urgent</span>{/if}
+		<a href="https://github.com/{owner}/{name}/commit/{batch.headSha}" target="_blank" rel="noopener" class="hidden max-w-[12rem] truncate font-mono text-[11px] text-gray-400 hover:text-indigo-600 sm:inline" title={batch.branch}>{batch.branch}</a>
 		<span class="ml-auto text-xs text-gray-400">{batch.finishedAt ? `took ${since(batch.createdAt, batch.finishedAt)}` : `running ${since(batch.createdAt, null)}`}</span>
 	</div>
+
+	{#if verdict}
+		<p class="mt-1 text-sm font-medium text-orange-800">{verdict}</p>
+	{/if}
 
 	{#if p}
 		<div class="mt-2">
@@ -68,7 +100,7 @@
 	{/if}
 
 	{#if batch.context.length > 0}
-		<p class="mt-2 text-xs text-gray-500">On top of {batch.context.map((n) => `#${n}`).join(', ')} (already passed)</p>
+		<p class="mt-2 text-xs text-gray-500">On top of {prList(batch.context)}, which passed</p>
 	{/if}
 
 	<ul class="mt-2 space-y-1 text-sm">
@@ -89,8 +121,8 @@
 
 	{#if batch.bisection.length > 0}
 		<div class="mt-3 space-y-2 border-l-2 border-orange-200 pl-3">
-			{#each batch.bisection as run (run.id)}
-				<BatchCard batch={run} {owner} {name} nested />
+			{#each batch.bisection as run, i (run.id)}
+				<BatchCard batch={run} {owner} {name} nested step={i + 1} />
 			{/each}
 		</div>
 	{/if}

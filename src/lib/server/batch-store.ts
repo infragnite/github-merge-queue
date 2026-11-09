@@ -48,6 +48,10 @@ export interface BatchRow {
 	members: number[];
 	/** PRs applied below `members` that are already known to pass (bisection only). */
 	context: number[];
+	/** PRs of a bisecting batch that already landed, in landing order. */
+	landed: number[];
+	/** PRs that left a bisecting batch without landing. */
+	left_prs: number[];
 	status: BatchStatus;
 	express: boolean;
 	ci_result: 'pending' | 'success' | 'failure';
@@ -59,6 +63,8 @@ export interface BatchStep {
 	sha: string;
 	tree: string;
 	fork: string | null;
+	/** The PR this one was stacked on when it was batched (unset in rows from before it was recorded). */
+	parent?: number | null;
 }
 
 export interface CISettings {
@@ -150,6 +156,22 @@ export function migrateBatches(database: Database.Database) {
 		-- default-branch run started after landing it hasn't finished. 'checking': a baseline run of
 		-- it alone is going (it moved outside the queue). 'red': it fails on its own; \`tried\` lists
 		-- the PR heads that failed on top of it (pr@sha in a batch, pr@sha! alone).
+		-- Queue branches about to be pushed (written before the push, removed once the batch row
+		-- that owns the branch exists): after a crash in between, the branch is an orphan to delete.
+		-- A landing in progress (written before the first merge, removed after the last): after a
+		-- crash, what was merged is recorded and green statuses on unmerged PRs are taken back.
+		CREATE TABLE IF NOT EXISTS landing_intents (
+			repo_id INTEGER PRIMARY KEY,
+			batch_id INTEGER NOT NULL,
+			src_id INTEGER NOT NULL,
+			prs TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS branch_intents (
+			repo_id INTEGER NOT NULL,
+			branch TEXT NOT NULL,
+			sha TEXT NOT NULL,
+			PRIMARY KEY (repo_id, branch)
+		);
 		CREATE TABLE IF NOT EXISTS master_health (
 			repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
 			sha TEXT NOT NULL,
@@ -163,10 +185,18 @@ export function migrateBatches(database: Database.Database) {
 	const batchCols = database.prepare(`PRAGMA table_info(batches)`).all() as Array<{ name: string }>;
 	for (const [name, ddl] of [
 		['steps', `TEXT NOT NULL DEFAULT '{}'`],
-		['retried_at', 'INTEGER']
+		['retried_at', 'INTEGER'],
+		// Bisection lands passing groups as it goes: the PRs of this batch that landed so far.
+		['landed', `TEXT NOT NULL DEFAULT '[]'`],
+		// PRs that left a bisecting batch without landing (ejected, or back in the queue).
+		['left_prs', `TEXT NOT NULL DEFAULT '[]'`]
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
+	// Bisection runs used to keep status 'testing' after their result came in; their status now
+	// follows the result (a run still 'testing' is still running).
+	database.exec(`UPDATE batches SET status = CASE ci_result WHEN 'success' THEN 'passed' ELSE 'failed' END
+		WHERE kind = 'bisect' AND status IN ('testing', 'retrying') AND ci_result != 'pending'`);
 	const cols = database.prepare(`PRAGMA table_info(queue_items)`).all() as Array<{ name: string }>;
 	const add = (name: string, ddl: string) => {
 		if (!cols.some((c) => c.name === name)) database.exec(`ALTER TABLE queue_items ADD COLUMN ${name} ${ddl}`);
@@ -176,6 +206,8 @@ export function migrateBatches(database: Database.Database) {
 	add('deferred_for', `TEXT`);
 	// Batches this PR failed in without being found the culprit (flaky or unclear failures).
 	add('batch_failures', `INTEGER NOT NULL DEFAULT 0`);
+	// Why the planner holds this queued PR back: { code, wait, reason } (see setHold).
+	add('hold', `TEXT`);
 }
 
 // --- settings ---
@@ -224,8 +256,10 @@ export function setQueuePriority(repoId: number, prNumber: number, priority: Pri
 
 // --- batches ---
 
-type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps'> & {
+type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs'> & {
 	members: string;
+	landed: string | null;
+	left_prs: string | null;
 	heads: string;
 	steps: string;
 	context: string;
@@ -237,6 +271,8 @@ function parse(r: RawBatch): BatchRow {
 		...r,
 		members: JSON.parse(r.members),
 		context: JSON.parse(r.context),
+		landed: JSON.parse(r.landed ?? '[]'),
+		left_prs: JSON.parse(r.left_prs ?? '[]'),
 		heads: JSON.parse(r.heads),
 		steps: JSON.parse(r.steps),
 		express: !!r.express
@@ -279,6 +315,63 @@ export function insertBatch(b: {
 			b.express ? 1 : 0
 		);
 	return getBatch(Number(r.lastInsertRowid))!;
+}
+
+/** A bisecting batch landed `prs` on master `sha` (tree `tree`): the rest bisects on top of it. */
+export function recordBisectLanding(id: number, prs: number[], sha: string, tree: string) {
+	const b = getBatch(id)!;
+	getDb()
+		.prepare('UPDATE batches SET landed = ?, base_sha = ?, base_tree = ? WHERE id = ?')
+		.run(JSON.stringify([...b.landed, ...prs]), sha, tree, id);
+}
+
+/** PRs leave a bisecting batch without landing: it no longer carries them. */
+export function leaveBatch(id: number, prs: number[]) {
+	const b = getBatch(id);
+	if (!b || !prs.length) return;
+	const left = [...new Set([...b.left_prs, ...prs])];
+	getDb().prepare('UPDATE batches SET left_prs = ? WHERE id = ?').run(JSON.stringify(left), id);
+}
+
+/** The default branch moved under a bisecting batch: it follows it. */
+export function rebaseBatch(id: number, sha: string, tree: string) {
+	getDb().prepare('UPDATE batches SET base_sha = ?, base_tree = ? WHERE id = ?').run(sha, tree, id);
+}
+
+// --- crash recovery ---
+
+/** About to push queue branch `branch` at `sha`; `branchPushed` clears it once a batch row owns it. */
+export function intendBranch(repoId: number, branch: string, sha: string) {
+	getDb().prepare('INSERT OR REPLACE INTO branch_intents (repo_id, branch, sha) VALUES (?, ?, ?)').run(repoId, branch, sha);
+}
+
+export function branchPushed(repoId: number, branch: string) {
+	getDb().prepare('DELETE FROM branch_intents WHERE repo_id = ? AND branch = ?').run(repoId, branch);
+}
+
+/** Branches whose push may have happened without the queue recording what they belong to. */
+export function branchIntents(repoId: number): Array<{ branch: string; sha: string }> {
+	return getDb().prepare('SELECT branch, sha FROM branch_intents WHERE repo_id = ?').all(repoId) as Array<{ branch: string; sha: string }>;
+}
+
+export function setLandingIntent(repoId: number, i: { batchId: number; srcId: number; prs: number[] } | null) {
+	if (!i) getDb().prepare('DELETE FROM landing_intents WHERE repo_id = ?').run(repoId);
+	else
+		getDb()
+			.prepare('INSERT OR REPLACE INTO landing_intents (repo_id, batch_id, src_id, prs) VALUES (?, ?, ?, ?)')
+			.run(repoId, i.batchId, i.srcId, JSON.stringify(i.prs));
+}
+
+export function getLandingIntent(repoId: number): { batchId: number; srcId: number; prs: number[] } | null {
+	const r = getDb().prepare('SELECT batch_id, src_id, prs FROM landing_intents WHERE repo_id = ?').get(repoId) as
+		| { batch_id: number; src_id: number; prs: string }
+		| undefined;
+	return r ? { batchId: r.batch_id, srcId: r.src_id, prs: JSON.parse(r.prs) } : null;
+}
+
+export function getBatchByBranch(repoId: number, branch: string): BatchRow | undefined {
+	const r = getDb().prepare('SELECT * FROM batches WHERE repo_id = ? AND branch = ?').get(repoId, branch) as RawBatch | undefined;
+	return r ? parse(r) : undefined;
 }
 
 export function getBatch(id: number): BatchRow | undefined {
@@ -351,6 +444,34 @@ export function deferredFor(item: { deferred_for?: string | null }): number[] {
 		return item.deferred_for ? (JSON.parse(item.deferred_for) as number[]) : [];
 	} catch {
 		return [];
+	}
+}
+
+/**
+ * Why the planner holds a queued PR back, so the dashboard can tell a PR that waits by itself
+ * (CI running, parent pending) from one that needs someone. The reason matches the item's
+ * error_message while the hold is current.
+ */
+export interface Hold {
+	code: string;
+	wait: boolean;
+	reason: string;
+}
+
+export function setHold(itemId: number, hold: Hold | null) {
+	getDb()
+		.prepare('UPDATE queue_items SET hold = ? WHERE id = ?')
+		.run(hold ? JSON.stringify(hold) : null, itemId);
+}
+
+/** The item's hold, when it still describes the item's current message. */
+export function currentHold(item: { hold?: string | null; status: string; error_message: string | null }): Hold | null {
+	if (item.status !== 'queued' || !item.hold || !item.error_message) return null;
+	try {
+		const h = JSON.parse(item.hold) as Hold;
+		return h.reason === item.error_message ? h : null;
+	} catch {
+		return null;
 	}
 }
 

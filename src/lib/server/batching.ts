@@ -361,20 +361,6 @@ export interface TestGroup {
 	members: number[];
 }
 
-export type BisectStep =
-	| { kind: 'test'; groups: TestGroup[] }
-	| {
-			kind: 'done';
-			/** Tested together on the base and passed: land these, in order. */
-			land: number[];
-			/** PRs that broke the batch, with why. */
-			eject: { pr: number; reason: string }[];
-			/** PRs that were not shown bad but did not pass together with the rest: back to the queue. */
-			requeue: number[];
-	  };
-
-const key = (g: TestGroup) => `${g.context.join(',')}|${g.members.join(',')}`;
-
 /**
  * Where to cut `members` (in landing order) so that the halves keep stacks
  * whole. `independent` means the right half has no ancestor in the left and
@@ -402,149 +388,150 @@ export function splitPoint(
 	return { left: members.slice(0, mid), right: members.slice(mid), independent: false };
 }
 
-/**
- * Finds the PRs that broke a failed batch. Every group is tested on the same
- * base as the failed batch. Drive it with `next()`, run every group it asks
- * for (they are independent and can run in parallel), `record()` each result,
- * and repeat until it returns `done`.
- */
-export class Bisection {
-	private readonly results = new Map<string, boolean>();
-	private readonly culprits = new Map<number, string>();
-	private readonly requeued = new Set<number>();
-	/** Failed groups still to narrow down. */
-	private open: TestGroup[];
-
-	constructor(
-		private readonly batch: number[],
-		private readonly parentOf: (n: number) => number | null
-	) {
-		this.open = [{ context: [], members: [...batch] }];
-		this.results.set(key(this.open[0]), false);
-	}
-
-	record(group: TestGroup, passed: boolean): void {
-		this.results.set(key(group), passed);
-	}
-
-	next(): BisectStep {
-		for (;;) {
-			const groups = this.open;
-			this.open = [];
-			const wanted: TestGroup[] = [];
-			for (const g of groups) wanted.push(...this.narrow(g));
-			if (wanted.length) return { kind: 'test', groups: dedupe(wanted) };
-			if (this.open.length === 0) return this.finish();
-		}
-	}
-
-	/**
-	 * Advances one failed group: either returns the groups it still needs
-	 * results for (and stays open), or replaces itself in `open` with narrower
-	 * failed groups, or resolves to a culprit. Returns [] unless it needs tests.
-	 */
-	private narrow(g: TestGroup): TestGroup[] {
-		if (g.members.length === 1) {
-			const n = g.members[0];
-			this.culprits.set(
-				n,
-				g.context.length
-					? `#${n} fails when combined with ${g.context.map((c) => `#${c}`).join(', ')}`
-					: `#${n} fails on its own on top of the default branch`
-			);
-			return [];
-		}
-		const { left, right, independent } = splitPoint(g.members, this.parentOf);
-		const a: TestGroup = { context: g.context, members: left };
-		const ra = this.results.get(key(a));
-		if (independent) {
-			const b: TestGroup = { context: g.context, members: right };
-			const rb = this.results.get(key(b));
-			const need = [ra === undefined ? a : null, rb === undefined ? b : null].filter(Boolean) as TestGroup[];
-			if (need.length) {
-				this.open.push(g);
-				return need;
-			}
-			if (!ra) this.open.push(a);
-			if (!rb) this.open.push(b);
-			if (ra && rb) {
-				// Each half passes alone, so the right half breaks on top of the left.
-				const onLeft: TestGroup = { context: [...g.context, ...left], members: right };
-				this.results.set(key(onLeft), false);
-				this.open.push(onLeft);
-			}
-			return [];
-		}
-		if (ra === undefined) {
-			this.open.push(g);
-			return [a];
-		}
-		if (ra) {
-			// The left half passes; the whole failed, so the right half fails on top of it.
-			const onLeft: TestGroup = { context: [...g.context, ...left], members: right };
-			this.results.set(key(onLeft), false);
-			this.open.push(onLeft);
-		} else {
-			// The right half can't be tested without the left: send it back to the queue.
-			this.open.push(a);
-			for (const n of right) this.requeued.add(n);
-		}
-		return [];
-	}
-
-	private finish(): BisectStep {
-		const bad = new Set(this.culprits.keys());
-		// Stack children of a culprit leave with it.
-		for (const n of this.batch) {
-			for (let p = this.parentOf(n); p !== null; p = this.parentOf(p)) {
-				if (bad.has(p) && !bad.has(n)) {
-					this.culprits.set(n, `Stacked on #${p}, which failed in the queue`);
-					bad.add(n);
-					break;
-				}
-			}
-		}
-		const survivors = this.batch.filter((n) => !bad.has(n) && !this.requeued.has(n));
-		const eject = this.batch.filter((n) => bad.has(n)).map((n) => ({ pr: n, reason: this.culprits.get(n)! }));
-		const requeue = this.batch.filter((n) => this.requeued.has(n) && !bad.has(n));
-		if (survivors.length === 0) return { kind: 'done', land: [], eject, requeue };
-
-		// Survivors were only shown good in parts; land them only once they pass together.
-		const final: TestGroup = { context: [], members: survivors };
-		const r = this.results.get(key(final));
-		if (r === undefined) {
-			return { kind: 'test', groups: [final] };
-		}
-		if (r) return { kind: 'done', land: survivors, eject, requeue };
-
-		// They interact in a way the bisection didn't isolate: land the largest group
-		// that passed on the bare base and whose stacks are complete; requeue the rest.
-		let best: number[] = [];
-		for (const [k, passed] of this.results) {
-			if (!passed) continue;
-			const [ctx, mem] = k.split('|');
-			if (ctx !== '') continue;
-			const members = mem.split(',').map(Number).filter((n) => survivors.includes(n));
-			if (members.length > best.length) best = members;
-		}
-		const land = best;
-		return {
-			kind: 'done',
-			land,
-			eject,
-			requeue: [...requeue, ...survivors.filter((n) => !land.includes(n))]
-		};
-	}
+/** A test run of a bisection: `members` on top of `context`, on the default branch at `baseTree`. */
+export interface BisectRun {
+	context: number[];
+	members: number[];
+	baseTree: string;
+	result: 'pending' | 'success' | 'failure';
 }
 
-function dedupe(groups: TestGroup[]): TestGroup[] {
-	const seen = new Set<string>();
-	return groups.filter((g) => {
-		const k = key(g);
-		if (seen.has(k)) return false;
-		seen.add(k);
+export type BisectPlan =
+	/** A run passed on the current default branch: land its PRs now, before anything else. */
+	| { kind: 'land'; run: number; prs: number[] }
+	| {
+			kind: 'step';
+			/** PRs shown to fail alone, with the run that shows it. */
+			eject: { pr: number; reason: string; run: number }[];
+			/** Groups to test now, each alone on the current default branch. */
+			start: number[][];
+			/** PRs the bisection can't place: back to the queue. */
+			requeue: number[];
+			/** Nothing is left to test or land. */
+			done: boolean;
+	  };
+
+/**
+ * One step of finding the PRs that broke a failed batch, from what the runs so far showed. Pure
+ * and stateless, so it is planned again from the recorded runs on every tick (and after a restart).
+ *
+ * - A run that passed on the current default branch lands right away; the rest bisects on top of it.
+ * - A failed run shows that its PRs (those still left) hold a breaker, whichever branch it ran on.
+ *   Each such group is split in two (stacks kept whole) and both halves run on the current branch.
+ * - A PR is ejected only when it failed alone, never by inference: a flake can't eject an innocent PR.
+ * - PRs no failure points at (a half that passed on an older branch, the rest of a group explained
+ *   by a smaller failing one) run together on the current branch, and land if they pass.
+ *
+ * `runs` includes the failed batch itself; `remaining` are the PRs still to land or eject, in order.
+ */
+export function planBisection(input: {
+	runs: BisectRun[];
+	remaining: number[];
+	masterTree: string;
+	parentOf: (n: number) => number | null;
+	/**
+	 * Default-branch trees known green, on which a PR failing alone is its own fault: the current
+	 * one once settled, the batch's own base, trees this bisection landed. By default only the current.
+	 */
+	trusted?: (tree: string) => boolean;
+}): BisectPlan {
+	const { runs, masterTree, parentOf } = input;
+	const trusted = input.trusted ?? ((t: string) => t === masterTree);
+	const left = new Set(input.remaining);
+	const order = input.remaining;
+	const inOrder = (s: Set<number>) => order.filter((n) => s.has(n));
+	/** A group can be tested (and landed) alone: no PR in it sits on a PR still left outside it. */
+	const whole = (g: number[]) => {
+		const set = new Set(g);
+		return g.every((n) => {
+			for (let p = parentOf(n); p !== null; p = parentOf(p)) if (left.has(p) && !set.has(p)) return false;
+			return true;
+		});
+	};
+	const same = (a: number[], b: number[]) => a.length === b.length && a.every((n, i) => n === b[i]);
+	const current = (g: number[]) => runs.findIndex((r) => r.baseTree === masterTree && r.context.length === 0 && same(r.members, g));
+
+	// 1. Land a group that passed on exactly this default branch: the one first in queue order (the
+	// larger one of two that start alike), so the queue's order holds where it can.
+	const first = (g: number[]) => Math.min(...g.map((n) => order.indexOf(n)));
+	let best = -1;
+	runs.forEach((r, i) => {
+		if (r.result !== 'success' || r.baseTree !== masterTree || r.context.length || !r.members.length) return;
+		if (!r.members.every((n) => left.has(n)) || !whole(r.members)) return;
+		const b = best < 0 ? null : runs[best].members;
+		if (!b || first(r.members) < first(b) || (first(r.members) === first(b) && r.members.length > b.length)) best = i;
+	});
+	if (best >= 0) return { kind: 'land', run: best, prs: runs[best].members };
+
+	// 2. Failing groups: what's left of each failed run; a group that contains a smaller failing
+	// group is explained by it, so only disjoint, smallest ones are narrowed.
+	const failing: { set: Set<number>; run: number }[] = [];
+	runs
+		.map((r, i) => ({ set: new Set(r.members.filter((n) => left.has(n))), run: i, ok: r.result !== 'failure' }))
+		.filter((f) => !f.ok && f.set.size > 0)
+		// A later run with all of them that passed outweighs it: the failure was a flake, or came from
+		// PRs that have landed or left since (if they still fail on top of what landed, a run says so).
+		.filter((f) => !runs.some((r, i) => i > f.run && r.result === 'success' && [...f.set].every((n) => r.members.includes(n))))
+		.sort((a, b) => a.set.size - b.set.size || a.run - b.run)
+		.forEach((f) => {
+			if (failing.some((g) => [...g.set].some((n) => f.set.has(n)))) return;
+			failing.push(f);
+		});
+
+	const eject: { pr: number; reason: string; run: number }[] = [];
+	const start: number[][] = [];
+	const busy = new Set(runs.filter((r) => r.result === 'pending').flatMap((r) => r.members));
+	const want = (g: number[]) => {
+		// Wait for a run still going with any of these PRs: its failure narrows them down.
+		if (g.some((n) => busy.has(n))) return;
+		if (current(g) >= 0) return;
+		start.push(g);
+	};
+	const suspects = new Set<number>();
+	for (const f of failing) {
+		const g = inOrder(f.set);
+		for (const n of g) suspects.add(n);
+		if (g.length === 1) {
+			// Eject only on a run of this PR alone (on top of its passing context, if any), on a branch
+			// known green; on any other, it runs alone again on the current one.
+			const alone = runs.findIndex((r) => r.result === 'failure' && same(r.members, g) && trusted(r.baseTree));
+			if (alone >= 0) {
+				const ctx = runs[alone].context;
+				eject.push({
+					pr: g[0],
+					reason: ctx.length
+						? `#${g[0]} fails when combined with ${ctx.map((c) => `#${c}`).join(', ')}`
+						: `#${g[0]} fails on its own on top of the default branch`,
+					run: alone
+				});
+			} else if (whole(g)) want(g);
+			continue;
+		}
+		const { left: a, right: b, independent } = splitPoint(g, parentOf);
+		want(a);
+		// A right half stacked on the left can only run once the left landed (it is then whole).
+		if (independent) want(b);
+	}
+
+	// 3. Everything no failure points at runs together on the current branch, so it can land.
+	const ejected = new Set(eject.map((e) => e.pr));
+	const gone = (n: number) => {
+		for (let p: number | null = n; p !== null; p = parentOf(p)) if (ejected.has(p)) return true;
+		return false;
+	};
+	const rest = order.filter((n) => !suspects.has(n) && !gone(n));
+	const clear = rest.filter((n) => {
+		for (let p = parentOf(n); p !== null; p = parentOf(p)) if (suspects.has(p)) return false;
 		return true;
 	});
+	if (clear.length) want(clear);
+
+	const pending = runs.some((r) => r.result === 'pending');
+	const stuck = !start.length && !eject.length && !pending;
+	// Nothing to run and nothing running: what's left can't be placed (e.g. waits on a parent that
+	// left); the queue takes it from here.
+	const requeue = stuck ? order.filter((n) => !gone(n)) : [];
+	return { kind: 'step', eject, start, requeue, done: stuck || order.every((n) => gone(n)) };
 }
 
 /**

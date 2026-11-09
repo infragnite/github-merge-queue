@@ -10,7 +10,10 @@ import {
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
 import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
-import { getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
+import { currentHold, getQueueSettings, setQueuePriority, updateQueueSettings } from '$lib/server/batch-store';
+import { withRepoLock } from '$lib/server/repo-lock';
+import { retireBatches } from '$lib/server/batch-queue';
+import { liveDeps } from '$lib/server/batch-live';
 import { emitEvent } from '$lib/server/events';
 import { markDirty } from '$lib/server/wake';
 import { currentStackAnalysis } from '$lib/server/stack-runtime';
@@ -23,7 +26,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const repo = getRepoByOwnerName(params.owner, params.name);
 	if (!repo) error(404, 'Repository not found');
 
-	const queueItems = getQueueItems(repo.id);
+	const queueItems = getQueueItems(repo.id).map((i) => ({ ...i, holdWait: currentHold(i)?.wait ?? null }));
 
 	let openPrs: Array<{
 		number: number;
@@ -67,17 +70,56 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 			draft: pr.draft
 		}));
 
+	const settings = getQueueSettings(repo.id);
 	return {
 		repo,
 		queueItems,
 		openPrs: availablePrs,
 		stacks,
 		pipeline,
+		mode: settings.mode,
+		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },
 		history: getRepoHistory(repo.id)
 	};
 };
 
 export const actions: Actions = {
+	/** Switches between merging PRs one by one and in batches. */
+	setMode: async ({ request, params, locals }) => {
+		if (!locals.user) return fail(401);
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+		const mode = (await request.formData()).get('mode');
+		if (mode !== 'serial' && mode !== 'batch') return fail(400, { error: 'mode must be serial or batch' });
+		// Under the repo lock, so a running tick finishes first and none starts a batch after the retire.
+		await withRepoLock(repo.id, async () => {
+			const was = getQueueSettings(repo.id).mode;
+			if (was === mode) return;
+			updateQueueSettings(repo.id, { mode });
+			if (was === 'batch') await retireBatches(liveDeps(repo));
+			emitEvent(repo.id, null, 'mode', { mode, by: locals.user!.login });
+			markDirty(repo.id);
+			console.log(`[merge-queue] ${repo.owner}/${repo.name} switched to ${mode} mode by ${locals.user!.login}`);
+		});
+		return { success: true };
+	},
+
+	/** Batch mode's order: urgent PRs go first, in an express batch. */
+	setPriority: async ({ request, params, locals }) => {
+		if (!locals.user) return fail(401);
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+		const form = await request.formData();
+		const n = parseInt(form.get('pr_number') as string, 10);
+		const priority = form.get('priority');
+		if (!n || (priority !== 'urgent' && priority !== 'normal' && priority !== 'low')) return fail(400);
+		if (!getQueueItems(repo.id).some((i) => i.pr_number === n)) return fail(404);
+		setQueuePriority(repo.id, n, priority);
+		emitEvent(repo.id, n, 'priority', { priority, by: locals.user.login });
+		markDirty(repo.id);
+		return { success: true };
+	},
+
 	/** Lifts a pause of the batch queue; it acts on the next processor cycle. */
 	resume: async ({ params, locals }) => {
 		if (!locals.user) return fail(401);

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
-const { tickBatchQueue, startTry, retireBatches } = await import('./batch-queue');
+const { tickBatchQueue, startTry, retireBatches, recoverInterrupted } = await import('./batch-queue');
 const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
@@ -43,6 +43,8 @@ class World {
 	rerunWaits = 0;
 	/** PRs whose merge GitHub refuses (e.g. a ruleset the queue doesn't satisfy). */
 	refuseMerge = new Set<number>();
+	/** PRs GitHub answers 404 for. */
+	deleted = new Set<number>();
 	/** PRs opened from a fork. */
 	forks = new Set<number>();
 
@@ -53,6 +55,10 @@ class World {
 	everythingFails = false;
 	/** Commits whose CI keeps running (reports pending) until removed. */
 	stillRunning = new Set<string>();
+	/** The default branch's own runs keep running while set. */
+	holdMasterRuns = false;
+	/** Runs of these PRs keep running while it says so. */
+	hold: (prs: number[]) => boolean = () => false;
 
 	ciFails(sha: string) {
 		if (this.everythingFails) return true;
@@ -83,6 +89,9 @@ class World {
 				},
 				result: async (head) => {
 					if (this.ciPendingOnce.delete(head) || this.stillRunning.has(head)) return 'pending';
+					if (this.holdMasterRuns && head === git.sha('main')) return 'pending';
+					const started = this.started.find((x) => x.head === head);
+					if (started && this.hold(started.prs)) return 'pending';
 					const flakeNow = this.flaky.has(head) && !this.reruns.has(head);
 					return flakeNow || this.ciFails(head) ? 'failure' : 'success';
 				},
@@ -106,6 +115,7 @@ class World {
 			github: {
 				defaultBranchSha: async () => git.sha('main'),
 				pr: async (n): Promise<LivePR> => {
+					if (this.deleted.has(n)) throw Object.assign(new Error('Not Found'), { status: 404 });
 					const p = git.pr(n);
 					const head = p.frozenHead ?? git.sha(p.headRef);
 					return {
@@ -260,10 +270,126 @@ describe('batch queue runtime', () => {
 		// (bisection runs that fail are re-run once too, so a flake can't eject an innocent PR)
 		expect(world.reruns.size).toBeGreaterThanOrEqual(1);
 		expect(world.started.length).toBeGreaterThanOrEqual(4);
-		expect(world.started.at(-1)!.prs).toEqual([1, 2, 4]);
-		// the survivors land on the bisection's own proof run, not a fresh batch
+		// each passing group lands on its own bisection run as soon as it passes, not on a fresh batch
 		expect(store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch')).toHaveLength(1);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.landed).toEqual([1, 2, 4]);
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('landed');
+	});
+
+	test('a bisection lands the half that passes at once, while the other half is still running', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		// The right half's runs take long.
+		world.hold = (prs) => prs.includes(3) && !prs.includes(1);
+		await run(30);
+		expect(world.merged).toEqual([1, 2]);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')).toMatchObject({ status: 'bisecting', landed: [1, 2] });
+		world.hold = () => false;
+		await run(30);
+		expect(world.merged).toEqual([1, 2, 3]);
+		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own on top of the default branch \(batch \d+, which landed #1, #2, #3\)/) }]);
+		// The right half failed on the old branch, so it was split on the new one straight away.
+		const bisect = world.started.filter((x) => x.branch.includes('-bisect-')).map((x) => x.prs);
+		expect(bisect).toEqual([[1, 2], [3, 4], [3], [4]]);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('landed');
+	});
+
+	test('a PR pushed to while its half is tested leaves the bisection and is tested again as it is now', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.includes(1);
+		for (let i = 0; i < 30 && !world.started.some((x) => x.prs.join() === '1,2'); i++) await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change', 'pr1-late.txt');
+		world.hold = () => false;
+		await run(60);
+		// #1 changed since it was batched: it goes back in line at once, the bisection goes on without
+		// it (it doesn't take it back), and it lands later from a batch of its own; #2 lands from the bisection.
+		expect([...world.merged].sort()).toEqual([1, 2, 3]);
+		expect(world.files('main').has('pr1-late.txt')).toBe(true);
+		expect(world.comments.map((c) => c.pr)).toEqual([4]);
+		expect(queued()).toEqual([]);
+		const first = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
+		expect(first).toMatchObject({ status: 'landed', landed: [2, 3], left_prs: [1, 4] });
+	});
+
+	test('a PR stacked on one that leaves the bisection leaves with it, and never lands its parent as batched', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' }); // stacked on #1
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.includes(1);
+		for (let i = 0; i < 30 && !world.started.some((x) => x.prs.join() === '1,2'); i++) await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change', 'pr1-late.txt');
+		world.hold = () => false;
+		await run(60);
+		const first = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
+		expect(first).toMatchObject({ landed: [3], left_prs: expect.arrayContaining([1, 2, 4]) });
+		// #1 landed with its late change before #2, which came after it from a batch of their own
+		expect(world.merged.indexOf(1)).toBeLessThan(world.merged.indexOf(2));
+		expect(world.files('main').has('pr1-late.txt')).toBe(true);
+	});
+
+	test('a batch that failed by flake ejects nobody: its halves pass and land', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4);
+		await tickBatchQueue(world.deps());
+		world.flaky.add(world.started[0].head);
+		await run(40);
+		expect(world.merged).toEqual([1, 2, 3, 4]);
+		expect(world.comments).toEqual([]);
+		// The halves passed side by side; the second ran again on top of the first to land.
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2, 3, 4], [1, 2], [3, 4], [3, 4]]);
+	});
+
+	test('a bisection follows the default branch when it moves outside the queue', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		git.commit('main', 'hotfix pushed by hand', 'hotfix.txt');
+		world.hold = () => false;
+		await run(40);
+		// Not rebuilt from scratch: the halves that ran on the old branch still count, #1 runs again on the new one.
+		expect(store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch')).toHaveLength(1);
+		expect(world.merged).toEqual([1]);
+		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/#2 fails on its own/) }]);
+		expect(world.files('main').has('hotfix.txt')).toBe(true);
+	});
+
+	test('a bisection group that no longer applies on the moved default branch goes back in line and stops no CI', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		// someone lands a change to #1's file by hand: #1 no longer applies on the default branch
+		git.commit('main', 'clashes with pr1', 'pr1.txt');
+		const moved = git.sha('main');
+		world.hold = () => false;
+		await run(40);
+		expect(world.cancelled).not.toContain(moved);
+		expect(world.merged).toEqual([]);
+		expect(queued()).toEqual([{ pr: 1, status: 'conflict' }]);
+		// No run stands for the group that didn't build: one carrying the default branch's head would
+		// read that branch's CI as its own result, and stopping it would stop the default branch's CI.
+		const batch = store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!;
+		expect(store.getBisectRuns(batch.id).map((r) => r.head_sha)).not.toContain(moved);
 	});
 
 	test('each status on a PR links to the run behind it, and says when its batch is bisected', async () => {
@@ -277,7 +403,8 @@ describe('batch queue runtime', () => {
 		expect(of('pr2').map((x) => [x.state, x.description.split(';')[0].split(':')[0], x.url])).toEqual([
 			['pending', `Testing in ${branch} with 1 other PR(s)`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`],
 			['pending', `${branch} failed`, `https://ci.example/${world.started[0].head}`],
-			['failure', 'Left the queue', expect.stringMatching(/^https:\/\/ci\.example\//)]
+			['pending', `Batch ${store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!.id} failed`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${world.started[2].branch}`)}`],
+			['failure', 'Left the queue', `https://ci.example/${world.started[2].head}`]
 		]);
 		expect(of('pr1').at(-1)).toMatchObject({ state: 'success', url: expect.stringMatching(/^https:\/\/ci\.example\//) });
 		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/\n\nCI run: https:\/\/ci\.example\//) }]);
@@ -290,7 +417,7 @@ describe('batch queue runtime', () => {
 		world.conflictPairs.push(['x-adds-field.txt', 'x-uses-old-initializer.txt']);
 		await run(60);
 		expect(world.merged).toEqual([1, 2]);
-		expect(world.comments[0]).toMatchObject({ pr: 3, body: expect.stringMatching(/combined with/) });
+		expect(world.comments[0]).toMatchObject({ pr: 3, body: expect.stringMatching(/#3 fails on its own on top of the default branch \(batch \d+, which landed #1, #2\)/) });
 	});
 
 	test('a PR that conflicts with one ahead of it waits for it, then gets a conflict notice', async () => {
@@ -387,6 +514,8 @@ describe('batch queue runtime', () => {
 		await run();
 		expect(world.merged).toEqual([1]);
 		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, '#2 has changes requested']]);
+		// The dashboard shows it as needing someone, not as waiting for its turn.
+		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', wait: false, reason: '#2 has changes requested' });
 	});
 
 	test('marks the PR head as tested right before merging it', async () => {
@@ -771,17 +900,18 @@ describe('batch queue runtime', () => {
 		for (let i = 0; i < 10 && world.merged.length === 0; i++) await tickBatchQueue(world.deps());
 		const master = store.getMasterHealth(repo.id)!;
 		expect(master.state).toBe('verifying');
-		world.stillRunning.add(master.sha); // the default-branch run after the landing takes a while
+		world.holdMasterRuns = true; // the default-branch runs after landings take a while
 		store.updateQueueSettings(repo.id, { config: { maxBatch: 8, retryFailed: false } });
 		pr(2);
 		pr(3, { file: 'x-breaks-master.txt' });
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run(30);
-		// bisection ran while the default branch was being verified, but nobody was blamed yet
+		// bisection ran while the default branch was being verified: #2 passed and landed, but nobody was blamed yet
 		expect(store.getRecentBatches(repo.id).find((b) => b.members.join() === '2,3')?.status).toBe('bisecting');
 		expect(world.started.some((s) => s.branch.includes('-bisect-'))).toBe(true);
+		expect(world.merged).toEqual([1, 2]);
 		expect(world.comments).toEqual([]);
-		world.stillRunning.delete(master.sha);
+		world.holdMasterRuns = false;
 		await run(30);
 		expect(world.merged).toEqual([1, 2]);
 		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }]);
@@ -796,6 +926,35 @@ describe('batch queue runtime', () => {
 		expect(last?.state).toBe('pending');
 		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #1: Repository rule violations found/);
 		expect(world.merged).toEqual([]);
+	});
+
+	test('a landing that stops part way keeps what it merged as known green, and the rest lands without a recheck of the default branch', async () => {
+		pr(1);
+		pr(2);
+		world.refuseMerge.add(2);
+		await run();
+		expect(world.merged).toEqual([1]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #2/);
+		const h = store.getMasterHealth(repo.id)!;
+		expect(h.state).toBe('green');
+		expect(h.sha).toBe(git.sha('main'));
+		world.refuseMerge.delete(2);
+		store.updateQueueSettings(repo.id, { pausedReason: null });
+		const before = world.started.length;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		// one batch of #2 on the new default branch, no check of the default branch alone
+		expect(world.started.slice(before).map((x) => x.prs)).toEqual([[2]]);
+	});
+
+	test('an interrupted landing of a PR that was deleted meanwhile is settled, not retried forever', async () => {
+		pr(1);
+		await tickBatchQueue(world.deps());
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1] });
+		world.deleted.add(1);
+		await recoverInterrupted(world.deps());
+		expect(store.getLandingIntent(repo.id)).toBeNull();
 	});
 
 	test('a superseded batch has its CI cancelled', async () => {
@@ -837,4 +996,116 @@ describe('batch queue runtime', () => {
 		expect(store.getActiveBatches(repo.id)).toEqual([]);
 		expect(db.getQueueItems(repo.id)[0].status).toBe('queued');
 	});
+});
+
+describe('surviving a crash at any step', () => {
+	const MUTATING = {
+		github: ['pushBranch', 'pushHead', 'deleteBranch', 'retargetBase', 'squashMerge', 'setStatus', 'setPRStatus', 'label', 'comment'],
+		ci: ['start', 'refreshCaches', 'cancel', 'rerunFailed']
+	} as const;
+
+	/**
+	 * Runs ticks where the k-th call that changes something outside (GitHub, CI) never returns: the
+	 * process died there, before (`before`) or after (`after`) the change took effect. Later ticks
+	 * run normally, from what is in the database and on GitHub. Returns the number of such calls seen.
+	 */
+	const trace: string[] = [];
+	async function runCrashingAt(k: number, mode: 'before' | 'after', ticks: number): Promise<number> {
+		let calls = 0;
+		let crash: (() => void) | null = null;
+		const crashed = new Promise<void>((r) => (crash = r));
+		let dead = false;
+		for (let i = 0; i < ticks; i++) {
+			const d = world.deps();
+			if (!dead) {
+				for (const [part, names] of Object.entries(MUTATING) as [keyof typeof MUTATING, readonly string[]][]) {
+					const o = d[part] as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+					for (const name of names) {
+						const real = o[name];
+						o[name] = async (...a: unknown[]) => {
+							if (dead) return new Promise(() => {});
+							if (process.env.CRASH_TRACE) trace.push(`${calls + 1} ${part}.${name}(${a.map((x) => String(x).slice(0, 40)).join(', ')})`);
+							if (++calls === k) {
+								dead = true;
+								if (mode === 'after') await real(...a);
+								crash!();
+								return new Promise(() => {});
+							}
+							return real(...a);
+						};
+					}
+				}
+			}
+			await Promise.race([tickBatchQueue(d), crashed]);
+			if (dead && i < ticks) {
+				// The process restarts: the remaining ticks run with nothing carried over in memory.
+				for (let j = i + 1; j < ticks; j++) await tickBatchQueue(world.deps());
+				break;
+			}
+		}
+		return calls;
+	}
+
+	function scenario() {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3, { file: 'x-breaks-master.txt' });
+		pr(4);
+		world.breakingFiles.add('x-breaks-master.txt');
+	}
+
+	/** What must hold once the queue has settled, however often it was killed on the way. */
+	function settled() {
+		expect([...world.merged].sort()).toEqual([1, 2, 4]);
+		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr4.txt']);
+		expect(queued()).toEqual([]);
+		expect(db.getRepoHistory(repo.id).filter((h) => h.status === 'failed').map((h) => h.pr_number)).toEqual([3]);
+		// Each PR is recorded once, however often the queue was restarted on the way.
+		expect(db.getRepoHistory(repo.id).map((h) => h.pr_number).sort()).toEqual([1, 2, 3, 4]);
+		expect(store.getActiveBatches(repo.id)).toEqual([]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		// No queue branch is left behind, and no unmerged PR carries the queue's green status.
+		expect(git.git('branch', '--list', 'mq/*').trim()).toBe('');
+		const last = new Map<string, string>();
+		for (const s of world.prStatuses.filter((x) => x.context === 'merge-queue')) last.set(s.sha, s.state);
+		expect(last.get(git.sha('pr3'))).toBe('failure');
+		for (const n of [1, 2, 3, 4]) if (!git.pr(n).merged) expect(last.get(git.sha(`pr${n}`))).not.toBe('success');
+	}
+
+	test('without a crash (the reference)', async () => {
+		scenario();
+		const calls = await runCrashingAt(0, 'before', 80);
+		if (process.env.CRASH_TRACE) console.log(trace.join('\n'));
+		settled();
+		expect(calls).toBeGreaterThan(10);
+	});
+
+	for (const mode of ['before', 'after'] as const) {
+		test(`killed ${mode} any call that changes GitHub or CI, it still settles`, { timeout: 600_000 }, async () => {
+			// Count the calls of an uninterrupted run first.
+			scenario();
+			const total = await runCrashingAt(0, mode, 80);
+			const failures: string[] = [];
+			for (let k = 1; k <= total; k++) {
+				git.cleanup();
+				git = new GitSandbox();
+				world = new World();
+				const user = db.upsertUser(1, 'dev', null, null);
+				const name = `repo${++repoSeq}`;
+				db.addRepo('acme', name, 'main', user);
+				repo = { ...db.getRepoByOwnerName('acme', name)!, default_branch: 'main' };
+				store.updateQueueSettings(repo.id, { mode: 'batch', config: { collectWindowMs: 0, depth: 1 } });
+				store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+				scenario();
+				await runCrashingAt(k, mode, 80);
+				try {
+					settled();
+				} catch (e) {
+					failures.push(`call ${k}: ${(e as Error).message.split('\n')[0]}; paused: ${store.getQueueSettings(repo.id).pausedReason}; batches: ${store.getRecentBatches(repo.id).map((b) => `${b.id}:${b.kind}:${b.status}:${b.members}`).join(' ')}`);
+				}
+			}
+			expect(failures).toEqual([]);
+		});
+	}
 });
