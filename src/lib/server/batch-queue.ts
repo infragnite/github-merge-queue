@@ -56,7 +56,8 @@ export interface QueueGitHub {
 	defaultBranchSha(): Promise<string>;
 	pr(n: number): Promise<LivePR>;
 	/** CI and reviews of a PR at `headSha` (the expensive part, fetched only when needed). */
-	readiness(n: number, headSha: string, author: string): Promise<Readiness>;
+	/** `needApprovals`: fetch reviews even when the config doesn't require approval (a fork PR). */
+	readiness(n: number, headSha: string, author: string, needApprovals?: boolean): Promise<Readiness>;
 	/** Creates or force-moves a queue branch to `sha` (the commit must be in the mirror). */
 	pushBranch(branch: string, sha: string): Promise<void>;
 	/** Moves a PR's head branch to `sha`, only if it still points at `expected`. */
@@ -178,7 +179,7 @@ class Tick {
 		const key = `${n}@${p.headSha}`;
 		let r = fresh ? undefined : this.ready.get(key);
 		if (!r) {
-			r = await this.d.github.readiness(n, p.headSha, p.authorLogin);
+			r = await this.d.github.readiness(n, p.headSha, p.authorLogin, !p.sameRepo);
 			this.ready.set(key, r);
 		}
 		// A head the queue made by restacking keeps the approval and CI of the head it replaced.
@@ -302,7 +303,7 @@ class Tick {
 	/** Stops a batch's CI (deleting a branch doesn't) and deletes its branch, and its bisection runs'. */
 	async retire(b: BatchRow) {
 		for (const r of [b, ...(b.kind === 'batch' ? store.getBisectRuns(b.id) : [])]) {
-			if (r.ci_result === 'pending') await this.d.ci.cancel(r.head_sha).catch(() => {});
+			if (r.ci_result === 'pending' || r.status === 'retrying') await this.d.ci.cancel(r.head_sha).catch(() => {});
 			await this.d.github.deleteBranch(r.branch).catch(() => {});
 		}
 	}
@@ -397,6 +398,19 @@ class Tick {
 		const built = await this.build(baseSha, prs, below, masterSha);
 		if (!built) return 'conflict';
 		const { result, members } = built;
+		// A PR whose changes are all on the default branch already adds nothing: there is nothing to
+		// test or squash (GitHub refuses an empty squash), and a batch of only such PRs would point
+		// its branch at the default branch's own commit.
+		let tip = baseSha;
+		const empty: number[] = [];
+		for (const c of result.commits) {
+			if (c.sha === tip) empty.push(c.pr);
+			tip = c.sha;
+		}
+		if (empty.length) {
+			for (const n of empty) await this.eject(n, `#${n} has no changes left against ${this.d.repo.default_branch}`);
+			return 'conflict';
+		}
 		const branch = `mq/batch-${this.d.now()}`;
 		try {
 			await this.d.github.pushBranch(branch, result.headSha);
@@ -650,7 +664,7 @@ class Tick {
 					run.ci_result = res;
 				}
 				if (res === 'pending' && this.timedOut(run)) {
-					await this.d.github.deleteBranch(run.branch).catch(() => {});
+					await this.retire(batch);
 					store.setBatchStatus(batch.id, 'failed');
 					this.requeue(batch.members);
 					this.pause(`Bisection run ${run.branch} got no CI result in time`);
@@ -674,7 +688,10 @@ class Tick {
 
 		for (const r of runs) await this.d.github.deleteBranch(r.branch).catch(() => {});
 		await this.ejectWithStack(step.eject.map((e) => ({ pr: e.pr, reason: `${e.reason} (batch ${batch.id})` })));
-		await this.requeueAfterFailure(step.requeue, batch.id);
+		// A PR the bisection never got to test apart from the failure isn't counted against it.
+		const tested = new Set(runs.flatMap((r) => r.members));
+		this.requeue(step.requeue.filter((n) => !tested.has(n)));
+		await this.requeueAfterFailure(step.requeue.filter((n) => tested.has(n)), batch.id);
 		let landed = false;
 		if (step.land.length) {
 			const proof = runs.find(
@@ -795,7 +812,7 @@ class Tick {
 		// between steps) goes back in line rather than waiting forever.
 		const carried = new Set(store.getActiveBatches(this.repoId).flatMap((b) => b.members));
 		for (const it of this.items()) {
-			if (it.status === 'checking' && !carried.has(it.pr_number)) {
+			if ((it.status === 'checking' || it.status === 'updating' || it.status === 'merging') && !carried.has(it.pr_number)) {
 				db.updateQueueItemStatus(it.id, 'queued');
 				it.status = 'queued';
 			}
@@ -889,11 +906,19 @@ class Tick {
 
 	async plan(active: BatchRow[], masterSha: string): Promise<'started' | 'conflict' | 'error' | 'idle'> {
 		const settings = this.settings();
-		const live = new Set(this.items().map((i) => i.pr_number));
+		// A deferred PR waits while a PR it conflicts with is in a batch or about to be. One that is
+		// held back (unapproved, deferred itself, in conflict: it then has a reason or another
+		// status) must not hold it forever, so it is planned again.
+		const carried = new Set(active.flatMap((b) => b.members));
+		const blocking = new Set(
+			this.items()
+				.filter((i) => carried.has(i.pr_number) || (i.status === 'queued' && !i.error_message))
+				.map((i) => i.pr_number)
+		);
 		const waiting = this.items().filter((i) => {
 			if (i.status !== 'queued') return false;
 			const behind = store.deferredFor(i as QueueItem & { deferred_for?: string | null });
-			if (behind.some((b) => live.has(b))) return false;
+			if (behind.some((b) => blocking.has(b))) return false;
 			if (behind.length) store.setDeferredFor(i.id, null);
 			return true;
 		});
@@ -926,7 +951,8 @@ class Tick {
 
 export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	const t = new Tick(deps);
-	if (store.getQueueSettings(deps.repo.id).pausedReason) return;
+	const settings = store.getQueueSettings(deps.repo.id);
+	if (settings.pausedReason || settings.mode !== 'batch') return;
 	await t.reconcile();
 	await t.advanceTries();
 

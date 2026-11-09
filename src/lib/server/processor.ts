@@ -6,6 +6,7 @@ import { getQueueSettings } from './batch-store';
 import { tickBatchQueue } from './batch-queue';
 import { liveDeps } from './batch-live';
 import { takeDirty } from './wake';
+import { withRepoLock } from './repo-lock';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -65,7 +66,7 @@ async function recordOpenPRHeads(repo: RepoRef) {
 // once a minute, or sooner when a webhook says something changed.
 const BATCH_TICK_MS = 60_000;
 /** Even a webhook can't make it tick more often than this; a burst of events becomes one tick. */
-const MIN_BATCH_TICK_MS = 10_000;
+const MIN_BATCH_TICK_MS = 30_000;
 const lastBatchTick = new Map<number, number>();
 
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
@@ -78,7 +79,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		takeDirty(repo.id);
 		lastBatchTick.set(repo.id, Date.now());
 		try {
-			await tickBatchQueue(liveDeps(repo));
+			await withRepoLock(repo.id, () => tickBatchQueue(liveDeps(repo)));
 		} catch (err) {
 			// Transient GitHub or git errors: the next cycle picks up where this one stopped.
 			console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
