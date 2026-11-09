@@ -2,7 +2,9 @@ import { env } from '$env/dynamic/private';
 import * as db from './db';
 import * as github from './github';
 import { closedPRReason, stackMergeBlocker } from './stack-runtime';
-import { getQueueSettings } from './batch-store';
+import { getQueueSettings, updateQueueSettings } from './batch-store';
+import { GitHubError } from './github-retry';
+import { emitEvent } from './events';
 import { tickBatchQueue } from './batch-queue';
 import { liveDeps } from './batch-live';
 import { takeDirty } from './wake';
@@ -71,6 +73,11 @@ const lastBatchTick = new Map<number, number>();
 /** A tick slower than this is logged, so a slow GitHub or git shows up in the logs. */
 const SLOW_TICK_MS = 5_000;
 
+/** A 403 GitHub answers when the App was not granted a permission the call needs. */
+export function missingPermission(err: unknown): err is GitHubError {
+	return err instanceof GitHubError && err.status === 403 && /not accessible by integration/i.test(err.message);
+}
+
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	await recordOpenPRHeads(repo);
 
@@ -84,6 +91,14 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		try {
 			await withRepoLock(repo.id, () => tickBatchQueue(liveDeps(repo)));
 		} catch (err) {
+			if (missingPermission(err)) {
+				// Retrying can't fix it; say so once, where the dashboard shows it, instead of every tick.
+				const reason = `The GitHub App lacks a permission (${err.message}). Grant it in the App's settings, approve it on this account's installation, then resume.`;
+				updateQueueSettings(repo.id, { pausedReason: reason });
+				emitEvent(repo.id, null, 'paused', { reason });
+				console.error(`[merge-queue] Paused ${repo.owner}/${repo.name}: ${reason}`);
+				return;
+			}
 			// Transient GitHub or git errors: the next cycle picks up where this one stopped.
 			console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
 		} finally {

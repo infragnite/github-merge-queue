@@ -865,8 +865,9 @@ class Tick {
 			}
 			if (r === 'failure' && rerun === 'none') {
 				// A failure on a default branch that may be broken itself blames nobody yet; on a red
-				// one, nobody at all.
-				if (!this.masterSettled(head.base_tree)) return;
+				// one, nobody at all. A branch being verified after a landing already passed as that
+				// batch's tree, so bisection starts at once; only its verdict waits for the branch.
+				if (this.masterState(head.base_tree) === 'checking') return;
 				if (this.masterState(head.base_tree) === 'red') {
 					await this.supersede(rest);
 					await this.failedOnRed(head);
@@ -952,6 +953,12 @@ class Tick {
 
 		// The default branch may be what fails: decide nothing, and count nothing, until it's known.
 		if (!this.masterSettled(batch.base_tree)) return;
+		if (this.masterState(batch.base_tree) === 'red') {
+			// It turned red while bisecting: the failure is nobody's.
+			for (const r of runs) await this.retire(r);
+			await this.failedOnRed(batch);
+			return;
+		}
 		for (const r of runs) await this.d.github.deleteBranch(r.branch).catch(this.bestEffort('github.deleteBranch'));
 		await this.ejectWithStack(step.eject.map((e) => ({ pr: e.pr, reason: `${e.reason} (batch ${batch.id})` })));
 		// A PR the bisection never got to test apart from the failure isn't counted against it.

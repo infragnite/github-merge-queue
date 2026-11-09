@@ -27,7 +27,10 @@ async function ghFetch(token: string, path: string, init?: RequestInit) {
 	if (res.status === 204) return null;
 	const body = await res.json().catch(() => ({}));
 	if (!res.ok) {
-		throw new GitHubError(res.status, body.message || `GitHub API ${res.status}: ${path}`, body);
+		// A missing App permission names only the symptom; the call says which permission it is.
+		const missingPermission = res.status === 403 && /not accessible by integration/i.test(body.message ?? '');
+		const message = missingPermission ? `${body.message}: ${init?.method ?? 'GET'} ${path.split('?')[0]}` : body.message;
+		throw new GitHubError(res.status, message || `GitHub API ${res.status}: ${path}`, body);
 	}
 	return body;
 }
