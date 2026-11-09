@@ -9,6 +9,8 @@ import {
 	updateQueueItemStatus
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
+import { currentStackAnalysis } from '$lib/server/stack-runtime';
+import { stackView, type StackView } from '$lib/server/stack-view';
 import type { PageServerLoad, Actions } from './$types';
 
 export const load: PageServerLoad = async ({ params, locals }) => {
@@ -32,6 +34,16 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		// GitHub API error — user sees empty PR list
 	}
 
+	// Streamed: the page renders while the analysis (a call per changed PR) finishes.
+	const prMeta = new Map(openPrs.map((pr) => [pr.number, { title: pr.title, url: pr.html_url }]));
+	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
+	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = currentStackAnalysis(repo)
+		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
+		.catch((e) => {
+			console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
+			return { stacks: [], error: 'Stack analysis failed; it is retried on the next refresh.' };
+		});
+
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
 	const availablePrs = openPrs
 		.filter((pr) => !queuedNumbers.has(pr.number))
@@ -48,6 +60,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		repo,
 		queueItems,
 		openPrs: availablePrs,
+		stacks,
 		history: getRepoHistory(repo.id)
 	};
 };

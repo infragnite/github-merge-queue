@@ -8,7 +8,7 @@ import * as github from './github';
 import { baselineCommit, buildBatch, GitRunner } from './batch-builder';
 import { replay } from './rebase';
 import { getQueueSettings, type CISettings } from './batch-store';
-import { analyzeRepoStacks } from './stack-runtime';
+import { currentStackAnalysis } from './stack-runtime';
 import { bumpGeneration, memoByGeneration } from './wake';
 import type { LivePR, QueueDeps, Readiness } from './batch-queue';
 import type { GhReview } from './github';
@@ -137,9 +137,8 @@ export class Mirror {
 	}
 }
 
-// Stack analysis and reviews cost a call per open PR; webhooks bump the repo's generation when
-// PRs change, and the queue's own merges and pushes do too.
-const analysisMemo = memoByGeneration<Awaited<ReturnType<typeof analyzeRepoStacks>>>(5 * 60 * 1000);
+// Reviews cost a call per open PR; webhooks bump the repo's generation when PRs change, and the
+// queue's own merges and pushes do too.
 const reviewsMemo = memoByGeneration<GhReview[]>(10 * 60 * 1000);
 
 const ROLE_TTL_MS = 10 * 60 * 1000;
@@ -164,7 +163,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 	return {
 		repo,
 		now: () => Date.now(),
-		analysis: () => analysisMemo(repo.id, 'stacks', () => analyzeRepoStacks(repo)),
+		analysis: () => currentStackAnalysis(repo),
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
