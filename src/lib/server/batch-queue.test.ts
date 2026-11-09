@@ -295,6 +295,28 @@ describe('batch queue runtime', () => {
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('landed');
 	});
 
+	test('a PR pushed to while its half is tested leaves the bisection and is tested again as it is now', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.includes(1);
+		for (let i = 0; i < 30 && !world.started.some((x) => x.prs.join() === '1,2'); i++) await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change', 'pr1-late.txt');
+		world.hold = () => false;
+		await run(60);
+		// The tested half can't land as tested: #1 and #2 go back in line, the bisection goes on without
+		// them (it doesn't take them back), and they land later from a batch of their own.
+		expect([...world.merged].sort()).toEqual([1, 2, 3]);
+		expect(world.files('main').has('pr1-late.txt')).toBe(true);
+		expect(world.comments.map((c) => c.pr)).toEqual([4]);
+		expect(queued()).toEqual([]);
+		const first = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
+		expect(first).toMatchObject({ status: 'landed', landed: [3], left_prs: expect.arrayContaining([1, 2, 4]) });
+	});
+
 	test('a batch that failed by flake ejects nobody: its halves pass and land', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
@@ -863,6 +885,25 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([]);
 	});
 
+	test('a landing that stops part way keeps what it merged as known green, and the rest lands without a recheck of the default branch', async () => {
+		pr(1);
+		pr(2);
+		world.refuseMerge.add(2);
+		await run();
+		expect(world.merged).toEqual([1]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #2/);
+		const h = store.getMasterHealth(repo.id)!;
+		expect(h.state).toBe('green');
+		expect(h.sha).toBe(git.sha('main'));
+		world.refuseMerge.delete(2);
+		store.updateQueueSettings(repo.id, { pausedReason: null });
+		const before = world.started.length;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		// one batch of #2 on the new default branch, no check of the default branch alone
+		expect(world.started.slice(before).map((x) => x.prs)).toEqual([[2]]);
+	});
+
 	test('a superseded batch has its CI cancelled', async () => {
 		pr(1);
 		await tickBatchQueue(world.deps());
@@ -967,6 +1008,8 @@ describe('surviving a crash at any step', () => {
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr4.txt']);
 		expect(queued()).toEqual([]);
 		expect(db.getRepoHistory(repo.id).filter((h) => h.status === 'failed').map((h) => h.pr_number)).toEqual([3]);
+		// Each PR is recorded once, however often the queue was restarted on the way.
+		expect(db.getRepoHistory(repo.id).map((h) => h.pr_number).sort()).toEqual([1, 2, 3, 4]);
 		expect(store.getActiveBatches(repo.id)).toEqual([]);
 		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
 		// No queue branch is left behind, and no unmerged PR carries the queue's green status.

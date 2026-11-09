@@ -15,8 +15,8 @@
 	let stacks = $state<Loaded<typeof data.stacks> | null>(null);
 	$effect(() => {
 		let current = true;
-		data.pipeline.then((v) => current && (pipe = v));
-		data.stacks.then((v) => current && (stacks = v));
+		data.pipeline.then((v) => current && (pipe = v)).catch(() => {});
+		data.stacks.then((v) => current && (stacks = v)).catch(() => {});
 		return () => {
 			current = false;
 		};
@@ -116,15 +116,16 @@
 		handleDragEnd();
 	}
 
-	function confirmMode(e: SubmitEvent) {
-		const to = (e.submitter as HTMLButtonElement | null)?.value;
-		if (!to || to === data.mode) return;
+	// Asked in the enhance callback: `use:enhance` submits regardless of a prevented submit event.
+	const confirmMode: import('@sveltejs/kit').SubmitFunction = ({ submitter, cancel }) => {
+		const to = (submitter as HTMLButtonElement | null)?.value;
+		if (!to || to === data.mode) return cancel();
 		const text =
 			to === 'serial'
 				? 'Switch to one by one? Batches being tested now are stopped and their PRs go back in line; PRs then merge one at a time in the order shown.'
 				: 'Switch to batches? PRs are then tested together, urgent first and then oldest, and the order can no longer be dragged.';
-		if (!confirm(text)) e.preventDefault();
-	}
+		if (!confirm(text)) cancel();
+	};
 </script>
 
 <svelte:head>
@@ -156,7 +157,7 @@
 			</div>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
-			<form method="POST" action="?/setMode" use:enhance onsubmit={confirmMode} class="flex overflow-hidden rounded-lg border border-border-subtle text-sm" aria-label="Merge mode">
+			<form method="POST" action="?/setMode" use:enhance={confirmMode} class="flex overflow-hidden rounded-lg border border-border-subtle text-sm" aria-label="Merge mode">
 				{#each [['serial', 'One by one'], ['batch', 'Batches']] as [value, label] (value)}
 					<button
 						type="submit"

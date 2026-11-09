@@ -429,8 +429,14 @@ export function planBisection(input: {
 	remaining: number[];
 	masterTree: string;
 	parentOf: (n: number) => number | null;
+	/**
+	 * Default-branch trees known green, on which a PR failing alone is its own fault: the current
+	 * one once settled, the batch's own base, trees this bisection landed. By default only the current.
+	 */
+	trusted?: (tree: string) => boolean;
 }): BisectPlan {
 	const { runs, masterTree, parentOf } = input;
+	const trusted = input.trusted ?? ((t: string) => t === masterTree);
 	const left = new Set(input.remaining);
 	const order = input.remaining;
 	const inOrder = (s: Set<number>) => order.filter((n) => s.has(n));
@@ -486,8 +492,9 @@ export function planBisection(input: {
 		const g = inOrder(f.set);
 		for (const n of g) suspects.add(n);
 		if (g.length === 1) {
-			// Eject only on a run of this PR alone (on top of its passing context, if any).
-			const alone = runs.findIndex((r) => r.result === 'failure' && same(r.members, g));
+			// Eject only on a run of this PR alone (on top of its passing context, if any), on a branch
+			// known green; on any other, it runs alone again on the current one.
+			const alone = runs.findIndex((r) => r.result === 'failure' && same(r.members, g) && trusted(r.baseTree));
 			if (alone >= 0) {
 				const ctx = runs[alone].context;
 				eject.push({
