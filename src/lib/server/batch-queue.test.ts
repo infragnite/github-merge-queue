@@ -691,6 +691,17 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 2]);
 	});
 
+	test('on a red default branch a fixing parent is tried without its breaking child', async () => {
+		redMain();
+		fixPR(1);
+		pr(2, { from: 'pr1', base: 'pr1', file: 'y-breaks.txt' });
+		world.breakingFiles.add('y-breaks.txt');
+		store.setQueuePriority(repo.id, 2, 'urgent');
+		await run();
+		expect(world.merged[0]).toBe(1);
+		expect(store.getMasterHealth(repo.id)?.state).not.toBe('red');
+	});
+
 	test('on a red default branch a fix deep in a stack is reached', async () => {
 		store.updateQueueSettings(repo.id, { config: { maxBatch: 2 } });
 		redMain();

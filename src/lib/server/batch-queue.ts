@@ -1179,14 +1179,17 @@ class Tick {
 		const analysis = await this.analysis();
 		let plan: Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express' | 'held'>;
 		if (red) {
-			if (active.length >= settings.config.depth) return 'idle';
+			// Siblings go only beside siblings: a stacked pipeline still in flight (built before the
+			// branch turned red) is decided first.
+			if (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha)) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
 			plan = planRedBatch({
 				queue,
 				states,
 				analysis,
 				config: settings.config,
-				tried: (n, alone) => tried.has(`${n}@${states.get(n)!.headSha}${alone ? '!' : ''}`)
+				tried: (n, alone) => tried.has(`${n}@${states.get(n)!.headSha}${alone ? '!' : ''}`),
+				live: new Set(this.items().map((i) => i.pr_number))
 			});
 		} else {
 			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: active.map((b) => b.members), config: settings.config });
