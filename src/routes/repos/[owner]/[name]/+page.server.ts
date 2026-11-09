@@ -9,6 +9,7 @@ import {
 	updateQueueItemStatus
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
+import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
 import { currentStackAnalysis } from '$lib/server/stack-runtime';
 import { stackView, type StackView } from '$lib/server/stack-view';
 import type { PageServerLoad, Actions } from './$types';
@@ -35,7 +36,9 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	}
 
 	// Streamed: the page renders while the analysis (a call per changed PR) finishes.
-	const prMeta = new Map(openPrs.map((pr) => [pr.number, { title: pr.title, url: pr.html_url }]));
+	// Queue items keep a title even when GitHub can't be reached; open PRs have the current one.
+	const prMeta = new Map(queueItems.map((i) => [i.pr_number, { title: i.pr_title, url: i.pr_url }]));
+	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: pr.html_url });
 	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
 	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = currentStackAnalysis(repo)
 		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
@@ -43,6 +46,11 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 			console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
 			return { stacks: [], error: 'Stack analysis failed; it is retried on the next refresh.' };
 		});
+
+	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta).catch((e) => {
+		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, e instanceof Error ? e.message : e);
+		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: 'Loading batches failed; it is retried on the next refresh.' };
+	});
 
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
 	const availablePrs = openPrs
@@ -61,6 +69,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		queueItems,
 		openPrs: availablePrs,
 		stacks,
+		pipeline,
 		history: getRepoHistory(repo.id)
 	};
 };

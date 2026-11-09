@@ -3,6 +3,7 @@
 	import { invalidateAll } from '$app/navigation';
 	import QueueItem from '$lib/components/QueueItem.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
+	import BatchCard from '$lib/components/BatchCard.svelte';
 
 	let { data } = $props();
 	let showAddDialog = $state(false);
@@ -117,6 +118,42 @@
 			</button>
 		</div>
 	</div>
+
+	<!-- Batches -->
+	{#await data.pipeline then pipe}
+		{#if pipe.mode === 'batch' || pipe.active.length > 0 || pipe.recent.length > 0}
+			<div class="space-y-3">
+				<div class="flex flex-wrap items-center gap-2">
+					<h2 class="text-lg font-semibold text-gray-900">Batches</h2>
+					{#if pipe.master}
+						<span class="rounded px-1.5 py-0.5 text-xs {pipe.master.state === 'red' ? 'bg-red-100 text-red-800' : pipe.master.state === 'green' ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'}">
+							{data.repo.default_branch} {pipe.master.state} at {pipe.master.sha.slice(0, 7)}
+						</span>
+					{/if}
+				</div>
+				{#if pipe.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
+				{#if pipe.paused}
+					<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">Paused: {pipe.paused}</p>
+				{/if}
+				{#if pipe.active.length === 0}
+					<p class="text-sm text-gray-500">No batch is running.</p>
+				{/if}
+				{#each pipe.active as batch (batch.id)}
+					<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} />
+				{/each}
+				{#if pipe.recent.length > 0}
+					<details class="rounded-xl border border-border-subtle bg-surface-raised p-3">
+						<summary class="cursor-pointer text-sm font-medium text-gray-700">Recent batches ({pipe.recent.length})</summary>
+						<div class="mt-3 space-y-2">
+							{#each pipe.recent as batch (batch.id)}
+								<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} nested />
+							{/each}
+						</div>
+					</details>
+				{/if}
+			</div>
+		{/if}
+	{/await}
 
 	<!-- Queue -->
 	{#if data.queueItems.length === 0}
