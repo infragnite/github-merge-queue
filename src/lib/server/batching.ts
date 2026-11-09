@@ -560,6 +560,8 @@ export function planRedBatch(input: {
 	analysis: StackAnalysis;
 	config: BatchConfig;
 	tried: (n: number, alone: boolean) => boolean;
+	/** Every PR still in the queue, also those being tested in another batch. */
+	live?: Set<number>;
 }): Pick<Plan, 'batch' | 'express' | 'held'> {
 	const { queue, states, analysis, config, tried } = input;
 	const held: Plan['held'] = [];
@@ -569,10 +571,11 @@ export function planRedBatch(input: {
 		if (a.ok) ok.set(e.pr, e);
 		else held.push({ pr: e.pr, admission: a });
 	}
-	const queued = new Set(queue.map((e) => e.pr));
+	const queued = input.live ?? new Set(queue.map((e) => e.pr));
 	const chainOf = (n: number): number[] | null => {
 		const out = [n];
 		for (let p = openParent(analysis, n); p !== null; p = openParent(analysis, p)) {
+			if (out.includes(p)) return null; // a cycle in the analysis: never loop
 			if (!ok.has(p)) {
 				held.push({
 					pr: n,
@@ -612,6 +615,12 @@ export function planRedBatch(input: {
 		return { batch, express: false, held };
 	}
 	cands = chains(true);
-	if (cands.length) return { batch: cands[0].chain, express: cands[0].tip.priority === 'urgent', held };
+	if (cands.length) {
+		// The lowest PR of the stack not yet tried alone goes first, with only what's under it:
+		// a fixing parent must not be tried only together with a breaking child.
+		const { chain, tip } = cands[0];
+		const batch = chain.slice(0, chain.findIndex((n) => !tried(n, true)) + 1);
+		return { batch, express: tip.priority === 'urgent', held };
+	}
 	return { batch: null, express: false, held };
 }
