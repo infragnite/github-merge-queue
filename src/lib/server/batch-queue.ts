@@ -23,11 +23,11 @@ import {
 	Bisection,
 	descendants,
 	planNextBatch,
+	planRedBatch,
 	type PRState,
 	type Priority,
 	type QueueEntry,
-	type TestGroup,
-	type BatchConfig
+	type TestGroup
 } from './batching';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
@@ -1177,36 +1177,19 @@ class Tick {
 		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
 		const red = this.masterState(await this.d.git.tree(masterSha)) === 'red';
 		const analysis = await this.analysis();
-		const planWith = (entries: QueueEntry[], config: BatchConfig, inflight: number[][]) =>
-			planNextBatch({ now: this.d.now(), queue: entries, states, analysis, inflight, config });
-		let plan: ReturnType<typeof planNextBatch>;
+		let plan: Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express' | 'held'>;
 		if (red) {
 			if (active.length >= settings.config.depth) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
-			const key = (n: number) => `${n}@${states.get(n)!.headSha}`;
-			const byPr = new Map(queue.map((e) => [e.pr, e]));
-			// An untried PR brings its queued ancestors along, tried or not: a child is never tested without them.
-			const withAncestors = (keep: (e: QueueEntry) => boolean) => {
-				const out = new Set<number>();
-				for (const e of queue) {
-					if (!keep(e)) continue;
-					out.add(e.pr);
-					for (let p = analysis.prs.get(e.pr)?.parent ?? null; p !== null && byPr.has(p); p = analysis.prs.get(p)?.parent ?? null) out.add(p);
-				}
-				return queue.filter((e) => out.has(e.pr));
-			};
-			// Siblings on the same base: nothing is in flight beneath them.
-			const base = { ...settings.config, depth: settings.config.depth + active.length, collectWindowMs: 0 };
-			// A batch must try something new, or the tries never run out.
-			const fresh = (p: typeof plan, mark: string) =>
-				p.batch?.some((n) => !tried.has(`${key(n)}${mark}`)) ? p : { ...p, batch: null };
-			plan = fresh(planWith(withAncestors((e) => !tried.has(key(e.pr))), base, []), '');
-			if (!plan.batch) {
-				const alone = queue.filter((e) => !tried.has(`${key(e.pr)}!`));
-				plan = fresh(planWith(alone, { ...base, maxBatch: 1, expressMax: 1 }, []), '!');
-			}
+			plan = planRedBatch({
+				queue,
+				states,
+				analysis,
+				config: settings.config,
+				tried: (n, alone) => tried.has(`${n}@${states.get(n)!.headSha}${alone ? '!' : ''}`)
+			});
 		} else {
-			plan = planWith(queue, settings.config, active.map((b) => b.members));
+			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: active.map((b) => b.members), config: settings.config });
 		}
 		for (const h of plan.held) {
 			const it = this.item(h.pr);
@@ -1240,6 +1223,13 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	if (active.length && (await t.advanceRed(active))) {
 		active = store.getActiveBatches(deps.repo.id);
 	} else if (active.length) {
+		// Batches side by side on a branch that is no longer red (it was vouched for) aren't a
+		// pipeline: keep the head, rebuild the rest on top of it.
+		const loose = active.findIndex((b, i) => i > 0 && b.base_sha !== active[i - 1].head_sha);
+		if (loose > 0) {
+			await t.supersede(active.slice(loose));
+			active = active.slice(0, loose);
+		}
 		await t.advanceHead(active[0], active.slice(1));
 		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 		active = store.getActiveBatches(deps.repo.id);
