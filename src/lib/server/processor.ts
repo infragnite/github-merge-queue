@@ -30,13 +30,27 @@ export function stopProcessor() {
 	}
 }
 
+/**
+ * On shutdown: start no new cycle and let the running one finish (within `timeoutMs`). Not needed
+ * for correctness, since the queue picks up after a kill at any point, but it saves redoing work.
+ */
+export async function drainProcessor(timeoutMs = 25_000): Promise<void> {
+	stopProcessor();
+	stopping = true;
+	const deadline = Date.now() + timeoutMs;
+	while (running && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+	console.log(`[merge-queue] Processor stopped${running ? ' (a cycle was still running)' : ''}`);
+}
+let stopping = false;
+
 async function processAll() {
-	if (running) return;
+	if (running || stopping) return;
 	running = true;
 
 	try {
 		const repos = db.getRepos();
 		for (const repo of repos) {
+			if (stopping) break;
 			await processRepo(repo);
 		}
 	} catch (err) {
