@@ -180,6 +180,8 @@ export function queueState(repo: Repo) {
 		asOf: new Date().toISOString(),
 		mode: s.mode,
 		paused: s.pausedReason,
+		/** The default branch as the queue knows it; 'red' holds the queue until a new commit passes. */
+		defaultBranch: store.getMasterHealth(repo.id),
 		inFlight: store.getActiveBatches(repo.id).map(batchSummary),
 		waiting
 	};
@@ -305,6 +307,8 @@ export function pause(repo: Repo, caller: Caller, reason: unknown) {
 export function resume(repo: Repo, caller: Caller) {
 	requireRole(caller, 'maintain', 'Resuming the queue');
 	store.updateQueueSettings(repo.id, { pausedReason: null });
+	// A default branch the queue holds for as red is checked again (say, after a flaky outage).
+	if (store.getMasterHealth(repo.id)?.state === 'red') store.clearMasterHealth(repo.id);
 	emitEvent(repo.id, null, 'resumed', { by: caller.login });
 	return getConfig(repo);
 }

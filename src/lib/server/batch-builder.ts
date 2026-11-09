@@ -96,6 +96,23 @@ export function squashMessage(m: BatchMember): string {
  */
 export const BASE_TRAILER = 'Merge-Queue-Base';
 
+/**
+ * A commit with `baseSha`'s own tree on top of it, so CI can test the default branch alone on a
+ * queue branch (its trailer names the base, like a batch's).
+ */
+export function baselineCommit(git: GitRunner, baseSha: string): string {
+	const tree = git.run(['rev-parse', `${baseSha}^{tree}`]).out;
+	return git.run(['commit-tree', tree, '-p', baseSha, '-F', '-'], {
+		input: `Merge queue: ${baseSha.slice(0, 12)} alone\n\n${BASE_TRAILER}: ${baseSha}\n`,
+		env: {
+			GIT_AUTHOR_NAME: 'merge-queue',
+			GIT_AUTHOR_EMAIL: 'merge-queue@users.noreply.github.com',
+			GIT_COMMITTER_NAME: 'merge-queue',
+			GIT_COMMITTER_EMAIL: 'merge-queue@users.noreply.github.com'
+		}
+	}).out;
+}
+
 /** Applies `members` in order on top of `baseSha`. Stops at the first PR that conflicts. */
 export function buildBatch(
 	git: GitRunner,
