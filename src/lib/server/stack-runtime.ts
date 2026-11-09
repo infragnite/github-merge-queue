@@ -4,6 +4,7 @@ import * as db from './db';
 import * as github from './github';
 import { loadStackInput } from './stack-source';
 import { analyzeStacks, detectAutoClose, mergeBlocker, type StackAnalysis } from './stacks';
+import { memoByGeneration } from './wake';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -13,6 +14,15 @@ export async function analyzeRepoStacks(repo: RepoRef): Promise<StackAnalysis> {
 		cacheKey: `${repo.owner}/${repo.name}`
 	});
 	return analyzeStacks(input);
+}
+
+// Analysis costs a call per open PR; webhooks bump the repo's generation when PRs change,
+// and the queue's own merges and pushes do too.
+const analysisMemo = memoByGeneration<StackAnalysis>(5 * 60 * 1000);
+
+/** The repo's stack analysis, reused until a PR changes or five minutes pass. */
+export function currentStackAnalysis(repo: RepoRef): Promise<StackAnalysis> {
+	return analysisMemo(repo.id, 'stacks', () => analyzeRepoStacks(repo));
 }
 
 /** Why the queue must not merge this PR yet, or null. */

@@ -145,6 +145,43 @@
 		</div>
 	{/if}
 
+	<!-- Stacks -->
+	<div>
+		<h2 class="mb-3 text-lg font-semibold text-gray-900">Stacks</h2>
+		{#await data.stacks}
+			<p class="text-sm text-gray-500">Detecting stacks…</p>
+		{:then result}
+			{#if result.error}
+				<p class="text-sm text-red-600">{result.error}</p>
+			{:else if result.stacks.length === 0}
+				<p class="text-sm text-gray-500">No open PR sits on another open PR.</p>
+			{:else}
+				<div class="space-y-3">
+					{#each result.stacks as stack (stack.root)}
+						<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised">
+							{#each stack.rows as row (row.pr)}
+								<div class="border-b border-border-subtle px-4 py-2 text-sm last:border-b-0" style="padding-left: {1 + row.depth * 1.5}rem">
+									<div class="flex flex-wrap items-center gap-2">
+										{#if row.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
+										<a href={row.url || `https://github.com/${data.repo.owner}/${data.repo.name}/pull/${row.pr}`} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{row.pr}</a>
+										<span class="min-w-0 truncate text-gray-600">{row.title}</span>
+										{#if row.link && row.link !== 'healthy'}
+											<span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">{row.link}</span>
+										{/if}
+										{#if row.queue}<StatusBadge status={row.queue} />{/if}
+									</div>
+									{#each row.issues as issue, i (i)}
+										<p class="mt-1 text-xs {issue.severity === 'blocking' ? 'text-red-600' : 'text-amber-700'}">{issue.message}</p>
+									{/each}
+								</div>
+							{/each}
+						</div>
+					{/each}
+				</div>
+			{/if}
+		{/await}
+	</div>
+
 	<!-- History -->
 	{#if data.history.length > 0}
 		<div>
