@@ -4,7 +4,7 @@ process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
 const { tickBatchQueue, startTry, retireBatches } = await import('./batch-queue');
-const { buildBatch, GitRunner } = await import('./batch-builder');
+const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
 import { GitSandbox } from './testing/git-sandbox';
@@ -50,7 +50,10 @@ class World {
 		return new Set(git.git('ls-tree', '-r', '--name-only', sha).split('\n'));
 	}
 
+	everythingFails = false;
+
 	ciFails(sha: string) {
+		if (this.everythingFails) return true;
 		const f = this.files(sha);
 		if ([...this.breakingFiles].some((b) => f.has(b))) return true;
 		return this.conflictPairs.some((pair) => pair.every((p) => f.has(p)));
@@ -68,7 +71,8 @@ class World {
 				fetch: async () => {},
 				tree: async (sha) => git.git('rev-parse', `${sha}^{tree}`),
 				build: async (base, members) => buildBatch(runner, base, members),
-				restack: async (head, upstream, onto) => replay(runner, { head, upstream, onto })
+				restack: async (head, upstream, onto) => replay(runner, { head, upstream, onto }),
+				baseline: async (base) => baselineCommit(runner, base)
 			},
 			ci: {
 				start: async (branch, _base, head, prs) => {
@@ -174,6 +178,8 @@ beforeEach(() => {
 	db.addRepo('acme', name, 'main', user);
 	repo = { ...db.getRepoByOwnerName('acme', name)!, default_branch: 'main' };
 	store.updateQueueSettings(repo.id, { mode: 'batch', config: { collectWindowMs: 0, depth: 1 } });
+	// The queue starts from a default branch it knows is green (tests of a broken one set their own).
+	store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
 });
 
 afterEach(() => git?.cleanup());
@@ -455,8 +461,9 @@ describe('batch queue runtime', () => {
 		await tickBatchQueue(world.deps());
 		git.commit('main', 'hotfix pushed by hand');
 		await run();
-		expect(world.started).toHaveLength(2);
-		expect(store.getRecentBatches(repo.id).map((b) => b.status).sort()).toEqual(['landed', 'superseded']);
+		// the batch, a check of the new master alone (it came from outside the queue), the rebuilt batch
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [], [1, 2]]);
+		expect(store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').map((b) => b.status).sort()).toEqual(['landed', 'superseded']);
 		expect(world.merged).toEqual([1, 2]);
 	});
 
@@ -514,6 +521,7 @@ describe('batch queue runtime', () => {
 		world.approved.add(1);
 		git.git('checkout', '-q', 'main');
 		git.git('cherry-pick', 'pr1');
+		store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
 		db.addToQueue(repo.id, 1, 'PR 1', 'u', 'dev', '', 'dev');
 		await run(3);
 		expect(world.started).toEqual([]);
@@ -556,6 +564,47 @@ describe('batch queue runtime', () => {
 		expect(world.reruns.get(world.started[0].head)).toBe(1);
 		expect(world.started).toHaveLength(1);
 		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('a broken default branch holds the queue and ejects nobody, then resumes once fixed', async () => {
+		pr(1);
+		pr(2);
+		// someone pushes a broken commit to main outside the queue
+		git.commit('main', 'broken by hand', 'x-breaks-master.txt');
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run();
+		expect(world.started.map((x) => x.prs)).toEqual([[]]);
+		expect(store.getMasterHealth(repo.id)?.state).toBe('red');
+		expect(world.comments).toEqual([]);
+		expect(queued()).toEqual([
+			{ pr: 1, status: 'queued' },
+			{ pr: 2, status: 'queued' }
+		]);
+		// fixed on main: a new check passes and the PRs land
+		git.git('checkout', '-q', 'main');
+		git.git('rm', '-q', 'x-breaks-master.txt');
+		git.git('commit', '-qm', 'fix main');
+		await run();
+		expect(world.started.map((x) => x.prs)).toEqual([[], [], [1, 2]]);
+		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('a default-branch run failing after a landing stops the batch on top of it without blaming it', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 1, depth: 2 } });
+		pr(1);
+		pr(2);
+		await tickBatchQueue(world.deps()); // batches #1 and #2 (on top of #1)
+		for (let i = 0; i < 5 && world.merged.length === 0; i++) await tickBatchQueue(world.deps());
+		// #1 landed; the default-branch run started
+		expect(world.merged).toEqual([1]);
+		expect(store.getMasterHealth(repo.id)?.state).toBe('verifying');
+		// the environment broke: everything fails from now on, main included
+		world.everythingFails = true;
+		await run(10);
+		expect(store.getMasterHealth(repo.id)?.state).toBe('red');
+		expect(world.comments).toEqual([]);
+		expect(queued()).toEqual([{ pr: 2, status: 'queued' }]);
+		expect(world.cancelled).toContain(world.started[1].head);
 	});
 
 	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {

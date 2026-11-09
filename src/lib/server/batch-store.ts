@@ -26,7 +26,7 @@ export interface BatchRow {
 	id: number;
 	repo_id: number;
 	/** A batch in the pipeline, a bisection run of one, or a one-off `try` run of a single PR. */
-	kind: 'batch' | 'bisect' | 'try';
+	kind: 'batch' | 'bisect' | 'try' | 'baseline';
 	parent_batch_id: number | null;
 	branch: string;
 	base_sha: string;
@@ -144,6 +144,19 @@ export function migrateBatches(database: Database.Database) {
 			created_at TEXT DEFAULT (datetime('now'))
 		);
 		CREATE INDEX IF NOT EXISTS queue_events_repo ON queue_events(repo_id, id);
+
+		-- The last default-branch commit the queue knows the state of. 'green': its tree passed CI
+		-- (a batch the queue landed, or a baseline run). 'verifying': green by tree, while the
+		-- default-branch run started after landing it hasn't finished. 'checking': a baseline run of
+		-- it alone is going (it moved outside the queue). 'red': it fails on its own.
+		CREATE TABLE IF NOT EXISTS master_health (
+			repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+			sha TEXT NOT NULL,
+			tree TEXT NOT NULL,
+			state TEXT NOT NULL,
+			since INTEGER NOT NULL,
+			retried INTEGER NOT NULL DEFAULT 0
+		);
 	`);
 	const batchCols = database.prepare(`PRAGMA table_info(batches)`).all() as Array<{ name: string }>;
 	for (const [name, ddl] of [
@@ -382,4 +395,46 @@ export function getRunningTries(repoId: number): BatchRow[] {
 			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status = 'testing' ORDER BY id`)
 			.all(repoId) as RawBatch[]
 	).map(parse);
+}
+
+// --- default-branch health ---
+
+export type MasterState = 'green' | 'verifying' | 'checking' | 'red';
+
+export interface MasterHealth {
+	sha: string;
+	tree: string;
+	state: MasterState;
+	/** When this state began (epoch ms). */
+	since: number;
+	/** Whether a failed run of this state was re-run already. */
+	retried: boolean;
+}
+
+export function getMasterHealth(repoId: number): MasterHealth | null {
+	const r = getDb().prepare('SELECT sha, tree, state, since, retried FROM master_health WHERE repo_id = ?').get(repoId) as
+		| (Omit<MasterHealth, 'retried'> & { retried: number })
+		| undefined;
+	return r ? { ...r, retried: !!r.retried } : null;
+}
+
+export function setMasterHealth(repoId: number, h: { sha: string; tree: string; state: MasterState; since: number; retried?: boolean }) {
+	getDb()
+		.prepare(
+			`INSERT INTO master_health (repo_id, sha, tree, state, since, retried) VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(repo_id) DO UPDATE SET sha = excluded.sha, tree = excluded.tree, state = excluded.state,
+			   since = excluded.since, retried = excluded.retried`
+		)
+		.run(repoId, h.sha, h.tree, h.state, h.since, h.retried ? 1 : 0);
+}
+
+export function clearMasterHealth(repoId: number) {
+	getDb().prepare('DELETE FROM master_health WHERE repo_id = ?').run(repoId);
+}
+
+export function getRunningBaseline(repoId: number): BatchRow | null {
+	const r = getDb()
+		.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'baseline' AND status = 'testing' ORDER BY id DESC LIMIT 1`)
+		.get(repoId) as RawBatch | undefined;
+	return r ? parse(r) : null;
 }

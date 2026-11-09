@@ -5,7 +5,7 @@ import { env } from '$env/dynamic/private';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as github from './github';
-import { buildBatch, GitRunner } from './batch-builder';
+import { baselineCommit, buildBatch, GitRunner } from './batch-builder';
 import { replay } from './rebase';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { analyzeRepoStacks } from './stack-runtime';
@@ -153,7 +153,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			fetch: (shas) => mirror.fetch(shas),
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
 			build: async (base, members) => buildBatch(mirror.git, base, members),
-			restack: async (head, upstream, onto) => replay(mirror.git, { head, upstream, onto })
+			restack: async (head, upstream, onto) => replay(mirror.git, { head, upstream, onto }),
+			baseline: async (base) => baselineCommit(mirror.git, base)
 		},
 		ci: {
 			// Pushing the mq/* branch triggers the workflow; the base is in the batch commit's trailer.
