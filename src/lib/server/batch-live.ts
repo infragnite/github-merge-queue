@@ -185,6 +185,11 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			},
 			// Re-runs the workflow runs behind the required check's failed (or cancelled, timed-out) runs,
 			// not whatever else failed on the commit.
+			runUrl: async (headSha) => {
+				const runs = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
+				// A failed job's page shows the failure; otherwise any of the check's jobs.
+				return (runs.find((r) => r.conclusion && r.conclusion !== 'success') ?? runs[0])?.html_url ?? null;
+			},
 			rerunFailed: async (headSha) => {
 				const checks = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
 				const suites = new Set(

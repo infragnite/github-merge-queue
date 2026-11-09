@@ -31,7 +31,7 @@ class World {
 	comments: { pr: number; body: string }[] = [];
 	merged: number[] = [];
 	ciPendingOnce = new Set<string>();
-	prStatuses: { sha: string; state: string; description: string; context: string }[] = [];
+	prStatuses: { sha: string; state: string; description: string; context: string; url?: string }[] = [];
 	labels = new Map<number, Set<string>>();
 	pushedHeads: { branch: string; sha: string }[] = [];
 	changesRequested = new Set<number>();
@@ -92,6 +92,7 @@ class World {
 				refreshCaches: async () => {
 					this.cacheRefreshes++;
 				},
+				runUrl: async (head) => `https://ci.example/${head}`,
 				rerunFailed: async (head) => {
 					if (this.rerunWaits > 0) {
 						this.rerunWaits--;
@@ -135,7 +136,7 @@ class World {
 					this.pushedHeads.push({ branch, sha });
 				},
 				setPRStatus: async (sha, state, description, opts) => {
-					this.prStatuses.push({ sha, state, description, context: `merge-queue${opts?.suffix ?? ''}` });
+					this.prStatuses.push({ sha, state, description, context: `merge-queue${opts?.suffix ?? ''}`, ...(opts?.url ? { url: opts.url } : {}) });
 				},
 				label: async (n, name, on) => {
 					const set = this.labels.get(n) ?? new Set();
@@ -263,6 +264,23 @@ describe('batch queue runtime', () => {
 		// the survivors land on the bisection's own proof run, not a fresh batch
 		expect(store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch')).toHaveLength(1);
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('landed');
+	});
+
+	test('each status on a PR links to the run behind it, and says when its batch is bisected', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(60);
+		const of = (ref: string) => world.prStatuses.filter((x) => x.sha === git.sha(ref) && x.context === 'merge-queue');
+		const branch = world.started[0].branch;
+		expect(of('pr2').map((x) => [x.state, x.description.split(';')[0].split(':')[0], x.url])).toEqual([
+			['pending', `Testing in ${branch} with 1 other PR(s)`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`],
+			['pending', `${branch} failed`, `https://ci.example/${world.started[0].head}`],
+			['failure', 'Left the queue', expect.stringMatching(/^https:\/\/ci\.example\//)]
+		]);
+		expect(of('pr1').at(-1)).toMatchObject({ state: 'success', url: expect.stringMatching(/^https:\/\/ci\.example\//) });
+		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/\n\nCI run: https:\/\/ci\.example\//) }]);
 	});
 
 	test('finds two PRs that only break together and ejects the later one', async () => {
