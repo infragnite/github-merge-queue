@@ -577,7 +577,7 @@ export function planRedBatch(input: {
 		for (let p = openParent(analysis, n); p !== null; p = openParent(analysis, p)) {
 			if (out.includes(p)) return null; // a cycle in the analysis: never loop
 			if (!ok.has(p)) {
-				held.push({
+				if (!held.some((h) => h.pr === n)) held.push({
 					pr: n,
 					admission: {
 						ok: false,
