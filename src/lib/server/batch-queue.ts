@@ -338,7 +338,8 @@ class Tick {
 	/** Stops a batch's CI (deleting a branch doesn't) and deletes its branch, and its bisection runs'. */
 	async retire(b: BatchRow) {
 		for (const r of [b, ...(b.kind === 'batch' ? store.getBisectRuns(b.id) : [])]) {
-			if (r.ci_result === 'pending' || r.status === 'retrying') await this.d.ci.cancel(r.head_sha).catch(this.bestEffort('ci.cancel'));
+			// A cancelled run never started CI, so there is nothing of its own to stop.
+			if (r.status !== 'cancelled' && (r.ci_result === 'pending' || r.status === 'retrying')) await this.d.ci.cancel(r.head_sha).catch(this.bestEffort('ci.cancel'));
 			await this.d.github.deleteBranch(r.branch).catch(this.bestEffort('github.deleteBranch'));
 		}
 	}
@@ -573,7 +574,14 @@ class Tick {
 		const merged: number[] = [];
 		for (const n of intent.prs) {
 			// A GitHub error here is transient: the intent stays, and the next tick tries again.
-			const p = await this.pr(n, true);
+			let p: LivePR;
+			try {
+				p = await this.pr(n, true);
+			} catch (e) {
+				// A deleted PR can't be settled; anything else is transient and the intent stays for the next tick.
+				if ((e as { status?: number })?.status === 404) continue;
+				throw e;
+			}
 			if (p.merged) {
 				merged.push(n);
 				const it = this.item(n);
@@ -1067,6 +1075,19 @@ class Tick {
 		// A PR that left the queue (or the batch) meanwhile is just gone from it.
 		const gone = batch.members.filter((n) => !landed.has(n) && !left.has(n) && this.item(n)?.status !== 'checking');
 		if (gone.length) store.leaveBatch(batch.id, gone);
+		// A PR its author pushed to (or closed) since the batch was built: what bisection would test
+		// is stale, and evidence against it is not evidence against the new head. It goes back in line.
+		const changed: number[] = [];
+		for (const n of remaining) {
+			const p = await this.pr(n, true);
+			if (p.state !== 'open' || p.headSha !== batch.heads[n]) changed.push(n);
+		}
+		if (changed.length) {
+			this.log(`batch ${batch.id}: ${changed.map((n) => `#${n}`).join(' ')} changed since it was batched; back in line`);
+			store.leaveBatch(batch.id, changed);
+			this.requeue(changed);
+			remaining.splice(0, remaining.length, ...remaining.filter((n) => !changed.includes(n)));
+		}
 		// A run that never started (its push failed, or its PRs did not build on the new branch) shows nothing.
 		const all = [batch, ...runs.filter((r) => r.status !== 'cancelled')];
 		const plan = planBisection({
@@ -1145,32 +1166,31 @@ class Tick {
 			if (m.parentHeadSha && parent !== null && batch.heads[parent]) m.parentHeadSha = batch.heads[parent];
 		}
 		const r = await this.d.git.build(baseSha, members);
+		if (!r.ok) {
+			// They don't apply on the default branch as it is now (something landed meanwhile): not a
+			// CI failure, and no run; they go back in line, where a conflict is handled the usual way.
+			store.leaveBatch(batch.id, g.members);
+			this.requeue(g.members);
+			this.log(`batch ${batch.id}: ${g.members.map((n) => `#${n}`).join(' ')} no longer build on the default branch; back in line`);
+			return;
+		}
 		const branch = `${batch.branch}-bisect-${seq + 1}-${this.d.now()}`;
 		const steps: Record<number, BatchStep> = {};
-		if (r.ok) for (const c of r.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork };
+		for (const c of r.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork };
 		const run = store.insertBatch({
 			repoId: this.repoId,
 			kind: 'bisect',
 			parentBatchId: batch.id,
 			branch,
 			baseSha,
-			headSha: r.ok ? r.headSha : baseSha,
-			treeSha: r.ok ? r.tree : '',
+			headSha: r.headSha,
+			treeSha: r.tree,
 			baseTree,
 			members: g.members,
 			context: g.context,
 			heads: batch.heads,
 			steps
 		});
-		if (!r.ok) {
-			// They don't apply on the default branch as it is now (something landed meanwhile): not a
-			// CI failure; they go back in line, where a conflict is handled the usual way.
-			store.setBatchStatus(run.id, 'cancelled');
-			store.leaveBatch(batch.id, g.members);
-			this.requeue(g.members);
-			this.log(`batch ${batch.id}: ${g.members.map((n) => `#${n}`).join(' ')} no longer build on the default branch; back in line`);
-			return;
-		}
 		store.intendBranch(this.repoId, branch, r.headSha);
 		try {
 			await this.d.github.pushBranch(branch, r.headSha);
