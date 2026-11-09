@@ -7,6 +7,7 @@ import {
 	GitHubError
 } from './github-retry';
 import type { StackGitHub } from './stack-source';
+import { Installations, ownerOfPath } from './installations';
 
 const API = 'https://api.github.com';
 
@@ -33,11 +34,6 @@ async function ghFetch(token: string, path: string, init?: RequestInit) {
 
 // --- JWT and Installation Token ---
 
-// Cache for the GitHub App installation token. The 401 retry in
-// `ghFetchAsApp` / `withTokenRefreshOn401` is load-bearing — see comment
-// on `withTokenRefreshOn401` in ./github-retry.ts.
-let cachedInstallationToken: { token: string; expiresAt: number } | null = null;
-
 function createJWT(): string {
 	const appId = env.GITHUB_APP_ID;
 	const privateKey = env.GITHUB_APP_PRIVATE_KEY;
@@ -56,37 +52,39 @@ function createJWT(): string {
 	return `${header}.${payload}.${signature}`;
 }
 
-export async function getInstallationToken(): Promise<string> {
-	if (cachedInstallationToken && cachedInstallationToken.expiresAt > Date.now() + 60_000) {
-		return cachedInstallationToken.token;
-	}
+// Installation tokens, one per account the App is installed on. The 401 retry in
+// `ghFetchAsApp` / `withTokenRefreshOn401` is load-bearing — see comment
+// on `withTokenRefreshOn401` in ./github-retry.ts.
+const installations = new Installations({
+	async listInstallations() {
+		const out = [];
+		for (let page = 1; page <= 10; page++) {
+			const batch = await ghFetch(createJWT(), `/app/installations?per_page=100&page=${page}`);
+			out.push(...batch);
+			if (batch.length < 100) break;
+		}
+		return out;
+	},
+	createToken: (id) => ghFetch(createJWT(), `/app/installations/${id}/access_tokens`, { method: 'POST' })
+});
 
-	const jwt = createJWT();
-	const installationId = env.GITHUB_INSTALLATION_ID;
-	if (!installationId) throw new Error('GITHUB_INSTALLATION_ID required');
-
-	const res = await fetch(`${API}/app/installations/${installationId}/access_tokens`, {
-		method: 'POST',
-		headers: { ...headers(jwt) }
-	});
-	if (!res.ok) throw new Error(`Failed to create installation token: ${res.status}`);
-
-	const data = await res.json();
-	cachedInstallationToken = {
-		token: data.token,
-		expiresAt: new Date(data.expires_at).getTime()
-	};
-	return data.token;
+/** A token of the installation on `owner`, the account whose repositories it acts on. */
+export async function getInstallationToken(owner: string): Promise<string> {
+	return installations.token(await installations.idFor(owner));
 }
 
-async function ghFetchAsApp(path: string, init?: RequestInit) {
+async function withInstallation<T>(installationId: number, call: (token: string) => Promise<T>): Promise<T> {
 	return withTokenRefreshOn401(
-		getInstallationToken,
-		() => {
-			cachedInstallationToken = null;
-		},
-		(token) => ghFetch(token, path, init)
+		() => installations.token(installationId),
+		() => installations.forget(installationId),
+		call
 	);
+}
+
+/** Calls `path` as the installation on the account it acts on; a path that names none passes `owner`. */
+async function ghFetchAsApp(path: string, init?: RequestInit, owner: string | null = ownerOfPath(path)) {
+	if (!owner) throw new Error(`No account to pick an installation token for: ${path}`);
+	return withInstallation(await installations.idFor(owner), (token) => ghFetch(token, path, init));
 }
 
 // --- User-token operations (login flow only, token is discarded after) ---
@@ -110,14 +108,23 @@ export async function checkOrgMembership(username: string, org: string): Promise
 
 // --- Installation-token operations (all repo operations) ---
 
+/** Every repository of every account the App is installed on. */
 export async function listInstallationRepos(): Promise<
 	Array<{ full_name: string; default_branch: string }>
 > {
-	const data = await ghFetchAsApp('/installation/repositories?per_page=100');
-	return data.repositories.map((r: { full_name: string; default_branch: string }) => ({
-		full_name: r.full_name,
-		default_branch: r.default_branch
-	}));
+	const out: Array<{ full_name: string; default_branch: string }> = [];
+	for (const id of await installations.ids()) {
+		for (let page = 1; page <= 10; page++) {
+			const data = await withInstallation(id, (token) =>
+				ghFetch(token, `/installation/repositories?per_page=100&page=${page}`)
+			);
+			for (const r of data.repositories as Array<{ full_name: string; default_branch: string }>) {
+				out.push({ full_name: r.full_name, default_branch: r.default_branch });
+			}
+			if (data.repositories.length < 100) break;
+		}
+	}
+	return out.sort((a, b) => a.full_name.localeCompare(b.full_name));
 }
 
 export async function getRepo(owner: string, repo: string) {
@@ -260,8 +267,8 @@ export function stackClient(owner: string, repo: string): StackGitHub {
 
 // --- Batch queue ---
 
-export async function getInstallationTokenForGit(): Promise<string> {
-	return getInstallationToken();
+export async function getInstallationTokenForGit(owner: string): Promise<string> {
+	return getInstallationToken(owner);
 }
 
 export interface GhReview {
@@ -307,24 +314,28 @@ export async function setPRBase(owner: string, repo: string, n: number, base: st
 export async function squashMergeAt(owner: string, repo: string, n: number, title: string, sha: string) {
 	try {
 		const pr = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}`);
-		const data = await ghFetchAsApp('/graphql', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				query: `mutation($input: MergePullRequestInput!) {
-					mergePullRequest(input: $input) { pullRequest { merged mergeCommit { oid } } }
-				}`,
-				variables: {
-					input: {
-						pullRequestId: pr.node_id,
-						mergeMethod: 'SQUASH',
-						commitHeadline: title,
-						commitBody: '',
-						expectedHeadOid: sha
+		const data = await ghFetchAsApp(
+			'/graphql',
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					query: `mutation($input: MergePullRequestInput!) {
+						mergePullRequest(input: $input) { pullRequest { merged mergeCommit { oid } } }
+					}`,
+					variables: {
+						input: {
+							pullRequestId: pr.node_id,
+							mergeMethod: 'SQUASH',
+							commitHeadline: title,
+							commitBody: '',
+							expectedHeadOid: sha
+						}
 					}
-				}
-			})
-		});
+				})
+			},
+			owner
+		);
 		if (data.errors?.length) return { merged: false, sha: null, message: data.errors.map((e: { message: string }) => e.message).join('; ') };
 		const r = data.data?.mergePullRequest?.pullRequest;
 		return mergeResultFromData({ merged: !!r?.merged, sha: r?.mergeCommit?.oid });
