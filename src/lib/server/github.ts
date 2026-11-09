@@ -387,6 +387,12 @@ export async function checkRunsNamed(owner: string, repo: string, sha: string, n
 	}>;
 }
 
+/** Every Actions job on a commit (latest attempt), for showing a batch's progress. */
+export async function actionsJobsForSha(owner: string, repo: string, sha: string) {
+	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/commits/${sha}/check-runs?filter=latest&app_id=${ACTIONS_APP_ID}&per_page=100`);
+	return data.check_runs as Array<{ name: string; status: string; conclusion: string | null; html_url: string }>;
+}
+
 export async function workflowRunsForSha(owner: string, repo: string, sha: string) {
 	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=20`);
 	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string; check_suite_id: number }>;
