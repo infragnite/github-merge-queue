@@ -133,7 +133,10 @@
 				</div>
 				{#if pipe.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
 				{#if pipe.paused}
-					<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">Paused: {pipe.paused}</p>
+					<form method="POST" action="?/resume" use:enhance class="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+						<span class="min-w-0 flex-1">Paused: {pipe.paused}</span>
+						<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>
+					</form>
 				{/if}
 				{#if pipe.active.length === 0}
 					<p class="text-sm text-gray-500">No batch is running.</p>

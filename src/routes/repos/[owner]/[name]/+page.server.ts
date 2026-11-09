@@ -10,6 +10,9 @@ import {
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
 import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
+import { getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
+import { emitEvent } from '$lib/server/events';
+import { markDirty } from '$lib/server/wake';
 import { currentStackAnalysis } from '$lib/server/stack-runtime';
 import { stackView, type StackView } from '$lib/server/stack-view';
 import type { PageServerLoad, Actions } from './$types';
@@ -75,6 +78,20 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 };
 
 export const actions: Actions = {
+	/** Lifts a pause of the batch queue; it acts on the next processor cycle. */
+	resume: async ({ params, locals }) => {
+		if (!locals.user) return fail(401);
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+		const was = getQueueSettings(repo.id).pausedReason;
+		if (was === null) return { success: true };
+		updateQueueSettings(repo.id, { pausedReason: null });
+		emitEvent(repo.id, null, 'resumed', { by: locals.user.login });
+		markDirty(repo.id);
+		console.log(`[merge-queue] ${repo.owner}/${repo.name} resumed by ${locals.user.login} (was paused: ${was})`);
+		return { success: true };
+	},
+
 	addToQueue: async ({ request, params, locals }) => {
 		if (!locals.user) return fail(401);
 
