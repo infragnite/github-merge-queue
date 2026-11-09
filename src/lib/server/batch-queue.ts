@@ -571,11 +571,12 @@ class Tick {
 		return m;
 	}
 
+	/** Starts a default-branch CI run after a landing (`masterRun`), at most every `masterRunMinGapMs`. */
 	async maybeRefreshCaches() {
-		const every = this.settings().config.cacheRefreshMs;
-		if (!every) return;
-		const last = lastCacheRefresh.get(this.repoId) ?? 0;
-		if (this.d.now() - last < every) return;
+		const { masterRun, masterRunMinGapMs } = this.settings().config;
+		if (!masterRun) return;
+		const last = lastCacheRefresh.get(this.repoId);
+		if (last !== undefined && this.d.now() - last < masterRunMinGapMs) return;
 		lastCacheRefresh.set(this.repoId, this.d.now());
 		await this.d.ci.refreshCaches().catch((e) => this.log(`cache refresh failed: ${e instanceof Error ? e.message : e}`));
 	}
