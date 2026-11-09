@@ -85,7 +85,7 @@ export class Mirror {
 
 	/** The token goes in through the environment, never the command line (which errors and `ps` show). */
 	private async auth(): Promise<NodeJS.ProcessEnv> {
-		const token = await github.getInstallationTokenForGit();
+		const token = await github.getInstallationTokenForGit(this.repo.owner);
 		const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
 		return {
 			GIT_CONFIG_COUNT: '1',
