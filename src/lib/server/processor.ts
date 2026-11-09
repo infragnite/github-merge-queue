@@ -2,6 +2,11 @@ import { env } from '$env/dynamic/private';
 import * as db from './db';
 import * as github from './github';
 import { closedPRReason, stackMergeBlocker } from './stack-runtime';
+import { getQueueSettings } from './batch-store';
+import { tickBatchQueue } from './batch-queue';
+import { liveDeps } from './batch-live';
+import { takeDirty } from './wake';
+import { withRepoLock } from './repo-lock';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -51,13 +56,36 @@ async function recordOpenPRHeads(repo: RepoRef) {
 	try {
 		const prs: Array<{ number: number; head: { sha: string } }> = await github.getOpenPRs(repo.owner, repo.name);
 		db.stackStore(repo.id).recordHeads(prs.map((p) => ({ pr: p.number, sha: p.head.sha })));
+		db.prunePRHeads(repo.id, prs.map((p) => p.number));
 	} catch (err) {
 		console.error(`[merge-queue] Head polling failed for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
 	}
 }
 
+// A batch tick costs several GitHub calls per queued PR, so it runs at most
+// once a minute, or sooner when a webhook says something changed.
+const BATCH_TICK_MS = 60_000;
+/** Even a webhook can't make it tick more often than this; a burst of events becomes one tick. */
+const MIN_BATCH_TICK_MS = 30_000;
+const lastBatchTick = new Map<number, number>();
+
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	await recordOpenPRHeads(repo);
+
+	if (getQueueSettings(repo.id).mode === 'batch') {
+		const last = lastBatchTick.get(repo.id) ?? 0;
+		const since = Date.now() - last;
+		if (since < MIN_BATCH_TICK_MS || (since < BATCH_TICK_MS && !takeDirty(repo.id))) return;
+		takeDirty(repo.id);
+		lastBatchTick.set(repo.id, Date.now());
+		try {
+			await withRepoLock(repo.id, () => tickBatchQueue(liveDeps(repo)));
+		} catch (err) {
+			// Transient GitHub or git errors: the next cycle picks up where this one stopped.
+			console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
+		}
+		return;
+	}
 
 	// Reconcile ALL queued items (not just head) to detect externally merged/closed PRs
 	const allItems = db.getQueueItems(repo.id);
@@ -149,7 +177,16 @@ async function reconcilePR(
 
 async function handleQueued(
 	repo: RepoRef,
-	item: { id: number; pr_number: number; pr_title: string; pr_url: string; author_login: string; head_sha: string | null; created_at: string }
+	item: {
+		id: number;
+		pr_number: number;
+		pr_title: string;
+		pr_url: string;
+		author_login: string;
+		head_sha: string | null;
+		created_at: string;
+		error_message?: string | null;
+	}
 ) {
 	console.log(`[merge-queue] Processing ${repo.owner}/${repo.name}#${item.pr_number}`);
 	const pr = await github.getPR(repo.owner, repo.name, item.pr_number);
@@ -157,10 +194,21 @@ async function handleQueued(
 	if (await reconcilePR(pr, repo, item)) return;
 
 	// GitHub's base field can't be trusted for stacks, so check ancestry:
-	// a PR sitting on an unmerged or rewritten PR must not be merged.
-	const stackBlocker = await stackMergeBlocker(repo, item.pr_number);
+	// a PR sitting on an unmerged or rewritten PR must not be merged yet. It
+	// stays queued but moves to the back, so the PRs behind it go first; a
+	// failed check (rate limit, GitHub hiccup) is retried next cycle, never a failure.
+	let stackBlocker: string | null = null;
+	try {
+		stackBlocker = await stackMergeBlocker(repo, item.pr_number);
+	} catch (err) {
+		console.warn(`[merge-queue] Stack check for #${item.pr_number} failed, will retry: ${err instanceof Error ? err.message : err}`);
+		return;
+	}
 	if (stackBlocker) {
-		db.updateQueueItemStatus(item.id, 'failed', `Stacked PR: ${stackBlocker}`);
+		const msg = `Stacked PR: ${stackBlocker}`;
+		if (item.error_message !== msg) db.updateQueueItemStatus(item.id, 'queued', msg);
+		const order = db.getQueueItems(repo.id).map((i) => i.id);
+		if (order[order.length - 1] !== item.id) db.reorderQueue(repo.id, [...order.filter((id) => id !== item.id), item.id]);
 		return;
 	}
 

@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { env } from '$env/dynamic/private';
 import type { User, Repo, RepoWithStats, QueueItem, HistoryItem } from '$lib/types';
 import type { StackStore } from './stack-source';
+import { migrateBatches } from './batch-store';
 
 let db: Database.Database;
 
@@ -91,6 +92,7 @@ function migrate(database: Database.Database) {
 		);
 	`);
 
+	migrateBatches(database);
 }
 
 // --- Users ---
@@ -311,6 +313,16 @@ export function recordPRHead(repoId: number, prNumber: number, headSha: string) 
 	getDb()
 		.prepare('INSERT OR IGNORE INTO pr_heads (repo_id, pr_number, head_sha) VALUES (?, ?, ?)')
 		.run(repoId, prNumber, headSha);
+}
+
+/** Forgets heads of PRs that are no longer open and were last seen over 30 days ago. */
+export function prunePRHeads(repoId: number, openPRs: number[]) {
+	getDb()
+		.prepare(
+			`DELETE FROM pr_heads WHERE repo_id = ? AND seen_at < datetime('now', '-30 days')
+			 AND pr_number NOT IN (SELECT value FROM json_each(?))`
+		)
+		.run(repoId, JSON.stringify(openPRs));
 }
 
 export function getKnownPRHeads(repoId: number): Map<number, string[]> {
