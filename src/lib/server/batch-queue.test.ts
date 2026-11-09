@@ -665,8 +665,8 @@ describe('batch queue runtime', () => {
 		pr(2);
 		pr(3, { from: 'pr2', base: 'pr2' });
 		await run(40);
-		// in batches, then each stack on its own: #3 only ever with #2 under it
-		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [2, 3], [1], [2], [2, 3]]);
+		// in batches, then each stack on its own: #3 only ever with #2 under it ([2, 3] was its go alone)
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [2, 3], [1], [2]]);
 	});
 
 	/** A PR stacked on `from` that deletes main's breaking file. */

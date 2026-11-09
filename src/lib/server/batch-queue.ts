@@ -769,8 +769,18 @@ class Tick {
 		// had been tried already. Every failure adds a mark, so the tries run out.
 		const keys = batch.members.map((n) => `${n}@${batch.heads[n]}`);
 		const seen = new Set(h.tried);
+		// A batch that is one PR with only its queued ancestors is that PR's try alone too.
+		const parentOf = await this.parentOf();
+		const onlyAncestors = (n: number) =>
+			batch.members.every((m) => {
+				if (m === n) return true;
+				for (let p = parentOf(n); p !== null; p = parentOf(p)) if (p === m) return true;
+				return false;
+			});
+		const tip = batch.members.find(onlyAncestors);
 		const again = batch.members.length === 1 || keys.every((k) => seen.has(k));
-		const tried = [...new Set([...h.tried, ...keys, ...(again ? keys.map((k) => `${k}!`) : [])])];
+		const alone = again ? keys : tip !== undefined ? [`${tip}@${batch.heads[tip]}`] : [];
+		const tried = [...new Set([...h.tried, ...keys, ...alone.map((k) => `${k}!`)])];
 		store.setMasterHealth(this.repoId, { ...h, tried });
 		store.setBatchStatus(batch.id, 'failed');
 		await this.retire(batch);
@@ -795,6 +805,16 @@ class Tick {
 				if (!this.timedOut(b)) continue;
 				await this.d.ci.cancel(b.head_sha).catch(() => {});
 				r = 'failure';
+			}
+			if (r === 'failure' && b.status === 'testing') {
+				// A flake must not use up a fix's try: re-run once, as on a green branch.
+				const rerun = await this.retry(b.head_sha);
+				if (rerun === 'wait' && !this.timedOut(b)) continue;
+				if (rerun === 'rerun') {
+					store.setBatchStatus(b.id, 'retrying');
+					store.setBatchRetried(b.id, this.d.now());
+					continue;
+				}
 			}
 			store.setBatchCI(b.id, r);
 			if (r === 'failure') {
