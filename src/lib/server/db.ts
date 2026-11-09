@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { env } from '$env/dynamic/private';
 import type { User, Repo, RepoWithStats, QueueItem, HistoryItem } from '$lib/types';
 import type { StackStore } from './stack-source';
+import { migrateBatches } from './batch-store';
 
 let db: Database.Database;
 
@@ -91,6 +92,7 @@ function migrate(database: Database.Database) {
 		);
 	`);
 
+	migrateBatches(database);
 }
 
 // --- Users ---
