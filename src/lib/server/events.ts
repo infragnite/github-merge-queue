@@ -19,7 +19,9 @@ export type QueueEventKind =
 	| 'merged'
 	| 'tried'
 	| 'paused'
-	| 'resumed';
+	| 'resumed'
+	| 'mode'
+	| 'priority';
 
 export interface QueueEvent {
 	id: number;
