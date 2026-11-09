@@ -164,6 +164,11 @@ class Tick {
 		(this.d.log ?? ((m) => console.log(`[batch-queue] ${this.d.repo.owner}/${this.d.repo.name}: ${m}`)))(msg);
 	}
 
+	/** Catch handler for a call whose failure must not stop the tick; the failure is still logged. */
+	bestEffort(what: string) {
+		return (err: unknown) => this.log(`${what} failed (ignored): ${err instanceof Error ? err.message : err}`);
+	}
+
 	event(pr: number | null, kind: QueueEventKind, data: Record<string, unknown> = {}) {
 		try {
 			emitEvent(this.repoId, pr, kind, data);
@@ -247,13 +252,13 @@ class Tick {
 		const it = this.item(n);
 		if (!it) return;
 		const head = (await this.pr(n).catch(() => null))?.headSha ?? it.head_sha;
-		if (head) await this.d.github.setPRStatus(head, 'failure', short(`Left the queue: ${reason}`)).catch(() => {});
+		if (head) await this.d.github.setPRStatus(head, 'failure', short(`Left the queue: ${reason}`)).catch(this.bestEffort('github.setPRStatus'));
 		db.updateQueueItemStatus(it.id, 'failed', reason);
 		db.addToHistory(this.repoId, n, it.pr_title, it.pr_url, it.author_login, null, 'failed', reason, it.created_at);
 		db.removeFromQueue(it.id);
 		await this.d.github
 			.comment(n, `Removed from the merge queue: ${reason}${link ? `\n\nBatch: ${link}` : ''}`)
-			.catch(() => {});
+			.catch(this.bestEffort('github.comment'));
 		this.event(n, 'ejected', { reason });
 		this.log(`ejected #${n}: ${reason}`);
 	}
@@ -311,8 +316,8 @@ class Tick {
 	/** Stops a batch's CI (deleting a branch doesn't) and deletes its branch, and its bisection runs'. */
 	async retire(b: BatchRow) {
 		for (const r of [b, ...(b.kind === 'batch' ? store.getBisectRuns(b.id) : [])]) {
-			if (r.ci_result === 'pending' || r.status === 'retrying') await this.d.ci.cancel(r.head_sha).catch(() => {});
-			await this.d.github.deleteBranch(r.branch).catch(() => {});
+			if (r.ci_result === 'pending' || r.status === 'retrying') await this.d.ci.cancel(r.head_sha).catch(this.bestEffort('ci.cancel'));
+			await this.d.github.deleteBranch(r.branch).catch(this.bestEffort('github.deleteBranch'));
 		}
 	}
 
@@ -330,15 +335,15 @@ class Tick {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
 		}
-		await this.d.github.setPRStatus(p.headSha, 'failure', short(`Conflict: ${reason}`)).catch(() => {});
-		await this.d.github.label(n, CONFLICT_LABEL, true).catch(() => {});
+		await this.d.github.setPRStatus(p.headSha, 'failure', short(`Conflict: ${reason}`)).catch(this.bestEffort('github.setPRStatus'));
+		await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
 		const list = files.length ? `\n\nConflicting files:\n${files.slice(0, 20).map((f) => `- \`${f}\``).join('\n')}` : '';
 		await this.d.github
 			.comment(
 				n,
 				`The merge queue can't apply this PR: ${reason}.${list}\n\nTo fix it:\n\n\`\`\`sh\n${fix}\n# resolve the conflicts, then\ngit push --force-with-lease\n\`\`\`\n\nThe PR stays queued and is picked up again after the push.`
 			)
-			.catch(() => {});
+			.catch(this.bestEffort('github.comment'));
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
 	}
@@ -433,7 +438,7 @@ class Tick {
 			await this.d.ci.start(branch, baseSha, result.headSha, prs);
 		} catch (e) {
 			// A push or dispatch failure is a setup problem (permissions, workflow trigger): stop and say so.
-			await this.d.github.deleteBranch(branch).catch(() => {});
+			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			this.pause(`Could not start a batch of ${prs.map((n) => `#${n}`).join(' ')}: ${e instanceof Error ? e.message : e}`);
 			return 'error';
 		}
@@ -457,7 +462,7 @@ class Tick {
 			if (it) {
 				db.updateQueueItemStatus(it.id, 'checking');
 				this.event(n, 'batched', { batch: batch.id, branch, prs });
-				await this.d.github.setPRStatus(batch.heads[n], 'pending', short(`Testing in ${branch} with ${prs.length - 1} other PR(s)`)).catch(() => {});
+				await this.d.github.setPRStatus(batch.heads[n], 'pending', short(`Testing in ${branch} with ${prs.length - 1} other PR(s)`)).catch(this.bestEffort('github.setPRStatus'));
 			}
 		}
 		this.log(`batch ${batch.id} started: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
@@ -559,7 +564,7 @@ class Tick {
 				m = { merged: false, message: e instanceof Error ? e.message : String(e) };
 			}
 			if (!m.merged) {
-				await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (landing stopped)`)).catch(() => {});
+				await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (landing stopped)`)).catch(this.bestEffort('github.setPRStatus'));
 				this.pause(`Landing batch ${batch.id} stopped at #${n}: ${m.message ?? 'merge refused'}`);
 				return false;
 			}
@@ -687,7 +692,7 @@ class Tick {
 		if (run) {
 			store.setBatchCI(run.id, r);
 			store.setBatchStatus(run.id, r === 'success' ? 'landed' : 'failed');
-			await this.d.github.deleteBranch(run.branch).catch(() => {});
+			await this.d.github.deleteBranch(run.branch).catch(this.bestEffort('github.deleteBranch'));
 		}
 		if (r === 'success') {
 			store.setMasterHealth(this.repoId, { sha: h.sha, tree: h.tree, state: 'green', since: this.d.now() });
@@ -703,7 +708,7 @@ class Tick {
 		const why = `${this.d.repo.default_branch} ${sha.slice(0, 7)} fails CI on its own; the queue tries PRs on top of it until a batch passes`;
 		this.event(null, 'master-broken', { sha, reason: why });
 		this.log(why);
-		await this.d.github.setStatus(sha, 'failure', short('Fails on its own; the queue looks for a PR that fixes it')).catch(() => {});
+		await this.d.github.setStatus(sha, 'failure', short('Fails on its own; the queue looks for a PR that fixes it')).catch(this.bestEffort('github.setStatus'));
 	}
 
 	/**
@@ -725,7 +730,7 @@ class Tick {
 			await this.d.github.pushBranch(branch, head);
 			await this.d.ci.start(branch, masterSha, head, []);
 		} catch (e) {
-			await this.d.github.deleteBranch(branch).catch(() => {});
+			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			this.pause(`Could not start a check of ${this.d.repo.default_branch} alone: ${e instanceof Error ? e.message : e}`);
 			return;
 		}
@@ -803,7 +808,7 @@ class Tick {
 			let r = await this.d.ci.result(b.head_sha, b.retried_at);
 			if (r === 'pending') {
 				if (!this.timedOut(b)) continue;
-				await this.d.ci.cancel(b.head_sha).catch(() => {});
+				await this.d.ci.cancel(b.head_sha).catch(this.bestEffort('ci.cancel'));
 				r = 'failure';
 			}
 			if (r === 'failure' && b.status === 'testing') {
@@ -947,7 +952,7 @@ class Tick {
 
 		// The default branch may be what fails: decide nothing, and count nothing, until it's known.
 		if (!this.masterSettled(batch.base_tree)) return;
-		for (const r of runs) await this.d.github.deleteBranch(r.branch).catch(() => {});
+		for (const r of runs) await this.d.github.deleteBranch(r.branch).catch(this.bestEffort('github.deleteBranch'));
 		await this.ejectWithStack(step.eject.map((e) => ({ pr: e.pr, reason: `${e.reason} (batch ${batch.id})` })));
 		// A PR the bisection never got to test apart from the failure isn't counted against it.
 		const tested = new Set(runs.flatMap((r) => r.members));
@@ -963,7 +968,7 @@ class Tick {
 			else this.requeue(step.land);
 		}
 		store.setBatchStatus(batch.id, landed ? 'landed' : 'failed');
-		await this.d.github.deleteBranch(batch.branch).catch(() => {});
+		await this.d.github.deleteBranch(batch.branch).catch(this.bestEffort('github.deleteBranch'));
 	}
 
 	async startBisectRun(batch: BatchRow, g: TestGroup, seq: number) {
@@ -1029,7 +1034,7 @@ class Tick {
 		try {
 			await this.d.ci.start(branch, masterSha, r.headSha, [n]);
 		} catch (e) {
-			await this.d.github.deleteBranch(branch).catch(() => {});
+			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			throw e;
 		}
 		const run = store.insertBatch({
@@ -1043,7 +1048,7 @@ class Tick {
 			members: [n],
 			heads: { [n]: p.headSha }
 		});
-		await this.d.github.setPRStatus(p.headSha, 'pending', short(`Trying on ${this.d.repo.default_branch} in ${branch}`), { suffix: '/try' }).catch(() => {});
+		await this.d.github.setPRStatus(p.headSha, 'pending', short(`Trying on ${this.d.repo.default_branch} in ${branch}`), { suffix: '/try' }).catch(this.bestEffort('github.setPRStatus'));
 		this.event(n, 'tried', { status: 'started', branch, run: run.id });
 		return run;
 	}
@@ -1053,15 +1058,15 @@ class Tick {
 			let r = await this.d.ci.result(t.head_sha);
 			if (r === 'pending' && !this.timedOut(t)) continue;
 			if (r === 'pending') {
-				await this.d.ci.cancel(t.head_sha).catch(() => {});
+				await this.d.ci.cancel(t.head_sha).catch(this.bestEffort('ci.cancel'));
 				r = 'failure';
 			}
 			store.setBatchCI(t.id, r);
 			store.setBatchStatus(t.id, r === 'success' ? 'landed' : 'failed');
 			const n = t.members[0];
 			const desc = r === 'success' ? `Passed on ${this.d.repo.default_branch} in ${t.branch}` : `Failed on ${this.d.repo.default_branch} in ${t.branch}`;
-			await this.d.github.setPRStatus(t.heads[n], r, short(desc), { suffix: '/try' }).catch(() => {});
-			await this.d.github.deleteBranch(t.branch).catch(() => {});
+			await this.d.github.setPRStatus(t.heads[n], r, short(desc), { suffix: '/try' }).catch(this.bestEffort('github.setPRStatus'));
+			await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
 			this.event(n, 'tried', { status: r, branch: t.branch, run: t.id, headSha: t.heads[n] });
 		}
 	}
@@ -1091,7 +1096,7 @@ class Tick {
 			if (it.status === 'conflict' && it.head_sha !== p.headSha) {
 				// The author pushed a fix: try again.
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
-				await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(() => {});
+				await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
 				this.event(it.pr_number, 'requeued', { reason: 'pushed after a conflict', headSha: p.headSha });
 			}
 		}
@@ -1152,13 +1157,13 @@ class Tick {
 			}
 			store.recordRebasedHead(this.repoId, n, p.headSha, r.head, before.ciGreen);
 			db.updateQueueItemHeadSha(it.id, r.head);
-			if (merged && p.baseRef !== def) await this.d.github.retargetBase(n, def).catch(() => {});
+			if (merged && p.baseRef !== def) await this.d.github.retargetBase(n, def).catch(this.bestEffort('github.retargetBase'));
 			await this.d.github
 				.comment(
 					n,
 					`The merge queue restacked this PR onto ${ontoName} (${issue.message}). Its ${r.replayed} commit(s) applied without conflicts; approvals carry over.\n\nBefore pushing again, move any local commits onto it:\n\n\`\`\`sh\ngit fetch origin ${p.headRef} && git rebase --onto FETCH_HEAD ${p.headSha.slice(0, 12)}\n\`\`\``
 				)
-				.catch(() => {});
+				.catch(this.bestEffort('github.comment'));
 			this.event(n, 'rebased', { from: p.headSha, to: r.head, onto: ontoName, reason: issue.message });
 			this.log(`restacked #${n} onto ${ontoName}`);
 			pushed = true;

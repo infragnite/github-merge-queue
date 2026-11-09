@@ -14,7 +14,7 @@
 //
 // Needs git >= 2.40 (`merge-tree --write-tree --merge-base`).
 
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 
 export interface BatchMember {
 	pr: number;
@@ -78,6 +78,37 @@ export class GitRunner {
 			}
 			return { code: err.status ?? 1, out: (err.stdout ?? '').trim(), err: err.stderr ?? '' };
 		}
+	}
+
+	/**
+	 * Same as `run`, without blocking the event loop: for network git (fetch, push), which can
+	 * take minutes on a large repository and would otherwise freeze every request meanwhile.
+	 */
+	runAsync(
+		args: string[],
+		opts: { allowFail?: boolean; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}
+	): Promise<{ code: number; out: string; err?: string }> {
+		return new Promise((resolve, reject) => {
+			execFile(
+				'git',
+				args,
+				{
+					timeout: opts.timeoutMs ?? 2 * 60 * 1000,
+					killSignal: 'SIGKILL',
+					cwd: this.dir,
+					encoding: 'utf8',
+					env: { ...process.env, ...this.env, ...opts.env },
+					maxBuffer: 64 * 1024 * 1024
+				},
+				(e, stdout, stderr) => {
+					if (!e) return resolve({ code: 0, out: stdout.trim() });
+					const code = typeof e.code === 'number' ? e.code : 1;
+					const why = e.killed ? `killed after ${opts.timeoutMs ?? 120000} ms` : stderr || stdout || e.message;
+					if (!opts.allowFail) return reject(new Error(redact(`git ${args.join(' ')} failed: ${why}`)));
+					resolve({ code, out: stdout.trim(), err: stderr });
+				}
+			);
+		});
 	}
 }
 
