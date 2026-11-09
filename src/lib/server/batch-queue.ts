@@ -103,6 +103,8 @@ export interface QueueCI {
 	cancel(headSha: string): Promise<void>;
 	/** Re-runs only the failed jobs; false when there is nothing to re-run. */
 	rerunFailed(headSha: string): Promise<RerunResult>;
+	/** A link to the required check's run on `headSha` (a failed job first), once it exists. */
+	runUrl(headSha: string): Promise<string | null>;
 }
 
 export interface QueueGit {
@@ -232,6 +234,16 @@ class Tick {
 		return store.getQueueSettings(this.repoId);
 	}
 
+	/** The Actions runs of a queue branch; a link that works before the run exists and after the branch is deleted. */
+	branchRuns(branch: string): string {
+		return `https://github.com/${this.d.repo.owner}/${this.d.repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`;
+	}
+
+	/** The run that tested `run`'s commit, falling back to its branch's runs. */
+	async runLink(run: Pick<BatchRow, 'head_sha' | 'branch'>): Promise<string> {
+		return (await this.d.ci.runUrl(run.head_sha).catch(() => null)) ?? this.branchRuns(run.branch);
+	}
+
 	pause(reason: string) {
 		store.updateQueueSettings(this.repoId, { pausedReason: reason });
 		this.event(null, 'paused', { reason });
@@ -252,22 +264,26 @@ class Tick {
 		const it = this.item(n);
 		if (!it) return;
 		const head = (await this.pr(n).catch(() => null))?.headSha ?? it.head_sha;
-		if (head) await this.d.github.setPRStatus(head, 'failure', short(`Left the queue: ${reason}`)).catch(this.bestEffort('github.setPRStatus'));
+		if (head) {
+			await this.d.github
+				.setPRStatus(head, 'failure', short(`Left the queue: ${reason}`), link ? { url: link } : undefined)
+				.catch(this.bestEffort('github.setPRStatus'));
+		}
 		db.updateQueueItemStatus(it.id, 'failed', reason);
 		db.addToHistory(this.repoId, n, it.pr_title, it.pr_url, it.author_login, null, 'failed', reason, it.created_at);
 		db.removeFromQueue(it.id);
 		await this.d.github
-			.comment(n, `Removed from the merge queue: ${reason}${link ? `\n\nBatch: ${link}` : ''}`)
+			.comment(n, `Removed from the merge queue: ${reason}${link ? `\n\nCI run: ${link}` : ''}`)
 			.catch(this.bestEffort('github.comment'));
 		this.event(n, 'ejected', { reason });
 		this.log(`ejected #${n}: ${reason}`);
 	}
 
-	async ejectWithStack(culprits: { pr: number; reason: string }[]) {
+	async ejectWithStack(culprits: { pr: number; reason: string; link?: string }[]) {
 		const a = await this.analysis();
 		const done = new Set<number>();
 		for (const c of culprits) {
-			await this.eject(c.pr, c.reason);
+			await this.eject(c.pr, c.reason, c.link);
 			done.add(c.pr);
 		}
 		for (const n of descendants(a, done)) {
@@ -310,6 +326,12 @@ class Tick {
 			store.setBatchStatus(b.id, 'superseded');
 			this.requeue(b.members);
 			await this.retire(b);
+			for (const n of b.members) {
+				if (this.item(n)?.status !== 'queued') continue;
+				await this.d.github
+					.setPRStatus(b.heads[n], 'pending', short(`Back in line: ${b.branch} was dropped (a batch below it failed or master moved); it is rebuilt`))
+					.catch(this.bestEffort('github.setPRStatus'));
+			}
 		}
 	}
 
@@ -462,7 +484,9 @@ class Tick {
 			if (it) {
 				db.updateQueueItemStatus(it.id, 'checking');
 				this.event(n, 'batched', { batch: batch.id, branch, prs });
-				await this.d.github.setPRStatus(batch.heads[n], 'pending', short(`Testing in ${branch} with ${prs.length - 1} other PR(s)`)).catch(this.bestEffort('github.setPRStatus'));
+				await this.d.github
+					.setPRStatus(batch.heads[n], 'pending', short(`Testing in ${branch} with ${prs.length - 1} other PR(s)`), { url: this.branchRuns(branch) })
+					.catch(this.bestEffort('github.setPRStatus'));
 			}
 		}
 		this.log(`batch ${batch.id} started: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
@@ -558,7 +582,7 @@ class Tick {
 			// tested. Any outcome but a merge takes it back, so nobody can merge around the queue.
 			let m: { merged: boolean; sha?: string | null; message?: string };
 			try {
-				await this.d.github.setPRStatus(head, 'success', short(`Tested in ${batch.branch}`));
+				await this.d.github.setPRStatus(head, 'success', short(`Tested in ${src.branch}`), { url: await this.runLink(src) });
 				m = await this.mergeWithRetry(n, p.title, head);
 			} catch (e) {
 				m = { merged: false, message: e instanceof Error ? e.message : String(e) };
@@ -889,11 +913,17 @@ class Tick {
 				if (head.members.length === 1) {
 					store.setBatchStatus(head.id, 'failed');
 					await this.retire(head);
-					await this.ejectWithStack([{ pr: head.members[0], reason: `CI failed in ${head.branch}` }]);
+					await this.ejectWithStack([{ pr: head.members[0], reason: `CI failed in ${head.branch}`, link: await this.runLink(head) }]);
 					return;
 				}
 				store.setBatchStatus(head.id, 'bisecting');
 				head = { ...head, status: 'bisecting' };
+				const link = await this.runLink(head);
+				for (const n of head.members) {
+					await this.d.github
+						.setPRStatus(head.heads[n], 'pending', short(`${head.branch} failed; bisecting to find which PR breaks it`), { url: link })
+						.catch(this.bestEffort('github.setPRStatus'));
+				}
 			}
 		}
 		if (head.status === 'passed') {
@@ -960,7 +990,15 @@ class Tick {
 			return;
 		}
 		for (const r of runs) await this.d.github.deleteBranch(r.branch).catch(this.bestEffort('github.deleteBranch'));
-		await this.ejectWithStack(step.eject.map((e) => ({ pr: e.pr, reason: `${e.reason} (batch ${batch.id})` })));
+		const culprits = [];
+		for (const e of step.eject) {
+			// The smallest failed run with the PR in it shows its failure most directly.
+			const failed = runs
+				.filter((r) => r.ci_result === 'failure' && r.members.includes(e.pr))
+				.sort((a, b) => a.members.length + a.context.length - (b.members.length + b.context.length))[0];
+			culprits.push({ pr: e.pr, reason: `${e.reason} (batch ${batch.id})`, link: await this.runLink(failed ?? batch) });
+		}
+		await this.ejectWithStack(culprits);
 		// A PR the bisection never got to test apart from the failure isn't counted against it.
 		const tested = new Set(runs.flatMap((r) => r.members));
 		this.requeue(step.requeue.filter((n) => !tested.has(n)));
@@ -1055,7 +1093,9 @@ class Tick {
 			members: [n],
 			heads: { [n]: p.headSha }
 		});
-		await this.d.github.setPRStatus(p.headSha, 'pending', short(`Trying on ${this.d.repo.default_branch} in ${branch}`), { suffix: '/try' }).catch(this.bestEffort('github.setPRStatus'));
+		await this.d.github
+			.setPRStatus(p.headSha, 'pending', short(`Trying on ${this.d.repo.default_branch} in ${branch}`), { suffix: '/try', url: this.branchRuns(branch) })
+			.catch(this.bestEffort('github.setPRStatus'));
 		this.event(n, 'tried', { status: 'started', branch, run: run.id });
 		return run;
 	}
@@ -1072,7 +1112,7 @@ class Tick {
 			store.setBatchStatus(t.id, r === 'success' ? 'landed' : 'failed');
 			const n = t.members[0];
 			const desc = r === 'success' ? `Passed on ${this.d.repo.default_branch} in ${t.branch}` : `Failed on ${this.d.repo.default_branch} in ${t.branch}`;
-			await this.d.github.setPRStatus(t.heads[n], r, short(desc), { suffix: '/try' }).catch(this.bestEffort('github.setPRStatus'));
+			await this.d.github.setPRStatus(t.heads[n], r, short(desc), { suffix: '/try', url: await this.runLink(t) }).catch(this.bestEffort('github.setPRStatus'));
 			await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
 			this.event(n, 'tried', { status: r, branch: t.branch, run: t.id, headSha: t.heads[n] });
 		}
