@@ -9,6 +9,12 @@ import {
 	updateQueueItemStatus
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
+import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
+import { getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
+import { emitEvent } from '$lib/server/events';
+import { markDirty } from '$lib/server/wake';
+import { currentStackAnalysis } from '$lib/server/stack-runtime';
+import { stackView, type StackView } from '$lib/server/stack-view';
 import type { PageServerLoad, Actions } from './$types';
 
 export const load: PageServerLoad = async ({ params, locals }) => {
@@ -32,6 +38,23 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		// GitHub API error — user sees empty PR list
 	}
 
+	// Streamed: the page renders while the analysis (a call per changed PR) finishes.
+	// Queue items keep a title even when GitHub can't be reached; open PRs have the current one.
+	const prMeta = new Map(queueItems.map((i) => [i.pr_number, { title: i.pr_title, url: i.pr_url }]));
+	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: pr.html_url });
+	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
+	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = currentStackAnalysis(repo)
+		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
+		.catch((e) => {
+			console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
+			return { stacks: [], error: 'Stack analysis failed; it is retried on the next refresh.' };
+		});
+
+	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta).catch((e) => {
+		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, e instanceof Error ? e.message : e);
+		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: 'Loading batches failed; it is retried on the next refresh.' };
+	});
+
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
 	const availablePrs = openPrs
 		.filter((pr) => !queuedNumbers.has(pr.number))
@@ -48,11 +71,27 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		repo,
 		queueItems,
 		openPrs: availablePrs,
+		stacks,
+		pipeline,
 		history: getRepoHistory(repo.id)
 	};
 };
 
 export const actions: Actions = {
+	/** Lifts a pause of the batch queue; it acts on the next processor cycle. */
+	resume: async ({ params, locals }) => {
+		if (!locals.user) return fail(401);
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+		const was = getQueueSettings(repo.id).pausedReason;
+		if (was === null) return { success: true };
+		updateQueueSettings(repo.id, { pausedReason: null });
+		emitEvent(repo.id, null, 'resumed', { by: locals.user.login });
+		markDirty(repo.id);
+		console.log(`[merge-queue] ${repo.owner}/${repo.name} resumed by ${locals.user.login} (was paused: ${was})`);
+		return { success: true };
+	},
+
 	addToQueue: async ({ request, params, locals }) => {
 		if (!locals.user) return fail(401);
 

@@ -13,7 +13,7 @@ import {
 	recordBranchDeleted
 } from '$lib/server/db';
 import { closedPRReason } from '$lib/server/stack-runtime';
-import { getQueueSettings } from '$lib/server/batch-store';
+import { getActiveBatches, getQueueSettings } from '$lib/server/batch-store';
 import { bumpGeneration, markDirty } from '$lib/server/wake';
 import type { RequestHandler } from './$types';
 
@@ -86,7 +86,13 @@ export const POST: RequestHandler = async ({ request }) => {
 	const repo = getRepoByOwnerName(owner, name);
 	if (!repo) return json({ ok: true });
 	if (changesPRs(event, payload)) bumpGeneration(repo.id);
-	if (wakesQueue(event, payload)) markDirty(repo.id);
+	if (wakesQueue(event, payload)) {
+		markDirty(repo.id);
+		if (event === 'check_suite') {
+			const branch = (payload.check_suite as { head_branch?: string } | undefined)?.head_branch;
+			console.log(`[webhook] ${owner}/${name}: CI finished on ${branch}; waking the queue`);
+		}
+	}
 
 	const queueItems = getQueueItems(repo.id);
 
@@ -143,7 +149,11 @@ export const POST: RequestHandler = async ({ request }) => {
 
 				const item = queueItems.find((i) => i.pr_number === prNumber);
 
-				if (item) {
+				// The queue's own landing: it records that merge itself once GitHub confirms it.
+				const landing =
+					action === 'closed' && pullRequest.merged && getActiveBatches(repo.id).some((b) => b.members.includes(prNumber));
+
+				if (item && !landing) {
 					if (action === 'closed' && pullRequest.merged) {
 						updateQueueItemStatus(item.id, 'merged');
 						addToHistory(

@@ -3,6 +3,7 @@
 	import { invalidateAll } from '$app/navigation';
 	import QueueItem from '$lib/components/QueueItem.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
+	import BatchCard from '$lib/components/BatchCard.svelte';
 
 	let { data } = $props();
 	let showAddDialog = $state(false);
@@ -118,6 +119,45 @@
 		</div>
 	</div>
 
+	<!-- Batches -->
+	{#await data.pipeline then pipe}
+		{#if pipe.mode === 'batch' || pipe.active.length > 0 || pipe.recent.length > 0}
+			<div class="space-y-3">
+				<div class="flex flex-wrap items-center gap-2">
+					<h2 class="text-lg font-semibold text-gray-900">Batches</h2>
+					{#if pipe.master}
+						<span class="rounded px-1.5 py-0.5 text-xs {pipe.master.state === 'red' ? 'bg-red-100 text-red-800' : pipe.master.state === 'green' ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'}">
+							{data.repo.default_branch} {pipe.master.state} at {pipe.master.sha.slice(0, 7)}
+						</span>
+					{/if}
+				</div>
+				{#if pipe.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
+				{#if pipe.paused}
+					<form method="POST" action="?/resume" use:enhance class="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+						<span class="min-w-0 flex-1">Paused: {pipe.paused}</span>
+						<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>
+					</form>
+				{/if}
+				{#if pipe.active.length === 0}
+					<p class="text-sm text-gray-500">No batch is running.</p>
+				{/if}
+				{#each pipe.active as batch (batch.id)}
+					<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} />
+				{/each}
+				{#if pipe.recent.length > 0}
+					<details class="rounded-xl border border-border-subtle bg-surface-raised p-3">
+						<summary class="cursor-pointer text-sm font-medium text-gray-700">Recent batches ({pipe.recent.length})</summary>
+						<div class="mt-3 space-y-2">
+							{#each pipe.recent as batch (batch.id)}
+								<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} nested />
+							{/each}
+						</div>
+					</details>
+				{/if}
+			</div>
+		{/if}
+	{/await}
+
 	<!-- Queue -->
 	{#if data.queueItems.length === 0}
 		<div class="rounded-xl border border-dashed border-gray-300 bg-surface-raised p-12 text-center">
@@ -144,6 +184,43 @@
 			{/each}
 		</div>
 	{/if}
+
+	<!-- Stacks -->
+	<div>
+		<h2 class="mb-3 text-lg font-semibold text-gray-900">Stacks</h2>
+		{#await data.stacks}
+			<p class="text-sm text-gray-500">Detecting stacks…</p>
+		{:then result}
+			{#if result.error}
+				<p class="text-sm text-red-600">{result.error}</p>
+			{:else if result.stacks.length === 0}
+				<p class="text-sm text-gray-500">No open PR sits on another open PR.</p>
+			{:else}
+				<div class="space-y-3">
+					{#each result.stacks as stack (stack.root)}
+						<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised">
+							{#each stack.rows as row (row.pr)}
+								<div class="border-b border-border-subtle px-4 py-2 text-sm last:border-b-0" style="padding-left: {1 + row.depth * 1.5}rem">
+									<div class="flex flex-wrap items-center gap-2">
+										{#if row.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
+										<a href={row.url || `https://github.com/${data.repo.owner}/${data.repo.name}/pull/${row.pr}`} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{row.pr}</a>
+										<span class="min-w-0 truncate text-gray-600">{row.title}</span>
+										{#if row.link && row.link !== 'healthy'}
+											<span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">{row.link}</span>
+										{/if}
+										{#if row.queue}<StatusBadge status={row.queue} />{/if}
+									</div>
+									{#each row.issues as issue, i (i)}
+										<p class="mt-1 text-xs {issue.severity === 'blocking' ? 'text-red-600' : 'text-amber-700'}">{issue.message}</p>
+									{/each}
+								</div>
+							{/each}
+						</div>
+					{/each}
+				</div>
+			{/if}
+		{/await}
+	</div>
 
 	<!-- History -->
 	{#if data.history.length > 0}
