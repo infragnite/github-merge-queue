@@ -33,6 +33,7 @@ export type BuildResult =
 	| { ok: false; pr: number; reason: string; conflicts: string[]; commits: BuiltCommit[] };
 
 export interface BuildOptions {
+	/** Committer of the batch commits. Each squash commit keeps the author of the PR's head commit. */
 	author?: { name: string; email: string };
 	/** Fixed commit date (seconds since epoch) for reproducible SHAs, e.g. in tests. */
 	date?: number;
@@ -115,7 +116,12 @@ export function buildBatch(
 			commits.push({ pr: m.pr, sha: tip, tree });
 			continue;
 		}
-		const sha = git.run(['commit-tree', tree, '-p', tip, '-F', '-'], { input: squashMessage(m) + '\n', env }).out;
+		// A squash keeps the squashed commits' author (as `git merge --squash` would), not the queue's.
+		const [authorName, authorEmail] = git.run(['log', '-1', '--format=%an%x00%ae', m.headSha]).out.split('\0');
+		const sha = git.run(['commit-tree', tree, '-p', tip, '-F', '-'], {
+			input: squashMessage(m) + '\n',
+			env: { ...env, GIT_AUTHOR_NAME: authorName, GIT_AUTHOR_EMAIL: authorEmail }
+		}).out;
 		commits.push({ pr: m.pr, sha, tree });
 		tip = sha;
 		tipTree = tree;

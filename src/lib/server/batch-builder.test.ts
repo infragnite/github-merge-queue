@@ -38,6 +38,8 @@ describe('building a batch', () => {
 		expect(git.git('log', '--format=%s', `${base}..${r.headSha}`).split('\n')).toEqual(['PR 2 (#2)', 'PR 1 (#1)']);
 		expect(git.git('rev-list', '--parents', '-n', '1', r.commits[0].sha).split(' ')).toEqual([r.commits[0].sha, base]);
 		expect(files(r.headSha)).toEqual(['a1.txt', 'a2.txt', 'b1.txt']);
+		// each squash commit keeps the PR author; the queue is only the committer
+		expect(git.git('log', '-1', '--format=%ae|%ce', r.headSha)).toBe('dev@example.com|merge-queue[bot]@users.noreply.github.com');
 	});
 
 	test('is reproducible: the same inputs give the same SHA', () => {
