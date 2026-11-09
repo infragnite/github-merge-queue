@@ -57,9 +57,12 @@ export class GitRunner {
 		private readonly env: NodeJS.ProcessEnv = {}
 	) {}
 
-	run(args: string[], opts: { allowFail?: boolean; input?: string; env?: NodeJS.ProcessEnv } = {}) {
+	run(args: string[], opts: { allowFail?: boolean; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}) {
 		try {
 			const out = execFileSync('git', args, {
+				// Local plumbing takes seconds; a hung git must not stall the event loop for long.
+				timeout: opts.timeoutMs ?? 2 * 60 * 1000,
+				killSignal: 'SIGKILL',
 				cwd: this.dir,
 				encoding: 'utf8',
 				input: opts.input,

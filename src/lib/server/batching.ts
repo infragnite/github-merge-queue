@@ -69,6 +69,11 @@ export interface BatchConfig {
 	 * (releases). Off for a repo whose CI needs no default-branch run.
 	 */
 	masterRun: boolean;
+	/**
+	 * Re-run a failed batch's (and bisection step's) failed jobs once before treating the failure as
+	 * real. Off for a repo without flaky tests: a failure then goes straight to bisection.
+	 */
+	retryFailed: boolean;
 	/** At least this long between those runs (0: one per landed batch). */
 	masterRunMinGapMs: number;
 }
@@ -84,6 +89,7 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	ciTimeoutMs: 12 * 60 * 60 * 1000,
 	requirePRChecks: false,
 	masterRun: true,
+	retryFailed: true,
 	masterRunMinGapMs: 0
 };
 

@@ -39,6 +39,8 @@ class World {
 	approvedOn = new Map<number, string>();
 	cacheRefreshes = 0;
 	cancelled: string[] = [];
+	/** Re-run requests answered "the workflow is still running" before one is accepted. */
+	rerunWaits = 0;
 	/** PRs whose merge GitHub refuses (e.g. a ruleset the queue doesn't satisfy). */
 	refuseMerge = new Set<number>();
 	/** PRs opened from a fork. */
@@ -85,9 +87,13 @@ class World {
 					this.cacheRefreshes++;
 				},
 				rerunFailed: async (head) => {
+					if (this.rerunWaits > 0) {
+						this.rerunWaits--;
+						return 'wait';
+					}
 					this.reruns.set(head, (this.reruns.get(head) ?? 0) + 1);
 					this.ciPendingOnce.add(head);
-					return true;
+					return 'rerun';
 				}
 			},
 			github: {
@@ -529,6 +535,27 @@ describe('batch queue runtime', () => {
 		db.updateQueueItemStatus(db.getQueueItems(repo.id)[0].id, 'merging');
 		await run();
 		expect(world.merged).toEqual([1]);
+	});
+
+	test('with retryFailed off a failure is never re-run: a lone PR leaves at once', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run();
+		expect(world.reruns.size).toBe(0);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the merge queue/) }]);
+	});
+
+	test('a failed check whose workflow still runs other jobs is re-run once it finishes, not bisected', async () => {
+		pr(1);
+		pr(2);
+		await tickBatchQueue(world.deps());
+		world.flaky.add(world.started[0].head);
+		world.rerunWaits = 2;
+		await run();
+		expect(world.reruns.get(world.started[0].head)).toBe(1);
+		expect(world.started).toHaveLength(1);
+		expect(world.merged).toEqual([1, 2]);
 	});
 
 	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {

@@ -63,6 +63,9 @@ export function checkResult(
 	return runs.every((r) => r.conclusion === 'success') ? 'success' : 'failure';
 }
 
+/** A fetch or push gives up after this long (git runs synchronously, so a hang would stall the server). */
+const NETWORK_TIMEOUT_MS = 10 * 60 * 1000;
+
 /** A bare mirror per repository, fetched by SHA with the installation token. */
 export class Mirror {
 	readonly git: GitRunner;
@@ -88,7 +91,10 @@ export class Mirror {
 			GIT_CONFIG_COUNT: '1',
 			GIT_CONFIG_KEY_0: 'http.extraheader',
 			GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
-			GIT_TERMINAL_PROMPT: '0'
+			GIT_TERMINAL_PROMPT: '0',
+			// A stalled transfer (under 1 KB/s for a minute) fails instead of hanging.
+			GIT_HTTP_LOW_SPEED_LIMIT: '1000',
+			GIT_HTTP_LOW_SPEED_TIME: '60'
 		};
 	}
 
@@ -99,18 +105,18 @@ export class Mirror {
 	async fetch(shas: string[]) {
 		const missing = [...new Set(shas)].filter((s) => !this.has(s));
 		if (missing.length === 0) return;
-		this.git.run(['fetch', '-q', '--no-tags', this.url, ...missing], { env: await this.auth() });
+		this.git.run(['fetch', '-q', '--no-tags', this.url, ...missing], { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
 	}
 
 	async push(branch: string, sha: string) {
-		this.git.run(['push', '-q', '--force', this.url, `${sha}:refs/heads/${branch}`], { env: await this.auth() });
+		this.git.run(['push', '-q', '--force', this.url, `${sha}:refs/heads/${branch}`], { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
 	}
 
 	/** Force-pushes `sha` to `branch` only if the branch is still at `expected`. */
 	async pushLease(branch: string, sha: string, expected: string) {
 		this.git.run(
 			['push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`],
-			{ env: await this.auth() }
+			{ env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS }
 		);
 	}
 }
@@ -168,12 +174,13 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				const suites = new Set(
 					checks.filter((c) => c.status === 'completed' && c.conclusion !== 'success').flatMap((c) => (c.check_suite ? [c.check_suite.id] : []))
 				);
-				if (suites.size === 0) return false;
-				const runs = (await github.workflowRunsForSha(owner, name, headSha)).filter(
-					(r) => suites.has(r.check_suite_id) && r.status === 'completed'
-				);
+				if (suites.size === 0) return 'none';
+				const runs = (await github.workflowRunsForSha(owner, name, headSha)).filter((r) => suites.has(r.check_suite_id));
+				if (runs.length === 0) return 'none';
+				// GitHub re-runs failed jobs only once the whole run finished.
+				if (runs.some((r) => r.status !== 'completed')) return 'wait';
 				for (const r of runs) await github.rerunFailedJobs(owner, name, r.id);
-				return runs.length > 0;
+				return 'rerun';
 			}
 		},
 		github: {
@@ -198,11 +205,15 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					merged: !!p.merged
 				};
 			},
-			readiness: async (n, headSha, author, needApprovals): Promise<Readiness> => {
+			readiness: async (n, headSha, author, opts): Promise<Readiness> => {
 				const settings = getQueueSettings(repo.id);
+				const reviewsNow = () => github.listReviews(owner, name, n);
+				// The check right before merging reads reviews fresh: a missed webhook must not land a dismissed approval.
 				const [reviews, checks] = await Promise.all([
-					settings.config.requireApproval || needApprovals
-						? reviewsMemo(repo.id, `${n}:${headSha}`, () => github.listReviews(owner, name, n))
+					settings.config.requireApproval || opts?.needApprovals
+						? opts?.fresh
+							? reviewsNow()
+							: reviewsMemo(repo.id, `${n}:${headSha}`, reviewsNow)
 						: Promise.resolve([]),
 					settings.config.requirePRChecks
 						? github.checkRunsNamed(owner, name, headSha, ci().requiredCheck)

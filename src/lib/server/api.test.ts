@@ -51,8 +51,8 @@ describe('auth with the caller’s gh token', () => {
 		expect(calls).toHaveLength(6);
 	});
 
-	test('an installation token gets repo-level access, at most write', async () => {
-		expect(await resolveCaller(gh(), 'Bearer ghs_ok', 'acme', 'r')).toEqual({ login: 'github-app', role: 'write', app: true });
+	test('an installation token (any Actions GITHUB_TOKEN) only reads', async () => {
+		expect(await resolveCaller(gh(), 'Bearer ghs_ok', 'acme', 'r')).toEqual({ login: 'github-app', role: 'read', app: true });
 	});
 
 	test('the token itself must see the repo, and its permissions bound the role', async () => {

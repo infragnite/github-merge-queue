@@ -35,7 +35,9 @@ export function memoByGeneration<T>(ttlMs: number) {
 		if (cache.size > 2000) cache.clear();
 		const value = load();
 		cache.set(k, { gen, until: Date.now() + ttlMs, value });
-		value.catch(() => cache.delete(k));
+		value.catch(() => {
+			if (cache.get(k)?.value === value) cache.delete(k);
+		});
 		return value;
 	};
 }
