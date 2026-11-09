@@ -148,14 +148,16 @@ export function migrateBatches(database: Database.Database) {
 		-- The last default-branch commit the queue knows the state of. 'green': its tree passed CI
 		-- (a batch the queue landed, or a baseline run). 'verifying': green by tree, while the
 		-- default-branch run started after landing it hasn't finished. 'checking': a baseline run of
-		-- it alone is going (it moved outside the queue). 'red': it fails on its own.
+		-- it alone is going (it moved outside the queue). 'red': it fails on its own; \`tried\` lists
+		-- the PR heads (pr@sha) that failed alone on top of it.
 		CREATE TABLE IF NOT EXISTS master_health (
 			repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
 			sha TEXT NOT NULL,
 			tree TEXT NOT NULL,
 			state TEXT NOT NULL,
 			since INTEGER NOT NULL,
-			retried INTEGER NOT NULL DEFAULT 0
+			retried_at INTEGER,
+			tried TEXT NOT NULL DEFAULT '[]'
 		);
 	`);
 	const batchCols = database.prepare(`PRAGMA table_info(batches)`).all() as Array<{ name: string }>;
@@ -405,27 +407,32 @@ export interface MasterHealth {
 	sha: string;
 	tree: string;
 	state: MasterState;
-	/** When this state began (epoch ms). */
+	/** When this state began (epoch ms); its run's results from before then don't count. */
 	since: number;
-	/** Whether a failed run of this state was re-run already. */
-	retried: boolean;
+	/** When its failed run was re-run (epoch ms), or null. */
+	retriedAt: number | null;
+	/** While red: PR heads (`pr@sha`) that failed alone on top of it, so each is tried once. */
+	tried: string[];
 }
 
 export function getMasterHealth(repoId: number): MasterHealth | null {
-	const r = getDb().prepare('SELECT sha, tree, state, since, retried FROM master_health WHERE repo_id = ?').get(repoId) as
-		| (Omit<MasterHealth, 'retried'> & { retried: number })
-		| undefined;
-	return r ? { ...r, retried: !!r.retried } : null;
+	const r = getDb()
+		.prepare('SELECT sha, tree, state, since, retried_at, tried FROM master_health WHERE repo_id = ?')
+		.get(repoId) as { sha: string; tree: string; state: MasterState; since: number; retried_at: number | null; tried: string } | undefined;
+	return r ? { sha: r.sha, tree: r.tree, state: r.state, since: r.since, retriedAt: r.retried_at, tried: JSON.parse(r.tried) } : null;
 }
 
-export function setMasterHealth(repoId: number, h: { sha: string; tree: string; state: MasterState; since: number; retried?: boolean }) {
+export function setMasterHealth(
+	repoId: number,
+	h: { sha: string; tree: string; state: MasterState; since: number; retriedAt?: number | null; tried?: string[] }
+) {
 	getDb()
 		.prepare(
-			`INSERT INTO master_health (repo_id, sha, tree, state, since, retried) VALUES (?, ?, ?, ?, ?, ?)
+			`INSERT INTO master_health (repo_id, sha, tree, state, since, retried_at, tried) VALUES (?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(repo_id) DO UPDATE SET sha = excluded.sha, tree = excluded.tree, state = excluded.state,
-			   since = excluded.since, retried = excluded.retried`
+			   since = excluded.since, retried_at = excluded.retried_at, tried = excluded.tried`
 		)
-		.run(repoId, h.sha, h.tree, h.state, h.since, h.retried ? 1 : 0);
+		.run(repoId, h.sha, h.tree, h.state, h.since, h.retriedAt ?? null, JSON.stringify(h.tried ?? []));
 }
 
 export function clearMasterHealth(repoId: number) {

@@ -573,7 +573,9 @@ describe('batch queue runtime', () => {
 		git.commit('main', 'broken by hand', 'x-breaks-master.txt');
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run();
-		expect(world.started.map((x) => x.prs)).toEqual([[]]);
+		// a check of main alone, beside the batch built on it; then, main being red, each PR once
+		// more alone (none fixes it), and nothing else
+		expect(world.started.map((x) => x.prs)).toEqual([[], [1, 2], [1], [2]]);
 		expect(store.getMasterHealth(repo.id)?.state).toBe('red');
 		expect(world.comments).toEqual([]);
 		expect(queued()).toEqual([
@@ -585,8 +587,61 @@ describe('batch queue runtime', () => {
 		git.git('rm', '-q', 'x-breaks-master.txt');
 		git.git('commit', '-qm', 'fix main');
 		await run();
-		expect(world.started.map((x) => x.prs)).toEqual([[], [], [1, 2]]);
+		expect(world.started.map((x) => x.prs).slice(4)).toEqual([[], [1, 2]]);
 		expect(world.merged).toEqual([1, 2]);
+	});
+
+	/** A PR that deletes main's breaking file (main must already have it). */
+	function fixPR(n: number) {
+		git.branch(`pr${n}`, 'main');
+		git.git('checkout', '-q', `pr${n}`);
+		git.git('rm', '-q', 'x-breaks-master.txt');
+		git.git('commit', '-qm', `fix ${n}`);
+		git.openPR(n, `pr${n}`, 'main');
+		world.approved.add(n);
+		db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+	}
+
+	test('a batch with the fix in it passes together on a broken default branch and lands whole', async () => {
+		git.commit('main', 'broken by hand', 'x-breaks-master.txt');
+		world.breakingFiles.add('x-breaks-master.txt');
+		pr(1);
+		fixPR(2);
+		pr(3);
+		await run();
+		expect(world.merged).toEqual([1, 2, 3]);
+		expect(world.comments).toEqual([]);
+		expect(store.getMasterHealth(repo.id)?.state).not.toBe('red');
+	});
+
+	test('on a known-red default branch, batches run side by side until the one with the fix lands', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 2, depth: 2 } });
+		git.commit('main', 'broken by hand', 'x-breaks-master.txt');
+		world.breakingFiles.add('x-breaks-master.txt');
+		store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'red', since: 0 });
+		pr(1);
+		pr(2);
+		fixPR(3);
+		pr(4);
+		await run();
+		// both on red main at once; [3, 4] carries the fix and lands, then [1, 2] on the fixed main
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [3, 4], [1, 2]]);
+		expect(world.merged).toEqual([3, 4, 1, 2]);
+		expect(world.comments).toEqual([]);
+	});
+
+	test('an urgent fix is tried first, alone, on a red default branch', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 8, depth: 1 } });
+		git.commit('main', 'broken by hand', 'x-breaks-master.txt');
+		world.breakingFiles.add('x-breaks-master.txt');
+		store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'red', since: 0 });
+		pr(1);
+		pr(2);
+		fixPR(3);
+		store.setQueuePriority(repo.id, 3, 'urgent');
+		await run();
+		expect(world.started[0].prs).toEqual([3]);
+		expect(world.merged).toEqual([3, 1, 2]);
 	});
 
 	test('a default-branch run failing after a landing stops the batch on top of it without blaming it', async () => {

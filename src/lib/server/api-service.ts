@@ -307,8 +307,10 @@ export function pause(repo: Repo, caller: Caller, reason: unknown) {
 export function resume(repo: Repo, caller: Caller) {
 	requireRole(caller, 'maintain', 'Resuming the queue');
 	store.updateQueueSettings(repo.id, { pausedReason: null });
-	// A default branch the queue holds for as red is checked again (say, after a flaky outage).
-	if (store.getMasterHealth(repo.id)?.state === 'red') store.clearMasterHealth(repo.id);
+	// Resuming vouches for the default branch: a red one is trusted again (say, it failed for a
+	// reason only its own run has), and failures on top of it are blamed on PRs as usual.
+	const h = store.getMasterHealth(repo.id);
+	if (h?.state === 'red') store.setMasterHealth(repo.id, { sha: h.sha, tree: h.tree, state: 'green', since: Date.now() });
 	emitEvent(repo.id, null, 'resumed', { by: caller.login });
 	return getConfig(repo);
 }

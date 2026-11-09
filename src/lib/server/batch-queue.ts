@@ -134,6 +134,8 @@ export const CONFLICT_LABEL = 'needs-rebase';
 export type RerunResult = 'rerun' | 'none' | 'wait';
 /** When each repo last had its caches refreshed (in memory: a restart costs one extra refresh). */
 const lastCacheRefresh = new Map<number, number>();
+/** A default-branch or baseline run that reports nothing in this long is given up on. */
+const MASTER_CHECK_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 /** Batch failures without a culprit after which a PR leaves the queue (a flaky test, most likely). */
 const MAX_BATCH_FAILURES = 3;
 
@@ -635,8 +637,8 @@ class Tick {
 
 	/**
 	 * Follows the default branch's own CI: the run after a landing ('verifying') and a baseline run
-	 * of a commit that came from outside the queue ('checking'). A red default branch stops
-	 * everything in flight, so no PR is blamed for it.
+	 * of a commit that came from outside the queue ('checking'). Neither holds batches back; until
+	 * they report, a failure on top of that commit blames nobody (`masterSettled`).
 	 */
 	async advanceMaster() {
 		const h = store.getMasterHealth(this.repoId);
@@ -647,25 +649,31 @@ class Tick {
 			return;
 		}
 		const sha = run ? run.head_sha : h.sha;
-		let r = await this.d.ci.result(sha, run ? run.retried_at : null);
-		if (r === 'failure' && !h.retried) {
+		// Results from before this state (an older run on the same commit) or before the re-run don't count.
+		let r = await this.d.ci.result(sha, h.retriedAt ?? h.since);
+		const timedOut = this.d.now() - (h.retriedAt ?? h.since) > MASTER_CHECK_TIMEOUT_MS;
+		if (r === 'failure' && h.retriedAt === null) {
 			const rerun = await this.retry(sha);
-			if (rerun === 'wait') return;
+			if (rerun === 'wait' && !timedOut) return;
 			if (rerun === 'rerun') {
 				if (run) store.setBatchRetried(run.id, this.d.now());
-				store.setMasterHealth(this.repoId, { ...h, retried: true });
+				store.setMasterHealth(this.repoId, { ...h, retriedAt: this.d.now() });
 				return;
 			}
 		}
 		if (r === 'pending') {
-			if (this.d.now() - h.since < this.settings().config.ciTimeoutMs) return;
-			if (h.state === 'verifying') {
-				// Its tree passed in a batch; a run that never reports must not hold the queue forever.
-				this.log(`no result from the default-branch run on ${h.sha.slice(0, 7)}; taking its batch's result`);
-				store.setMasterHealth(this.repoId, { ...h, state: 'green', since: this.d.now() });
+			if (!timedOut) return;
+			if (run) {
+				// A baseline that never reports is a setup problem (does CI run on mq/base-*?), not a red branch.
+				await this.retire(run);
+				store.setBatchStatus(run.id, 'failed');
+				store.clearMasterHealth(this.repoId);
+				this.pause(`The check of ${this.d.repo.default_branch} alone (${run.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
 				return;
 			}
-			r = 'failure';
+			// Its tree passed in a batch; a default-branch run that never reports must not hold anything.
+			this.log(`no result from the default-branch run on ${h.sha.slice(0, 7)}; taking its batch's result`);
+			r = 'success';
 		}
 		if (run) {
 			store.setBatchCI(run.id, r);
@@ -673,30 +681,35 @@ class Tick {
 			await this.d.github.deleteBranch(run.branch).catch(() => {});
 		}
 		if (r === 'success') {
-			store.setMasterHealth(this.repoId, { ...h, state: 'green', since: this.d.now(), retried: false });
+			store.setMasterHealth(this.repoId, { sha: h.sha, tree: h.tree, state: 'green', since: this.d.now() });
 			this.event(null, 'master-green', { sha: h.sha });
 			this.log(`${this.d.repo.default_branch} ${h.sha.slice(0, 7)} is green`);
 			return;
 		}
-		store.setMasterHealth(this.repoId, { ...h, state: 'red', since: this.d.now() });
-		const why = `${this.d.repo.default_branch} ${h.sha.slice(0, 7)} fails CI on its own; holding the queue until it is fixed`;
-		this.event(null, 'master-broken', { sha: h.sha, reason: why });
+		await this.markRed(h.sha, h.tree);
+	}
+
+	async markRed(sha: string, tree: string) {
+		store.setMasterHealth(this.repoId, { sha, tree, state: 'red', since: this.d.now() });
+		const why = `${this.d.repo.default_branch} ${sha.slice(0, 7)} fails CI on its own; the queue tries PRs one at a time on top of it until one passes`;
+		this.event(null, 'master-broken', { sha, reason: why });
 		this.log(why);
-		await this.d.github.setStatus(h.sha, 'failure', short(`Fails on its own: the queue holds until it is fixed`)).catch(() => {});
-		// Whatever is testing on top of it would fail for the same reason: stop it, blame nobody.
-		await this.supersede(store.getActiveBatches(this.repoId));
+		await this.d.github.setStatus(sha, 'failure', short('Fails on its own; the queue looks for a PR that fixes it')).catch(() => {});
 	}
 
 	/**
-	 * True when batches may be built on `masterSha`: its tree is known green, or being confirmed
-	 * after a landing. A commit that came from outside the queue gets one baseline run first.
+	 * Before building on `masterSha`: a commit the queue doesn't know (it came from outside the
+	 * queue) gets a baseline run of itself alone, alongside the batches built on it.
 	 */
-	async masterReady(masterSha: string): Promise<boolean> {
+	async checkMaster(masterSha: string): Promise<void> {
 		const tree = await this.d.git.tree(masterSha);
 		const h = store.getMasterHealth(this.repoId);
-		if (h && h.tree === tree) return h.state === 'green' || h.state === 'verifying';
+		if (h && h.tree === tree) return;
 		const prev = store.getRunningBaseline(this.repoId);
-		if (prev) await this.retire(prev).then(() => store.setBatchStatus(prev.id, 'superseded'));
+		if (prev) {
+			await this.retire(prev);
+			store.setBatchStatus(prev.id, 'superseded');
+		}
 		const head = await this.d.git.baseline(masterSha);
 		const branch = `mq/base-${this.d.now()}`;
 		try {
@@ -705,7 +718,7 @@ class Tick {
 		} catch (e) {
 			await this.d.github.deleteBranch(branch).catch(() => {});
 			this.pause(`Could not start a check of ${this.d.repo.default_branch} alone: ${e instanceof Error ? e.message : e}`);
-			return false;
+			return;
 		}
 		store.insertBatch({
 			repoId: this.repoId,
@@ -720,13 +733,76 @@ class Tick {
 		});
 		store.setMasterHealth(this.repoId, { sha: masterSha, tree, state: 'checking', since: this.d.now() });
 		this.log(`${this.d.repo.default_branch} moved outside the queue; checking ${masterSha.slice(0, 7)} alone in ${branch}`);
-		return false;
 	}
 
-	/** Failures on a base whose own result is still coming in are not decided yet. */
-	masterSettled(): boolean {
+	/** The default branch's state, if it is the commit `baseTree` is the tree of. */
+	masterState(baseTree: string): store.MasterState | null {
 		const h = store.getMasterHealth(this.repoId);
-		return !h || h.state === 'green';
+		return h && h.tree === baseTree ? h.state : null;
+	}
+
+	/**
+	 * A failure on top of `baseTree` may be blamed on the PRs: their base is known green. On a base
+	 * still being checked it waits; on a red base it is decided by `onRedBase`.
+	 */
+	masterSettled(baseTree: string): boolean {
+		const st = this.masterState(baseTree);
+		return st !== 'verifying' && st !== 'checking';
+	}
+
+	/**
+	 * A batch failed on a red default branch: nobody is blamed. A lone PR's head is recorded as
+	 * tried, so each PR gets one go at fixing the branch; a larger batch is retried one by one.
+	 */
+	async failedOnRed(batch: BatchRow) {
+		const h = store.getMasterHealth(this.repoId)!;
+		// `pr@head` once tried in a batch, `pr@head!` once tried alone.
+		const mark = batch.members.length === 1 ? '!' : '';
+		const tried = [...new Set([...h.tried, ...batch.members.map((n) => `${n}@${batch.heads[n]}`), ...batch.members.map((n) => `${n}@${batch.heads[n]}${mark}`)])];
+		store.setMasterHealth(this.repoId, { ...h, tried });
+		store.setBatchStatus(batch.id, 'failed');
+		await this.retire(batch);
+		this.requeue(batch.members);
+		for (const n of batch.members) {
+			const it = this.item(n);
+			if (it) db.updateQueueItemStatus(it.id, 'queued', `Waiting: ${this.d.repo.default_branch} is red, and this PR does not fix it`);
+		}
+	}
+
+	/**
+	 * Batches side by side on a red default branch (see `plan`): each is decided on its own. A
+	 * pass lands (the others are then rebuilt on the fixed branch); a failure blames nobody.
+	 * Returns false when the pipeline isn't in red mode.
+	 */
+	async advanceRed(active: BatchRow[]): Promise<boolean> {
+		const tree = active[0].base_tree;
+		if (this.masterState(tree) !== 'red' || active.some((b) => b.base_tree !== tree || b.status === 'bisecting')) return false;
+		for (const b of active) {
+			let r = await this.d.ci.result(b.head_sha, b.retried_at);
+			if (r === 'pending') {
+				if (!this.timedOut(b)) continue;
+				await this.d.ci.cancel(b.head_sha).catch(() => {});
+				r = 'failure';
+			}
+			store.setBatchCI(b.id, r);
+			if (r === 'failure') {
+				await this.failedOnRed(b);
+				continue;
+			}
+			store.setBatchStatus(b.id, 'passed');
+			const passed = { ...b, status: 'passed' as const };
+			if (await this.land(passed, b.members, passed)) {
+				store.setBatchStatus(b.id, 'landed');
+				await this.retire(b);
+				this.log(`batch ${b.id} fixed ${this.d.repo.default_branch}`);
+			} else if (!this.settings().pausedReason) {
+				await this.supersede([b]);
+			}
+			// Master moved (or landing stopped): the siblings are rebuilt next tick.
+			await this.supersede(store.getActiveBatches(this.repoId).filter((x) => x.id !== b.id));
+			return true;
+		}
+		return true;
 	}
 
 	// --- the pipeline head ---
@@ -745,10 +821,21 @@ class Tick {
 				}
 				return;
 			}
-			const rerun = r === 'failure' && head.status === 'testing' ? await this.retry(head.head_sha) : 'none';
-			if (rerun === 'wait') return;
-			// A failure on a default branch that may be broken itself blames nobody yet.
-			if (r === 'failure' && rerun === 'none' && !this.masterSettled()) return;
+			let rerun = r === 'failure' && head.status === 'testing' ? await this.retry(head.head_sha) : 'none';
+			if (rerun === 'wait') {
+				if (!this.timedOut(head)) return;
+				rerun = 'none';
+			}
+			if (r === 'failure' && rerun === 'none') {
+				// A failure on a default branch that may be broken itself blames nobody yet; on a red
+				// one, nobody at all.
+				if (!this.masterSettled(head.base_tree)) return;
+				if (this.masterState(head.base_tree) === 'red') {
+					await this.supersede(rest);
+					await this.failedOnRed(head);
+					return;
+				}
+			}
 			store.setBatchCI(head.id, r);
 			if (r === 'success') {
 				store.setBatchStatus(head.id, 'passed');
@@ -826,7 +913,8 @@ class Tick {
 			return;
 		}
 
-		if (step.eject.length && !this.masterSettled()) return; // the default branch may be what fails
+		// The default branch may be what fails: decide nothing, and count nothing, until it's known.
+		if (!this.masterSettled(batch.base_tree)) return;
 		for (const r of runs) await this.d.github.deleteBranch(r.branch).catch(() => {});
 		await this.ejectWithStack(step.eject.map((e) => ({ pr: e.pr, reason: `${e.reason} (batch ${batch.id})` })));
 		// A PR the bisection never got to test apart from the failure isn't counted against it.
@@ -1072,21 +1160,43 @@ class Tick {
 		}));
 		const states = new Map<number, PRState>();
 		for (const e of queue) states.set(e.pr, await this.state(e.pr));
+		// On a red default branch, batches of PRs not yet tried there run side by side on it (not
+		// stacked) until one passes: that batch carries a fix and lands. PRs tried in a batch get
+		// one more go alone once every PR was tried, in case another PR in their batch broke it too.
+		const red = this.masterState(await this.d.git.tree(masterSha)) === 'red';
+		let config = settings.config;
+		let candidates = queue;
+		let base = active.length ? active[active.length - 1].head_sha : masterSha;
+		let inflight = active.map((b) => b.members);
+		if (red) {
+			if (active.length >= config.depth) return 'idle';
+			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
+			const key = (e: QueueEntry) => `${e.pr}@${states.get(e.pr)!.headSha}`;
+			candidates = queue.filter((e) => !tried.has(key(e)));
+			let maxBatch = config.maxBatch;
+			if (candidates.length === 0) {
+				candidates = queue.filter((e) => !tried.has(`${key(e)}!`));
+				maxBatch = 1;
+			}
+			if (candidates.length === 0) return 'idle';
+			config = { ...config, maxBatch, depth: config.depth + active.length, collectWindowMs: 0 };
+			base = masterSha;
+			inflight = []; // siblings on the same base; a child of an in-flight PR waits for it
+		}
 		const plan = planNextBatch({
 			now: this.d.now(),
-			queue,
+			queue: candidates,
 			states,
 			analysis: await this.analysis(),
-			inflight: active.map((b) => b.members),
-			config: settings.config
+			inflight,
+			config
 		});
 		for (const h of plan.held) {
 			const it = this.item(h.pr);
 			if (it && it.error_message !== h.admission.reason) db.updateQueueItemStatus(it.id, 'queued', h.admission.reason);
 		}
 		if (!plan.batch) return 'idle';
-		const base = active.length ? active[active.length - 1].head_sha : masterSha;
-		const below = active.flatMap((b) => b.members);
+		const below = red ? [] : active.flatMap((b) => b.members);
 		return this.startBatch(base, plan.batch, below, plan.express, masterSha);
 	}
 }
@@ -1109,7 +1219,9 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 			active = [];
 		}
 	}
-	if (active.length) {
+	if (active.length && (await t.advanceRed(active))) {
+		active = store.getActiveBatches(deps.repo.id);
+	} else if (active.length) {
 		await t.advanceHead(active[0], active.slice(1));
 		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 		active = store.getActiveBatches(deps.repo.id);
@@ -1123,11 +1235,11 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		// Landing earlier in this tick moved master: read it again before building on it.
 		masterSha = await deps.github.defaultBranchSha();
 		await deps.git.fetch([masterSha]);
-		if (!(await t.masterReady(masterSha))) return;
+		await t.checkMaster(masterSha);
+		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 	}
 	for (let i = 0; i < 8 && active.length < config.depth; i++) {
-		// A conflict sets a PR aside at build time; plan again with the rest.
-		if (!active.length) masterSha = await deps.github.defaultBranchSha();
+		// A conflict sets a PR aside at build time; plan again with the rest, on the same master.
 		const r = await t.plan(active, masterSha);
 		if (r === 'idle' || r === 'error') break;
 		active = store.getActiveBatches(deps.repo.id);
@@ -1136,7 +1248,14 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 
 /** Leaving batch mode: stops every batch in flight and puts its PRs back in line. */
 export async function retireBatches(deps: QueueDeps): Promise<void> {
-	await new Tick(deps).supersede(store.getActiveBatches(deps.repo.id));
+	const t = new Tick(deps);
+	await t.supersede(store.getActiveBatches(deps.repo.id));
+	const base = store.getRunningBaseline(deps.repo.id);
+	if (base) {
+		await t.retire(base);
+		store.setBatchStatus(base.id, 'superseded');
+		store.clearMasterHealth(deps.repo.id);
+	}
 }
 
 /** Starts a one-off CI run of a PR on top of the default branch (the `try` API). */
