@@ -51,6 +51,8 @@ class World {
 	}
 
 	everythingFails = false;
+	/** Commits whose CI keeps running (reports pending) until removed. */
+	stillRunning = new Set<string>();
 
 	ciFails(sha: string) {
 		if (this.everythingFails) return true;
@@ -80,7 +82,7 @@ class World {
 					this.ciPendingOnce.add(head);
 				},
 				result: async (head) => {
-					if (this.ciPendingOnce.delete(head)) return 'pending';
+					if (this.ciPendingOnce.delete(head) || this.stillRunning.has(head)) return 'pending';
 					const flakeNow = this.flaky.has(head) && !this.reruns.has(head);
 					return flakeNow || this.ciFails(head) ? 'failure' : 'success';
 				},
@@ -743,6 +745,28 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([]);
 		expect(queued()).toEqual([{ pr: 2, status: 'queued' }]);
 		expect(world.cancelled).toContain(world.started[1].head);
+	});
+
+	test('a batch failing on a default branch still being verified bisects at once, and blames only once it is green', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 1, retryFailed: false } });
+		pr(1);
+		for (let i = 0; i < 10 && world.merged.length === 0; i++) await tickBatchQueue(world.deps());
+		const master = store.getMasterHealth(repo.id)!;
+		expect(master.state).toBe('verifying');
+		world.stillRunning.add(master.sha); // the default-branch run after the landing takes a while
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 8, retryFailed: false } });
+		pr(2);
+		pr(3, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(30);
+		// bisection ran while the default branch was being verified, but nobody was blamed yet
+		expect(store.getRecentBatches(repo.id).find((b) => b.members.join() === '2,3')?.status).toBe('bisecting');
+		expect(world.started.some((s) => s.branch.includes('-bisect-'))).toBe(true);
+		expect(world.comments).toEqual([]);
+		world.stillRunning.delete(master.sha);
+		await run(30);
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }]);
 	});
 
 	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {
