@@ -162,3 +162,26 @@ test('a skip directive in a PR title cannot skip the batch CI', () => {
 	expect(squashMessage({ pr: 7, headSha: 'x', title: 'Docs only [skip ci]', parentHeadSha: null })).toBe('Docs only (#7)');
 	expect(squashMessage({ pr: 8, headSha: 'x', title: '[CI SKIP] tweak [no ci] it', parentHeadSha: null })).toBe('tweak it (#8)');
 });
+
+describe('running git without blocking', () => {
+	test('resolves with the output, like the synchronous run', async () => {
+		expect(await runner.runAsync(['rev-parse', 'main'])).toEqual({ code: 0, out: git.sha('main') });
+	});
+
+	test('reports a failure as its exit code when failure is allowed', async () => {
+		const r = await runner.runAsync(['cat-file', '-e', 'no-such-ref'], { allowFail: true });
+		expect(r.code).not.toBe(0);
+	});
+
+	test('rejects on failure, naming the command', async () => {
+		await expect(runner.runAsync(['cat-file', '-e', 'no-such-ref'])).rejects.toThrow(/^git cat-file -e no-such-ref failed: /);
+	});
+
+	test('lets other work run while git is busy', async () => {
+		let ticked = false;
+		const timer = setTimeout(() => (ticked = true), 0);
+		await runner.runAsync(['rev-parse', 'main']);
+		clearTimeout(timer);
+		expect(ticked).toBe(true);
+	});
+});

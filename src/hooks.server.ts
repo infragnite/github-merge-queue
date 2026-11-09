@@ -2,8 +2,10 @@ import type { Handle } from '@sveltejs/kit';
 import { verifySessionToken } from '$lib/server/auth';
 import { getUserById } from '$lib/server/db';
 import { startProcessor } from '$lib/server/processor';
+import { watchEventLoop } from '$lib/server/loop-watch';
 
 startProcessor();
+watchEventLoop();
 
 export const handle: Handle = async ({ event, resolve }) => {
 	const sessionCookie = event.cookies.get('session');

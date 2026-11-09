@@ -68,6 +68,8 @@ const BATCH_TICK_MS = 60_000;
 /** Even a webhook can't make it tick more often than this; a burst of events becomes one tick. */
 const MIN_BATCH_TICK_MS = 30_000;
 const lastBatchTick = new Map<number, number>();
+/** A tick slower than this is logged, so a slow GitHub or git shows up in the logs. */
+const SLOW_TICK_MS = 5_000;
 
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	await recordOpenPRHeads(repo);
@@ -78,11 +80,15 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		if (since < MIN_BATCH_TICK_MS || (since < BATCH_TICK_MS && !takeDirty(repo.id))) return;
 		takeDirty(repo.id);
 		lastBatchTick.set(repo.id, Date.now());
+		const started = Date.now();
 		try {
 			await withRepoLock(repo.id, () => tickBatchQueue(liveDeps(repo)));
 		} catch (err) {
 			// Transient GitHub or git errors: the next cycle picks up where this one stopped.
 			console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
+		} finally {
+			const took = Date.now() - started;
+			if (took >= SLOW_TICK_MS) console.log(`[merge-queue] Batch tick for ${repo.owner}/${repo.name} took ${took} ms`);
 		}
 		return;
 	}
