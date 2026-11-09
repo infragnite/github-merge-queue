@@ -10,7 +10,7 @@ import {
 } from '$lib/server/db';
 import { getOpenPRs } from '$lib/server/github';
 import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
-import { getQueueSettings, setQueuePriority, updateQueueSettings } from '$lib/server/batch-store';
+import { currentHold, getQueueSettings, setQueuePriority, updateQueueSettings } from '$lib/server/batch-store';
 import { withRepoLock } from '$lib/server/repo-lock';
 import { retireBatches } from '$lib/server/batch-queue';
 import { liveDeps } from '$lib/server/batch-live';
@@ -26,7 +26,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const repo = getRepoByOwnerName(params.owner, params.name);
 	if (!repo) error(404, 'Repository not found');
 
-	const queueItems = getQueueItems(repo.id);
+	const queueItems = getQueueItems(repo.id).map((i) => ({ ...i, holdWait: currentHold(i)?.wait ?? null }));
 
 	let openPrs: Array<{
 		number: number;
@@ -70,13 +70,15 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 			draft: pr.draft
 		}));
 
+	const settings = getQueueSettings(repo.id);
 	return {
 		repo,
 		queueItems,
 		openPrs: availablePrs,
 		stacks,
 		pipeline,
-		mode: getQueueSettings(repo.id).mode,
+		mode: settings.mode,
+		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },
 		history: getRepoHistory(repo.id)
 	};
 };

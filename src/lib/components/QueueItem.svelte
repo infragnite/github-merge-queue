@@ -1,66 +1,97 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
 	import StatusBadge from './StatusBadge.svelte';
-	import type { QueueItem } from '$lib/types';
+	import type { ViewItem, StackPlace } from '$lib/queue-view';
 
 	let {
 		item,
-		position,
+		position = null,
 		repoOwner,
 		repoName,
-		reorderable,
-		batchMode
-	}: { item: QueueItem; position: number; repoOwner: string; repoName: string; reorderable: boolean; batchMode: boolean } = $props();
+		reorderable = false,
+		batchMode,
+		stack = null,
+		why = null
+	}: {
+		item: ViewItem;
+		position?: number | null;
+		repoOwner: string;
+		repoName: string;
+		reorderable?: boolean;
+		batchMode: boolean;
+		stack?: StackPlace | null;
+		/** Set when the row is listed under "Needs attention": what is wrong. */
+		why?: string | null;
+	} = $props();
 
 	const isActive = $derived(['updating', 'checking', 'merging'].includes(item.status));
 	const canRemove = $derived(!['merging', 'merged'].includes(item.status));
 	const action = (name: string) => `/repos/${repoOwner}/${repoName}?/${name}`;
+	const priority = $derived(item.priority ?? 'normal');
+	// Plain queued rows carry no pill: only what differs from "waiting its turn" is shown.
+	const showStatus = $derived(item.status !== 'queued');
+	const note = $derived(
+		why ?? (item.status === 'queued' && item.error_message ? item.error_message : item.status !== 'conflict' ? item.error_message : null)
+	);
+	const noteTone = $derived(why || item.status === 'failed' || item.holdWait === false ? 'text-red-700' : 'text-gray-500');
+	const prLink = (n: number) => `https://github.com/${repoOwner}/${repoName}/pull/${n}`;
 </script>
 
 <div
-	class="flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 text-sm last:border-b-0 {isActive
+	class="group flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 text-sm last:border-b-0 {isActive
 		? 'bg-indigo-50/40'
-		: item.status === 'conflict'
-			? 'bg-orange-50/50'
-			: ''}"
+		: ''}"
 >
 	{#if reorderable}
-		<span class="shrink-0 cursor-grab text-gray-300 hover:text-gray-500 active:cursor-grabbing" title="Drag to reorder" aria-hidden="true">
+		<span class="hidden shrink-0 cursor-grab text-gray-300 hover:text-gray-500 active:cursor-grabbing sm:inline" title="Drag to reorder" aria-hidden="true">
 			<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
 				<circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
 				<circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
 				<circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
 			</svg>
 		</span>
-		<span class="w-6 shrink-0 text-right text-xs tabular-nums text-gray-400">{position}</span>
+	{/if}
+	{#if position !== null}
+		<span class="w-6 shrink-0 text-right text-xs tabular-nums text-gray-400" title="Place in line">{position}</span>
 	{/if}
 	<a href={item.pr_url} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600">#{item.pr_number}</a>
 	<div class="min-w-0 flex-1">
-		<p class="truncate text-gray-700" title={item.pr_title}>{item.pr_title}</p>
+		<div class="flex min-w-0 items-center gap-1.5">
+			<p class="min-w-0 truncate text-gray-700" title={item.pr_title}>{item.pr_title}</p>
+			{#if stack && stack.parent !== null}
+				<a href={prLink(stack.parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Stacked on #{stack.parent}; lands after it">on #{stack.parent}</a>
+			{:else if stack && stack.children > 0}
+				<span class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700" title="{stack.children} PR(s) stacked on this one">stack base</span>
+			{/if}
+		</div>
 		{#if item.status === 'conflict'}
 			<p class="truncate text-xs text-orange-700">
-				Merge conflicts:
+				Merge conflict:
 				{#if item.author_login === 'dependabot[bot]'}
 					<a href={item.pr_url} target="_blank" rel="noopener" class="underline">comment <code>@dependabot recreate</code></a>
 				{:else}
 					<a href="{item.pr_url}/conflicts" target="_blank" rel="noopener" class="underline">resolve on GitHub</a>
 				{/if}; retried automatically
 			</p>
-		{:else if item.error_message}
-			<p class="truncate text-xs text-red-700" title={item.error_message}>{item.error_message}</p>
+		{:else if note}
+			<p class="truncate text-xs {noteTone}" title={note}>{note}</p>
 		{/if}
 	</div>
-	<span class="hidden shrink-0 text-xs text-gray-400 sm:inline">{item.author_login}</span>
-	<StatusBadge status={item.status} />
+	<span class="hidden shrink-0 text-xs text-gray-400 md:inline">{item.author_login}</span>
+	{#if batchMode && priority !== 'normal'}
+		<span class="shrink-0 rounded px-1.5 py-0.5 text-xs font-medium {priority === 'urgent' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'}">{priority}</span>
+	{/if}
+	{#if showStatus}<StatusBadge status={item.status} />{/if}
 	{#if batchMode && (item.status === 'queued' || item.status === 'conflict')}
-		<form method="POST" action={action('setPriority')} use:enhance class="shrink-0">
+		<form method="POST" action={action('setPriority')} use:enhance class="hidden shrink-0 sm:block sm:opacity-0 sm:transition-opacity sm:focus-within:opacity-100 sm:group-hover:opacity-100">
 			<input type="hidden" name="pr_number" value={item.pr_number} />
 			<select
 				name="priority"
-				value={item.priority ?? 'normal'}
+				value={priority}
 				onchange={(e) => e.currentTarget.form?.requestSubmit()}
-				class="rounded border border-border-subtle bg-transparent py-0.5 pl-1 pr-6 text-xs {item.priority === 'urgent' ? 'text-red-700' : item.priority === 'low' ? 'text-gray-400' : 'text-gray-600'}"
+				class="rounded border border-border-subtle bg-transparent py-0.5 pl-1 pr-6 text-xs text-gray-600"
 				aria-label="Priority of #{item.pr_number}"
+				title="Urgent PRs go first, in a small express batch"
 			>
 				<option value="urgent">urgent</option>
 				<option value="normal">normal</option>
@@ -72,7 +103,7 @@
 		{#if item.status === 'failed'}
 			<form method="POST" action={action('retry')} use:enhance>
 				<input type="hidden" name="item_id" value={item.id} />
-				<button type="submit" class="rounded p-1 text-gray-400 hover:bg-indigo-50 hover:text-indigo-600" title="Retry" aria-label="Retry #{item.pr_number}">
+				<button type="submit" class="rounded p-1 text-gray-400 hover:bg-indigo-50 hover:text-indigo-600" title="Put back in the queue" aria-label="Retry #{item.pr_number}">
 					<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
 						<path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
 					</svg>
@@ -80,7 +111,13 @@
 			</form>
 		{/if}
 		{#if canRemove}
-			<form method="POST" action={action('removeFromQueue')} use:enhance>
+			<form
+				method="POST"
+				action={action('removeFromQueue')}
+				use:enhance={({ cancel }) => {
+					if (!confirm(`Remove #${item.pr_number} from the queue?${isActive ? ' It is being tested in a batch right now.' : ''}`)) cancel();
+				}}
+			>
 				<input type="hidden" name="item_id" value={item.id} />
 				<button type="submit" class="rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-600" title="Remove from queue" aria-label="Remove #{item.pr_number} from the queue">
 					<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">

@@ -1268,7 +1268,10 @@ class Tick {
 		}
 		for (const h of plan.held) {
 			const it = this.item(h.pr);
-			if (it && it.error_message !== h.admission.reason) db.updateQueueItemStatus(it.id, 'queued', h.admission.reason);
+			if (!it) continue;
+			const { code, wait, reason } = h.admission;
+			if (it.error_message !== reason) db.updateQueueItemStatus(it.id, 'queued', reason);
+			store.setHold(it.id, { code, wait, reason });
 		}
 		if (!plan.batch) return 'idle';
 		const below = red ? [] : active.flatMap((b) => b.members);

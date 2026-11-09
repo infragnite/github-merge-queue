@@ -176,6 +176,8 @@ export function migrateBatches(database: Database.Database) {
 	add('deferred_for', `TEXT`);
 	// Batches this PR failed in without being found the culprit (flaky or unclear failures).
 	add('batch_failures', `INTEGER NOT NULL DEFAULT 0`);
+	// Why the planner holds this queued PR back: { code, wait, reason } (see setHold).
+	add('hold', `TEXT`);
 }
 
 // --- settings ---
@@ -351,6 +353,34 @@ export function deferredFor(item: { deferred_for?: string | null }): number[] {
 		return item.deferred_for ? (JSON.parse(item.deferred_for) as number[]) : [];
 	} catch {
 		return [];
+	}
+}
+
+/**
+ * Why the planner holds a queued PR back, so the dashboard can tell a PR that waits by itself
+ * (CI running, parent pending) from one that needs someone. The reason matches the item's
+ * error_message while the hold is current.
+ */
+export interface Hold {
+	code: string;
+	wait: boolean;
+	reason: string;
+}
+
+export function setHold(itemId: number, hold: Hold | null) {
+	getDb()
+		.prepare('UPDATE queue_items SET hold = ? WHERE id = ?')
+		.run(hold ? JSON.stringify(hold) : null, itemId);
+}
+
+/** The item's hold, when it still describes the item's current message. */
+export function currentHold(item: { hold?: string | null; status: string; error_message: string | null }): Hold | null {
+	if (item.status !== 'queued' || !item.hold || !item.error_message) return null;
+	try {
+		const h = JSON.parse(item.hold) as Hold;
+		return h.reason === item.error_message ? h : null;
+	} catch {
+		return null;
 	}
 }
 
