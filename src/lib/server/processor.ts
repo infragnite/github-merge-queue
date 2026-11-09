@@ -2,6 +2,9 @@ import { env } from '$env/dynamic/private';
 import * as db from './db';
 import * as github from './github';
 import { closedPRReason, stackMergeBlocker } from './stack-runtime';
+import { getQueueSettings } from './batch-store';
+import { tickBatchQueue } from './batch-queue';
+import { liveDeps } from './batch-live';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -58,6 +61,16 @@ async function recordOpenPRHeads(repo: RepoRef) {
 
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	await recordOpenPRHeads(repo);
+
+	if (getQueueSettings(repo.id).mode === 'batch') {
+		try {
+			await tickBatchQueue(liveDeps(repo));
+		} catch (err) {
+			// Transient GitHub or git errors: the next cycle picks up where this one stopped.
+			console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
+		}
+		return;
+	}
 
 	// Reconcile ALL queued items (not just head) to detect externally merged/closed PRs
 	const allItems = db.getQueueItems(repo.id);

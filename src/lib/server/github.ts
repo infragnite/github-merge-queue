@@ -250,3 +250,100 @@ export function stackClient(owner: string, repo: string): StackGitHub {
 		compare: (base, head, page, perPage) => compareCommits(owner, repo, base, head, page, perPage)
 	};
 }
+
+// --- Batch queue ---
+
+export async function getInstallationTokenForGit(): Promise<string> {
+	return getInstallationToken();
+}
+
+export interface GhReview {
+	user: { login: string } | null;
+	state: string;
+	commit_id: string;
+	author_association: string;
+	submitted_at: string;
+}
+
+export async function listReviews(owner: string, repo: string, n: number): Promise<GhReview[]> {
+	const out: GhReview[] = [];
+	for (let page = 1; page <= 10; page++) {
+		const batch: GhReview[] = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}/reviews?per_page=100&page=${page}`);
+		out.push(...batch);
+		if (batch.length < 100) break;
+	}
+	return out;
+}
+
+export async function deleteBranch(owner: string, repo: string, branch: string) {
+	try {
+		await ghFetchAsApp(`/repos/${owner}/${repo}/git/refs/heads/${refPath(branch)}`, { method: 'DELETE' });
+	} catch (e) {
+		if (e instanceof GitHubError && (e.status === 404 || e.status === 422)) return;
+		throw e;
+	}
+}
+
+export async function setPRBase(owner: string, repo: string, n: number, base: string) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}`, {
+		method: 'PATCH',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ base })
+	});
+}
+
+export async function squashMergeAt(owner: string, repo: string, n: number, title: string, sha: string) {
+	try {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}/merge`, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ merge_method: 'squash', commit_title: title, sha })
+		});
+		return mergeResultFromData(data);
+	} catch (e) {
+		return mergeResultFromError(e);
+	}
+}
+
+export async function createCommitStatus(
+	owner: string,
+	repo: string,
+	sha: string,
+	status: { state: 'success' | 'failure' | 'pending'; context: string; description: string; target_url?: string }
+) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/statuses/${sha}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ ...status, description: status.description.slice(0, 140) })
+	});
+}
+
+export async function dispatchWorkflow(
+	owner: string,
+	repo: string,
+	workflow: string,
+	ref: string,
+	inputs: Record<string, string>
+) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ ref, inputs })
+	});
+}
+
+export async function checkRunsNamed(owner: string, repo: string, sha: string, name: string) {
+	const data = await ghFetchAsApp(
+		`/repos/${owner}/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest`
+	);
+	return data.check_runs as Array<{ status: string; conclusion: string | null; html_url: string }>;
+}
+
+export async function workflowRunsForSha(owner: string, repo: string, sha: string) {
+	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=20`);
+	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string }>;
+}
+
+export async function rerunFailedJobs(owner: string, repo: string, runId: number) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun-failed-jobs`, { method: 'POST' });
+}

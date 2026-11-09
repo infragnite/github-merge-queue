@@ -46,9 +46,25 @@ export interface BatchRow {
 	finished_at: string | null;
 }
 
+export interface CISettings {
+	/** Workflow file the queue dispatches on batch branches. */
+	workflow: string;
+	/** The check run that decides a batch, e.g. krusty's `ci-and-conformance`. */
+	requiredCheck: string;
+	/** Commit status the queue sets on master when its tree was already tested. */
+	testedStatus: string;
+}
+
+export const DEFAULT_CI: CISettings = {
+	workflow: 'ci.yml',
+	requiredCheck: 'ci',
+	testedStatus: 'merge-queue/tested'
+};
+
 export interface RepoQueueSettings {
 	mode: QueueMode;
 	config: BatchConfig;
+	ci: CISettings;
 	pausedReason: string | null;
 }
 
@@ -58,6 +74,7 @@ export function migrateBatches(database: Database.Database) {
 			repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
 			mode TEXT NOT NULL DEFAULT 'serial',
 			config TEXT NOT NULL DEFAULT '{}',
+			ci TEXT NOT NULL DEFAULT '{}',
 			paused_reason TEXT
 		);
 
@@ -92,33 +109,35 @@ export function migrateBatches(database: Database.Database) {
 
 export function getQueueSettings(repoId: number): RepoQueueSettings {
 	const row = getDb()
-		.prepare('SELECT mode, config, paused_reason FROM queue_settings WHERE repo_id = ?')
-		.get(repoId) as { mode: QueueMode; config: string; paused_reason: string | null } | undefined;
-	if (!row) return { mode: 'serial', config: { ...DEFAULT_BATCH_CONFIG }, pausedReason: null };
+		.prepare('SELECT mode, config, ci, paused_reason FROM queue_settings WHERE repo_id = ?')
+		.get(repoId) as { mode: QueueMode; config: string; ci: string; paused_reason: string | null } | undefined;
+	if (!row) return { mode: 'serial', config: { ...DEFAULT_BATCH_CONFIG }, ci: { ...DEFAULT_CI }, pausedReason: null };
 	return {
 		mode: row.mode,
 		config: { ...DEFAULT_BATCH_CONFIG, ...(JSON.parse(row.config) as Partial<BatchConfig>) },
+		ci: { ...DEFAULT_CI, ...(JSON.parse(row.ci) as Partial<CISettings>) },
 		pausedReason: row.paused_reason
 	};
 }
 
 export function updateQueueSettings(
 	repoId: number,
-	change: { mode?: QueueMode; config?: Partial<BatchConfig>; pausedReason?: string | null }
+	change: { mode?: QueueMode; config?: Partial<BatchConfig>; ci?: Partial<CISettings>; pausedReason?: string | null }
 ): RepoQueueSettings {
 	const cur = getQueueSettings(repoId);
 	const next: RepoQueueSettings = {
 		mode: change.mode ?? cur.mode,
 		config: { ...cur.config, ...change.config },
+		ci: { ...cur.ci, ...change.ci },
 		pausedReason: change.pausedReason === undefined ? cur.pausedReason : change.pausedReason
 	};
 	getDb()
 		.prepare(
-			`INSERT INTO queue_settings (repo_id, mode, config, paused_reason) VALUES (?, ?, ?, ?)
+			`INSERT INTO queue_settings (repo_id, mode, config, ci, paused_reason) VALUES (?, ?, ?, ?, ?)
 			 ON CONFLICT(repo_id) DO UPDATE SET mode = excluded.mode, config = excluded.config,
-			   paused_reason = excluded.paused_reason`
+			   ci = excluded.ci, paused_reason = excluded.paused_reason`
 		)
-		.run(repoId, next.mode, JSON.stringify(next.config), next.pausedReason);
+		.run(repoId, next.mode, JSON.stringify(next.config), JSON.stringify(next.ci), next.pausedReason);
 	return next;
 }
 
