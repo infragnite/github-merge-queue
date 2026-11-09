@@ -48,12 +48,18 @@ export function approvalsFrom(
 	return { approvedShas: [...new Set(approvedShas)], changesRequested };
 }
 
-/** Result of the required check from its check runs on one commit. */
-export function checkResult(runs: Array<{ status: string; conclusion: string | null }>): 'pending' | 'success' | 'failure' {
+/**
+ * Result of the required check from its check runs on one commit. Only `success` passes: a
+ * skipped or neutral required job proved nothing. With `notBefore` (when failed jobs were re-run),
+ * runs that finished earlier are the old attempt and are ignored.
+ */
+export function checkResult(
+	runs: Array<{ status: string; conclusion: string | null; completed_at?: string | null }>,
+	notBefore?: number | null
+): 'pending' | 'success' | 'failure' {
+	if (notBefore) runs = runs.filter((r) => r.status !== 'completed' || !r.completed_at || Date.parse(r.completed_at) >= notBefore);
 	if (runs.length === 0 || runs.some((r) => r.status !== 'completed')) return 'pending';
-	return runs.every((r) => r.conclusion === 'success' || r.conclusion === 'neutral' || r.conclusion === 'skipped')
-		? 'success'
-		: 'failure';
+	return runs.every((r) => r.conclusion === 'success') ? 'success' : 'failure';
 }
 
 /** A bare mirror per repository, fetched by SHA with the installation token. */
@@ -143,7 +149,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			refreshCaches: async () => {
 				await github.dispatchWorkflow(owner, name, ci().workflow, dispatchRef(), {});
 			},
-			result: async (headSha) => checkResult(await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck)),
+			result: async (headSha, notBefore) =>
+				checkResult(await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck), notBefore),
+			cancel: async (headSha) => {
+				const runs = await github.workflowRunsForSha(owner, name, headSha);
+				for (const r of runs.filter((r) => r.status !== 'completed')) await github.cancelWorkflowRun(owner, name, r.id);
+			},
 			rerunFailed: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);
 				const failed = runs.filter((r) => r.status === 'completed' && r.conclusion === 'failure');
@@ -198,7 +209,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				await github.setPRBase(owner, name, n, base);
 			},
 			squashMerge: async (n, title, sha) => {
-				const r = await github.squashMergeAt(owner, name, n, title, sha);
+				const r = await github.squashMergeAt(owner, name, n, title, sha, await github.commitAuthorEmail(owner, name, sha));
 				return { merged: r.merged, sha: r.sha, message: r.message };
 			},
 			setStatus: async (sha, state, description) => {

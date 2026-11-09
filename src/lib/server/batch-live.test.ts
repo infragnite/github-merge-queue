@@ -48,10 +48,18 @@ describe('required check result', () => {
 		expect(checkResult([{ status: 'in_progress', conclusion: null }])).toBe('pending');
 	});
 
-	test('success only when every run succeeded or was skipped', () => {
+	test('success only when every run succeeded; a skipped or neutral required job proves nothing', () => {
 		expect(checkResult([{ status: 'completed', conclusion: 'success' }])).toBe('success');
-		expect(checkResult([{ status: 'completed', conclusion: 'skipped' }])).toBe('success');
+		expect(checkResult([{ status: 'completed', conclusion: 'skipped' }])).toBe('failure');
+		expect(checkResult([{ status: 'completed', conclusion: 'neutral' }])).toBe('failure');
 		expect(checkResult([{ status: 'completed', conclusion: 'failure' }])).toBe('failure');
 		expect(checkResult([{ status: 'completed', conclusion: 'cancelled' }])).toBe('failure');
+	});
+
+	test('after a re-run, the failed attempt that finished before it does not count', () => {
+		const old = { status: 'completed', conclusion: 'failure', completed_at: '2026-11-09T10:00:00Z' };
+		const rerun = Date.parse('2026-11-09T10:05:00Z');
+		expect(checkResult([old], rerun)).toBe('pending');
+		expect(checkResult([old, { status: 'completed', conclusion: 'success', completed_at: '2026-11-09T10:20:00Z' }], rerun)).toBe('success');
 	});
 });

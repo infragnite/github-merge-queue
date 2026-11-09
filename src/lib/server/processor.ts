@@ -55,6 +55,7 @@ async function recordOpenPRHeads(repo: RepoRef) {
 	try {
 		const prs: Array<{ number: number; head: { sha: string } }> = await github.getOpenPRs(repo.owner, repo.name);
 		db.stackStore(repo.id).recordHeads(prs.map((p) => ({ pr: p.number, sha: p.head.sha })));
+		db.prunePRHeads(repo.id, prs.map((p) => p.number));
 	} catch (err) {
 		console.error(`[merge-queue] Head polling failed for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
 	}
@@ -63,6 +64,8 @@ async function recordOpenPRHeads(repo: RepoRef) {
 // A batch tick costs several GitHub calls per queued PR, so it runs at most
 // once a minute, or sooner when a webhook says something changed.
 const BATCH_TICK_MS = 60_000;
+/** Even a webhook can't make it tick more often than this; a burst of events becomes one tick. */
+const MIN_BATCH_TICK_MS = 10_000;
 const lastBatchTick = new Map<number, number>();
 
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
@@ -70,7 +73,9 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 
 	if (getQueueSettings(repo.id).mode === 'batch') {
 		const last = lastBatchTick.get(repo.id) ?? 0;
-		if (!takeDirty(repo.id) && Date.now() - last < BATCH_TICK_MS) return;
+		const since = Date.now() - last;
+		if (since < MIN_BATCH_TICK_MS || (since < BATCH_TICK_MS && !takeDirty(repo.id))) return;
+		takeDirty(repo.id);
 		lastBatchTick.set(repo.id, Date.now());
 		try {
 			await tickBatchQueue(liveDeps(repo));

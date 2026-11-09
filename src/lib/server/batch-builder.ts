@@ -79,8 +79,12 @@ export class GitRunner {
 }
 
 /** Squash-commit message for one PR, matching GitHub's squash title. */
+/** GitHub skips workflows for a push whose commit message has one of these; a batch must never be skipped. */
+const SKIP_DIRECTIVE = /\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]/gi;
+
 export function squashMessage(m: BatchMember): string {
-	return `${m.title} (#${m.pr})`;
+	const title = m.title.replace(SKIP_DIRECTIVE, '').replace(/\s{2,}/g, ' ').trim();
+	return `${title} (#${m.pr})`;
 }
 
 /**

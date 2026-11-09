@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { buildBatch, GitRunner, type BatchMember } from './batch-builder';
+import { buildBatch, GitRunner, squashMessage, type BatchMember } from './batch-builder';
 import { GitSandbox } from './testing/git-sandbox';
 
 let git: GitSandbox;
@@ -156,4 +156,9 @@ describe('building a batch', () => {
 		const r = buildBatch(runner, base, [member(1, 'a')]);
 		expect(r.ok && r.headSha).toBe(base);
 	});
+});
+
+test('a skip directive in a PR title cannot skip the batch CI', () => {
+	expect(squashMessage({ pr: 7, headSha: 'x', title: 'Docs only [skip ci]', parentHeadSha: null })).toBe('Docs only (#7)');
+	expect(squashMessage({ pr: 8, headSha: 'x', title: '[CI SKIP] tweak [no ci] it', parentHeadSha: null })).toBe('tweak it (#8)');
 });

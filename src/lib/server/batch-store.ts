@@ -42,6 +42,8 @@ export interface BatchRow {
 	 * own work starts after (it is restacked onto master from there at landing).
 	 */
 	steps: Record<number, BatchStep>;
+	/** When failed jobs were last re-run (epoch ms); check runs finished before it are stale. */
+	retried_at: number | null;
 	/** PRs tested in this commit beyond `context`, in order. */
 	members: number[];
 	/** PRs applied below `members` that are already known to pass (bisection only). */
@@ -110,6 +112,7 @@ export function migrateBatches(database: Database.Database) {
 			members TEXT NOT NULL,
 			heads TEXT NOT NULL DEFAULT '{}',
 			steps TEXT NOT NULL DEFAULT '{}',
+			retried_at INTEGER,
 			context TEXT NOT NULL DEFAULT '[]',
 			status TEXT NOT NULL DEFAULT 'testing',
 			express INTEGER NOT NULL DEFAULT 0,
@@ -142,6 +145,13 @@ export function migrateBatches(database: Database.Database) {
 		);
 		CREATE INDEX IF NOT EXISTS queue_events_repo ON queue_events(repo_id, id);
 	`);
+	const batchCols = database.prepare(`PRAGMA table_info(batches)`).all() as Array<{ name: string }>;
+	for (const [name, ddl] of [
+		['steps', `TEXT NOT NULL DEFAULT '{}'`],
+		['retried_at', 'INTEGER']
+	]) {
+		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
+	}
 	const cols = database.prepare(`PRAGMA table_info(queue_items)`).all() as Array<{ name: string }>;
 	const add = (name: string, ddl: string) => {
 		if (!cols.some((c) => c.name === name)) database.exec(`ALTER TABLE queue_items ADD COLUMN ${name} ${ddl}`);
@@ -303,6 +313,10 @@ export function setBatchStatus(id: number, status: BatchStatus) {
 /** When a batch was created, in epoch ms. */
 export function batchCreatedMs(b: BatchRow): number {
 	return Date.parse(b.created_at.includes('T') ? b.created_at : `${b.created_at.replace(' ', 'T')}Z`);
+}
+
+export function setBatchRetried(id: number, at: number) {
+	getDb().prepare(`UPDATE batches SET retried_at = ?, ci_result = 'pending' WHERE id = ?`).run(at, id);
 }
 
 export function setBatchCI(id: number, result: BatchRow['ci_result']) {
