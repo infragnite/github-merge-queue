@@ -37,6 +37,8 @@ export interface BatchCard {
 	finishedAt: string | null;
 	/** PRs below the tested ones that already passed (bisection only). */
 	context: number[];
+	/** PRs of a bisecting batch that already landed. */
+	landed: number[];
 	prs: BatchPR[];
 	bisection: BatchCard[];
 	progress: CIProgress | null;
@@ -87,6 +89,7 @@ export function batchCard(
 		createdAt: b.created_at,
 		finishedAt: b.finished_at,
 		context: b.context,
+		landed: b.landed,
 		prs: b.members.map((n) => ({
 			pr: n,
 			title: prs.get(n)?.title ?? '',

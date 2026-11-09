@@ -48,6 +48,8 @@ export interface BatchRow {
 	members: number[];
 	/** PRs applied below `members` that are already known to pass (bisection only). */
 	context: number[];
+	/** PRs of a bisecting batch that already landed, in landing order. */
+	landed: number[];
 	status: BatchStatus;
 	express: boolean;
 	ci_result: 'pending' | 'success' | 'failure';
@@ -163,7 +165,9 @@ export function migrateBatches(database: Database.Database) {
 	const batchCols = database.prepare(`PRAGMA table_info(batches)`).all() as Array<{ name: string }>;
 	for (const [name, ddl] of [
 		['steps', `TEXT NOT NULL DEFAULT '{}'`],
-		['retried_at', 'INTEGER']
+		['retried_at', 'INTEGER'],
+		// Bisection lands passing groups as it goes: the PRs of this batch that landed so far.
+		['landed', `TEXT NOT NULL DEFAULT '[]'`]
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
@@ -226,8 +230,9 @@ export function setQueuePriority(repoId: number, prNumber: number, priority: Pri
 
 // --- batches ---
 
-type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps'> & {
+type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed'> & {
 	members: string;
+	landed: string | null;
 	heads: string;
 	steps: string;
 	context: string;
@@ -239,6 +244,7 @@ function parse(r: RawBatch): BatchRow {
 		...r,
 		members: JSON.parse(r.members),
 		context: JSON.parse(r.context),
+		landed: JSON.parse(r.landed ?? '[]'),
 		heads: JSON.parse(r.heads),
 		steps: JSON.parse(r.steps),
 		express: !!r.express
@@ -281,6 +287,19 @@ export function insertBatch(b: {
 			b.express ? 1 : 0
 		);
 	return getBatch(Number(r.lastInsertRowid))!;
+}
+
+/** A bisecting batch landed `prs` on master `sha` (tree `tree`): the rest bisects on top of it. */
+export function recordBisectLanding(id: number, prs: number[], sha: string, tree: string) {
+	const b = getBatch(id)!;
+	getDb()
+		.prepare('UPDATE batches SET landed = ?, base_sha = ?, base_tree = ? WHERE id = ?')
+		.run(JSON.stringify([...b.landed, ...prs]), sha, tree, id);
+}
+
+/** The default branch moved under a bisecting batch: it follows it. */
+export function rebaseBatch(id: number, sha: string, tree: string) {
+	getDb().prepare('UPDATE batches SET base_sha = ?, base_tree = ? WHERE id = ?').run(sha, tree, id);
 }
 
 export function getBatch(id: number): BatchRow | undefined {
