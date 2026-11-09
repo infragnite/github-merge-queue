@@ -38,6 +38,8 @@ export interface QueueItem {
 	created_at: string;
 	started_at: string | null;
 	completed_at: string | null;
+	/** Batch mode's order: urgent PRs go first, in an express batch. */
+	priority?: 'urgent' | 'normal' | 'low' | null;
 }
 
 export interface HistoryItem {

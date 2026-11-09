@@ -113,6 +113,18 @@
 			</div>
 		</div>
 		<div class="flex items-center gap-3">
+			<form method="POST" action="?/setMode" use:enhance class="flex overflow-hidden rounded-lg border border-border-subtle text-sm" aria-label="Merge mode">
+				{#each [['serial', 'One by one'], ['batch', 'Batches']] as [value, label] (value)}
+					<button
+						type="submit"
+						name="mode"
+						{value}
+						aria-pressed={data.mode === value}
+						class="px-3 py-2 transition-colors {data.mode === value ? 'bg-indigo-600 text-white' : 'bg-surface-raised text-gray-600 hover:bg-surface-sunken'}"
+						title={value === 'batch' ? 'Test queued PRs together in batches; order by priority' : 'Test and merge PRs one at a time, in queue order'}
+					>{label}</button>
+				{/each}
+			</form>
 			<button
 				onclick={refresh}
 				disabled={refreshing}
@@ -182,19 +194,25 @@
 			<p class="mt-1 text-sm text-gray-500">Add a pull request to start the merge queue.</p>
 		</div>
 	{:else}
-		<div class="space-y-3">
+		<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
 			{#each data.queueItems as item, index (item.id)}
-				<div
-					draggable="true"
-					ondragstart={() => handleDragStart(index)}
-					ondragover={(e) => handleDragOver(e, index)}
-					ondrop={(e) => handleDrop(e, index)}
-					ondragend={handleDragEnd}
-					class="transition-transform {dragOverIndex === index && dragIndex !== index ? 'translate-y-1 border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''}"
-					role="listitem"
-				>
-					<QueueItem {item} position={index + 1} repoOwner={data.repo.owner} repoName={data.repo.name} />
-				</div>
+				{#if data.mode === 'batch'}
+					<div role="listitem">
+						<QueueItem {item} position={index + 1} repoOwner={data.repo.owner} repoName={data.repo.name} reorderable={false} batchMode />
+					</div>
+				{:else}
+					<div
+						draggable="true"
+						ondragstart={() => handleDragStart(index)}
+						ondragover={(e) => handleDragOver(e, index)}
+						ondrop={(e) => handleDrop(e, index)}
+						ondragend={handleDragEnd}
+						class="{dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''}"
+						role="listitem"
+					>
+						<QueueItem {item} position={index + 1} repoOwner={data.repo.owner} repoName={data.repo.name} reorderable batchMode={false} />
+					</div>
+				{/if}
 			{/each}
 		</div>
 	{/if}
