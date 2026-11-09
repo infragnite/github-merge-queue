@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
-const { tickBatchQueue } = await import('./batch-queue');
+const { tickBatchQueue, startTry, retireBatches } = await import('./batch-queue');
 const { buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
@@ -38,6 +38,11 @@ class World {
 	/** Approval given on one specific head SHA only. */
 	approvedOn = new Map<number, string>();
 	cacheRefreshes = 0;
+	cancelled: string[] = [];
+	/** PRs whose merge GitHub refuses (e.g. a ruleset the queue doesn't satisfy). */
+	refuseMerge = new Set<number>();
+	/** PRs opened from a fork. */
+	forks = new Set<number>();
 
 	files(sha: string) {
 		return new Set(git.git('ls-tree', '-r', '--name-only', sha).split('\n'));
@@ -54,6 +59,7 @@ class World {
 		return {
 			repo,
 			now: () => Date.now() + this.started.length,
+			sleep: async () => {},
 			log: () => {},
 			analysis: async () => analyzeStacks(git.input()),
 			git: {
@@ -71,6 +77,9 @@ class World {
 					if (this.ciPendingOnce.delete(head)) return 'pending';
 					const flakeNow = this.flaky.has(head) && !this.reruns.has(head);
 					return flakeNow || this.ciFails(head) ? 'failure' : 'success';
+				},
+				cancel: async (head) => {
+					this.cancelled.push(head);
 				},
 				refreshCaches: async () => {
 					this.cacheRefreshes++;
@@ -90,7 +99,7 @@ class World {
 						pr: n,
 						headSha: head,
 						headRef: p.headRef,
-						sameRepo: true,
+						sameRepo: !this.forks.has(n),
 						draft: false,
 						title: `PR ${n}`,
 						url: `https://example.test/pull/${n}`,
@@ -127,6 +136,7 @@ class World {
 				},
 				retargetBase: async (n, base) => git.retarget(n, base),
 				squashMerge: async (n, _title, expected) => {
+					if (this.refuseMerge.has(n)) return { merged: false, message: 'Repository rule violations found' };
 					if (git.sha(git.pr(n).headRef) !== expected) return { merged: false, message: 'Head branch was modified' };
 					try {
 						git.merge(n, 'squash');
@@ -196,6 +206,7 @@ describe('batch queue runtime', () => {
 	});
 
 	test('holds unapproved PRs and PRs with red checks', async () => {
+		store.updateQueueSettings(repo.id, { config: { requirePRChecks: true } });
 		pr(1, { approve: false });
 		pr(2);
 		pr(3);
@@ -235,6 +246,9 @@ describe('batch queue runtime', () => {
 		expect(world.reruns.size).toBeGreaterThanOrEqual(1);
 		expect(world.started.length).toBeGreaterThanOrEqual(4);
 		expect(world.started.at(-1)!.prs).toEqual([1, 2, 4]);
+		// the survivors land on the bisection's own proof run, not a fresh batch
+		expect(store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch')).toHaveLength(1);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('landed');
 	});
 
 	test('finds two PRs that only break together and ejects the later one', async () => {
@@ -456,5 +470,56 @@ describe('batch queue runtime', () => {
 		pr(1);
 		await run(3);
 		expect(world.started).toEqual([]);
+	});
+
+	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {
+		pr(1);
+		world.refuseMerge.add(1);
+		await run();
+		const head = git.sha('pr1');
+		const last = world.prStatuses.filter((s) => s.sha === head).at(-1);
+		expect(last?.state).toBe('pending');
+		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #1: Repository rule violations found/);
+		expect(world.merged).toEqual([]);
+	});
+
+	test('a superseded batch has its CI cancelled', async () => {
+		pr(1);
+		await tickBatchQueue(world.deps());
+		const first = world.started[0].head;
+		git.commit('main', 'hotfix pushed by hand');
+		await run();
+		expect(world.cancelled).toContain(first);
+		expect(world.merged).toEqual([1]);
+	});
+
+	test('a fork PR is not queued, or tried, without approval of its head', async () => {
+		store.updateQueueSettings(repo.id, { config: { requireApproval: false } });
+		pr(1, { approve: false });
+		world.forks.add(1);
+		await run(3);
+		expect(world.started).toEqual([]);
+		expect(db.getQueueItems(repo.id)[0].error_message).toMatch(/comes from a fork/);
+		await expect(startTry(world.deps(), 1)).rejects.toThrow(/comes from a fork/);
+		world.approved.add(1);
+		await run();
+		expect(world.merged).toEqual([1]);
+	});
+
+	test('a PR left checking with no batch carrying it goes back in line', async () => {
+		pr(1);
+		const it = db.getQueueItems(repo.id)[0];
+		db.updateQueueItemStatus(it.id, 'checking');
+		await run();
+		expect(world.merged).toEqual([1]);
+	});
+
+	test('leaving batch mode stops the batches in flight and requeues their PRs', async () => {
+		pr(1);
+		await tickBatchQueue(world.deps());
+		await retireBatches(world.deps());
+		expect(world.cancelled).toEqual([world.started[0].head]);
+		expect(store.getActiveBatches(repo.id)).toEqual([]);
+		expect(db.getQueueItems(repo.id)[0].status).toBe('queued');
 	});
 });

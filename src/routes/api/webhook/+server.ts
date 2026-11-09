@@ -28,6 +28,20 @@ function verifySignature(payload: string, signature: string | null, secret: stri
 	return diff === 0;
 }
 
+/** Events that can change what the batch queue should do next; check_run fires per job, so only suites count. */
+function wakesQueue(event: string | null, payload: Record<string, unknown>): boolean {
+	switch (event) {
+		case 'pull_request':
+		case 'pull_request_review':
+		case 'push':
+			return true;
+		case 'check_suite':
+			return payload.action === 'completed';
+		default:
+			return false;
+	}
+}
+
 export const POST: RequestHandler = async ({ request }) => {
 	const webhookSecret = env.GITHUB_WEBHOOK_SECRET;
 	if (!webhookSecret) return json({ error: 'Webhook secret not configured' }, { status: 500 });
@@ -54,7 +68,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	const [owner, name] = repository.full_name.split('/');
 	const repo = getRepoByOwnerName(owner, name);
 	if (!repo) return json({ ok: true });
-	markDirty(repo.id);
+	if (wakesQueue(event, payload)) markDirty(repo.id);
 
 	const queueItems = getQueueItems(repo.id);
 

@@ -299,14 +299,43 @@ export async function setPRBase(owner: string, repo: string, n: number, base: st
 	});
 }
 
-export async function squashMergeAt(owner: string, repo: string, n: number, title: string, sha: string) {
+/**
+ * Squash-merges PR `n` at exactly `sha`, with an empty body and `authorEmail` as the commit's
+ * author. REST can set neither: its default body lists every commit message of the PR, and it
+ * credits whoever opened the PR. GraphQL `mergePullRequest` can.
+ */
+export async function squashMergeAt(
+	owner: string,
+	repo: string,
+	n: number,
+	title: string,
+	sha: string,
+	authorEmail?: string | null
+) {
 	try {
-		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}/merge`, {
-			method: 'PUT',
+		const pr = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}`);
+		const data = await ghFetchAsApp('/graphql', {
+			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ merge_method: 'squash', commit_title: title, sha })
+			body: JSON.stringify({
+				query: `mutation($input: MergePullRequestInput!) {
+					mergePullRequest(input: $input) { pullRequest { merged mergeCommit { oid } } }
+				}`,
+				variables: {
+					input: {
+						pullRequestId: pr.node_id,
+						mergeMethod: 'SQUASH',
+						commitHeadline: title,
+						commitBody: '',
+						expectedHeadOid: sha,
+						...(authorEmail ? { authorEmail } : {})
+					}
+				}
+			})
 		});
-		return mergeResultFromData(data);
+		if (data.errors?.length) return { merged: false, sha: null, message: data.errors.map((e: { message: string }) => e.message).join('; ') };
+		const r = data.data?.mergePullRequest?.pullRequest;
+		return mergeResultFromData({ merged: !!r?.merged, sha: r?.mergeCommit?.oid });
 	} catch (e) {
 		return mergeResultFromError(e);
 	}
@@ -343,12 +372,28 @@ export async function checkRunsNamed(owner: string, repo: string, sha: string, n
 	const data = await ghFetchAsApp(
 		`/repos/${owner}/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest`
 	);
-	return data.check_runs as Array<{ status: string; conclusion: string | null; html_url: string }>;
+	return data.check_runs as Array<{ status: string; conclusion: string | null; html_url: string; completed_at: string | null }>;
 }
 
 export async function workflowRunsForSha(owner: string, repo: string, sha: string) {
 	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=20`);
 	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string }>;
+}
+
+export async function cancelWorkflowRun(owner: string, repo: string, runId: number) {
+	try {
+		await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs/${runId}/cancel`, { method: 'POST' });
+	} catch (e) {
+		// 409: the run already finished.
+		if (e instanceof GitHubError && e.status === 409) return;
+		throw e;
+	}
+}
+
+/** The email of a commit's author (the PR's head commit credits the squash). */
+export async function commitAuthorEmail(owner: string, repo: string, sha: string): Promise<string | null> {
+	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/commits/${sha}`);
+	return data.commit?.author?.email ?? null;
 }
 
 export async function addLabel(owner: string, repo: string, n: number, label: string) {

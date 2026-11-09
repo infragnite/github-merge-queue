@@ -22,11 +22,11 @@ import { json, type RequestHandler } from '@sveltejs/kit';
 import * as github from '$lib/server/github';
 import { getRepoByOwnerName } from '$lib/server/db';
 import { getQueueSettings, getRecentBatches } from '$lib/server/batch-store';
-import { startTry } from '$lib/server/batch-queue';
+import { retireBatches, startTry } from '$lib/server/batch-queue';
 import { liveDeps } from '$lib/server/batch-live';
 import { requireRole } from '$lib/server/api-auth';
 import { analyzeRepoStacks } from '$lib/server/stack-runtime';
-import { AuthError, resolveCaller, type AuthGitHub } from '$lib/server/api-auth';
+import { AuthError, bearer, resolveCaller, type AuthGitHub } from '$lib/server/api-auth';
 import * as api from '$lib/server/api-service';
 
 const authGitHub: AuthGitHub = {
@@ -37,10 +37,12 @@ const authGitHub: AuthGitHub = {
 
 const handle: RequestHandler = async ({ params, request, url }) => {
 	try {
-		// Authenticate first, so callers without access can't tell which repos the queue manages.
-		const caller = await resolveCaller(authGitHub, request.headers.get('authorization'), params.owner!, params.repo!);
+		// Unmanaged repos are refused before any GitHub call, so arbitrary owner/repo paths can't
+		// spend the app's rate limit. That a repo is managed is not a secret; its queue is.
+		if (!bearer(request.headers.get('authorization'))) throw new AuthError(401, 'Send your GitHub token: Authorization: Bearer $(gh auth token)');
 		const repo = getRepoByOwnerName(params.owner!, params.repo!);
 		if (!repo) return json({ error: `${params.owner}/${params.repo} is not managed by this queue` }, { status: 404 });
+		const caller = await resolveCaller(authGitHub, request.headers.get('authorization'), params.owner!, params.repo!);
 		const parts = (params.path ?? '').split('/').filter(Boolean);
 		const m = request.method;
 		const body = async (): Promise<Record<string, unknown>> => {
@@ -68,8 +70,14 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 				return json(api.dequeue(repo, caller, n));
 			case 'GET queue/config':
 				return json(api.getConfig(repo));
-			case 'PATCH queue/config':
-				return json(api.patchConfig(repo, caller, await body()));
+			case 'PATCH queue/config': {
+				const was = getQueueSettings(repo.id).mode;
+				const r = api.patchConfig(repo, caller, await body());
+				if (was === 'batch' && getQueueSettings(repo.id).mode !== 'batch') {
+					await retireBatches(liveDeps(repo));
+				}
+				return json(r);
+			}
 			case 'POST queue/pause':
 				return json(api.pause(repo, caller, (await body()).reason));
 			case 'POST queue/resume':

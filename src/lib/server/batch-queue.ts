@@ -92,8 +92,13 @@ export interface QueueCI {
 	start(branch: string, baseSha: string, headSha: string, prs: number[]): Promise<void>;
 	/** Runs the workflow on the default branch, so caches are saved in its scope. */
 	refreshCaches(): Promise<void>;
-	/** The required check's result on `headSha`. */
-	result(headSha: string): Promise<'pending' | 'success' | 'failure'>;
+	/**
+	 * The required check's result on `headSha`. With `notBefore` (epoch ms, when failed jobs were
+	 * re-run), a check run that finished before it is stale: the result is pending until a newer one finishes.
+	 */
+	result(headSha: string, notBefore?: number | null): Promise<'pending' | 'success' | 'failure'>;
+	/** Cancels workflow runs still going on `headSha` (a superseded batch). */
+	cancel(headSha: string): Promise<void>;
 	/** Re-runs only the failed jobs; false when there is nothing to re-run. */
 	rerunFailed(headSha: string): Promise<boolean>;
 }
@@ -114,6 +119,8 @@ export interface QueueDeps {
 	git: QueueGit;
 	analysis(): Promise<StackAnalysis>;
 	now(): number;
+	/** Waits; tests pass a no-op. */
+	sleep?: (ms: number) => Promise<void>;
 	log?: (msg: string) => void;
 }
 
@@ -189,7 +196,8 @@ class Tick {
 			ciGreen,
 			approvedShas,
 			changesRequested: r.changesRequested,
-			targetsDefault: p.baseRef === this.d.repo.default_branch
+			targetsDefault: p.baseRef === this.d.repo.default_branch,
+			fromFork: !p.sameRepo
 		};
 	}
 
@@ -287,7 +295,15 @@ class Tick {
 		for (const b of batches) {
 			store.setBatchStatus(b.id, 'superseded');
 			this.requeue(b.members);
-			await this.d.github.deleteBranch(b.branch).catch(() => {});
+			await this.retire(b);
+		}
+	}
+
+	/** Stops a batch's CI (deleting a branch doesn't) and deletes its branch, and its bisection runs'. */
+	async retire(b: BatchRow) {
+		for (const r of [b, ...(b.kind === 'batch' ? store.getBisectRuns(b.id) : [])]) {
+			if (r.ci_result === 'pending') await this.d.ci.cancel(r.head_sha).catch(() => {});
+			await this.d.github.deleteBranch(r.branch).catch(() => {});
 		}
 	}
 
@@ -491,12 +507,24 @@ class Tick {
 				store.recordRebasedHead(this.repoId, n, head, r.head, true);
 				this.event(n, 'rebased', { from: head, to: r.head, onto: def, reason: 'landing after its parent' });
 				head = r.head;
+				// GitHub takes a moment to see the new head; merging before that is refused.
+				if (!(await this.waitForHead(n, head))) {
+					this.pause(`GitHub did not pick up the restacked head of #${n} in time`);
+					return false;
+				}
 			}
 			if (p.baseRef !== def) await this.d.github.retargetBase(n, def);
-			// The default branch requires this status, so only the queue can merge, and only what it tested.
-			await this.d.github.setPRStatus(head, 'success', short(`Tested in ${batch.branch}`));
-			const m = await this.d.github.squashMerge(n, `${p.title} (#${n})`, head);
+			// The default branch requires this status, so only the queue can merge, and only what it
+			// tested. Any outcome but a merge takes it back, so nobody can merge around the queue.
+			let m: { merged: boolean; sha?: string | null; message?: string };
+			try {
+				await this.d.github.setPRStatus(head, 'success', short(`Tested in ${batch.branch}`));
+				m = await this.mergeWithRetry(n, p.title, head);
+			} catch (e) {
+				m = { merged: false, message: e instanceof Error ? e.message : String(e) };
+			}
 			if (!m.merged) {
+				await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (landing stopped)`)).catch(() => {});
 				this.pause(`Landing batch ${batch.id} stopped at #${n}: ${m.message ?? 'merge refused'}`);
 				return false;
 			}
@@ -520,6 +548,29 @@ class Tick {
 		return true;
 	}
 
+	async sleep(ms: number) {
+		await (this.d.sleep ?? ((t) => new Promise<void>((r) => setTimeout(r, t))))(ms);
+	}
+
+	async waitForHead(n: number, sha: string): Promise<boolean> {
+		for (let i = 0; i < 15; i++) {
+			if ((await this.pr(n, true)).headSha === sha) return true;
+			await this.sleep(1000 * Math.min(i + 1, 4));
+		}
+		return false;
+	}
+
+	/** GitHub refuses a merge for a while after a push or retarget (405/409); try a few times. */
+	async mergeWithRetry(n: number, title: string, head: string) {
+		let m: { merged: boolean; sha?: string | null; message?: string } = { merged: false };
+		for (let i = 0; i < 4; i++) {
+			m = await this.d.github.squashMerge(n, `${title} (#${n})`, head);
+			if (m.merged || !/modified|not mergeable|try again|base branch was modified|405|409/i.test(m.message ?? '')) return m;
+			await this.sleep(2000 * (i + 1));
+		}
+		return m;
+	}
+
 	async maybeRefreshCaches() {
 		const every = this.settings().config.cacheRefreshMs;
 		if (!every) return;
@@ -537,7 +588,7 @@ class Tick {
 
 	async advanceHead(head: BatchRow, rest: BatchRow[]) {
 		if (head.status === 'testing' || head.status === 'retrying') {
-			const r = await this.d.ci.result(head.head_sha);
+			const r = await this.d.ci.result(head.head_sha, head.retried_at);
 			if (r === 'pending') {
 				if (this.timedOut(head)) {
 					await this.supersede([head, ...rest]);
@@ -551,7 +602,7 @@ class Tick {
 				head = { ...head, status: 'passed' };
 			} else if (head.status === 'testing' && (await this.d.ci.rerunFailed(head.head_sha))) {
 				store.setBatchStatus(head.id, 'retrying');
-				store.setBatchCI(head.id, 'pending');
+				store.setBatchRetried(head.id, this.d.now());
 				this.log(`batch ${head.id} failed; re-running failed jobs`);
 				return;
 			} else {
@@ -559,7 +610,7 @@ class Tick {
 				await this.supersede(rest);
 				if (head.members.length === 1) {
 					store.setBatchStatus(head.id, 'failed');
-					await this.d.github.deleteBranch(head.branch).catch(() => {});
+					await this.retire(head);
 					await this.ejectWithStack([{ pr: head.members[0], reason: `CI failed in ${head.branch}` }]);
 					return;
 				}
@@ -570,7 +621,7 @@ class Tick {
 		if (head.status === 'passed') {
 			if (await this.land(head, head.members, head)) {
 				store.setBatchStatus(head.id, 'landed');
-				await this.d.github.deleteBranch(head.branch).catch(() => {});
+				await this.retire(head);
 			} else if (!this.settings().pausedReason) {
 				await this.supersede([head, ...rest]);
 			}
@@ -587,12 +638,16 @@ class Tick {
 		for (const run of runs) {
 			let res = run.ci_result;
 			if (res === 'pending') {
-				res = await this.d.ci.result(run.head_sha);
+				res = await this.d.ci.result(run.head_sha, run.retried_at);
 				if (res === 'failure' && run.status !== 'retrying' && (await this.d.ci.rerunFailed(run.head_sha))) {
 					// A bisection step is retried once too, so a flake doesn't eject an innocent PR.
 					store.setBatchStatus(run.id, 'retrying');
+					store.setBatchRetried(run.id, this.d.now());
 					res = 'pending';
-				} else if (res !== 'pending') store.setBatchCI(run.id, res);
+				} else if (res !== 'pending') {
+					store.setBatchCI(run.id, res);
+					run.ci_result = res;
+				}
 				if (res === 'pending' && this.timedOut(run)) {
 					await this.d.github.deleteBranch(run.branch).catch(() => {});
 					store.setBatchStatus(batch.id, 'failed');
@@ -625,7 +680,8 @@ class Tick {
 				(r) => r.context.length === 0 && r.members.join(',') === step.land.join(',') && r.ci_result === 'success'
 			);
 			if (proof && (await this.land(batch, step.land, proof))) landed = true;
-			else if (!this.settings().pausedReason) this.requeue(step.land);
+			// Not landed (or landing paused): whatever is still queued goes back to be rebuilt.
+			else this.requeue(step.land);
 		}
 		store.setBatchStatus(batch.id, landed ? 'landed' : 'failed');
 		await this.d.github.deleteBranch(batch.branch).catch(() => {});
@@ -634,8 +690,13 @@ class Tick {
 	async startBisectRun(batch: BatchRow, g: TestGroup, seq: number) {
 		const prs = [...g.context, ...g.members];
 		const members = await this.members(prs, []);
-		// Bisection tests the PRs exactly as they were in the failed batch.
-		for (const m of members) m.headSha = batch.heads[m.pr] ?? m.headSha;
+		// Bisection tests the PRs exactly as they were in the failed batch, parents included.
+		const parentOf = await this.parentOf();
+		for (const m of members) {
+			m.headSha = batch.heads[m.pr] ?? m.headSha;
+			const parent = parentOf(m.pr);
+			if (m.parentHeadSha && parent !== null && batch.heads[parent]) m.parentHeadSha = batch.heads[parent];
+		}
 		const r = await this.d.git.build(batch.base_sha, members);
 		const branch = `${batch.branch}-bisect-${seq + 1}-${this.d.now()}`;
 		const steps: Record<number, BatchStep> = {};
@@ -674,6 +735,11 @@ class Tick {
 	async startTry(n: number): Promise<BatchRow> {
 		const p = await this.pr(n, true);
 		if (p.state !== 'open') throw new Error(`#${n} is not open`);
+		if (!p.sameRepo) {
+			// A try run executes the PR's code (its workflow too) in this repo's CI.
+			const s = await this.state(n, true);
+			if (!s.approvedShas.includes(p.headSha)) throw new Error(`#${n} comes from a fork; a writer must approve its head first`);
+		}
 		const masterSha = await this.d.github.defaultBranchSha();
 		const member: BatchMember = { pr: n, headSha: p.headSha, title: p.title, parentHeadSha: null };
 		await this.d.git.fetch([masterSha, p.headSha]);
@@ -707,7 +773,10 @@ class Tick {
 		for (const t of store.getRunningTries(this.repoId)) {
 			let r = await this.d.ci.result(t.head_sha);
 			if (r === 'pending' && !this.timedOut(t)) continue;
-			if (r === 'pending') r = 'failure';
+			if (r === 'pending') {
+				await this.d.ci.cancel(t.head_sha).catch(() => {});
+				r = 'failure';
+			}
 			store.setBatchCI(t.id, r);
 			store.setBatchStatus(t.id, r === 'success' ? 'landed' : 'failed');
 			const n = t.members[0];
@@ -721,7 +790,14 @@ class Tick {
 	// --- reconcile, restack and plan ---
 
 	async reconcile() {
+		// A PR is `checking` only while a batch carries it; any other (a mode switch, a crash
+		// between steps) goes back in line rather than waiting forever.
+		const carried = new Set(store.getActiveBatches(this.repoId).flatMap((b) => b.members));
 		for (const it of this.items()) {
+			if (it.status === 'checking' && !carried.has(it.pr_number)) {
+				db.updateQueueItemStatus(it.id, 'queued');
+				it.status = 'queued';
+			}
 			const p = await this.pr(it.pr_number);
 			if (p.state !== 'open') {
 				if (it.status === 'checking') continue; // its batch notices when landing
@@ -800,7 +876,7 @@ class Tick {
 			await this.d.github
 				.comment(
 					n,
-					`The merge queue restacked this PR onto ${ontoName} (${issue.message}). Its ${r.replayed} commit(s) applied without conflicts; approvals carry over.\n\nUpdate your local branch before pushing again:\n\n\`\`\`sh\ngit fetch origin ${p.headRef} && git reset --hard origin/${p.headRef}\n\`\`\``
+					`The merge queue restacked this PR onto ${ontoName} (${issue.message}). Its ${r.replayed} commit(s) applied without conflicts; approvals carry over.\n\nBefore pushing again, move any local commits onto it:\n\n\`\`\`sh\ngit fetch origin ${p.headRef} && git rebase --onto FETCH_HEAD ${p.headSha.slice(0, 12)}\n\`\`\``
 				)
 				.catch(() => {});
 			this.event(n, 'rebased', { from: p.headSha, to: r.head, onto: ontoName, reason: issue.message });
@@ -880,6 +956,11 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		if (r === 'idle' || r === 'error') break;
 		active = store.getActiveBatches(deps.repo.id);
 	}
+}
+
+/** Leaving batch mode: stops every batch in flight and puts its PRs back in line. */
+export async function retireBatches(deps: QueueDeps): Promise<void> {
+	await new Tick(deps).supersede(store.getActiveBatches(deps.repo.id));
 }
 
 /** Starts a one-off CI run of a PR on top of the default branch (the `try` API). */

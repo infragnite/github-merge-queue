@@ -37,6 +37,8 @@ export interface PRState {
 	changesRequested: boolean;
 	/** The PR's base is the default branch. Otherwise it may only enter as a stacked child. */
 	targetsDefault?: boolean;
+	/** The head is in a fork: its code runs in this repo's CI only once a writer approved that head. */
+	fromFork?: boolean;
 }
 
 export interface BatchConfig {
@@ -56,7 +58,10 @@ export interface BatchConfig {
 	autoRebase: boolean;
 	/** A batch whose CI has not finished after this long pauses the queue. */
 	ciTimeoutMs: number;
-	/** The PR's own checks must pass first. Off when CI runs only in batches (and `try` runs). */
+	/**
+	 * The PR's own `requiredCheck` must pass on its head first. Off by default: the batch run is the
+	 * gate, and a repo whose CI runs only on queue branches has no PR checks at all.
+	 */
 	requirePRChecks: boolean;
 	/**
 	 * After landing, dispatch the workflow on the default branch at most this often, so a run in
@@ -74,7 +79,7 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	approvalOnHead: true,
 	autoRebase: true,
 	ciTimeoutMs: 12 * 60 * 60 * 1000,
-	requirePRChecks: true,
+	requirePRChecks: false,
 	cacheRefreshMs: 6 * 60 * 60 * 1000
 };
 
@@ -145,6 +150,11 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 				wait: false
 			};
 		}
+	}
+
+	if (state.fromFork && !state.approvedShas.includes(state.headSha)) {
+		// Batches run in this repo's CI, with its secrets and runners: outside code needs a writer's look first.
+		return { ok: false, code: 'not-approved', reason: `#${n} comes from a fork; a writer must approve its head first`, wait: false };
 	}
 
 	const info = analysis.prs.get(n);

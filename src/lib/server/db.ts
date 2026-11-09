@@ -315,6 +315,16 @@ export function recordPRHead(repoId: number, prNumber: number, headSha: string) 
 		.run(repoId, prNumber, headSha);
 }
 
+/** Forgets heads of PRs that are no longer open and were last seen over 30 days ago. */
+export function prunePRHeads(repoId: number, openPRs: number[]) {
+	getDb()
+		.prepare(
+			`DELETE FROM pr_heads WHERE repo_id = ? AND seen_at < datetime('now', '-30 days')
+			 AND pr_number NOT IN (SELECT value FROM json_each(?))`
+		)
+		.run(repoId, JSON.stringify(openPRs));
+}
+
 export function getKnownPRHeads(repoId: number): Map<number, string[]> {
 	const rows = getDb()
 		.prepare('SELECT pr_number, head_sha FROM pr_heads WHERE repo_id = ?')
