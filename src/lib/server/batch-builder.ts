@@ -5,10 +5,12 @@
 // Each PR is applied as a three-way merge of the PR head onto the batch tip:
 // - a PR on the default branch merges with its usual merge base, so only its
 //   own changes are applied;
-// - a stacked child merges with its parent's head as the merge base, so only
-//   `parent..child` is applied (the parent's changes are already in the batch
-//   as the parent's squash commit). This is what restacking the child onto the
-//   default branch would produce, without asking the author to rebase.
+// - a stacked child merges with its fork point from the parent (the newest
+//   parent commit it contains) as the merge base, so only its own commits are
+//   applied (the parent's changes are already in the batch as the parent's
+//   squash commit). This is what restacking the child onto the default branch
+//   would produce; the queue does exactly that restack when it lands the child
+//   (see rebase.ts), so GitHub's squash merge gives the tree tested here.
 //
 // Needs git >= 2.40 (`merge-tree --write-tree --merge-base`).
 
@@ -26,6 +28,8 @@ export interface BuiltCommit {
 	pr: number;
 	sha: string;
 	tree: string;
+	/** For a stacked child: the parent commit its own work starts after (the restack upstream). */
+	fork: string | null;
 }
 
 export type BuildResult =
@@ -37,6 +41,14 @@ export interface BuildOptions {
 	author?: { name: string; email: string };
 	/** Fixed commit date (seconds since epoch) for reproducible SHAs, e.g. in tests. */
 	date?: number;
+}
+
+/** Strips credentials from text that may end up in logs. */
+export function redact(text: string): string {
+	return text
+		.replace(/(Authorization:\s*\w+\s+)\S+/gi, '$1***')
+		.replace(/(x-access-token:)[^@\s]+/gi, '$1***')
+		.replace(/\bgh[opsu]_[A-Za-z0-9]{20,}/g, '***');
 }
 
 export class GitRunner {
@@ -59,7 +71,7 @@ export class GitRunner {
 		} catch (e) {
 			const err = e as { status?: number; stdout?: string; stderr?: string };
 			if (!opts.allowFail) {
-				throw new Error(`git ${args.join(' ')} failed: ${err.stderr || err.stdout || e}`);
+				throw new Error(redact(`git ${args.join(' ')} failed: ${err.stderr || err.stdout || e}`));
 			}
 			return { code: err.status ?? 1, out: (err.stdout ?? '').trim(), err: err.stderr ?? '' };
 		}
@@ -70,6 +82,12 @@ export class GitRunner {
 export function squashMessage(m: BatchMember): string {
 	return `${m.title} (#${m.pr})`;
 }
+
+/**
+ * Trailer naming the commit a batch is built on, so CI triggered by the push
+ * of an `mq/*` branch knows its base (the range to check) without inputs.
+ */
+export const BASE_TRAILER = 'Merge-Queue-Base';
 
 /** Applies `members` in order on top of `baseSha`. Stops at the first PR that conflicts. */
 export function buildBatch(
@@ -93,7 +111,10 @@ export function buildBatch(
 	const commits: BuiltCommit[] = [];
 	for (const m of members) {
 		const args = ['merge-tree', '--write-tree', '--name-only', '--no-messages'];
-		if (m.parentHeadSha) args.push(`--merge-base=${m.parentHeadSha}`);
+		// The parent may have moved on after the child branched: the child's work
+		// starts at the newest parent commit it contains, not at the parent's head.
+		const fork = m.parentHeadSha ? git.run(['merge-base', m.parentHeadSha, m.headSha]).out : null;
+		if (fork) args.push(`--merge-base=${fork}`);
 		args.push(tip, m.headSha);
 		const r = git.run(args, { allowFail: true });
 		const lines = r.out.split('\n').filter(Boolean);
@@ -113,16 +134,16 @@ export function buildBatch(
 		const tree = lines[0];
 		if (tree === tipTree) {
 			// Nothing to apply (e.g. already on the default branch): record no commit.
-			commits.push({ pr: m.pr, sha: tip, tree });
+			commits.push({ pr: m.pr, sha: tip, tree, fork });
 			continue;
 		}
 		// A squash keeps the squashed commits' author (as `git merge --squash` would), not the queue's.
 		const [authorName, authorEmail] = git.run(['log', '-1', '--format=%an%x00%ae', m.headSha]).out.split('\0');
 		const sha = git.run(['commit-tree', tree, '-p', tip, '-F', '-'], {
-			input: squashMessage(m) + '\n',
+			input: `${squashMessage(m)}\n\n${BASE_TRAILER}: ${baseSha}\n`,
 			env: { ...env, GIT_AUTHOR_NAME: authorName, GIT_AUTHOR_EMAIL: authorEmail }
 		}).out;
-		commits.push({ pr: m.pr, sha, tree });
+		commits.push({ pr: m.pr, sha, tree, fork });
 		tip = sha;
 		tipTree = tree;
 	}

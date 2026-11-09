@@ -35,6 +35,8 @@ export interface PRState {
 	approvedShas: string[];
 	/** An unresolved CHANGES_REQUESTED review from someone with write access. */
 	changesRequested: boolean;
+	/** The PR's base is the default branch. Otherwise it may only enter as a stacked child. */
+	targetsDefault?: boolean;
 }
 
 export interface BatchConfig {
@@ -50,6 +52,17 @@ export interface BatchConfig {
 	requireApproval: boolean;
 	/** The approval must be on the PR's current head, not an earlier push. */
 	approvalOnHead: boolean;
+	/** Restack PRs whose parent was rebased or merged when that needs no conflict resolution. */
+	autoRebase: boolean;
+	/** A batch whose CI has not finished after this long pauses the queue. */
+	ciTimeoutMs: number;
+	/** The PR's own checks must pass first. Off when CI runs only in batches (and `try` runs). */
+	requirePRChecks: boolean;
+	/**
+	 * After landing, dispatch the workflow on the default branch at most this often, so a run in
+	 * its cache scope refreshes the caches batch runs restore. 0 turns it off.
+	 */
+	cacheRefreshMs: number;
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
@@ -58,7 +71,11 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	depth: 2,
 	expressMax: 2,
 	requireApproval: true,
-	approvalOnHead: true
+	approvalOnHead: true,
+	autoRebase: true,
+	ciTimeoutMs: 12 * 60 * 60 * 1000,
+	requirePRChecks: true,
+	cacheRefreshMs: 6 * 60 * 60 * 1000
 };
 
 export type AdmissionCode =
@@ -69,7 +86,8 @@ export type AdmissionCode =
 	| 'stale-approval'
 	| 'changes-requested'
 	| 'stack-broken'
-	| 'parent-not-ready';
+	| 'parent-not-ready'
+	| 'wrong-base';
 
 export type Admission =
 	| { ok: true }
@@ -130,6 +148,10 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 	}
 
 	const info = analysis.prs.get(n);
+	if (state.targetsDefault === false && (info?.parent ?? null) === null) {
+		// Only the default branch is batched; a PR into another branch is merged some other way.
+		return { ok: false, code: 'wrong-base', reason: `#${n} does not target the default branch`, wait: false };
+	}
 	if (info) {
 		const own = stopper(info);
 		if (own) return { ok: false, code: 'stack-broken', reason: own, wait: false };

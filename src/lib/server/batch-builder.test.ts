@@ -92,6 +92,25 @@ describe('building a batch', () => {
 		expect(r.ok && files(r.headSha)).toEqual(['a2.txt', 'b1.txt', 'lib.txt']);
 	});
 
+	test('a stacked child of a parent that moved on starts from its fork point, not the parent head', () => {
+		git.branch('a', 'main');
+		git.commit('a', 'a1', 'lib.txt');
+		git.branch('b', 'a');
+		git.commit('b', 'b1');
+		git.commit('a', 'a2'); // the child doesn't have this
+		const r = buildBatch(runner, git.sha('main'), [member(1, 'a'), member(2, 'b', 'a')]);
+		expect(r.ok && files(r.headSha)).toEqual(['a2.txt', 'b1.txt', 'lib.txt']);
+		expect(r.ok && r.commits[1].fork).toBe(git.sha('a~1'));
+	});
+
+	test('batch commits name their base in a trailer, for CI', () => {
+		git.branch('a', 'main');
+		git.commit('a', 'a1');
+		const base = git.sha('main');
+		const r = buildBatch(runner, base, [member(1, 'a')]);
+		expect(r.ok && git.git('log', '-1', '--format=%(trailers:key=Merge-Queue-Base,valueonly)', r.headSha)).toBe(base);
+	});
+
 	test('stops at a PR that conflicts with the batch and names the files', () => {
 		git.branch('a', 'main');
 		git.commit('a', 'from a', 'same.txt');

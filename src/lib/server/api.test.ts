@@ -20,7 +20,13 @@ describe('auth with the caller’s gh token', () => {
 			calls.push(`perm:${login}`);
 			return login === 'mia' ? 'maintain' : 'write';
 		},
-		repoAsCaller: async (t) => (t === 'ghs_ok' ? { permissions: { push: true } } : null),
+		repoAsCaller: async (t): Promise<{ permissions?: Record<string, boolean> } | null> => {
+			calls.push(`repo:${t}`);
+			if (t === 'ghs_ok') return { permissions: { push: true } };
+			if (t === 'bad' || t === 'other-repos') return null;
+			if (t === 'readonly-token') return { permissions: { pull: true } };
+			return { permissions: { admin: true, maintain: true, push: true, pull: true } };
+		},
 		...over
 	});
 
@@ -37,13 +43,25 @@ describe('auth with the caller’s gh token', () => {
 	test('caches per token and repo, so GitHub is asked once', async () => {
 		await resolveCaller(gh(), 'Bearer gho_x', 'acme', 'r');
 		await resolveCaller(gh(), 'Bearer gho_x', 'acme', 'r');
-		expect(calls).toEqual(['user:gho_x', 'perm:agent']);
+		expect(calls).toEqual(['repo:gho_x', 'user:gho_x', 'perm:agent']);
 		await resolveCaller(gh(), 'Bearer gho_x', 'acme', 'r', Date.now() + 6 * 60 * 1000);
-		expect(calls).toHaveLength(4);
+		expect(calls).toHaveLength(6);
 	});
 
 	test('an installation token gets repo-level access, at most write', async () => {
 		expect(await resolveCaller(gh(), 'Bearer ghs_ok', 'acme', 'r')).toEqual({ login: 'github-app', role: 'write', app: true });
+	});
+
+	test('the token itself must see the repo, and its permissions bound the role', async () => {
+		await expect(resolveCaller(gh(), 'Bearer other-repos', 'acme', 'r')).rejects.toMatchObject({ status: 403 });
+		expect((await resolveCaller(gh(), 'Bearer readonly-token', 'acme', 'r')).role).toBe('read');
+	});
+
+	test('denials are cached, so a stranger costs one lookup', async () => {
+		const g = gh({ permission: async (_o, _r, login) => (calls.push(`perm:${login}`), 'none') });
+		await expect(resolveCaller(g, 'Bearer x', 'acme', 'r')).rejects.toMatchObject({ status: 403 });
+		await expect(resolveCaller(g, 'Bearer x', 'acme', 'r')).rejects.toMatchObject({ status: 403 });
+		expect(calls.filter((c) => c.startsWith('perm:'))).toHaveLength(1);
 	});
 
 	test('rejects a missing or unknown token, and users without access', async () => {
