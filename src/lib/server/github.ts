@@ -7,6 +7,7 @@ import {
 	GitHubError
 } from './github-retry';
 import type { StackGitHub } from './stack-source';
+import { Installations, ownerOfPath } from './installations';
 
 const API = 'https://api.github.com';
 
@@ -33,11 +34,6 @@ async function ghFetch(token: string, path: string, init?: RequestInit) {
 
 // --- JWT and Installation Token ---
 
-// Cache for the GitHub App installation token. The 401 retry in
-// `ghFetchAsApp` / `withTokenRefreshOn401` is load-bearing — see comment
-// on `withTokenRefreshOn401` in ./github-retry.ts.
-let cachedInstallationToken: { token: string; expiresAt: number } | null = null;
-
 function createJWT(): string {
 	const appId = env.GITHUB_APP_ID;
 	const privateKey = env.GITHUB_APP_PRIVATE_KEY;
@@ -56,37 +52,39 @@ function createJWT(): string {
 	return `${header}.${payload}.${signature}`;
 }
 
-export async function getInstallationToken(): Promise<string> {
-	if (cachedInstallationToken && cachedInstallationToken.expiresAt > Date.now() + 60_000) {
-		return cachedInstallationToken.token;
-	}
+// Installation tokens, one per account the App is installed on. The 401 retry in
+// `ghFetchAsApp` / `withTokenRefreshOn401` is load-bearing — see comment
+// on `withTokenRefreshOn401` in ./github-retry.ts.
+const installations = new Installations({
+	async listInstallations() {
+		const out = [];
+		for (let page = 1; page <= 10; page++) {
+			const batch = await ghFetch(createJWT(), `/app/installations?per_page=100&page=${page}`);
+			out.push(...batch);
+			if (batch.length < 100) break;
+		}
+		return out;
+	},
+	createToken: (id) => ghFetch(createJWT(), `/app/installations/${id}/access_tokens`, { method: 'POST' })
+});
 
-	const jwt = createJWT();
-	const installationId = env.GITHUB_INSTALLATION_ID;
-	if (!installationId) throw new Error('GITHUB_INSTALLATION_ID required');
-
-	const res = await fetch(`${API}/app/installations/${installationId}/access_tokens`, {
-		method: 'POST',
-		headers: { ...headers(jwt) }
-	});
-	if (!res.ok) throw new Error(`Failed to create installation token: ${res.status}`);
-
-	const data = await res.json();
-	cachedInstallationToken = {
-		token: data.token,
-		expiresAt: new Date(data.expires_at).getTime()
-	};
-	return data.token;
+/** A token of the installation on `owner`, the account whose repositories it acts on. */
+export async function getInstallationToken(owner: string): Promise<string> {
+	return installations.token(await installations.idFor(owner));
 }
 
-async function ghFetchAsApp(path: string, init?: RequestInit) {
+async function withInstallation<T>(installationId: number, call: (token: string) => Promise<T>): Promise<T> {
 	return withTokenRefreshOn401(
-		getInstallationToken,
-		() => {
-			cachedInstallationToken = null;
-		},
-		(token) => ghFetch(token, path, init)
+		() => installations.token(installationId),
+		() => installations.forget(installationId),
+		call
 	);
+}
+
+/** Calls `path` as the installation on the account it acts on; a path that names none passes `owner`. */
+async function ghFetchAsApp(path: string, init?: RequestInit, owner: string | null = ownerOfPath(path)) {
+	if (!owner) throw new Error(`No account to pick an installation token for: ${path}`);
+	return withInstallation(await installations.idFor(owner), (token) => ghFetch(token, path, init));
 }
 
 // --- User-token operations (login flow only, token is discarded after) ---
@@ -110,14 +108,23 @@ export async function checkOrgMembership(username: string, org: string): Promise
 
 // --- Installation-token operations (all repo operations) ---
 
+/** Every repository of every account the App is installed on. */
 export async function listInstallationRepos(): Promise<
 	Array<{ full_name: string; default_branch: string }>
 > {
-	const data = await ghFetchAsApp('/installation/repositories?per_page=100');
-	return data.repositories.map((r: { full_name: string; default_branch: string }) => ({
-		full_name: r.full_name,
-		default_branch: r.default_branch
-	}));
+	const out: Array<{ full_name: string; default_branch: string }> = [];
+	for (const id of await installations.ids()) {
+		for (let page = 1; page <= 10; page++) {
+			const data = await withInstallation(id, (token) =>
+				ghFetch(token, `/installation/repositories?per_page=100&page=${page}`)
+			);
+			for (const r of data.repositories as Array<{ full_name: string; default_branch: string }>) {
+				out.push({ full_name: r.full_name, default_branch: r.default_branch });
+			}
+			if (data.repositories.length < 100) break;
+		}
+	}
+	return out.sort((a, b) => a.full_name.localeCompare(b.full_name));
 }
 
 export async function getRepo(owner: string, repo: string) {
@@ -125,9 +132,16 @@ export async function getRepo(owner: string, repo: string) {
 }
 
 export async function getOpenPRs(owner: string, repo: string) {
-	return ghFetchAsApp(
-		`/repos/${owner}/${repo}/pulls?state=open&sort=created&direction=desc&per_page=100`
-	);
+	// All of them: a stack's parent may be older than the newest hundred.
+	const out = [];
+	for (let page = 1; page <= 20; page++) {
+		const batch = await ghFetchAsApp(
+			`/repos/${owner}/${repo}/pulls?state=open&sort=created&direction=desc&per_page=100&page=${page}`
+		);
+		out.push(...batch);
+		if (batch.length < 100) break;
+	}
+	return out;
 }
 
 export async function getPR(owner: string, repo: string, prNumber: number) {
@@ -249,4 +263,199 @@ export function stackClient(owner: string, repo: string): StackGitHub {
 		getBranchSha: (branch) => getBranchSha(owner, repo, branch),
 		compare: (base, head, page, perPage) => compareCommits(owner, repo, base, head, page, perPage)
 	};
+}
+
+// --- Batch queue ---
+
+export async function getInstallationTokenForGit(owner: string): Promise<string> {
+	return getInstallationToken(owner);
+}
+
+export interface GhReview {
+	user: { login: string } | null;
+	state: string;
+	commit_id: string;
+	author_association: string;
+	submitted_at: string;
+}
+
+export async function listReviews(owner: string, repo: string, n: number): Promise<GhReview[]> {
+	const out: GhReview[] = [];
+	for (let page = 1; page <= 10; page++) {
+		const batch: GhReview[] = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}/reviews?per_page=100&page=${page}`);
+		out.push(...batch);
+		if (batch.length < 100) break;
+	}
+	return out;
+}
+
+export async function deleteBranch(owner: string, repo: string, branch: string) {
+	try {
+		await ghFetchAsApp(`/repos/${owner}/${repo}/git/refs/heads/${refPath(branch)}`, { method: 'DELETE' });
+	} catch (e) {
+		if (e instanceof GitHubError && (e.status === 404 || e.status === 422)) return;
+		throw e;
+	}
+}
+
+export async function setPRBase(owner: string, repo: string, n: number, base: string) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}`, {
+		method: 'PATCH',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ base })
+	});
+}
+
+/**
+ * Squash-merges PR `n` at exactly `sha` with an empty body. REST can't send an empty body (its
+ * default lists every commit message of the PR); GraphQL `mergePullRequest` can. GitHub credits
+ * the squash to whoever opened the PR, which is the author a repo's rules expect.
+ */
+export async function squashMergeAt(owner: string, repo: string, n: number, title: string, sha: string) {
+	try {
+		const pr = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}`);
+		const data = await ghFetchAsApp(
+			'/graphql',
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					query: `mutation($input: MergePullRequestInput!) {
+						mergePullRequest(input: $input) { pullRequest { merged mergeCommit { oid } } }
+					}`,
+					variables: {
+						input: {
+							pullRequestId: pr.node_id,
+							mergeMethod: 'SQUASH',
+							commitHeadline: title,
+							commitBody: '',
+							expectedHeadOid: sha
+						}
+					}
+				})
+			},
+			owner
+		);
+		if (data.errors?.length) return { merged: false, sha: null, message: data.errors.map((e: { message: string }) => e.message).join('; ') };
+		const r = data.data?.mergePullRequest?.pullRequest;
+		return mergeResultFromData({ merged: !!r?.merged, sha: r?.mergeCommit?.oid });
+	} catch (e) {
+		return mergeResultFromError(e);
+	}
+}
+
+export async function createCommitStatus(
+	owner: string,
+	repo: string,
+	sha: string,
+	status: { state: 'success' | 'failure' | 'pending'; context: string; description: string; target_url?: string }
+) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/statuses/${sha}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ ...status, description: status.description.slice(0, 140) })
+	});
+}
+
+export async function dispatchWorkflow(
+	owner: string,
+	repo: string,
+	workflow: string,
+	ref: string,
+	inputs: Record<string, string>
+) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ ref, inputs })
+	});
+}
+
+/** GitHub Actions' app: only its check runs count, so no other app (or job) can fake the required check. */
+const ACTIONS_APP_ID = 15368;
+
+export async function checkRunsNamed(owner: string, repo: string, sha: string, name: string) {
+	const data = await ghFetchAsApp(
+		`/repos/${owner}/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&app_id=${ACTIONS_APP_ID}`
+	);
+	return data.check_runs as Array<{
+		status: string;
+		conclusion: string | null;
+		html_url: string;
+		completed_at: string | null;
+		check_suite?: { id: number };
+	}>;
+}
+
+export async function workflowRunsForSha(owner: string, repo: string, sha: string) {
+	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=20`);
+	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string; check_suite_id: number }>;
+}
+
+export async function cancelWorkflowRun(owner: string, repo: string, runId: number) {
+	try {
+		await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs/${runId}/cancel`, { method: 'POST' });
+	} catch (e) {
+		// 409: the run already finished.
+		if (e instanceof GitHubError && e.status === 409) return;
+		throw e;
+	}
+}
+
+export async function addLabel(owner: string, repo: string, n: number, label: string) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/issues/${n}/labels`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ labels: [label] })
+	});
+}
+
+export async function removeLabel(owner: string, repo: string, n: number, label: string) {
+	try {
+		await ghFetchAsApp(`/repos/${owner}/${repo}/issues/${n}/labels/${encodeURIComponent(label)}`, { method: 'DELETE' });
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return;
+		throw e;
+	}
+}
+
+export async function rerunFailedJobs(owner: string, repo: string, runId: number) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun-failed-jobs`, { method: 'POST' });
+}
+
+// --- Agent API auth ---
+
+/** The caller's own identity, from their token; null when GitHub rejects it as a user token. */
+export async function userForToken(token: string): Promise<{ login: string } | null> {
+	try {
+		return await ghFetch(token, '/user');
+	} catch (e) {
+		if (e instanceof GitHubError && (e.status === 401 || e.status === 403)) return null;
+		throw e;
+	}
+}
+
+export async function collaboratorRole(owner: string, repo: string, login: string): Promise<string> {
+	try {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
+		// role_name distinguishes maintain and triage; permission only says admin/write/read/none.
+		// A custom repository role has its own name: fall back to the base permission it grants.
+		const known = ['admin', 'maintain', 'write', 'triage', 'read'];
+		return known.includes(data.role_name) ? data.role_name : data.permission || 'none';
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return 'none';
+		throw e;
+	}
+}
+
+/**
+ * The repo as the caller's token sees it, with the token's OAuth scopes (`X-OAuth-Scopes`, sent
+ * for classic and OAuth-app tokens only; null otherwise). Null when the token can't see the repo.
+ */
+export async function repoForToken(token: string, owner: string, repo: string) {
+	const res = await fetch(`${API}/repos/${owner}/${repo}`, { headers: headers(token) });
+	if (res.status === 401 || res.status === 403 || res.status === 404) return null;
+	const body = await res.json().catch(() => ({}));
+	if (!res.ok) throw new GitHubError(res.status, body.message || `GitHub API ${res.status}`, body);
+	return { permissions: body.permissions as Record<string, boolean> | undefined, scopes: res.headers.get('x-oauth-scopes') };
 }
