@@ -26,7 +26,8 @@ import {
 	type PRState,
 	type Priority,
 	type QueueEntry,
-	type TestGroup
+	type TestGroup,
+	type BatchConfig
 } from './batching';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
@@ -581,6 +582,12 @@ class Tick {
 		// The tree on master passed CI. The default-branch run started now confirms it in that
 		// branch's environment; until it does, failures on top of it wait rather than eject.
 		// (Only a run on the default branch itself reports on this commit.)
+		const baseline = store.getRunningBaseline(this.repoId);
+		if (baseline) {
+			// A check of an older default branch: this landing's tree is known now.
+			await this.retire(baseline);
+			store.setBatchStatus(baseline.id, 'superseded');
+		}
 		const ref = this.settings().ci.dispatchRef;
 		const verifying = (await this.maybeRefreshCaches()) && (!ref || ref === this.d.repo.default_branch);
 		store.setMasterHealth(this.repoId, { sha: master, tree: expected, state: verifying ? 'verifying' : 'green', since: this.d.now() });
@@ -693,7 +700,7 @@ class Tick {
 
 	async markRed(sha: string, tree: string) {
 		store.setMasterHealth(this.repoId, { sha, tree, state: 'red', since: this.d.now() });
-		const why = `${this.d.repo.default_branch} ${sha.slice(0, 7)} fails CI on its own; the queue tries PRs one at a time on top of it until one passes`;
+		const why = `${this.d.repo.default_branch} ${sha.slice(0, 7)} fails CI on its own; the queue tries PRs on top of it until a batch passes`;
 		this.event(null, 'master-broken', { sha, reason: why });
 		this.log(why);
 		await this.d.github.setStatus(sha, 'failure', short('Fails on its own; the queue looks for a PR that fixes it')).catch(() => {});
@@ -758,9 +765,12 @@ class Tick {
 	 */
 	async failedOnRed(batch: BatchRow) {
 		const h = store.getMasterHealth(this.repoId)!;
-		// `pr@head` once tried in a batch, `pr@head!` once tried alone.
-		const mark = batch.members.length === 1 ? '!' : '';
-		const tried = [...new Set([...h.tried, ...batch.members.map((n) => `${n}@${batch.heads[n]}`), ...batch.members.map((n) => `${n}@${batch.heads[n]}${mark}`)])];
+		// `pr@head` once tried in a batch; `pr@head!` once tried alone, or again after every member
+		// had been tried already. Every failure adds a mark, so the tries run out.
+		const keys = batch.members.map((n) => `${n}@${batch.heads[n]}`);
+		const seen = new Set(h.tried);
+		const again = batch.members.length === 1 || keys.every((k) => seen.has(k));
+		const tried = [...new Set([...h.tried, ...keys, ...(again ? keys.map((k) => `${k}!`) : [])])];
 		store.setMasterHealth(this.repoId, { ...h, tried });
 		store.setBatchStatus(batch.id, 'failed');
 		await this.retire(batch);
@@ -1163,42 +1173,48 @@ class Tick {
 		const states = new Map<number, PRState>();
 		for (const e of queue) states.set(e.pr, await this.state(e.pr));
 		// On a red default branch, batches of PRs not yet tried there run side by side on it (not
-		// stacked) until one passes: that batch carries a fix and lands. PRs tried in a batch get
-		// one more go alone once every PR was tried, in case another PR in their batch broke it too.
+		// stacked) until one passes: that batch carries a fix and lands. When no untried PR can be
+		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
 		const red = this.masterState(await this.d.git.tree(masterSha)) === 'red';
-		let config = settings.config;
-		let candidates = queue;
-		let base = active.length ? active[active.length - 1].head_sha : masterSha;
-		let inflight = active.map((b) => b.members);
+		const analysis = await this.analysis();
+		const planWith = (entries: QueueEntry[], config: BatchConfig, inflight: number[][]) =>
+			planNextBatch({ now: this.d.now(), queue: entries, states, analysis, inflight, config });
+		let plan: ReturnType<typeof planNextBatch>;
 		if (red) {
-			if (active.length >= config.depth) return 'idle';
+			if (active.length >= settings.config.depth) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
-			const key = (e: QueueEntry) => `${e.pr}@${states.get(e.pr)!.headSha}`;
-			candidates = queue.filter((e) => !tried.has(key(e)));
-			let maxBatch = config.maxBatch;
-			if (candidates.length === 0) {
-				candidates = queue.filter((e) => !tried.has(`${key(e)}!`));
-				maxBatch = 1;
+			const key = (n: number) => `${n}@${states.get(n)!.headSha}`;
+			const byPr = new Map(queue.map((e) => [e.pr, e]));
+			// An untried PR brings its queued ancestors along, tried or not: a child is never tested without them.
+			const withAncestors = (keep: (e: QueueEntry) => boolean) => {
+				const out = new Set<number>();
+				for (const e of queue) {
+					if (!keep(e)) continue;
+					out.add(e.pr);
+					for (let p = analysis.prs.get(e.pr)?.parent ?? null; p !== null && byPr.has(p); p = analysis.prs.get(p)?.parent ?? null) out.add(p);
+				}
+				return queue.filter((e) => out.has(e.pr));
+			};
+			// Siblings on the same base: nothing is in flight beneath them.
+			const base = { ...settings.config, depth: settings.config.depth + active.length, collectWindowMs: 0 };
+			// A batch must try something new, or the tries never run out.
+			const fresh = (p: typeof plan, mark: string) =>
+				p.batch?.some((n) => !tried.has(`${key(n)}${mark}`)) ? p : { ...p, batch: null };
+			plan = fresh(planWith(withAncestors((e) => !tried.has(key(e.pr))), base, []), '');
+			if (!plan.batch) {
+				const alone = queue.filter((e) => !tried.has(`${key(e.pr)}!`));
+				plan = fresh(planWith(alone, { ...base, maxBatch: 1, expressMax: 1 }, []), '!');
 			}
-			if (candidates.length === 0) return 'idle';
-			config = { ...config, maxBatch, depth: config.depth + active.length, collectWindowMs: 0 };
-			base = masterSha;
-			inflight = []; // siblings on the same base; a child of an in-flight PR waits for it
+		} else {
+			plan = planWith(queue, settings.config, active.map((b) => b.members));
 		}
-		const plan = planNextBatch({
-			now: this.d.now(),
-			queue: candidates,
-			states,
-			analysis: await this.analysis(),
-			inflight,
-			config
-		});
 		for (const h of plan.held) {
 			const it = this.item(h.pr);
 			if (it && it.error_message !== h.admission.reason) db.updateQueueItemStatus(it.id, 'queued', h.admission.reason);
 		}
 		if (!plan.batch) return 'idle';
 		const below = red ? [] : active.flatMap((b) => b.members);
+		const base = red || !active.length ? masterSha : active[active.length - 1].head_sha;
 		return this.startBatch(base, plan.batch, below, plan.express, masterSha);
 	}
 }

@@ -630,6 +630,43 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([]);
 	});
 
+	/** main broken by hand, and known red. */
+	function redMain() {
+		git.commit('main', 'broken by hand', 'x-breaks-master.txt');
+		world.breakingFiles.add('x-breaks-master.txt');
+		store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'red', since: 0 });
+	}
+
+	test('on a red default branch every PR is tried a bounded number of times, urgent ones too', async () => {
+		redMain();
+		pr(1);
+		pr(2);
+		store.setQueuePriority(repo.id, 1, 'urgent');
+		store.setQueuePriority(repo.id, 2, 'urgent');
+		await run(40);
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [1], [2]]);
+		expect(world.comments).toEqual([]);
+	});
+
+	test('a PR held back on a red default branch does not stop the others from being tried alone', async () => {
+		redMain();
+		pr(1);
+		pr(2);
+		pr(3, { approve: false });
+		await run(40);
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [1], [2]]);
+	});
+
+	test('on a red default branch a stacked child is tried with its parent, never without it', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 2 } });
+		redMain();
+		pr(1);
+		pr(2);
+		pr(3, { from: 'pr2', base: 'pr2' });
+		await run(40);
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [2, 3], [1], [2]]);
+	});
+
 	test('an urgent fix is tried first, alone, on a red default branch', async () => {
 		store.updateQueueSettings(repo.id, { config: { maxBatch: 8, depth: 1 } });
 		git.commit('main', 'broken by hand', 'x-breaks-master.txt');

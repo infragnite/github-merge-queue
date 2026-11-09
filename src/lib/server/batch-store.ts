@@ -149,7 +149,7 @@ export function migrateBatches(database: Database.Database) {
 		-- (a batch the queue landed, or a baseline run). 'verifying': green by tree, while the
 		-- default-branch run started after landing it hasn't finished. 'checking': a baseline run of
 		-- it alone is going (it moved outside the queue). 'red': it fails on its own; \`tried\` lists
-		-- the PR heads (pr@sha) that failed alone on top of it.
+		-- the PR heads that failed on top of it (pr@sha in a batch, pr@sha! alone).
 		CREATE TABLE IF NOT EXISTS master_health (
 			repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
 			sha TEXT NOT NULL,

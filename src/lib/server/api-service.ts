@@ -180,7 +180,7 @@ export function queueState(repo: Repo) {
 		asOf: new Date().toISOString(),
 		mode: s.mode,
 		paused: s.pausedReason,
-		/** The default branch as the queue knows it; 'red' holds the queue until a new commit passes. */
+		/** The default branch as the queue knows it; on 'red' the queue looks for a batch that fixes it. */
 		defaultBranch: store.getMasterHealth(repo.id),
 		inFlight: store.getActiveBatches(repo.id).map(batchSummary),
 		waiting
@@ -306,11 +306,13 @@ export function pause(repo: Repo, caller: Caller, reason: unknown) {
 
 export function resume(repo: Repo, caller: Caller) {
 	requireRole(caller, 'maintain', 'Resuming the queue');
+	const wasPaused = store.getQueueSettings(repo.id).pausedReason !== null;
 	store.updateQueueSettings(repo.id, { pausedReason: null });
-	// Resuming vouches for the default branch: a red one is trusted again (say, it failed for a
-	// reason only its own run has), and failures on top of it are blamed on PRs as usual.
+	// Resuming a queue that isn't paused vouches for a red default branch: it is trusted again
+	// (say, it failed for a reason only its own run has), and failures on top of it are blamed on
+	// PRs as usual. Resuming from a pause only lifts the pause.
 	const h = store.getMasterHealth(repo.id);
-	if (h?.state === 'red') store.setMasterHealth(repo.id, { sha: h.sha, tree: h.tree, state: 'green', since: Date.now() });
+	if (!wasPaused && h?.state === 'red') store.setMasterHealth(repo.id, { sha: h.sha, tree: h.tree, state: 'green', since: Date.now() });
 	emitEvent(repo.id, null, 'resumed', { by: caller.login });
 	return getConfig(repo);
 }
