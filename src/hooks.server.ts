@@ -1,11 +1,13 @@
 import type { Handle } from '@sveltejs/kit';
 import { verifySessionToken } from '$lib/server/auth';
 import { getUserById } from '$lib/server/db';
-import { startProcessor } from '$lib/server/processor';
+import { drainProcessor, startProcessor } from '$lib/server/processor';
 import { watchEventLoop } from '$lib/server/loop-watch';
 
 startProcessor();
 watchEventLoop();
+// adapter-node emits this on SIGTERM/SIGINT once it stops taking requests.
+process.on('sveltekit:shutdown' as 'beforeExit', () => void drainProcessor());
 
 export const handle: Handle = async ({ event, resolve }) => {
 	const sessionCookie = event.cookies.get('session');

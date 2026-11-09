@@ -5,7 +5,7 @@ import { closedPRReason, stackMergeBlocker } from './stack-runtime';
 import { getQueueSettings, updateQueueSettings } from './batch-store';
 import { GitHubError } from './github-retry';
 import { emitEvent } from './events';
-import { tickBatchQueue } from './batch-queue';
+import { recoverInterrupted, tickBatchQueue } from './batch-queue';
 import { liveDeps } from './batch-live';
 import { takeDirty } from './wake';
 import { withRepoLock } from './repo-lock';
@@ -30,13 +30,27 @@ export function stopProcessor() {
 	}
 }
 
+/**
+ * On shutdown: start no new cycle and let the running one finish (within `timeoutMs`). Not needed
+ * for correctness, since the queue picks up after a kill at any point, but it saves redoing work.
+ */
+export async function drainProcessor(timeoutMs = 25_000): Promise<void> {
+	stopProcessor();
+	stopping = true;
+	const deadline = Date.now() + timeoutMs;
+	while (running && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+	console.log(`[merge-queue] Processor stopped${running ? ' (a cycle was still running)' : ''}`);
+}
+let stopping = false;
+
 async function processAll() {
-	if (running) return;
+	if (running || stopping) return;
 	running = true;
 
 	try {
 		const repos = db.getRepos();
 		for (const repo of repos) {
+			if (stopping) break;
 			await processRepo(repo);
 		}
 	} catch (err) {
@@ -106,6 +120,13 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 			if (took >= SLOW_TICK_MS) console.log(`[merge-queue] Batch tick for ${repo.owner}/${repo.name} took ${took} ms`);
 		}
 		return;
+	}
+
+	// A crash in batch mode may have left a landing half done, even if the repo switched mode since.
+	try {
+		await withRepoLock(repo.id, () => recoverInterrupted(liveDeps(repo)));
+	} catch (err) {
+		console.error(`[merge-queue] Recovery for ${repo.owner}/${repo.name} failed:`, err instanceof Error ? err.message : err);
 	}
 
 	// Reconcile ALL queued items (not just head) to detect externally merged/closed PRs

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import {
 	admit,
-	Bisection,
+	planBisection,
+	type BisectRun,
 	DEFAULT_BATCH_CONFIG,
 	descendants,
 	planNextBatch,
@@ -9,8 +10,7 @@ import {
 	type BatchConfig,
 	type PRState,
 	type Priority,
-	type QueueEntry,
-	type TestGroup
+	type QueueEntry
 } from './batching';
 import { analyzeStacks, type PRStackInfo, type StackAnalysis, type StackIssue } from './stacks';
 import { GitSandbox } from './testing/git-sandbox';
@@ -251,16 +251,48 @@ describe('split points', () => {
 	});
 });
 
-/** Runs a bisection against an oracle; returns the outcome and how many test runs it took. */
+/**
+ * Drives a bisection the way the queue does, against an oracle: every group runs on top of what
+ * landed so far, results come back together each round, a passing group lands at once, and stack
+ * children leave with an ejected parent.
+ */
 function bisect(batch: number[], fails: (tested: number[]) => boolean, parentOf: (n: number) => number | null = () => null) {
-	const b = new Bisection(batch, parentOf);
-	const tested: TestGroup[] = [];
-	for (let i = 0; i < 100; i++) {
-		const step = b.next();
-		if (step.kind === 'done') return { ...step, runs: tested.length, tested };
-		for (const g of step.groups) {
-			tested.push(g);
-			b.record(g, !fails([...g.context, ...g.members]));
+	const runs: BisectRun[] = [{ context: [], members: batch, baseTree: '', result: 'failure' }];
+	const land: number[] = [];
+	const eject: { pr: number; reason: string }[] = [];
+	const tested: { base: number[]; members: number[] }[] = [];
+	let remaining = [...batch];
+	let rounds = 0;
+	/** Round in which each PR landed. */
+	const landedIn = new Map<number, number>();
+	for (let i = 0; i < 200; i++) {
+		// Every base here is the batch's own or a tree the bisection landed: all known green.
+		const step = planBisection({ runs, remaining, masterTree: land.join(','), parentOf, trusted: () => true });
+		if (step.kind === 'land') {
+			expect(fails([...land, ...step.prs])).toBe(false);
+			land.push(...step.prs);
+			for (const n of step.prs) landedIn.set(n, rounds);
+			remaining = remaining.filter((n) => !step.prs.includes(n));
+			continue;
+		}
+		for (const e of step.eject) {
+			eject.push({ pr: e.pr, reason: e.reason });
+			remaining = remaining.filter((n) => n !== e.pr);
+			// The queue ejects an ejected PR's stack children with it.
+			for (const n of [...remaining]) {
+				let p = parentOf(n);
+				while (p !== null && p !== e.pr) p = parentOf(p);
+				if (p === e.pr) {
+					eject.push({ pr: n, reason: `Stacked on #${parentOf(n)}, which failed in the queue` });
+					remaining = remaining.filter((m) => m !== n);
+				}
+			}
+		}
+		if (step.done) return { land, eject, requeue: step.requeue, runs: runs.length - 1, rounds, tested, landedIn };
+		if (step.start.length) rounds++;
+		for (const g of step.start) {
+			tested.push({ base: [...land], members: g });
+			runs.push({ context: [], members: g, baseTree: land.join(','), result: fails([...land, ...g]) ? 'failure' : 'success' });
 		}
 	}
 	throw new Error('bisection did not finish');
@@ -269,27 +301,42 @@ function bisect(batch: number[], fails: (tested: number[]) => boolean, parentOf:
 describe('bisection', () => {
 	const batch = [1, 2, 3, 4, 5, 6, 7, 8];
 
-	test('finds one breaker in a batch of 8 and lands the rest', () => {
+	test('finds one breaker in a batch of 8, landing each passing half as soon as it passes', () => {
 		const r = bisect(batch, (t) => t.includes(6));
-		expect(r.eject.map((e) => e.pr)).toEqual([6]);
-		expect(r.eject[0].reason).toMatch(/fails on its own/);
-		expect(r.land).toEqual([1, 2, 3, 4, 5, 7, 8]);
+		expect(r.eject).toEqual([{ pr: 6, reason: '#6 fails on its own on top of the default branch' }]);
+		expect([...r.land].sort()).toEqual([1, 2, 3, 4, 5, 7, 8]);
 		expect(r.requeue).toEqual([]);
-		expect(r.runs).toBeLessThanOrEqual(8);
+		// 1-4 pass in the first round and land then; 5-8 narrow down on top of them.
+		expect([1, 2, 3, 4].map((n) => r.landedIn.get(n))).toEqual([1, 1, 1, 1]);
+		expect(r.rounds).toBe(3);
+		expect(r.runs).toBeLessThanOrEqual(6);
+	});
+
+	test('a passing half lands first and the failing half is narrowed on top of it', () => {
+		const r = bisect(batch, (t) => t.includes(2));
+		expect(r.land.slice(0, 4)).toEqual([5, 6, 7, 8]);
+		expect(r.tested.filter((t) => t.members.includes(2)).every((t) => t.base[0] === 5 || t.base.length === 0)).toBe(true);
+		expect(r.eject.map((e) => e.pr)).toEqual([2]);
 	});
 
 	test('finds two breakers in different halves', () => {
 		const r = bisect(batch, (t) => t.includes(2) || t.includes(7));
 		expect(r.eject.map((e) => e.pr).sort()).toEqual([2, 7]);
-		expect(r.land).toEqual([1, 3, 4, 5, 6, 8]);
+		expect([...r.land].sort()).toEqual([1, 3, 4, 5, 6, 8]);
 	});
 
 	test('finds a semantic conflict between two PRs that pass alone', () => {
 		// #3 adds a field, #6 adds an initializer without it: only the pair fails
 		const r = bisect(batch, (t) => t.includes(3) && t.includes(6));
-		expect(r.eject.map((e) => e.pr)).toEqual([6]);
-		expect(r.eject[0].reason).toMatch(/combined with/);
-		expect(r.land).toEqual([1, 2, 3, 4, 5, 7, 8]);
+		expect(r.eject).toEqual([{ pr: 6, reason: '#6 fails on its own on top of the default branch' }]);
+		expect([...r.land].sort()).toEqual([1, 2, 3, 4, 5, 7, 8]);
+	});
+
+	test('a flaky batch failure ejects nobody: both halves pass and land', () => {
+		const r = bisect(batch, () => false);
+		expect(r.eject).toEqual([]);
+		expect([...r.land].sort()).toEqual(batch);
+		expect(r.rounds).toBe(2);
 	});
 
 	test('a failing parent takes its stack children with it', () => {
@@ -297,15 +344,14 @@ describe('bisection', () => {
 		const parentOf = (n: number) => (n === 5 ? 4 : n === 6 ? 5 : null);
 		const r = bisect(batch, (t) => t.includes(4), parentOf);
 		expect(r.eject).toEqual([
-			{ pr: 4, reason: expect.stringMatching(/fails on its own/) },
+			{ pr: 4, reason: '#4 fails on its own on top of the default branch' },
 			{ pr: 5, reason: 'Stacked on #4, which failed in the queue' },
 			{ pr: 6, reason: 'Stacked on #5, which failed in the queue' }
 		]);
-		expect(r.land).toEqual([1, 2, 3, 7, 8]);
-		// a child is never tested without its parent
+		expect([...r.land].sort()).toEqual([1, 2, 3, 7, 8]);
+		// a child is never tested without its parent, which is landed or tested with it
 		for (const g of r.tested) {
-			const all = [...g.context, ...g.members];
-			for (const n of all) if (parentOf(n) !== null) expect(all).toContain(parentOf(n));
+			for (const n of g.members) if (parentOf(n) !== null) expect([...g.base, ...g.members]).toContain(parentOf(n));
 		}
 	});
 
@@ -316,19 +362,67 @@ describe('bisection', () => {
 		expect(r.land).toEqual([1, 2]);
 	});
 
-	test('a single-PR batch ejects that PR without more runs', () => {
-		const r = bisect([9], () => true);
-		expect(r).toMatchObject({ land: [], eject: [{ pr: 9 }], requeue: [], runs: 0 });
+	test('a PR is ejected only on a run of it alone', () => {
+		// The batch failed by flake; #2 then fails alone for real only on top of #1.
+		const fails = (t: number[]) => t.includes(1) && t.includes(2);
+		const r = bisect([1, 2], fails);
+		expect(r.land).toEqual([1]);
+		expect(r.eject).toEqual([{ pr: 2, reason: '#2 fails on its own on top of the default branch' }]);
+		expect(r.tested).toEqual([
+			{ base: [], members: [1] },
+			{ base: [], members: [2] },
+			{ base: [1], members: [2] }
+		]);
 	});
 
-	test('survivors that fail together are not landed blindly', () => {
-		// 1 fails alone; {2,3} pass in every tested group except all of 2,3,4 together
-		const fails = (t: number[]) => t.includes(1) || (t.includes(2) && t.includes(3) && t.includes(4));
-		const r = bisect([1, 2, 3, 4], fails);
-		expect(r.eject.map((e) => e.pr)).toContain(1);
-		for (const n of r.land) expect([2, 3, 4]).toContain(n);
-		expect(fails(r.land)).toBe(false);
-		expect([...r.land, ...r.requeue, ...r.eject.map((e) => e.pr)].sort()).toEqual([1, 2, 3, 4]);
+	test('runs still going hold back new runs of their PRs, and a pass lands without waiting for them', () => {
+		const runs: BisectRun[] = [
+			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [1, 2], baseTree: 'm0', result: 'success' },
+			{ context: [], members: [3, 4], baseTree: 'm0', result: 'pending' }
+		];
+		const none = () => null;
+		expect(planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: none })).toEqual({ kind: 'land', run: 1, prs: [1, 2] });
+		// Landed: 3, 4 wait for their run on the old branch rather than start again.
+		expect(planBisection({ runs, remaining: [3, 4], masterTree: 'm1', parentOf: none })).toEqual({
+			kind: 'step',
+			eject: [],
+			start: [],
+			requeue: [],
+			done: false
+		});
+		// It failed: split on the new branch.
+		runs[2].result = 'failure';
+		expect(planBisection({ runs, remaining: [3, 4], masterTree: 'm1', parentOf: none })).toMatchObject({ start: [[3], [4]], done: false });
+		// It passed on the old branch: run again on the new one to land.
+		runs[2].result = 'success';
+		expect(planBisection({ runs, remaining: [3, 4], masterTree: 'm1', parentOf: none })).toMatchObject({ start: [[3, 4]], done: false });
+	});
+
+	test('runs from before landing as it goes (on top of a passing context) are taken as they are', () => {
+		// An older bisection tested [3, 4] on top of [1, 2]: its failure still points at 3, 4.
+		const runs: BisectRun[] = [
+			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [1, 2], baseTree: 'm0', result: 'success' },
+			{ context: [1, 2], members: [3, 4], baseTree: 'm0', result: 'failure' }
+		];
+		const r = planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: () => null });
+		expect(r).toEqual({ kind: 'land', run: 1, prs: [1, 2] });
+		expect(planBisection({ runs, remaining: [3, 4], masterTree: 'm1', parentOf: () => null })).toMatchObject({ start: [[3], [4]] });
+	});
+
+	test('a PR that failed alone on a branch not known green runs alone again before it is ejected', () => {
+		const runs: BisectRun[] = [{ context: [], members: [2], baseTree: 'outside', result: 'failure' }];
+		expect(planBisection({ runs, remaining: [2], masterTree: 'm1', parentOf: () => null })).toMatchObject({ eject: [], start: [[2]] });
+		expect(planBisection({ runs, remaining: [2], masterTree: 'm1', parentOf: () => null, trusted: (t) => t === 'outside' })).toMatchObject({
+			eject: [{ pr: 2, run: 0 }],
+			start: []
+		});
+	});
+
+	test('a single-PR group with a failure only in a larger run is run alone first', () => {
+		const runs: BisectRun[] = [{ context: [], members: [1, 2], baseTree: 'm0', result: 'failure' }];
+		expect(planBisection({ runs, remaining: [2], masterTree: 'm1', parentOf: () => null })).toMatchObject({ eject: [], start: [[2]] });
 	});
 });
 
@@ -376,10 +470,11 @@ describe('bisection invariants (randomised)', () => {
 			expect([...r.land, ...r.requeue, ...r.eject.map((e) => e.pr)].sort((a, b) => a - b)).toEqual(batch);
 			for (const b of breakers) expect(r.land).not.toContain(b);
 			for (const g of r.tested) {
-				const all = [...g.context, ...g.members];
-				for (const n of all) if (parentOf(n) !== null) expect(all).toContain(parentOf(n));
+				for (const n of g.members) if (parentOf(n) !== null) expect([...g.base, ...g.members]).toContain(parentOf(n));
 			}
-			for (const n of r.land) if (parentOf(n) !== null) expect(r.land).toContain(parentOf(n));
+			for (const n of r.land) if (parentOf(n) !== null) expect(r.land.slice(0, r.land.indexOf(n))).toContain(parentOf(n));
+			// Only PRs that fail alone on top of what landed are ejected (and their stack children).
+			for (const e of r.eject) if (!e.reason.startsWith('Stacked')) expect(fails([...r.land, e.pr])).toBe(true);
 			expect(r.runs).toBeLessThanOrEqual(4 * size);
 		}
 	});
