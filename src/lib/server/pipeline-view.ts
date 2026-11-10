@@ -54,7 +54,11 @@ async function progressFor(repo: RepoRef, sha: string, low: boolean): Promise<CI
 
 const RECENT = 10;
 
-export async function pipelineView(repo: RepoRef, prs: Map<number, { title: string; url: string }>): Promise<PipelineView> {
+/**
+ * With `cachedOnly` (a read-only viewer), nothing is fetched from GitHub: CI progress and stacks
+ * come from what signed-in viewers or the processor's warm-up last fetched.
+ */
+export async function pipelineView(repo: RepoRef, prs: Map<number, { title: string; url: string }>, opts: { cachedOnly?: boolean } = {}): Promise<PipelineView> {
 	const settings = store.getQueueSettings(repo.id);
 	const active = store.getActiveBatches(repo.id);
 	const activeIds = new Set(active.map((b) => b.id));
@@ -68,14 +72,14 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 	const progress = new Map<string, CIProgress>();
 	await Promise.all(
 		running.map(async (b) => {
-			const p = await progressFor(repo, b.head_sha, !!budget?.low);
+			const p = await progressFor(repo, b.head_sha, !!budget?.low || !!opts.cachedOnly);
 			if (p) progress.set(b.head_sha, p);
 		})
 	);
 
 	let analysis: StackAnalysis | null = null;
 	try {
-		analysis = await dashboardStackAnalysis(repo);
+		analysis = await dashboardStackAnalysis(repo, opts);
 	} catch {
 		// Logged by the stacks section; batches still show, just without stack nesting.
 	}
@@ -97,5 +101,24 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 				return why ? [[b.head_sha, why]] : [];
 			})
 		)
+	};
+}
+
+/**
+ * What a read-only viewer gets of the pipeline: named fields only, so a field added to the view
+ * later isn't published by default. No pause reason, step errors or CI lookup errors (they can
+ * name GitHub or App internals).
+ */
+export function publicPipeline(p: PipelineView): PipelineView {
+	return {
+		mode: p.mode,
+		paused: p.paused ? 'The queue is paused' : null,
+		master: p.master ? { sha: p.master.sha, state: p.master.state, since: p.master.since } : null,
+		active: p.active,
+		recent: p.recent,
+		error: p.error ? 'Batches could not be loaded' : null,
+		rateLimitedUntil: p.rateLimitedUntil,
+		tickError: null,
+		progressErrors: {}
 	};
 }

@@ -12,6 +12,10 @@ import { withRepoLock } from './repo-lock';
 import { RateLimitedError } from './rate-limit';
 import { clearTickError, noteTickError } from './tick-errors';
 import { recordRunCosts } from './ci-savings';
+import { noteVisibility, readOnlyViewers, visibilityDue } from './public-view';
+import { repoVisibility } from './api-service';
+import { dashboardStackAnalysis } from './stack-runtime';
+import { pipelineView } from './pipeline-view';
 
 /** The reset time last logged per repo, so a rate limit is logged once, not every cycle. */
 const loggedLimit = new Map<number, number>();
@@ -110,6 +114,28 @@ async function recordCosts(repo: RepoRef) {
 	}
 }
 
+/**
+ * For a repository with a public page: asks GitHub every 10 minutes whether it is still public
+ * (turning the page off when not), and while read-only viewers are around, refreshes what their
+ * page shows at most once a minute, as one signed-in viewer would. Read-only loads never call GitHub.
+ */
+const lastWarm = new Map<number, number>();
+async function keepPublicPage(repo: RepoRef) {
+	if (!getQueueSettings(repo.id).publicView) return;
+	if (visibilityDue(repo.id)) {
+		noteVisibility(repo.id, await repoVisibility(() => github.getRepo(repo.owner, repo.name)), () => {
+			updateQueueSettings(repo.id, { publicView: false });
+			emitEvent(repo.id, null, 'settings', { by: 'merge-queue', changes: { publicView: { from: true, to: false } }, why: 'the repository is private on GitHub' });
+			console.warn(`[merge-queue] ${repo.owner}/${repo.name} is private on GitHub: its public queue page is turned off`);
+		});
+	}
+	if (!readOnlyViewers(repo.id) || Date.now() - (lastWarm.get(repo.id) ?? 0) < 60_000) return;
+	lastWarm.set(repo.id, Date.now());
+	if ((await github.rateLimitOf(repo.owner).catch(() => null))?.low) return;
+	await dashboardStackAnalysis(repo).catch(() => {});
+	await pipelineView(repo, new Map()).catch(() => {});
+}
+
 // A batch tick costs several GitHub calls per queued PR, so it runs at most
 // once a minute, or sooner when a webhook says something changed.
 const BATCH_TICK_MS = 60_000;
@@ -129,6 +155,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	if (await rateLimited(repo)) return;
 	await recordOpenPRHeads(repo);
 	await recordCosts(repo);
+	await keepPublicPage(repo).catch((err) => console.warn(`[merge-queue] Public page upkeep for ${repo.owner}/${repo.name} failed:`, err instanceof Error ? err.message : err));
 
 	if (getQueueSettings(repo.id).mode === 'batch') {
 		const last = lastBatchTick.get(repo.id) ?? 0;

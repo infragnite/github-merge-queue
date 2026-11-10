@@ -56,33 +56,46 @@ export function publicHistory(h: HistoryItem): HistoryItem {
 }
 
 // --- the repository must still be public ---
+//
+// A read-only viewer never makes the app call GitHub. The processor asks GitHub whether each repo
+// with a public page is still public (every 10 minutes) and keeps the page's caches warm while
+// read-only viewers are around; a viewer only reads what it found.
 
-/** A visibility GitHub reported is trusted this long; a page turned public is re-checked after it. */
-const VISIBILITY_TTL_MS = 10 * 60_000;
+/** How often the processor re-asks GitHub; an answer older than three times this is not trusted. */
+export const VISIBILITY_TTL_MS = 10 * 60_000;
 const visibility = new Map<number, { at: number; public: boolean }>();
 
-/**
- * Whether a repository whose queue page was made public is still public on GitHub. Checked when a
- * read-only viewer loads the page (at most once per 10 minutes per repository); a repository that
- * went private has its public page turned off. When GitHub can't say and nothing recent is known,
- * the page is refused.
- */
-export async function stillPublic(
-	repo: { id: number; owner: string; name: string },
-	lookup: () => Promise<'public' | 'private' | null>,
-	onPrivate: () => void,
-	now = Date.now()
-): Promise<boolean> {
-	const hit = visibility.get(repo.id);
-	if (hit && now - hit.at < VISIBILITY_TTL_MS) return hit.public;
-	const v = await lookup();
-	if (v === null) return !!hit && hit.public && now - hit.at < 3 * VISIBILITY_TTL_MS;
-	visibility.set(repo.id, { at: now, public: v === 'public' });
+/** Whether the repository was public on GitHub when last asked, recently enough to trust; else false. */
+export function knownPublic(repoId: number, now = Date.now()): boolean {
+	const v = visibility.get(repoId);
+	return !!v && v.public && now - v.at < 3 * VISIBILITY_TTL_MS;
+}
+
+export function visibilityDue(repoId: number, now = Date.now()): boolean {
+	const v = visibility.get(repoId);
+	return !v || now - v.at >= VISIBILITY_TTL_MS;
+}
+
+/** Records what GitHub said (null: it couldn't say, and the last answer ages out); private turns the page off. */
+export function noteVisibility(repoId: number, v: 'public' | 'private' | null, onPrivate: () => void, now = Date.now()) {
+	if (v === null) return;
+	visibility.set(repoId, { at: now, public: v === 'public' });
 	if (v === 'private') onPrivate();
-	return v === 'public';
 }
 
 export function forgetVisibility(repoId?: number) {
 	if (repoId === undefined) visibility.clear();
 	else visibility.delete(repoId);
+}
+
+/** When a read-only viewer last loaded each repo's page: the processor keeps its caches warm meanwhile. */
+const viewed = new Map<number, number>();
+export const WARM_FOR_MS = 5 * 60_000;
+
+export function noteReadOnlyView(repoId: number, now = Date.now()) {
+	viewed.set(repoId, now);
+}
+
+export function readOnlyViewers(repoId: number, now = Date.now()): boolean {
+	return now - (viewed.get(repoId) ?? -Infinity) < WARM_FOR_MS;
 }

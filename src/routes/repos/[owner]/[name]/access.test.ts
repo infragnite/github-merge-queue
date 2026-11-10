@@ -28,7 +28,8 @@ vi.mock('$lib/server/stack-runtime', async (orig) => ({
 		throw new Error('secret internals');
 	})
 }));
-vi.mock('$lib/server/pipeline-view', () => ({
+vi.mock('$lib/server/pipeline-view', async (orig) => ({
+	...(await orig<typeof import('$lib/server/pipeline-view')>()),
 	pipelineView: vi.fn(async () => ({ mode: 'serial', paused: 'App lacks permission X', master: null, active: [], recent: [], error: null, rateLimitedUntil: null, tickError: { message: 'boom', count: 1, since: 0 }, progressErrors: { a: 'b' } }))
 }));
 
@@ -37,7 +38,7 @@ const store = await import('$lib/server/batch-store');
 const { clearWebRoles } = await import('$lib/server/web-auth');
 const page = await import('./+page.server');
 const github = await import('$lib/server/github');
-const { forgetVisibility } = await import('$lib/server/public-view');
+const { forgetVisibility, noteVisibility } = await import('$lib/server/public-view');
 const settingsPage = await import('./settings/+page.server');
 
 let repoId: number;
@@ -53,6 +54,7 @@ beforeEach(() => {
 	role.value = 'admin';
 	role.fail = false;
 	store.updateQueueSettings(repoId, { publicView: false, pausedReason: null, mode: 'serial' });
+	noteVisibility(repoId, 'public', () => {});
 });
 
 function form(fields: Record<string, string>) {
@@ -71,7 +73,7 @@ async function act(name: string, who: typeof user | null, fields: Record<string,
 
 async function load(who: typeof user | null, from: { load: unknown } = page) {
 	try {
-		return await (from.load as (e: unknown) => Promise<Record<string, unknown>>)({ params: { owner: 'acme', name: 'repo' }, locals: { user: who }, url: new URL('http://localhost/repos/acme/repo') });
+		return await (from.load as (e: unknown) => Promise<Record<string, unknown>>)({ params: { owner: 'acme', name: 'repo' }, locals: { user: who }, url: new URL('http://localhost/repos/acme/repo'), setHeaders: () => {} });
 	} catch (e) {
 		return { thrown: e as { status: number; location?: string } };
 	}
@@ -153,20 +155,24 @@ describe('who sees the page', () => {
 		for (const i of d.queueItems as Array<Record<string, unknown>>) expect(i).toMatchObject({ queued_by: '', head_sha: null });
 	});
 
-	test('a repository that went private loses its public page', async () => {
+	test('the public page needs GitHub to have said recently that the repository is public', async () => {
 		store.updateQueueSettings(repoId, { publicView: true });
 		forgetVisibility();
-		vi.mocked(github.getRepo).mockResolvedValueOnce({ private: true });
 		expect((await load(null)).thrown).toMatchObject({ status: 302 });
+		noteVisibility(repoId, 'private', () => store.updateQueueSettings(repoId, { publicView: false }));
 		expect(store.getQueueSettings(repoId).publicView).toBe(false);
+		expect((await load(null)).thrown).toMatchObject({ status: 302 });
+		noteVisibility(repoId, 'public', () => {});
 	});
 
-	test('when GitHub cannot say whether it is still public, the page is refused', async () => {
+	test('a read-only load calls GitHub for nothing', async () => {
 		store.updateQueueSettings(repoId, { publicView: true });
-		forgetVisibility();
-		vi.mocked(github.getRepo).mockRejectedValueOnce(new Error('down'));
-		expect((await load(null)).thrown).toMatchObject({ status: 302 });
-		forgetVisibility();
+		noteVisibility(repoId, 'public', () => {});
+		const calls = [github.getRepo, github.getOpenPRs, github.collaboratorRole].map((f) => vi.mocked(f).mock.calls.length);
+		const d = await load(null);
+		await d.pipeline;
+		await d.stacks;
+		expect([github.getRepo, github.getOpenPRs, github.collaboratorRole].map((f) => vi.mocked(f).mock.calls.length)).toEqual(calls);
 	});
 
 	test('signed in without access, a public repository shows read-only', async () => {
