@@ -1014,6 +1014,40 @@ describe('batch queue runtime', () => {
 		expect(item(3).error_message).toBe('Conflicts with #1 ahead of it; waits for them to land');
 	});
 
+	test('a deferred PR is commented on once; fewer PRs ahead only update its status, and a lifted deferral says nothing', async () => {
+		pr(1);
+		pr(2);
+		world.hold = () => true;
+		pr(4);
+		world.changesRequested.add(4);
+		pr(3);
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		store.setDeferredFor(item(3).id, [1, 2, 4]);
+		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #1 #2 #4 ahead of it; waits for them to land');
+		await tickBatchQueue(world.deps());
+		// #4 is held now, so #3 no longer waits for it.
+		await tickBatchQueue(world.deps());
+		expect(item(3).error_message).toBe('Conflicts with #1 #2 ahead of it; waits for them to land');
+		const told = () => world.prStatuses.filter((x) => x.sha === git.sha('pr3') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told()).toEqual([
+			['failure', 'Needs attention: Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
+			['failure', 'Needs attention: Conflicts with #1 #2 ahead of it; waits for them to land']
+		]);
+		const deferredComment = {
+			pr: 3,
+			body: 'Needs attention in the merge queue: Conflicts with #1 #2 #4 ahead of it; waits for them to land\n\nWhat to do: rebase it onto the PRs it conflicts with (it then goes with them), or wait for them to land and rebase it onto the default branch.'
+		};
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([deferredComment]);
+		// The deferral lifts (only #4, held, is left ahead), then comes back: no comment either time.
+		store.setDeferredFor(item(3).id, [4]);
+		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #4 ahead of it; waits for them to land');
+		await tickBatchQueue(world.deps());
+		store.setDeferredFor(item(3).id, [1]);
+		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #1 ahead of it; waits for them to land');
+		await tickBatchQueue(world.deps());
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([deferredComment]);
+	});
+
 	test('a PR whose changes are already on the default branch leaves the queue instead of an empty batch', async () => {
 		git.branch('pr1', 'main');
 		git.commit('pr1', 'pr1', 'pr1.txt');

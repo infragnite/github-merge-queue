@@ -126,6 +126,31 @@ jobs:
     steps: [{ run: echo }]
 `;
 
+	test('a job named only by an expression matches no check run, rather than every one', () => {
+		const feeds = gateFeeds(
+			`
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  matrixed:
+    name: \${{ matrix.name }}
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  gate:
+    needs: [matrixed]
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+`,
+			'gate'
+		)!;
+		expect(['route', 'release', 'gate'].map((n) => [n, feeds(n)])).toEqual([
+			['route', false],
+			['release', false],
+			['gate', true]
+		]);
+	});
+
 	test('a matrix job named with expressions in parentheses feeds the gate by its check run names', () => {
 		const feeds = gateFeeds(workflow, 'ci-and-conformance')!;
 		const names = [
