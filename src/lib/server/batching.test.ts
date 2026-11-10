@@ -249,10 +249,51 @@ describe('split points', () => {
 		expect(splitPoint([1, 2, 3, 4], none)).toEqual({ left: [1, 2], right: [3, 4], independent: true });
 	});
 
-	test('moves the cut to a stack boundary', () => {
-		// 2 <- 3: cutting between them would separate a child from its parent
+	test('keeps a stack whole and balances the halves around it', () => {
+		// 2 <- 3: the stack is one unit of two; the halves are two and two
 		const parent = (n: number) => (n === 3 ? 2 : null);
-		expect(splitPoint([1, 2, 3, 4], parent)).toEqual({ left: [1, 2, 3], right: [4], independent: true });
+		expect(splitPoint([1, 2, 3, 4], parent)).toEqual({ left: [2, 3], right: [1, 4], independent: true });
+	});
+
+	test('batch 49: a stack spread through the queue still splits 7 | 8, not 4 | 11', () => {
+		const members = [3342, 3039, 3296, 3309, 3241, 3308, 3364, 3365, 3334, 3366, 3358, 3286, 3234, 3356, 3352];
+		const parent = (n: number) => (n === 3308 || n === 3286 ? 3241 : null);
+		const { left, right, independent } = splitPoint(members, parent);
+		expect({ left, right, independent }).toEqual({
+			left: [3342, 3039, 3296, 3309, 3241, 3308, 3286],
+			right: [3364, 3365, 3334, 3366, 3358, 3234, 3356, 3352],
+			independent: true
+		});
+	});
+
+	test('a stack over half the group goes alone, the rest in the other half', () => {
+		const parent = (n: number) => (n >= 2 && n <= 5 ? n - 1 : null);
+		expect(splitPoint([1, 2, 3, 4, 5, 6, 7], parent)).toEqual({ left: [1, 2, 3, 4, 5], right: [6, 7], independent: true });
+	});
+
+	test('two stacks go to different halves, singles even them out', () => {
+		// 1 <- 2 <- 3 and 4 <- 5, with 6, 7 and 8 alone
+		const parent = (n: number) => ({ 2: 1, 3: 2, 5: 4 })[n] ?? null;
+		expect(splitPoint([1, 2, 3, 4, 5, 6, 7, 8], parent)).toEqual({ left: [1, 2, 3, 6], right: [4, 5, 7, 8], independent: true });
+	});
+
+	test('a stack whose middle is outside the group is still one unit', () => {
+		// 1 <- 9 <- 2: 9 landed or sits elsewhere, 1 and 2 still go together
+		const parent = (n: number) => ({ 2: 9, 9: 1 })[n] ?? null;
+		expect(splitPoint([1, 3, 2, 4], parent)).toEqual({ left: [1, 2], right: [3, 4], independent: true });
+	});
+
+	test('the halves differ by at most one PR when every unit is small', () => {
+		for (let n = 3; n <= 40; n++) {
+			const members = Array.from({ length: n }, (_, i) => i + 1);
+			// pairs 1 <- 2, 4 <- 5, ...: every third PR starts a stack of two
+			const parent = (x: number) => (x % 3 === 2 ? x - 1 : null);
+			const { left, right } = splitPoint(members, parent);
+			expect(Math.abs(left.length - right.length)).toBeLessThanOrEqual(1);
+			expect([...left, ...right].sort((x, y) => x - y)).toEqual(members);
+			for (const x of right) expect(left).not.toContain(parent(x));
+			for (const x of left) expect(right).not.toContain(parent(x));
+		}
 	});
 
 	test('a single stack is cut at a prefix', () => {
@@ -504,7 +545,7 @@ describe('bisection', () => {
 		});
 	});
 
-	test('with one slot, what is expected to pass runs first and the halves wait their turn', () => {
+	test('with one slot, what is expected to pass runs first; then both halves of one split', () => {
 		const runs: BisectRun[] = [
 			{ context: [], members: [1, 2, 3, 4, 5, 6, 7, 8], baseTree: 'm0', result: 'failure' },
 			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
@@ -514,9 +555,9 @@ describe('bisection', () => {
 			{ context: [], members: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20], baseTree: 'm0', result: 'success' }
 		];
 		const plan = (slots?: number) => planBisection({ runs, remaining: [1, 2, 3, 4, 5, 6, 7, 8, 9], masterTree: 'm1', parentOf: () => null, slots });
-		expect(plan()).toMatchObject({ start: [[9], [1, 2], [5, 6], [3, 4], [7, 8]] });
+		expect(plan()).toMatchObject({ start: [[9], [1, 2], [3, 4], [5, 6], [7, 8]] });
 		expect(plan(1)).toMatchObject({ start: [[9]] });
-		expect(plan(3)).toMatchObject({ start: [[9], [1, 2], [5, 6]] });
+		expect(plan(3)).toMatchObject({ start: [[9], [1, 2], [3, 4]] });
 		// A run going takes its slot.
 		runs.push({ context: [], members: [9], baseTree: 'm1', result: 'pending' });
 		expect(plan(1)).toMatchObject({ start: [], done: false });
