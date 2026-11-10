@@ -533,6 +533,8 @@ export function deferredFor(item: { deferred_for?: string | null }): number[] {
 export interface Hold {
 	code: string;
 	reason: string;
+	/** Its agent was told on GitHub. A hold saved before agents were told is told again. */
+	told?: boolean;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {

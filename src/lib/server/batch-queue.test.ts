@@ -551,7 +551,13 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 3]);
 		// once #1 is on master, #2 conflicts with master itself: its author is told, and it stays queued
 		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
-		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/can't apply this PR[\s\S]*same.txt[\s\S]*git rebase origin\/main/) }]);
+		expect(world.comments).toEqual([
+			{
+				pr: 2,
+				body: 'Needs attention in the merge queue: Conflicts with #1 ahead of it; waits for them to land\n\nWhat to do: rebase it onto the PRs it conflicts with (it then goes with them), or wait for them to land and rebase it onto the default branch.'
+			},
+			{ pr: 2, body: expect.stringMatching(/can't apply this PR[\s\S]*same.txt[\s\S]*git rebase origin\/main/) }
+		]);
 		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
 		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'failure', description: expect.stringMatching(/^Conflict/) });
 
@@ -636,7 +642,7 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1]);
 		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, '#2 has changes requested']]);
 		// The dashboard shows it as needing someone, not as waiting for its turn.
-		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: '#2 has changes requested' });
+		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: '#2 has changes requested', told: true });
 	});
 
 	test('marks the PR head as tested right before merging it', async () => {

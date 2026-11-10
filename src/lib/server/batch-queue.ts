@@ -20,10 +20,12 @@ import * as store from './batch-store';
 import type { BatchRow, BatchStep } from './batch-store';
 import {
 	admit,
+	holdAdvice,
 	planBisection,
 	descendants,
 	planRedBatch,
 	type Hold,
+	type HoldCode,
 	type PRState,
 	type Priority,
 	type QueueEntry,
@@ -1607,6 +1609,14 @@ class Tick {
 	 * of the queue, is released. What couldn't be posted is recorded only once it is, so the next
 	 * tick tries again.
 	 */
+	/** A comment on PR `n`, best effort; a rate limit stops the tick. */
+	async say(n: number, body: string) {
+		await this.d.github.comment(n, body).catch((e) => {
+			if (e instanceof RateLimitedError) throw e;
+			this.bestEffort('github.comment')(e);
+		});
+	}
+
 	async recordHolds(held: { pr: number; admission: Hold }[]) {
 		const now = new Map(held.map((h) => [h.pr, h.admission]));
 		const tell = async (n: number, state: 'failure' | 'pending', description: string): Promise<boolean> => {
@@ -1632,16 +1642,22 @@ class Tick {
 			if (!h) {
 				if (!was) continue;
 				if (!(await tell(it.pr_number, 'pending', 'In line in the merge queue'))) continue;
+				if (was.told) await this.say(it.pr_number, 'Back in line in the merge queue.');
 				store.setHold(it.id, null);
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 				this.event(it.pr_number, 'released', { code: was.code });
 				continue;
 			}
 			const { code, reason } = h;
-			if (was?.code === code && was.reason === reason) continue;
+			if (was?.told && was.code === code && was.reason === reason) continue;
 			if (!(await tell(it.pr_number, 'failure', `Needs attention: ${reason}`))) continue;
+			// One comment per kind of hold: it notifies the author, a status doesn't. A new reason of
+			// the same kind (fewer PRs ahead) only updates the status.
+			const advice = holdAdvice(code as HoldCode);
+			if (advice && !(was?.told && was.code === code))
+				await this.say(it.pr_number, `Needs attention in the merge queue: ${reason}\n\nWhat to do: ${advice}`);
 			db.updateQueueItemStatus(it.id, 'queued', reason);
-			store.setHold(it.id, { code, reason });
+			store.setHold(it.id, { code, reason, told: true });
 			this.event(it.pr_number, 'held', { code, reason });
 		}
 		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).
