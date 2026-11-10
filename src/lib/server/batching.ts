@@ -181,7 +181,7 @@ export function holdAdvice(code: HoldCode): string {
 		case 'conflict':
 			return 'Rebase it and push:';
 		case 'workflow-permission':
-			return 'A repository admin grants the app the Workflows: Read and write permission; push again, or queue it again, to retry.';
+			return 'A repository admin grants the app the Workflows: Read and write permission; then push to retry.';
 		case 'failed':
 			return 'Fix the failure and push.';
 		// Nothing the author can do: it waits for other PRs, or for the queue itself.
