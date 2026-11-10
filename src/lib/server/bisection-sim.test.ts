@@ -130,12 +130,42 @@ function simulate(w: World): Outcome {
 			return { landed, ejected, requeued: step.requeue, runs: runs.length - 1, time, landedAt, settledAt, violations };
 		}
 		if (w.slots !== undefined && pending.length + step.start.length > w.slots) fail(`${pending.length + step.start.length} runs at once on ${w.slots} slots`);
-		// No slot idles while there is work: with a slot to spare, one more slot starts nothing more
-		// (unless it lets a group run PR by PR, a choice the slot count makes).
-		if (w.slots !== undefined && pending.length + step.start.length < w.slots) {
-			const more = planBisection({ runs, remaining, masterTree: tree, parentOf, trusted: () => true, slots: w.slots + 1 });
-			if (more.kind === 'step' && more.start.length > step.start.length && !more.start.every((g) => g.length === 1))
-				fail(`a slot idles: started ${JSON.stringify(step.start)}, one more slot starts ${JSON.stringify(more.start)}`);
+		// No slot idles while a failure can be narrowed. The failing groups are what is left of each
+		// failed run, unless a later green run holds all of it or a PR ejected since explains it;
+		// of overlapping ones only the smallest. With a slot to spare, each with two PRs or more and
+		// none of them running starts a part of it; an independent half starts with its other half,
+		// unless that other half already ran on this tree.
+		if (w.slots === undefined || pending.length + step.start.length < w.slots) {
+			const gone = new Set(ejected.map((e) => e.pr));
+			const groups: Set<number>[] = [];
+			runs
+				.map((r, j) => ({ r, j, set: new Set(r.members.filter((n) => remaining.includes(n))) }))
+				.filter(({ r, j, set }) => r.result === 'failure' && set.size > 0 && !r.members.some((n) => gone.has(n)) && !runs.some((o, k) => k > j && o.result === 'success' && [...set].every((n) => o.members.includes(n))))
+				.sort((x, y) => x.set.size - y.set.size || x.j - y.j)
+				.forEach(({ set }) => {
+					if (!groups.some((g) => [...g].some((n) => set.has(n)))) groups.push(set);
+				});
+			const busy = new Set(pending.flatMap((r) => r.members));
+			const above = (n: number, among: Set<number>) => {
+				for (let p = parentOf(n); p !== null; p = parentOf(p)) if (among.has(p)) return true;
+				return false;
+			};
+			for (const g of groups) {
+				if (g.size < 2 || [...g].some((n) => busy.has(n))) continue;
+				// A part may carry PRs from outside: what passed pooled with it, or a branch stacked on it.
+				const parts = step.start.filter((x) => x.some((n) => g.has(n)));
+				if (!parts.length) {
+					fail(`a slot idles while ${key([...g])} can be narrowed: started ${JSON.stringify(step.start)}`);
+					continue;
+				}
+				// Run PR by PR (cheaper for a small group or many breakers): the slots take them in turn.
+				if (parts.every((x) => x.length === 1)) continue;
+				const covered = new Set(parts.flat());
+				const rest = [...g].filter((n) => !covered.has(n));
+				const ranHere = runs.some((r) => r.baseTree === tree && !r.context.length && key(r.members) === key(rest));
+				if (rest.length && !rest.some((n) => above(n, covered)) && !ranHere)
+					fail(`half of ${key([...g])} waits with a slot to spare: started ${JSON.stringify(step.start)}`);
+			}
 		}
 		// What passed before never runs with unrelated PRs that never passed: a pass then lands the
 		// first, and a failure points at the second. A PR may run on a parent that passed, which it needs.
