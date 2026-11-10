@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import {
+	aloneIsCheaper,
 	admit,
 	planBisection,
 	type BisectRun,
@@ -464,7 +465,9 @@ describe('bisection', () => {
 			{ context: [], members: [1, 2, 3, 4, 5, 6, 7, 8], baseTree: 'm0', result: 'failure' },
 			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
 			{ context: [], members: [5, 6, 7, 8], baseTree: 'm0', result: 'failure' },
-			{ context: [], members: [9], baseTree: 'm0', result: 'success' }
+			{ context: [], members: [9], baseTree: 'm0', result: 'success' },
+			// Ten PRs of the batch already landed: breakers are rare, so failing groups are halved.
+			{ context: [], members: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20], baseTree: 'm0', result: 'success' }
 		];
 		const plan = (slots?: number) => planBisection({ runs, remaining: [1, 2, 3, 4, 5, 6, 7, 8, 9], masterTree: 'm1', parentOf: () => null, slots });
 		expect(plan()).toMatchObject({ start: [[9], [1, 2], [5, 6], [3, 4], [7, 8]] });
@@ -634,5 +637,34 @@ describe('bisection invariants (randomised)', () => {
 				expect(r.runs).toBeLessThanOrEqual(4 * size);
 			}
 		}
+	});
+});
+
+describe('never worse than one run per PR', () => {
+	test('a small group, or one among many breakers, is cheaper alone than halved', () => {
+		expect(aloneIsCheaper(2, 0.05)).toBe(true);
+		expect(aloneIsCheaper(3, 0.05)).toBe(true);
+		expect(aloneIsCheaper(8, 0.05)).toBe(false);
+		expect(aloneIsCheaper(27, 0.15)).toBe(false);
+		expect(aloneIsCheaper(8, 0.3)).toBe(true);
+		expect(aloneIsCheaper(27, 0.3)).toBe(true);
+	});
+
+	test('a failing group of never-passed PRs in a batch full of breakers runs each PR alone', () => {
+		// Three failed groups and nothing passed yet: breakers are common here, so [1..4] is not halved.
+		const runs: BisectRun[] = [
+			{ context: [], members: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [5, 6, 7, 8], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [9, 10, 11, 12], baseTree: 'm0', result: 'failure' }
+		];
+		const step = planBisection({ runs, remaining: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], masterTree: 'm0', parentOf: () => null, slots: 1 });
+		expect(step).toEqual({ kind: 'step', eject: [], requeue: [], done: false, start: [[1]] });
+	});
+
+	test('a stacked group is still narrowed along the stack (prefixes), never into children without their parents', () => {
+		const runs: BisectRun[] = [{ context: [], members: [1, 2, 3], baseTree: 'm0', result: 'failure' }];
+		const step = planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm0', parentOf: (n) => (n > 1 ? n - 1 : null), slots: 1 });
+		expect(step.kind === 'step' && step.start).toEqual([[1]]);
 	});
 });

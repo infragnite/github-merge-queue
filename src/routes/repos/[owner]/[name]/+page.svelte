@@ -4,7 +4,6 @@
 	import QueueItem from '$lib/components/QueueItem.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import BatchCard from '$lib/components/BatchCard.svelte';
-	import QueueSettings from '$lib/components/QueueSettings.svelte';
 	import { queueView, type Row } from '$lib/queue-view';
 	import { runOrder } from '$lib/run-order';
 
@@ -35,7 +34,7 @@
 		queueView({
 			items: data.queueItems,
 			mode: batchMode ? 'batch' : 'serial',
-			batches: (pipe?.active ?? []).filter((b) => b.kind === 'batch').map((b) => ({ id: b.id, status: b.status, prs: b.prs.map((p) => p.pr) })),
+			batches: (pipe?.active ?? []).filter((b) => b.kind === 'batch').map((b) => ({ id: b.id, status: b.status, prs: b.prs.filter((p) => p.activity !== 'landed' && p.activity !== 'left' && p.verdict !== 'failing').map((p) => p.pr) })),
 			stacks: stacks?.stacks ?? null,
 			limits: data.limits
 		})
@@ -120,16 +119,6 @@
 		handleDragEnd();
 	}
 
-	// Asked in the enhance callback: `use:enhance` submits regardless of a prevented submit event.
-	const confirmMode: import('@sveltejs/kit').SubmitFunction = ({ submitter, cancel }) => {
-		const to = (submitter as HTMLButtonElement | null)?.value;
-		if (!to || to === data.mode) return cancel();
-		const text =
-			to === 'serial'
-				? 'Switch to one by one? Batches being tested now are stopped and their PRs go back in line; PRs then merge one at a time in the order shown.'
-				: 'Switch to batches? PRs are then tested together, urgent first and then in line order, and the order can no longer be dragged.';
-		if (!confirm(text)) cancel();
-	};
 </script>
 
 <svelte:head>
@@ -155,24 +144,27 @@
 					Into <code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs">{data.repo.default_branch}</code>
 					{#if pipe?.master}
 						{@const m = MASTER[pipe.master.state] ?? { label: pipe.master.state, tone: 'bg-gray-100 text-gray-700', hint: '' }}
-						<span class="ml-1 rounded px-1.5 py-0.5 text-xs {m.tone}" title={m.hint}>{m.label} at {pipe.master.sha.slice(0, 7)}</span>
+						<span class="ml-1 rounded px-1.5 py-0.5 text-xs {m.tone}" title={m.hint}>{m.label} at <span class="whitespace-nowrap">{pipe.master.sha.slice(0, 7)}</span></span>
 					{/if}
+					<a href="/repos/{data.repo.owner}/{data.repo.name}/settings#strategy" class="ml-1 whitespace-nowrap text-xs text-gray-500 underline decoration-dotted underline-offset-2 hover:text-indigo-600" title="How the queue merges PRs; change it in the queue settings"
+						>{batchMode ? `Batches of up to ${data.limits.maxBatch}` : 'One by one'}</a
+					>
 				</p>
 			</div>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
-			<form method="POST" action="?/setMode" use:enhance={confirmMode} class="flex overflow-hidden rounded-lg border border-border-subtle text-sm" aria-label="Merge mode">
-				{#each [['serial', 'One by one'], ['batch', 'Batches']] as [value, label] (value)}
-					<button
-						type="submit"
-						name="mode"
-						{value}
-						aria-pressed={data.mode === value}
-						class="whitespace-nowrap px-3 py-1.5 transition-colors {data.mode === value ? 'bg-indigo-600 text-white' : 'bg-surface-raised text-gray-600 hover:bg-surface-sunken'}"
-						title={value === 'batch' ? 'Test queued PRs together in batches, urgent first' : 'Test and merge PRs one at a time, in the order you set'}
-					>{label}</button>
-				{/each}
-			</form>
+			<a
+				href="/repos/{data.repo.owner}/{data.repo.name}/settings"
+				class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-2 text-sm text-gray-700 transition-colors hover:bg-surface-sunken sm:py-1.5"
+				aria-label="Queue settings"
+				title="Queue settings: merge strategy, batches, CI"
+			>
+				<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+					<path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+					<path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+				</svg>
+				<span class="hidden sm:inline">Queue settings</span>
+			</a>
 			<button
 				onclick={refresh}
 				disabled={refreshing}
@@ -397,8 +389,6 @@
 					</div>
 				</details>
 			{/if}
-
-			<QueueSettings settings={data.settings} canEdit={data.can.settings} error={form?.settingsError ?? null} saved={!!form?.settingsSaved} />
 
 			<!-- History -->
 			{#if data.history.length > 0}
