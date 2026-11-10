@@ -64,8 +64,9 @@ class World {
 	holdMasterRuns = false;
 	/** Runs of these PRs keep running while it says so. */
 	hold: (prs: number[]) => boolean = () => false;
-	/** Failing runs keep going after their first failed job, which only a fail-fast read sees. */
+	/** Failing runs keep going a few reads after their first failed job, which a fail-fast read sees at once. */
 	slowFailures = false;
+	slowReads = new Map<string, number>();
 	/** Each result read: the head and whether it asked to fail fast. */
 	resultReads: { head: string; failFast: boolean }[] = [];
 	/** Called as each PR is about to be merged (before GitHub checks its head). */
@@ -120,7 +121,12 @@ class World {
 				result: async (head, _notBefore, opts) => {
 					this.resultReads.push({ head, failFast: !!opts?.failFast });
 					if (this.ciPendingOnce.delete(head) || this.stillRunning.has(head)) return 'pending';
-					if (this.slowFailures && this.ciFails(head) && !this.cancelled.includes(head)) return opts?.failFast ? 'failure' : 'pending';
+					if (this.slowFailures && this.ciFails(head) && !this.cancelled.includes(head) && !opts?.failFast) {
+						// The rest of a failing run takes a few more reads to finish.
+						const n = (this.slowReads.get(head) ?? 0) + 1;
+						this.slowReads.set(head, n);
+						if (n <= 3) return 'pending';
+					}
 					if (this.holdMasterRuns && head === git.sha('main')) return 'pending';
 					const started = this.started.find((x) => x.head === head);
 					if (started && this.hold(started.prs)) return 'pending';
@@ -1434,14 +1440,10 @@ describe('stopping a red run at its first failed job', () => {
 	test('a batch and a bisection step of several PRs fail fast and are cancelled; a PR alone runs to the end', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		world.slowFailures = true;
-		pr(1);
-		pr(2);
-		pr(3);
-		pr(4, { file: 'x-breaks-master.txt' });
+		for (let n = 1; n <= 8; n++) pr(n, n === 4 ? { file: 'x-breaks-master.txt' } : {});
 		world.breakingFiles.add('x-breaks-master.txt');
-		await run(60);
-		// Without fail-fast the failing runs would never finish here.
-		expect(world.merged).toEqual([1, 2, 3]);
+		await run(80);
+		expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 3, 5, 6, 7, 8]);
 		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own/) }]);
 		// Every run of several PRs read fail-fast, every run of one PR did not.
 		for (const r of world.resultReads) expect(r.failFast, `run of ${prsOf(r.head).join(' ')}`).toBe(prsOf(r.head).length > 1);
@@ -1449,8 +1451,11 @@ describe('stopping a red run at its first failed job', () => {
 		const failing = world.started.filter((x) => x.prs.length > 1 && x.prs.includes(4)).map((x) => x.head);
 		expect(failing.length).toBeGreaterThanOrEqual(2);
 		for (const h of failing) expect(world.cancelled).toContain(h);
+		// The lone run of #4 was read to its end (it took its extra reads) and never cancelled.
 		const lone = world.started.find((x) => x.prs.length === 1 && x.prs[0] === 4)!.head;
 		expect(world.cancelled).not.toContain(lone);
+		expect(world.slowReads.get(lone)).toBe(4);
+		for (const h of failing) expect(world.slowReads.has(h)).toBe(false);
 	});
 
 	test('off, a red run is read to its end', async () => {
