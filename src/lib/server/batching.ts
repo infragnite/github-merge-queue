@@ -226,42 +226,42 @@ function stopper(info: PRStackInfo): string | null {
 /** Whether a PR may be tested in a batch now, looking at the PR alone and its stack. */
 export function admit(state: PRState, analysis: StackAnalysis, config: BatchConfig): Admission {
 	const n = state.pr;
-	if (state.draft) return { ok: false, code: 'draft', reason: `#${n} is a draft` };
+	if (state.draft) return { ok: false, code: 'draft', reason: 'Draft' };
 
 	// Checks still running don't hold a PR: the batch's own CI tests it.
 	if (state.ciGreen === false) {
-		return { ok: false, code: 'ci-failed', reason: `#${n}'s own checks failed on its head` };
+		return { ok: false, code: 'ci-failed', reason: 'Its own checks failed on its head' };
 	}
 
 	if (config.requireApproval) {
 		if (state.changesRequested) {
-			return { ok: false, code: 'changes-requested', reason: `#${n} has changes requested` };
+			return { ok: false, code: 'changes-requested', reason: 'Changes requested' };
 		}
 		if (state.approvedShas.length === 0) {
-			return { ok: false, code: 'not-approved', reason: `#${n} is not approved` };
+			return { ok: false, code: 'not-approved', reason: 'Not approved' };
 		}
 		if (config.approvalOnHead && !state.approvedShas.includes(state.headSha)) {
 			return {
 				ok: false,
 				code: 'stale-approval',
-				reason: `#${n} was approved on an earlier push; approve its current head ${state.headSha.slice(0, 7)}`
+				reason: `Approved on an earlier push; approve its current head ${state.headSha.slice(0, 7)}`
 			};
 		}
 	}
 
 	if (state.fromFork && !state.approvedShas.includes(state.headSha)) {
 		// Batches run in this repo's CI, with its secrets and runners: outside code needs a writer's look first.
-		return { ok: false, code: 'not-approved', reason: `#${n} comes from a fork; a writer must approve its head first` };
+		return { ok: false, code: 'not-approved', reason: 'From a fork; a writer must approve its head first' };
 	}
 
 	const info = analysis.prs.get(n);
 	if (state.targetsDefault === false && (info?.parent ?? null) === null) {
 		// Only the default branch is batched; a PR into another branch is merged some other way.
-		return { ok: false, code: 'wrong-base', reason: `#${n} does not target the default branch` };
+		return { ok: false, code: 'wrong-base', reason: 'Does not target the default branch' };
 	}
 	if (state.fromFork && (info?.parent ?? null) !== null) {
 		// Landing a stacked child restacks and pushes its branch, which the queue can't do in a fork.
-		return { ok: false, code: 'wrong-base', reason: `#${n} is stacked on another PR from a fork; retarget it to the default branch once its parent lands` };
+		return { ok: false, code: 'wrong-base', reason: 'Stacked on another PR from a fork; retarget it to the default branch once its parent lands' };
 	}
 	if (info) {
 		const own = stopper(info);
