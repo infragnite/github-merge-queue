@@ -259,7 +259,7 @@ class Tick {
 	}
 
 	settings() {
-		return store.getQueueSettings(this.repoId);
+		return planningSettings(store.getQueueSettings(this.repoId));
 	}
 
 	/** The Actions runs of a queue branch; a link that works before the run exists and after the branch is deleted. */
@@ -1659,7 +1659,8 @@ class Tick {
 				live: new Set(this.items().map((i) => i.pr_number))
 			});
 		} else {
-			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config });
+			if (opts.urgentOnly && settings.mode === 'serial') return 'idle';
+			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode });
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
 			if (opts.urgentOnly && !plan.express) return 'idle';
@@ -1678,11 +1679,19 @@ class Tick {
 	}
 }
 
+/**
+ * The settings the runtime plans with. One by one is the batch runtime with one run in flight,
+ * started as soon as the head stack can go.
+ */
+function planningSettings(s: ReturnType<typeof store.getQueueSettings>): ReturnType<typeof store.getQueueSettings> {
+	return s.mode === 'serial' ? { ...s, config: { ...s.config, depth: 1, collectWindowMs: 0 } } : s;
+}
+
 export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	const t = new Tick(deps);
 	const settings = store.getQueueSettings(deps.repo.id);
 	await t.recoverInterrupted();
-	if (settings.pausedReason || settings.mode !== 'batch') return;
+	if (settings.pausedReason) return;
 	await t.reconcile();
 	await t.advanceTries();
 	await t.advanceMaster();
@@ -1729,7 +1738,7 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	}
 	// Don't plan new work on top of a bisection: its base is about to change.
 	if (active.some((b) => b.status === 'bisecting')) return;
-	const config = store.getQueueSettings(deps.repo.id).config;
+	const config = planningSettings(store.getQueueSettings(deps.repo.id)).config;
 	if (config.autoRebase && (await t.restack())) return;
 	if (!t.items().some((i) => i.status === 'queued')) return;
 	if (!active.length) {

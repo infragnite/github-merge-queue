@@ -192,11 +192,17 @@ export function serialPick(model: QueueModel, opts: { inflight: number }): numbe
 	return model.stacks.find((s) => s.on === null)?.members ?? null;
 }
 
-/** The next batch for the batch planner: the queue model, filled. */
-export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string> }): Plan {
+/**
+ * What the queue tests next: in batches, a new batch filled from the queue model; one by one, the
+ * head stack whole.
+ */
+export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial' }): Plan {
 	const inflight = new Set(input.inflight.flat());
 	const model = queueModel({ queue: input.queue, states: input.states, analysis: input.analysis, config: input.config, inflight, conflicts: input.conflicts });
-	const fill = fillBatch(model, { config: input.config, inflightBatches: input.inflight.length, now: input.now });
+	const fill: FillResult =
+		input.strategy === 'serial'
+			? { batch: serialPick(model, { inflight: input.inflight.length }), express: false, waitUntil: null }
+			: fillBatch(model, { config: input.config, inflightBatches: input.inflight.length, now: input.now });
 	const effectivePriority = new Map<number, Priority>(input.queue.map((e) => [e.pr, e.priority]));
 	for (const s of model.stacks) for (const m of s.members) effectivePriority.set(m, s.priority);
 	return {
