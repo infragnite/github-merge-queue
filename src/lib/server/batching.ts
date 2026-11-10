@@ -126,7 +126,7 @@ export type AdmissionCode =
 	| 'wrong-base';
 
 /** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
-export type HoldCode = AdmissionCode | 'conflict' | 'parent-not-queued' | 'parent-held';
+export type HoldCode = AdmissionCode | 'conflict' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
 
 export interface Hold {
 	ok: false;

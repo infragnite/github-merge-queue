@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import { DEFAULT_BATCH_CONFIG, type BatchConfig, type PRState, type Priority, type QueueEntry } from './batching';
-import { fillBatch, queueModel, serialPick, type QueueModel } from './queue-model';
+import { fillBatch, plannedAdmission, queueModel, serialPick, type QueueModel } from './queue-model';
 import { entry, MIN, NOW, ready, stacks } from './testing/stack-fixture';
 import type { StackAnalysis } from './stacks';
 
@@ -15,11 +15,10 @@ function model(
 	for (const s of opts.states ?? []) states.set(s.pr, s);
 	return queueModel({
 		queue,
-		states,
+		admission: plannedAdmission({ states, analysis, config: { ...config, ...opts.config } }),
 		analysis,
-		config: { ...config, ...opts.config },
 		inflight: new Set(opts.inflight ?? []),
-		conflicts: new Map(Object.entries(opts.conflicts ?? {}).map(([k, v]) => [Number(k), v]))
+		problems: new Map(Object.entries(opts.conflicts ?? {}).map(([k, v]) => [Number(k), { code: 'conflict' as const, reason: v }]))
 	});
 }
 

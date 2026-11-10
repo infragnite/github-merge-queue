@@ -8,7 +8,7 @@
 //
 // Pure: the runtime gathers the queue, PR states, the stack analysis and known conflicts.
 
-import { admit, type BatchConfig, type HoldCode, type Plan, type PlanInput, type PRState, type Priority, type QueueEntry } from './batching';
+import { admit, type Admission, type BatchConfig, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
 import type { StackAnalysis } from './stacks';
 
 const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
@@ -16,13 +16,13 @@ const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
 export interface QueueModelInput {
 	/** The queued PRs (not those being tested). */
 	queue: QueueEntry[];
-	states: Map<number, PRState>;
+	/** Whether a queued PR may be tested now, by itself and its stack (see `admit`). */
+	admission: (pr: number) => Admission;
 	analysis: StackAnalysis;
-	config: BatchConfig;
 	/** PRs in a batch being tested: a stack may sit on one of them. */
 	inflight: Set<number>;
-	/** PRs known not to apply (on the default branch, or on a PR below them), with why. */
-	conflicts?: Map<number, string>;
+	/** PRs that need someone whatever their admission says (a known conflict, a failure), with why. */
+	problems?: Map<number, { code: HoldCode; reason: string }>;
 }
 
 export interface QueueStack {
@@ -62,7 +62,7 @@ export interface QueueModel {
 const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? s[0].toLowerCase() + s.slice(1) : s);
 
 export function queueModel(input: QueueModelInput): QueueModel {
-	const { queue, states, analysis, config, inflight } = input;
+	const { queue, analysis, inflight } = input;
 	const entries = new Map(queue.filter((e) => !inflight.has(e.pr)).map((e) => [e.pr, e]));
 	const parentOf = (n: number) => {
 		const p = analysis.prs.get(n)?.parent ?? null;
@@ -77,11 +77,10 @@ export function queueModel(input: QueueModelInput): QueueModel {
 	// Each PR's own reason to wait, if any.
 	const own = new Map<number, { code: HoldCode; reason: string; wait: boolean }>();
 	for (const n of entries.keys()) {
-		const s = states.get(n);
-		const a = s ? admit(s, analysis, config) : ({ ok: false, code: 'ci-pending', reason: `#${n} has not been fetched yet`, wait: true } as const);
-		const conflict = input.conflicts?.get(n);
+		const a = input.admission(n);
+		const problem = input.problems?.get(n);
 		if (!a.ok && !a.wait) own.set(n, { code: a.code, reason: a.reason, wait: false });
-		else if (conflict) own.set(n, { code: 'conflict', reason: conflict, wait: false });
+		else if (problem) own.set(n, { ...problem, wait: false });
 		else if (!a.ok) own.set(n, { code: a.code, reason: a.reason, wait: true });
 		else {
 			const p = parentOf(n);
@@ -198,7 +197,8 @@ export function serialPick(model: QueueModel, opts: { inflight: number }): numbe
  */
 export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial' }): Plan {
 	const inflight = new Set(input.inflight.flat());
-	const model = queueModel({ queue: input.queue, states: input.states, analysis: input.analysis, config: input.config, inflight, conflicts: input.conflicts });
+	const conflicts = [...(input.conflicts ?? [])].map(([pr, reason]) => [pr, { code: 'conflict' as const, reason }] as const);
+	const model = queueModel({ queue: input.queue, admission: plannedAdmission(input), analysis: input.analysis, inflight, problems: new Map(conflicts) });
 	const fill: FillResult =
 		input.strategy === 'serial'
 			? { batch: serialPick(model, { inflight: input.inflight.length }), express: false, waitUntil: null }
@@ -209,5 +209,13 @@ export function planNextBatch(input: PlanInput & { conflicts?: Map<number, strin
 		...fill,
 		held: [...model.waiting, ...model.attention].map((h) => ({ pr: h.pr, admission: { ok: false, code: h.code, reason: h.reason, wait: h.wait } })),
 		effectivePriority
+	};
+}
+
+/** A queued PR's admission from what the planner fetched about it. */
+export function plannedAdmission(input: Pick<PlanInput, 'states' | 'analysis' | 'config'>): (pr: number) => Admission {
+	return (n) => {
+		const s = input.states.get(n);
+		return s ? admit(s, input.analysis, input.config) : { ok: false, code: 'ci-pending', reason: `#${n} has not been fetched yet`, wait: true };
 	};
 }
