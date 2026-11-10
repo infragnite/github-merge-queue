@@ -7,11 +7,12 @@ import {
 	reorderQueue,
 	updateQueueItemStatus
 } from '$lib/server/db';
-import { getOpenPRs, rateLimitOf, getPR } from '$lib/server/github';
+import { getOpenPRs, rateLimitOf, getPR, getRepo } from '$lib/server/github';
 import { atLeast, AuthError, requireRole, type Caller, type Role } from '$lib/server/api-auth';
 import { ApiError, changeEntry, enqueue } from '$lib/server/api-service';
 import { webCaller } from '$lib/server/web-auth';
-import { publicHistory, publicQueueItem, prUrl } from '$lib/server/public-view';
+import { publicHistory, publicQueueItem, prUrl, stillPublic } from '$lib/server/public-view';
+import { repoVisibility } from '$lib/server/api-service';
 import { savingsFor } from '$lib/server/ci-savings';
 import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
 import { currentHold, deferredFor, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
@@ -52,7 +53,14 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 	// Anyone else sees the read-only page of a repository that made it public, or nothing: an unknown
 	// repository and one they can't see answer the same.
 	const readonly = !member;
-	if (readonly && !(repo && getQueueSettings(repo.id).publicView)) {
+	const isPublic = async (r: NonNullable<typeof repo>) =>
+		getQueueSettings(r.id).publicView &&
+		(await stillPublic(r, () => repoVisibility(() => getRepo(r.owner, r.name)), () => {
+			updateQueueSettings(r.id, { publicView: false });
+			emitEvent(r.id, null, 'settings', { by: 'merge-queue', changes: { publicView: { from: true, to: false } }, why: 'the repository is private on GitHub' });
+			console.warn(`[merge-queue] ${r.owner}/${r.name} is private on GitHub: its public queue page is turned off`);
+		}));
+	if (readonly && !(repo && (await isPublic(repo)))) {
 		if (anonymous) redirect(302, `/login?next=${encodeURIComponent(url.pathname)}`);
 		error(404, 'Repository not found');
 	}

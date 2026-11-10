@@ -25,7 +25,8 @@ export function publicQueueItem(i: ViewItem): ViewItem {
 		head_sha: null,
 		status: i.status,
 		position: i.position,
-		error_message: i.error_message,
+		// The planner's own note on why a PR waits is shown; raw errors (GitHub's, git's) are not.
+		error_message: i.holdWait !== null ? i.error_message : i.status === 'failed' ? 'Failed in the queue' : null,
 		queued_by: '',
 		created_at: '',
 		started_at: null,
@@ -52,4 +53,36 @@ export function publicHistory(h: HistoryItem): HistoryItem {
 		repo_owner: '',
 		repo_name: ''
 	};
+}
+
+// --- the repository must still be public ---
+
+/** A visibility GitHub reported is trusted this long; a page turned public is re-checked after it. */
+const VISIBILITY_TTL_MS = 10 * 60_000;
+const visibility = new Map<number, { at: number; public: boolean }>();
+
+/**
+ * Whether a repository whose queue page was made public is still public on GitHub. Checked when a
+ * read-only viewer loads the page (at most once per 10 minutes per repository); a repository that
+ * went private has its public page turned off. When GitHub can't say and nothing recent is known,
+ * the page is refused.
+ */
+export async function stillPublic(
+	repo: { id: number; owner: string; name: string },
+	lookup: () => Promise<'public' | 'private' | null>,
+	onPrivate: () => void,
+	now = Date.now()
+): Promise<boolean> {
+	const hit = visibility.get(repo.id);
+	if (hit && now - hit.at < VISIBILITY_TTL_MS) return hit.public;
+	const v = await lookup();
+	if (v === null) return !!hit && hit.public && now - hit.at < 3 * VISIBILITY_TTL_MS;
+	visibility.set(repo.id, { at: now, public: v === 'public' });
+	if (v === 'private') onPrivate();
+	return v === 'public';
+}
+
+export function forgetVisibility(repoId?: number) {
+	if (repoId === undefined) visibility.clear();
+	else visibility.delete(repoId);
 }

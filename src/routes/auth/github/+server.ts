@@ -1,6 +1,7 @@
 import { redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import { randomBytes } from 'crypto';
+import { safeNext } from '$lib/server/next-path';
 import type { RequestHandler } from './$types';
 
 export const GET: RequestHandler = ({ cookies, url }) => {
@@ -19,8 +20,8 @@ export const GET: RequestHandler = ({ cookies, url }) => {
 	});
 
 	// A path on this site only: `//host` or a scheme would send the user elsewhere after sign-in.
-	const next = url.searchParams.get('next');
-	if (next && /^\/(?![\/\\])/.test(next)) cookies.set('oauth_next', next, { path: '/', httpOnly: true, sameSite: 'lax', secure: isSecure, maxAge: 600 });
+	const next = safeNext(url.searchParams.get('next'), appUrl);
+	if (next) cookies.set('oauth_next', next, { path: '/', httpOnly: true, sameSite: 'lax', secure: isSecure, maxAge: 600 });
 	else cookies.delete('oauth_next', { path: '/' });
 
 	const params = new URLSearchParams({
