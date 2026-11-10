@@ -35,7 +35,7 @@ import type { ReplayResult } from './rebase';
 import type { StackAnalysis } from './stacks';
 import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
-import { emitEvent, type QueueEventKind } from './events';
+import { emitEvent, heldPRs, type QueueEventKind } from './events';
 
 /** A PR as the queue sees it; `PRState`'s readiness fields come from `QueueGitHub.readiness`. */
 export interface LivePR {
@@ -1603,10 +1603,27 @@ class Tick {
 	 */
 	/**
 	 * Records why each held PR can't go and tells its agent on GitHub, once per reason: a failing
-	 * merge-queue status on its head and a `held` event. A PR held before and free now is released.
+	 * merge-queue status on its head and a `held` event. A PR held before and free now, or taken out
+	 * of the queue, is released. What couldn't be posted is recorded only once it is, so the next
+	 * tick tries again.
 	 */
 	async recordHolds(held: { pr: number; admission: Hold }[]) {
 		const now = new Map(held.map((h) => [h.pr, h.admission]));
+		const tell = async (n: number, state: 'failure' | 'pending', description: string): Promise<boolean> => {
+			const p = await this.pr(n).catch((e) => {
+				if (e instanceof RateLimitedError) throw e;
+				return null;
+			});
+			if (!p) return true; // closed or gone: there is no head to tell
+			try {
+				await this.d.github.setPRStatus(p.headSha, state, short(description));
+				return true;
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRStatus')(e);
+				return false;
+			}
+		};
 		for (const it of this.items()) {
 			// A PR in conflict keeps its status and message: it is held for that, and was told.
 			if (it.status !== 'queued') continue;
@@ -1614,24 +1631,33 @@ class Tick {
 			const h = now.get(it.pr_number);
 			if (!h) {
 				if (!was) continue;
+				if (!(await tell(it.pr_number, 'pending', 'In line in the merge queue'))) continue;
 				store.setHold(it.id, null);
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
-				const p = await this.pr(it.pr_number).catch(() => null);
-				if (p) await this.d.github.setPRStatus(p.headSha, 'pending', 'In line in the merge queue').catch(this.bestEffort('github.setPRStatus'));
 				this.event(it.pr_number, 'released', { code: was.code });
 				continue;
 			}
 			const { code, reason } = h;
 			if (was?.code === code && was.reason === reason) continue;
+			if (!(await tell(it.pr_number, 'failure', `Needs attention: ${reason}`))) continue;
 			db.updateQueueItemStatus(it.id, 'queued', reason);
 			store.setHold(it.id, { code, reason });
-			const p = await this.pr(it.pr_number).catch(() => null);
-			if (p) await this.d.github.setPRStatus(p.headSha, 'failure', short(`Needs attention: ${reason}`)).catch(this.bestEffort('github.setPRStatus'));
 			this.event(it.pr_number, 'held', { code, reason });
+		}
+		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).
+		const live = new Set(this.items().map((i) => i.pr_number));
+		for (const n of heldPRs(this.repoId)) {
+			if (live.has(n)) continue;
+			if (await tell(n, 'pending', 'Not in the merge queue')) this.event(n, 'released', { reason: 'left the queue' });
 		}
 	}
 
-	async plan(active: BatchRow[], masterSha: string, opts: { urgentOnly?: boolean } = {}): Promise<'started' | 'conflict' | 'error' | 'idle'> {
+	/**
+	 * Plans the next batch and starts it, and records what holds the PRs that can't go. With
+	 * `holdsOnly`, nothing starts: the queue can't take new work now (a bisection, a full pipeline),
+	 * but its agents still hear what their PRs need.
+	 */
+	async plan(active: BatchRow[], masterSha: string, opts: { urgentOnly?: boolean; holdsOnly?: boolean } = {}): Promise<'started' | 'conflict' | 'error' | 'idle'> {
 		const settings = this.settings();
 		// A deferred PR waits while a PR it conflicts with is in a batch or about to be. One that is
 		// held back (unapproved, deferred itself, in conflict: it then has a reason or another
@@ -1663,7 +1689,10 @@ class Tick {
 			}
 			return true;
 		});
-		if (waiting.length === 0) return 'idle';
+		if (waiting.length === 0 && !opts.holdsOnly) {
+			await this.recordHolds([...deferred].map(([pr, admission]) => ({ pr, admission })));
+			return 'idle';
+		}
 		// PRs in conflict stay in the queue model too (held, with the conflict), so what is stacked
 		// on them says the parent conflicts rather than that it isn't queued.
 		const conflicted = new Map(this.items().filter((i) => i.status === 'conflict').map((i) => [i.pr_number, i.error_message ?? 'Merge conflict']));
@@ -1704,7 +1733,7 @@ class Tick {
 		}
 		// On a red branch the deferred PRs were left out of the plan; they are still held.
 		if (!opts.urgentOnly) await this.recordHolds(red ? [...plan.held, ...[...deferred].map(([pr, admission]) => ({ pr, admission }))] : plan.held);
-		if (!plan.batch) return 'idle';
+		if (!plan.batch || opts.holdsOnly) return 'idle';
 		const below = red || opts.urgentOnly ? [] : active.flatMap((b) => b.members);
 		const base = red || opts.urgentOnly || !active.length ? masterSha : active[active.length - 1].head_sha;
 		return this.startBatch(base, plan.batch, below, plan.express, masterSha);
@@ -1768,11 +1797,17 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 		active = store.getActiveBatches(deps.repo.id);
 	}
-	// Don't plan new work on top of a bisection: its base is about to change.
-	if (active.some((b) => b.status === 'bisecting')) return;
+	// Don't plan new work on top of a bisection: its base is about to change. Holds are still said.
+	if (active.some((b) => b.status === 'bisecting')) {
+		await t.plan(active, masterSha, { holdsOnly: true });
+		return;
+	}
 	const config = planningSettings(store.getQueueSettings(deps.repo.id)).config;
 	if (config.autoRebase && (await t.restack())) return;
-	if (!t.items().some((i) => i.status === 'queued')) return;
+	if (!t.items().some((i) => i.status === 'queued')) {
+		await t.recordHolds([]);
+		return;
+	}
 	if (!active.length) {
 		// Landing earlier in this tick moved master: read it again before building on it.
 		masterSha = await deps.github.defaultBranchSha();
@@ -1780,12 +1815,16 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		await t.checkMaster(masterSha);
 		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 	}
+	let planned = false;
 	for (let i = 0; i < 8 && active.length < config.depth; i++) {
 		// A conflict sets a PR aside at build time; plan again with the rest, on the same master.
 		const r = await t.plan(active, masterSha);
+		planned = true;
 		if (r === 'idle' || r === 'error') break;
 		active = store.getActiveBatches(deps.repo.id);
 	}
+	// A full pipeline takes nothing new; what holds the rest is still said.
+	if (!planned) await t.plan(active, masterSha, { holdsOnly: true });
 }
 
 /** Leaving batch mode: stops every batch in flight and puts its PRs back in line. */

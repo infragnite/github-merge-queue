@@ -65,7 +65,7 @@ export interface BatchConfig {
 	/** A batch whose CI has not finished after this long pauses the queue. */
 	ciTimeoutMs: number;
 	/**
-	 * The PR's own `requiredCheck` must pass on its head first. Off by default: the batch run is the
+	 * A PR whose own `requiredCheck` failed on its head is held; one still running is not. Off by default: the batch run is the
 	 * gate, and a repo whose CI runs only on queue branches has no PR checks at all.
 	 */
 	requirePRChecks: boolean;
