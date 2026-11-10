@@ -3,6 +3,7 @@ import {
 	getRepoByOwnerName,
 	getQueueItems,
 	getRepoHistory,
+	getRepoPulse,
 	addToQueue,
 	removeFromQueue,
 	reorderQueue,
@@ -65,6 +66,8 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	// Queue items keep a title even when GitHub can't be reached; open PRs have the current one.
 	const prMeta = new Map(queueItems.map((i) => [i.pr_number, { title: i.pr_title, url: i.pr_url }]));
 	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: pr.html_url });
+	// Merged PRs keep their titles in finished batches.
+	for (const h of getRepoHistory(repo.id, 200)) if (!prMeta.has(h.pr_number)) prMeta.set(h.pr_number, { title: h.pr_title, url: h.pr_url });
 	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
 	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = dashboardStackAnalysis(repo)
 		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
@@ -76,7 +79,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta).catch((e) => {
 		const why = e instanceof Error ? e.message : String(e);
 		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);
-		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {} };
+		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {}, current: null };
 	});
 
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
@@ -103,7 +106,8 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		pipeline,
 		mode: settings.mode,
 		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },
-		history: getRepoHistory(repo.id)
+		history: getRepoHistory(repo.id),
+		pulse: getRepoPulse(repo.id)
 	};
 };
 

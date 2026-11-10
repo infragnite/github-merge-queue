@@ -32,7 +32,7 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 			const prs = b.prs.map((p) => p.pr);
 			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, detail: b.status === 'retrying' ? 're-running failed jobs' : `${prs.length} PR${prs.length === 1 ? '' : 's'}`, prs, urgent: b.express });
 		} else if (b.status === 'passed') {
-			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, detail: 'passed, landing', prs: b.prs.map((p) => p.pr), urgent: b.express });
+			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, detail: 'passed, waiting to land', prs: b.prs.map((p) => p.pr), urgent: b.express });
 		} else if (b.status === 'bisecting') {
 			b.bisection.forEach((r, i) => {
 				if (r.ci !== 'pending' || r.status === 'cancelled' || r.status === 'superseded') return;

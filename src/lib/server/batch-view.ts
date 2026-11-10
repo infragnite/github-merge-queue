@@ -125,9 +125,10 @@ export function batchCard(
 	const members = new Set(b.members);
 	const parentOf = (n: number) => analysis?.prs.get(n)?.parent ?? null;
 	const states = b.kind === 'batch' && bisection.length ? bisectStates(b, bisection) : null;
-	const depth = (n: number): number => {
+	// Bounded by the batch's size, so a cycle in the stack analysis can't take the view down.
+	const depth = (n: number, seen = 0): number => {
 		const p = parentOf(n);
-		return p !== null && members.has(p) ? depth(p) + 1 : 0;
+		return p !== null && members.has(p) && seen < members.size ? depth(p, seen + 1) + 1 : 0;
 	};
 	return {
 		id: b.id,

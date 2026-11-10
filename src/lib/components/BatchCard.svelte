@@ -24,7 +24,7 @@
 	const progressError = $derived(progressErrors[batch.headSha] ?? null);
 	const cancellable = $derived(canCancel && batch.kind === 'batch' && ['testing', 'retrying', 'bisecting', 'passed'].includes(batch.status));
 
-	const KIND: Record<Card['kind'], string> = { batch: 'Batch', bisect: 'Bisection run', try: 'Tried alone', baseline: 'Master check' };
+	const KIND: Record<Card['kind'], string> = { batch: 'Batch', bisect: 'Bisection step', try: 'Tried alone', baseline: 'Master check' };
 	const STATUS: Record<string, string> = {
 		testing: 'bg-amber-100 text-amber-800',
 		retrying: 'bg-amber-100 text-amber-800',
@@ -82,7 +82,11 @@
 	const verdictCounts = $derived(count(batch.prs.map((p) => p.verdict), ['passing', 'unknown', 'failing']));
 	const activityCounts = $derived(count(batch.prs.map((p) => p.activity), ['checking', 'landed', 'left']));
 	const runningRuns = $derived(batch.bisection.filter((r) => r.ci === 'pending' && !['cancelled', 'superseded'].includes(r.status)).length);
-	const pct = (n: number) => (p && p.total > 0 ? (n / p.total) * 100 : 0);
+	const pct = (q: NonNullable<Card['progress']>, n: number) => (q.total > 0 ? (n / q.total) * 100 : 0);
+	// Bisection steps whose CI is going now, numbered as in the list below.
+	const nowSteps = $derived(
+		batch.bisection.map((run, i) => ({ run, step: i + 1 })).filter(({ run }) => run.ci === 'pending' && !['cancelled', 'superseded'].includes(run.status))
+	);
 </script>
 
 <div id={nested ? undefined : `batch-${batch.id}`} class="scroll-mt-4 rounded-xl border border-border-subtle bg-surface-raised {nested ? 'p-3' : 'p-4'}">
@@ -107,21 +111,46 @@
 	</div>
 
 
-	{#if p}
-		<div class="mt-2">
-			<div class="flex h-2 overflow-hidden rounded-full bg-gray-100" role="progressbar" aria-valuenow={p.done} aria-valuemax={p.total} aria-label="CI jobs finished">
-				<div class="bg-green-500" style="width: {pct(p.done - p.failed)}%"></div>
-				<div class="bg-red-500" style="width: {pct(p.failed)}%"></div>
-				<div class="animate-pulse bg-amber-400" style="width: {pct(p.running)}%"></div>
+{#snippet bar(p: NonNullable<Card['progress']>)}
+	<div class="flex h-2 overflow-hidden rounded-full bg-gray-100" role="progressbar" aria-valuenow={p.done} aria-valuemax={p.total} aria-label="CI jobs finished">
+		<div class="bg-green-500" style="width: {pct(p, p.done - p.failed)}%"></div>
+		<div class="bg-red-500" style="width: {pct(p, p.failed)}%"></div>
+		<div class="bg-amber-400 motion-safe:animate-pulse" style="width: {pct(p, p.running)}%"></div>
+	</div>
+	<div class="mt-1 flex flex-wrap gap-x-3 text-xs text-gray-500">
+		<span>{p.done}/{p.total} jobs done</span>
+		{#if p.running > 0}<span>{p.running} running</span>{/if}
+		{#if p.total - p.done - p.running > 0}<span>{p.total - p.done - p.running} waiting for a runner</span>{/if}
+		{#if p.failed > 0}<span class="text-red-600">failed: {p.failedJobs.join(', ')}</span>{/if}
+		{#if p.url}<a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
+	</div>
+{/snippet}
+
+	{#if batch.status === 'bisecting'}
+		<!-- What runs now leads; the batch's own run already ended and failed. -->
+		{#each nowSteps as { run, step } (run.id)}
+			{@const err = progressErrors[run.headSha] ?? null}
+			<div class="mt-2 rounded-lg bg-amber-50/60 px-2.5 py-2">
+				<p class="mb-1.5 text-xs text-gray-700">
+					<span class="font-semibold">Now: step {step}</span>
+					<span class="text-gray-500">· {run.prs.length === 1 ? `#${run.prs[0].pr} alone` : prList(run.prs.map((x) => x.pr))}</span>
+					{#if run.context.length}<span class="text-gray-500"> on top of {prList(run.context)}</span>{/if}
+				</p>
+				{#if run.progress}
+					{@render bar(run.progress)}
+					{#if err}<p class="mt-1 text-xs text-red-600">Last known progress; reading it now failed: {err}</p>{/if}
+				{:else}
+					<p class="text-xs {err ? 'text-red-600' : 'text-gray-500'}">{err ? `Could not read CI progress: ${err}` : 'No CI run found for it yet.'}</p>
+				{/if}
 			</div>
-			<div class="mt-1 flex flex-wrap gap-x-3 text-xs text-gray-500">
-				<span>{p.done}/{p.total} jobs done</span>
-				{#if p.running > 0}<span>{p.running} running</span>{/if}
-				{#if p.total - p.done - p.running > 0}<span>{p.total - p.done - p.running} waiting for a runner</span>{/if}
-				{#if p.failed > 0}<span class="text-red-600">failed: {p.failedJobs.join(', ')}</span>{/if}
-				{#if p.url}<a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
-			</div>
-		</div>
+		{:else}
+			<p class="mt-2 text-xs text-gray-500">Between steps: the next one starts when runners are free.</p>
+		{/each}
+		<p class="mt-1.5 text-xs text-gray-500">
+			The batch's own run failed{p && p.failed > 0 ? `: ${p.failedJobs.join(', ')}` : ''}{#if p?.url}<span> · </span><a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
+		</p>
+	{:else if p}
+		<div class="mt-2">{@render bar(p)}</div>
 		{#if progressError}<p class="mt-1 text-xs text-red-600">Last known progress; reading it now failed: {progressError}</p>{/if}
 	{:else if batch.status === 'testing' && !batch.finishedAt}
 		<p class="mt-2 text-xs {progressError ? 'text-red-600' : 'text-gray-500'}">{progressError ? `Could not read CI progress: ${progressError}` : 'No CI run found for it yet.'}</p>
@@ -177,7 +206,7 @@
 	{#if batch.bisection.length > 0}
 		<details class="mt-3">
 			<summary class="cursor-pointer text-xs text-gray-500 hover:text-gray-700">
-				{batch.bisection.length} bisection run{batch.bisection.length === 1 ? '' : 's'}{runningRuns ? `, ${runningRuns} going` : ''}
+				{batch.bisection.length} bisection step{batch.bisection.length === 1 ? '' : 's'}{runningRuns ? `, ${runningRuns} going` : ''}
 			</summary>
 			<div class="mt-2 space-y-2 border-l-2 border-orange-200 pl-3">
 				{#each batch.bisection as run, i (run.id)}

@@ -291,6 +291,18 @@ export function getRepoHistory(repoId: number, limit = 20): HistoryItem[] {
 		.all(repoId, limit) as HistoryItem[];
 }
 
+/** How the queue is moving: the last PR it merged and how many it merged in the last 24 hours. */
+export function getRepoPulse(repoId: number): { lastLanded: { pr: number; at: string } | null; landed24h: number } {
+	const db = getDb();
+	const last = db
+		.prepare(`SELECT pr_number, completed_at FROM merge_history WHERE repo_id = ? AND status = 'merged' ORDER BY completed_at DESC, id DESC LIMIT 1`)
+		.get(repoId) as { pr_number: number; completed_at: string } | undefined;
+	const { n } = db
+		.prepare(`SELECT COUNT(*) AS n FROM merge_history WHERE repo_id = ? AND status = 'merged' AND completed_at >= datetime('now', '-1 day')`)
+		.get(repoId) as { n: number };
+	return { lastLanded: last ? { pr: last.pr_number, at: sqliteToIso(last.completed_at) } : null, landed24h: n };
+}
+
 export function getHistory(limit = 50): HistoryItem[] {
 	return getDb()
 		.prepare(

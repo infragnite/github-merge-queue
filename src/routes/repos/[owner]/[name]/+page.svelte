@@ -16,7 +16,8 @@
 	let stacks = $state<Loaded<typeof data.stacks> | null>(null);
 	$effect(() => {
 		let current = true;
-		data.pipeline.then((v) => current && (pipe = v)).catch(() => {});
+		// A failed load keeps what was last shown, marked as stale, rather than an empty pipeline.
+		data.pipeline.then((v) => current && (pipe = v.error && pipe ? { ...pipe, error: v.error } : v)).catch(() => {});
 		data.stacks.then((v) => current && (stacks = v)).catch(() => {});
 		return () => {
 			current = false;
@@ -49,6 +50,34 @@
 	const shownNext = $derived(view.upNext.filter(matches));
 	const inLine = $derived(view.rows.length + view.upNext.length);
 	const inFlightCount = $derived(view.inFlight.reduce((n, g) => n + g.prs.length, 0));
+	// One by one: the PR at the front is being worked on and isn't waiting.
+	const serialActive = $derived(batchMode ? 0 : view.rows.filter((r) => ['updating', 'checking', 'merging'].includes(r.item.status)).length);
+	const waiting = $derived(inLine - serialActive);
+	const testing = $derived(batchMode ? inFlightCount : serialActive);
+
+	// Is the queue moving: the last landing, landings in a day, and how long the oldest PR has waited.
+	let now = $state(Date.now());
+	$effect(() => {
+		const id = setInterval(() => (now = Date.now()), 30_000);
+		return () => clearInterval(id);
+	});
+	const sqlMs = (t: string) => Date.parse(t.includes('T') ? t : t.replace(' ', 'T') + 'Z');
+	const ago = (ms: number) => {
+		const m = Math.max(0, Math.round(ms / 60_000));
+		return m < 1 ? 'just now' : m < 60 ? `${m} min` : m < 48 * 60 ? `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ''}` : `${Math.floor(m / 1440)} days`;
+	};
+	const oldestWaiting = $derived(
+		[...view.rows, ...view.upNext].filter((r) => r.item.status === 'queued').reduce<number | null>((min, r) => {
+			const t = sqlMs(r.item.created_at);
+			return min === null || t < min ? t : min;
+		}, null)
+	);
+	const lastLandedMs = $derived(data.pulse.lastLanded ? sqlMs(data.pulse.lastLanded.at) : null);
+	// Stalled: PRs wait, nothing is being tested, and nothing landed for two hours.
+	const STALL_MS = 2 * 60 * 60_000;
+	const stalled = $derived(
+		waiting > 0 && testing === 0 && (pipe?.active.length ?? 0) === 0 && (lastLandedMs === null ? oldestWaiting !== null && now - oldestWaiting > STALL_MS : now - lastLandedMs > STALL_MS)
+	);
 	// What runs CI now and next: the queue's own order, apart from the batches it runs for.
 	const runs = $derived(batchMode && pipe ? runOrder({ active: pipe.active, upNext: view.upNext.map((r) => r.item.pr_number), express: view.express }) : []);
 	const brokenStacks = $derived((stacks?.stacks ?? []).filter((s) => s.rows.some((r) => r.broken)).length);
@@ -150,6 +179,17 @@
 						>{batchMode ? `Batches of up to ${data.limits.maxBatch}` : 'One by one'}</a
 					>
 				</p>
+				<p class="mt-0.5 text-xs {stalled ? 'text-amber-700' : 'text-gray-500'}" aria-label="Queue activity">
+					{#if data.pulse.lastLanded && lastLandedMs !== null}
+						Last landed <a href="https://github.com/{data.repo.owner}/{data.repo.name}/pull/{data.pulse.lastLanded.pr}" target="_blank" rel="noopener" class="hover:text-indigo-600">#{data.pulse.lastLanded.pr}</a>
+						<span title={new Date(lastLandedMs).toLocaleString()}>{ago(now - lastLandedMs)}{ago(now - lastLandedMs) === 'just now' ? '' : ' ago'}</span>
+						· {data.pulse.landed24h} in the last 24 h
+					{:else}
+						Nothing landed yet
+					{/if}
+					{#if oldestWaiting !== null}· oldest waiting {ago(now - oldestWaiting)}{/if}
+					{#if stalled}<span class="font-medium"> · nothing is being tested</span>{/if}
+				</p>
 			</div>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
@@ -185,7 +225,6 @@
 		</div>
 	</div>
 
-	{#if pipe?.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
 	{#if pipe?.tickError && !pipe.rateLimitedUntil}
 		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
 			The queue's last step failed: <span class="font-mono text-xs">{pipe.tickError.message}</span>
@@ -214,7 +253,7 @@
 					<h2 id="run-order" class="mb-2 text-base font-semibold text-gray-900">Run order</h2>
 					<ol class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised text-sm">
 						{#each runs as r, i (r.key)}
-							<li class="flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 last:border-b-0 {r.state === 'running' ? 'bg-amber-50/60' : ''}">
+							<li class="flex min-w-0 flex-wrap items-center gap-x-2 border-b border-border-subtle px-3 py-1.5 last:border-b-0 {r.state === 'running' ? 'bg-amber-50/60' : ''}">
 								<span class="w-4 shrink-0 text-center text-xs text-gray-400">
 									{#if r.state === 'running'}<span class="inline-block h-2 w-2 rounded-full bg-amber-400 motion-safe:animate-pulse" role="img" aria-label="running"></span>{:else}{i + 1 - runs.filter((x) => x.state === 'running').length}{/if}
 								</span>
@@ -224,7 +263,7 @@
 									<span class="shrink-0 font-medium {r.urgent ? 'text-indigo-700' : 'text-gray-900'}">{r.label}</span>
 								{/if}
 								<span class="shrink-0 text-xs text-gray-500">{r.detail}</span>
-								<span class="min-w-0 truncate text-xs text-gray-400" title={r.prs.map((n) => `#${n}`).join(' ')}>{r.prs.map((n) => `#${n}`).join(' ')}</span>
+								<span class="min-w-0 break-words text-xs text-gray-500">{r.prs.map((n) => `#${n}`).join(' ')}</span>
 							</li>
 						{/each}
 					</ol>
@@ -235,9 +274,51 @@
 					<h2 id="now" class="text-base font-semibold text-gray-900">
 						{batchMode ? 'Batches' : 'In progress'}
 					</h2>
-					{#if pipe.active.length === 0}
+					{#if pipe.error}
+						<div class="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
+							<p class="font-medium">Can't read the {batchMode ? 'batches' : 'queue'} right now; CI may still be running.</p>
+							<p class="mt-0.5 font-mono text-xs">{pipe.error}</p>
+							{#if pipe.active.length > 0}<p class="mt-0.5 text-xs">Showing what was last loaded.</p>{/if}
+						</div>
+					{:else if !batchMode}
+						{@const c = pipe.current}
+						{@const item = c ? data.queueItems.find((i) => i.pr_number === c.pr) : undefined}
+						{@const nextUp = view.rows.filter((r) => r.item.status === 'queued').slice(0, 3)}
+						{#if c}
+							{@const err = item?.head_sha ? (pipe.progressErrors[item.head_sha] ?? null) : null}
+							<div class="rounded-xl border border-border-subtle bg-surface-raised p-4">
+								<div class="flex flex-wrap items-center gap-2 text-sm">
+									<a href={item?.pr_url ?? `https://github.com/${data.repo.owner}/${data.repo.name}/pull/${c.pr}`} target="_blank" rel="noopener" class="font-semibold text-gray-900 hover:text-indigo-600">#{c.pr}</a>
+									<StatusBadge status={c.status} />
+									{#if c.startedAt}<span class="ml-auto text-xs text-gray-500">running {ago(now - sqlMs(c.startedAt))}</span>{/if}
+								</div>
+								{#if item}<p class="mt-1 truncate text-sm text-gray-600" title={item.pr_title}>{item.pr_title}</p>{/if}
+								{#if c.progress}
+									{@const q = c.progress}
+									<div class="mt-2 flex h-2 overflow-hidden rounded-full bg-gray-100" role="progressbar" aria-valuenow={q.done} aria-valuemax={q.total} aria-label="CI jobs finished">
+										<div class="bg-green-500" style="width: {q.total ? ((q.done - q.failed) / q.total) * 100 : 0}%"></div>
+										<div class="bg-red-500" style="width: {q.total ? (q.failed / q.total) * 100 : 0}%"></div>
+										<div class="bg-amber-400 motion-safe:animate-pulse" style="width: {q.total ? (q.running / q.total) * 100 : 0}%"></div>
+									</div>
+									<div class="mt-1 flex flex-wrap gap-x-3 text-xs text-gray-500">
+										<span>{q.done}/{q.total} jobs done</span>
+										{#if q.running > 0}<span>{q.running} running</span>{/if}
+										{#if q.total - q.done - q.running > 0}<span>{q.total - q.done - q.running} waiting for a runner</span>{/if}
+										{#if q.failed > 0}<span class="text-red-600">failed: {q.failedJobs.join(', ')}</span>{/if}
+										{#if q.url}<a href={q.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
+									</div>
+								{/if}
+								{#if err}<p class="mt-1 text-xs text-red-600">Could not read CI progress: {err}</p>{/if}
+							</div>
+						{:else}
+							<p class="text-sm text-gray-500">Nothing is being tested.</p>
+						{/if}
+						{#if nextUp.length}
+							<p class="text-xs text-gray-500">Then {nextUp.map((r) => `#${r.item.pr_number}`).join(', ')}{waiting > nextUp.length ? ` and ${waiting - nextUp.length} more` : ''}</p>
+						{/if}
+					{:else if pipe.active.length === 0}
 						<p class="text-sm text-gray-500">
-							{batchMode ? (inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.') : 'Batches are off; the queue merges one PR at a time.'}
+							{inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.'}
 						</p>
 					{/if}
 					{#each pipe.active as batch (batch.id)}
@@ -274,9 +355,9 @@
 				</div>
 			{:else}
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-					<h2 class="text-base font-semibold text-gray-900">Queue · {inLine}</h2>
+					<h2 class="text-base font-semibold text-gray-900">Queue</h2>
 					<span class="text-xs text-gray-500">
-						{batchMode ? 'urgent first, then in line order' : 'drag to reorder'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
+						{waiting} waiting{testing ? ` · ${testing} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''} · {batchMode ? 'urgent first, then in line order' : 'drag to reorder'}
 					</span>
 					<input
 						type="search"
@@ -287,24 +368,12 @@
 					/>
 				</div>
 
-				{#if view.inFlight.length > 0}
-					<div class="space-y-1">
-						{#each view.inFlight as g (g.batch)}
-							<a href="#batch-{g.batch}" class="flex items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50/50 px-3 py-1.5 text-sm hover:bg-indigo-50">
-								<span class="shrink-0 whitespace-nowrap font-medium text-indigo-900">Batch #{g.batch}</span>
-								<span class="shrink-0 whitespace-nowrap text-indigo-800">{g.prs.length} PRs · {g.status}</span>
-								<span class="min-w-0 truncate text-xs text-indigo-700/70">{g.prs.map((n) => `#${n}`).join(' ')}</span>
-							</a>
-						{/each}
-					</div>
-				{/if}
-
 				{#if batchMode && shownNext.length > 0}
 					<section aria-labelledby="next">
 						<h3 id="next" class="mb-1 text-sm font-medium text-gray-700">
 							{view.express ? 'Next: urgent batch' : 'Likely next batch'} · {view.upNext.length}
-							<span class="font-normal text-gray-500">(PRs whose checks or parent aren't ready are skipped)</span>
 						</h3>
+						<p class="mb-1 text-xs text-gray-500">PRs whose checks or parent aren't ready are skipped.</p>
 						<div class="overflow-hidden rounded-xl border border-indigo-200 bg-surface-raised" role="list">
 							{#each shownNext as r (r.item.id)}
 								<div role="listitem">

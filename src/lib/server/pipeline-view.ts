@@ -3,6 +3,7 @@
 
 import * as github from './github';
 import * as store from './batch-store';
+import { getActiveQueueItem } from './db';
 import { dashboardStackAnalysis } from './stack-runtime';
 import { tickError, type TickError } from './tick-errors';
 import { batchCard, isRunning, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
@@ -23,6 +24,8 @@ export interface PipelineView {
 	tickError: TickError | null;
 	/** Batch heads whose CI progress could not be read, with why (the last known progress is shown). */
 	progressErrors: Record<string, string>;
+	/** One by one: the PR the queue is on now, with its CI progress. */
+	current: { pr: number; status: string; startedAt: string | null; progress: CIProgress | null } | null;
 }
 
 /**
@@ -73,6 +76,18 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 		})
 	);
 
+	// One by one: the PR at the front, while the queue updates, checks or merges it.
+	const front = settings.mode === 'serial' ? getActiveQueueItem(repo.id) : undefined;
+	const current =
+		front && ['updating', 'checking', 'merging'].includes(front.status)
+			? {
+					pr: front.pr_number,
+					status: front.status,
+					startedAt: front.started_at,
+					progress: front.head_sha && front.status === 'checking' ? await progressFor(repo, front.head_sha, !!budget?.low) : null
+				}
+			: null;
+
 	let analysis: StackAnalysis | null = null;
 	try {
 		analysis = await dashboardStackAnalysis(repo);
@@ -91,10 +106,11 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 		error: null,
 		rateLimitedUntil: budget?.blockedUntil ?? null,
 		tickError: tickError(repo.id),
+		current,
 		progressErrors: Object.fromEntries(
-			running.flatMap((b) => {
-				const why = progressErrors.get(`${repo.owner}/${repo.name}@${b.head_sha}`);
-				return why ? [[b.head_sha, why]] : [];
+			[...running.map((b) => b.head_sha), ...(current && front?.head_sha ? [front.head_sha] : [])].flatMap((sha) => {
+				const why = progressErrors.get(`${repo.owner}/${repo.name}@${sha}`);
+				return why ? [[sha, why]] : [];
 			})
 		)
 	};

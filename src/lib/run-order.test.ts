@@ -60,7 +60,7 @@ describe('runOrder', () => {
 	test('a pipeline without a bisection: the batches testing, then the next one', () => {
 		expect(runOrder({ active: [card(1, { prs: [pr(1), pr(2)] }), card(2, { status: 'passed', ci: 'success', prs: [pr(3)] })], upNext: [4], express: false }).map((s) => [s.state, s.label, s.detail])).toEqual([
 			['running', 'Batch #1', '2 PRs'],
-			['running', 'Batch #2', 'passed, landing'],
+			['running', 'Batch #2', 'passed, waiting to land'],
 			['next', 'Next batch', '1 PR']
 		]);
 	});

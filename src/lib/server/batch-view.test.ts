@@ -73,3 +73,10 @@ test("a bisecting batch shows each PR's verdict and, apart from it, what is happ
 	// Runs themselves carry none.
 	expect(card.bisection[0].prs[0].verdict).toBeUndefined();
 });
+
+test('a cycle in the stack analysis does not take the batch view down', () => {
+	const analysis: StackAnalysis = { prs: new Map([[1, info(1, 2)], [2, info(2, 1)]]), stacks: [], issues: [] };
+	const card = batchCard(row({ members: [1, 2] }), [], analysis, new Map(), new Map());
+	expect(card.prs.map((p) => p.pr)).toEqual([1, 2]);
+	expect(card.prs.every((p) => p.depth <= 2)).toBe(true);
+});
