@@ -35,9 +35,12 @@ export type BisectVerdict = 'unknown' | 'passing' | 'failing';
 export type BisectActivity = 'checking' | 'landed' | 'left';
 
 export function bisectStates(
-	b: Pick<BatchRow, 'members' | 'landed' | 'left_prs' | 'ejected'>,
-	runs: Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'>[]
+	b: Pick<BatchRow, 'members' | 'landed' | 'left_prs' | 'ejected'> & Partial<Pick<BatchRow, 'base_tree'>>,
+	runs: (Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'> & Partial<Pick<BatchRow, 'base_tree' | 'tree_sha'>>)[]
 ) {
+	// Trees known green, as the planner trusts them: the one the batch failed on and those this
+	// bisection landed. Only a failure alone on one of them ejects.
+	const trusted = new Set([runs[0]?.base_tree ?? b.base_tree, ...runs.filter((r) => r.status === 'landed').map((r) => r.tree_sha)].filter(Boolean));
 	const out = new Map<number, { verdict: BisectVerdict; activity: BisectActivity | null; trail: string; awaitingEject?: boolean }>();
 	const tested = runs.map((r, i) => ({ r, step: i + 1 })).filter(({ r }) => r.status !== 'cancelled');
 	for (const n of b.members) {
@@ -66,7 +69,7 @@ export function bisectStates(
 			.join('\n');
 		// Failed alone and not ejected yet: the ejection waits for the default branch to be known.
 		const alone = inRun.filter(({ r }) => r.members.length === 1 && r.members[0] === n).at(-1);
-		const awaitingEject = !landed && !b.ejected.includes(n) && !b.left_prs.includes(n) && alone?.r.ci_result === 'failure';
+		const awaitingEject = !landed && !b.ejected.includes(n) && !b.left_prs.includes(n) && alone?.r.ci_result === 'failure' && trusted.has(alone.r.base_tree);
 		out.set(n, { verdict, activity, trail, ...(awaitingEject ? { awaitingEject } : {}) });
 	}
 	return out;
