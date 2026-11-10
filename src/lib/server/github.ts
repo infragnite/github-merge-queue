@@ -440,7 +440,7 @@ export async function actionsJobTimesForSha(owner: string, repo: string, sha: st
 
 export async function workflowRunsForSha(owner: string, repo: string, sha: string) {
 	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=20`);
-	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string; check_suite_id: number }>;
+	return data.workflow_runs as Array<{ id: number; status: string; conclusion: string | null; event: string; check_suite_id: number; path?: string }>;
 }
 
 export async function cancelWorkflowRun(owner: string, repo: string, runId: number) {

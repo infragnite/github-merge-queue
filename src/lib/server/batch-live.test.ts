@@ -88,7 +88,7 @@ describe('stopping at the first failed job', () => {
 		expect(earlyFailure(required, [job('nightly', 'completed', 'failure', 9)])).toBe(false);
 	});
 
-	test('without the required check yet, nothing is known to feed it', () => {
+	test('without the required check yet and without its workflow, nothing is known to feed it', () => {
 		expect(earlyFailure([], [job('tests', 'completed', 'failure', 7)])).toBe(false);
 	});
 
@@ -163,5 +163,27 @@ jobs:
 		const required = [{ check_suite: { id: 7 } }];
 		expect(earlyFailure(required, [job('route', 'failure')], null, feeds)).toBe(false);
 		expect(earlyFailure(required, [job('Test mac', 'failure')], null, feeds)).toBe(true);
+	});
+
+	test('before the gate has a check run (GitHub makes it once its needs end), a failed job it needs fails it early', () => {
+		// krusty's batch 8: eight conformance jobs red for 15 minutes, the gate not created yet.
+		const feeds = gateFeeds(workflow, 'ci-and-conformance')!;
+		const job = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion, completed_at: null, check_suite: { id: 7 } });
+		const ciRuns = new Set([7]);
+		expect(earlyFailure([], [job('Build', 'completed', 'success'), job('conformance / suite', 'completed', 'failure'), job('Test mac', 'in_progress', null)], null, feeds, ciRuns)).toBe(true);
+		expect(earlyFailure([], [job('route', 'completed', 'failure'), job('Test mac', 'in_progress', null)], null, feeds, ciRuns)).toBe(false);
+		expect(earlyFailure([], [job('Build', 'completed', 'success')], null, feeds, ciRuns)).toBe(false);
+	});
+
+	test("before the gate exists, a failed job of the same name in another workflow doesn't fail it", () => {
+		const feeds = gateFeeds(workflow, 'ci-and-conformance')!;
+		// `Build` failed in another workflow (suite 9) on the same commit; the CI workflow's run is suite 7.
+		const jobs = [
+			{ name: 'Build', status: 'completed', conclusion: 'failure', completed_at: null, check_suite: { id: 9 } },
+			{ name: 'Build', status: 'in_progress', conclusion: null, completed_at: null, check_suite: { id: 7 } }
+		];
+		expect(earlyFailure([], jobs, null, feeds, new Set([7]))).toBe(false);
+		// The CI workflow's runs not found: nothing is known to feed the gate.
+		expect(earlyFailure([], jobs, null, feeds, new Set())).toBe(false);
 	});
 });

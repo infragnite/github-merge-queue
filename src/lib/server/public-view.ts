@@ -25,13 +25,13 @@ export function publicQueueItem(i: ViewItem): ViewItem {
 		status: i.status,
 		position: i.position,
 		// The planner's own note on why a PR waits is shown; raw errors (GitHub's, git's) are not.
-		error_message: i.holdWait !== null ? i.error_message : i.status === 'failed' ? 'Failed in the queue' : null,
+		error_message: i.held ? i.error_message : i.status === 'failed' ? 'Failed in the queue' : null,
 		queued_by: '',
 		created_at: '',
 		started_at: null,
 		completed_at: null,
 		priority: i.priority ?? null,
-		holdWait: i.holdWait,
+		held: i.held,
 		deferred: i.deferred
 	};
 }

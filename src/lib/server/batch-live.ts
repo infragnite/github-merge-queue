@@ -74,9 +74,16 @@ export function earlyFailure(
 	jobs: Array<{ name?: string; status: string; conclusion: string | null; completed_at?: string | null; check_suite?: { id: number } }>,
 	notBefore?: number | null,
 	/** Whether the gate waits for the job of this check run name (see `gateFeeds`); every job when absent. */
-	feeds?: (name: string) => boolean
+	feeds?: (name: string) => boolean,
+	/** The check suites of the CI workflow's runs on the commit, for before the gate has a check run. */
+	ciSuites?: ReadonlySet<number>
 ): boolean {
-	const suites = new Set(required.flatMap((r) => (r.check_suite ? [r.check_suite.id] : [])));
+	// The gate's own workflow run, once the gate has a check run. Before that (GitHub makes it only
+	// when everything it needs has ended), the CI workflow's runs, and its file says which jobs
+	// feed the gate. Other workflows' jobs on the commit never count, whatever their names.
+	const gate = new Set(required.flatMap((r) => (r.check_suite ? [r.check_suite.id] : [])));
+	const suites = gate.size ? gate : feeds ? (ciSuites ?? new Set<number>()) : gate;
+	if (!suites.size) return false;
 	return jobs.some(
 		(j) =>
 			j.status === 'completed' &&
@@ -252,11 +259,16 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			result: async (headSha, notBefore, opts) => {
 				const required = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
 				const r = checkResult(required, notBefore);
-				if (r !== 'pending' || !opts?.failFast || !required.length) return r;
+				if (r !== 'pending' || !opts?.failFast) return r;
 				// Only a job the required check waits for can decide it early; unknown, then no early stop.
+				// The gate itself may not exist yet: GitHub makes its check run once its needs end.
 				const feeds = gateAt(headSha);
 				if (!feeds) return r;
-				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore, feeds) ? 'failure' : 'pending';
+				const file = `.github/workflows/${ci().workflow}`;
+				const ciSuites = required.length
+					? undefined
+					: new Set((await github.workflowRunsForSha(owner, name, headSha)).filter((w) => w.path?.split('@')[0] === file).map((w) => w.check_suite_id));
+				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore, feeds, ciSuites) ? 'failure' : 'pending';
 			},
 			cancel: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);

@@ -90,10 +90,10 @@ describe('admission', () => {
 		expect(admit(ready(1), a, cfg)).toEqual({ ok: true });
 	});
 
-	test('drafts and running checks wait; failed checks do not', () => {
-		expect(admit(ready(1, { draft: true }), a, cfg)).toMatchObject({ ok: false, code: 'draft', wait: true });
-		expect(admit(ready(1, { ciGreen: null }), a, cfg)).toMatchObject({ code: 'ci-pending', wait: true });
-		expect(admit(ready(1, { ciGreen: false }), a, cfg)).toMatchObject({ code: 'ci-failed', wait: false });
+	test("a draft and failed checks hold a PR; checks still running do not: the batch's CI tests it", () => {
+		expect(admit(ready(1, { draft: true }), a, cfg)).toMatchObject({ ok: false, code: 'draft' });
+		expect(admit(ready(1, { ciGreen: null }), a, cfg)).toEqual({ ok: true });
+		expect(admit(ready(1, { ciGreen: false }), a, cfg)).toMatchObject({ ok: false, code: 'ci-failed' });
 	});
 
 	test('requires an approval on the current head', () => {
@@ -117,7 +117,7 @@ describe('admission', () => {
 		};
 		const s = stacks([1, 2, 3], { 2: 1, 3: 2 }, [issue]);
 		expect(admit(ready(2), s, cfg)).toMatchObject({ code: 'stack-broken', reason: '#1 was rebased; restack #2' });
-		expect(admit(ready(3), s, cfg)).toMatchObject({ code: 'parent-not-ready', wait: true });
+		expect(admit(ready(3), s, cfg)).toMatchObject({ code: 'parent-not-ready' });
 	});
 
 	test('a hidden stack (base mismatch with a known parent) is admitted; a bogus base is not', () => {
@@ -210,7 +210,7 @@ describe('stacks in batches', () => {
 
 	test('a child whose parent is held is held too', () => {
 		const q = [entry(1, 90), entry(2, 80), entry(4, 70)];
-		const p = plan(q, s(), { states: [ready(1, { ciGreen: null }), ready(2), ready(4)] });
+		const p = plan(q, s(), { states: [ready(1, { ciGreen: false }), ready(2), ready(4)] });
 		expect(p.batch).toEqual([4]);
 		expect(p.held.map((h) => h.pr).sort()).toEqual([1, 2]);
 	});

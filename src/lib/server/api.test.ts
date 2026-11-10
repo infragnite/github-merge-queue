@@ -150,6 +150,26 @@ describe('stack state for agents', () => {
 		]);
 	});
 
+	test('a held PR lists what to do about its hold', () => {
+		const hold = (n: number, code: string, reason: string) => {
+			api.enqueue(repo, writer, pull(n), {});
+			const it = db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+			db.updateQueueItemStatus(it.id, 'queued', reason);
+			store.setHold(it.id, { code, reason });
+			return it;
+		};
+		hold(1, 'draft', '#1 is a draft');
+		hold(2, 'changes-requested', '#2 has changes requested');
+		const deferred = hold(3, 'deferred', 'Conflicts with #7 ahead of it; waits for them to land');
+		store.setDeferredFor(deferred.id, [7]);
+		const a = analysis([1, 2, 3, 7]);
+		expect(api.stackState(repo, 1, a).nextActions).toEqual([{ do: 'mark-ready', why: '#1 is a draft' }]);
+		expect(api.stackState(repo, 2, a).nextActions).toEqual([{ do: 'fix', why: '#2 has changes requested' }]);
+		expect(api.stackState(repo, 3, a).nextActions).toEqual([
+			{ do: 'resolve-conflict', cmd: 'git fetch origin pull/7/head && git rebase FETCH_HEAD && git push --force-with-lease', why: 'Conflicts with #7 ahead of it; waits for them to land' }
+		]);
+	});
+
 	test('an unknown PR is a 404', () => {
 		expect(() => api.stackState(repo, 99, analysis([1]))).toThrow(/not an open pull request/);
 	});

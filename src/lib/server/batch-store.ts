@@ -167,6 +167,7 @@ export function migrateBatches(database: Database.Database) {
 			created_at TEXT DEFAULT (datetime('now'))
 		);
 		CREATE INDEX IF NOT EXISTS queue_events_repo ON queue_events(repo_id, id);
+		CREATE INDEX IF NOT EXISTS queue_events_pr ON queue_events(repo_id, pr_number, kind);
 
 		-- The last default-branch commit the queue knows the state of. 'green': its tree passed CI
 		-- (a batch the queue landed, or a baseline run). 'verifying': green by tree, while the
@@ -526,13 +527,11 @@ export function deferredFor(item: { deferred_for?: string | null }): number[] {
 }
 
 /**
- * Why the planner holds a queued PR back, so the dashboard can tell a PR that waits by itself
- * (CI running, parent pending) from one that needs someone. The reason matches the item's
- * error_message while the hold is current.
+ * Why the planner holds a queued PR back, so the dashboard and agents see what must be done.
+ * The reason matches the item's error_message while the hold is current.
  */
 export interface Hold {
 	code: string;
-	wait: boolean;
 	reason: string;
 }
 

@@ -27,6 +27,7 @@ export type NextAction =
 	| { do: 'wait-for'; pr: number; why: string }
 	| { do: 'queue'; pr: number; why: string }
 	| { do: 'fix'; why: string }
+	| { do: 'mark-ready'; why: string }
 	| { do: 'resolve-conflict'; cmd: string; why: string };
 
 type Q = QueueItem & { priority?: Priority };
@@ -94,7 +95,10 @@ function nextActions(info: PRStackInfo, analysis: StackAnalysis, defaultBranch: 
 /** What the queue itself is waiting on from the author, if anything. */
 function queueActions(repo: Repo, n: number, info: PRStackInfo): NextAction[] {
 	const it = db.getQueueItems(repo.id).find((i) => i.pr_number === n);
-	if (!it || it.status !== 'conflict') return [];
+	if (!it) return [];
+	const hold = store.currentHold(it);
+	if (hold) return holdActions(it, hold);
+	if (it.status !== 'conflict') return [];
 	const onto = info.parent !== null ? `pull/${info.parent}/head` : repo.default_branch;
 	return [
 		{
@@ -103,6 +107,29 @@ function queueActions(repo: Repo, n: number, info: PRStackInfo): NextAction[] {
 			why: it.error_message ?? 'The queue could not apply this PR'
 		}
 	];
+}
+
+/**
+ * What the PR's author does about the planner's hold on it. Holds that come from the stack (a
+ * parent to queue or restack) are covered by the stack's own next actions.
+ */
+function holdActions(it: QueueItem, hold: store.Hold): NextAction[] {
+	switch (hold.code) {
+		case 'draft':
+			return [{ do: 'mark-ready', why: hold.reason }];
+		case 'ci-failed':
+		case 'not-approved':
+		case 'stale-approval':
+		case 'changes-requested':
+			return [{ do: 'fix', why: hold.reason }];
+		case 'deferred': {
+			// It conflicts with PRs ahead of it: rebased onto them, it is stacked on them and follows them.
+			const ahead = store.deferredFor(it as QueueItem & { deferred_for?: string | null });
+			return ahead.map((p) => ({ do: 'resolve-conflict' as const, cmd: `git fetch origin pull/${p}/head && git rebase FETCH_HEAD && git push --force-with-lease`, why: hold.reason }));
+		}
+		default:
+			return [];
+	}
 }
 
 /** Stack and queue state of one PR, with what to do next. */

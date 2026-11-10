@@ -12,6 +12,8 @@ export type QueueEventKind =
 	| 'rebased'
 	| 'conflict'
 	| 'deferred'
+	| 'held'
+	| 'released'
 	| 'ejected'
 	| 'requeued'
 	| 'changed'
@@ -83,6 +85,17 @@ export function listEvents(repoId: number, opts: { after?: number | null; pr?: n
 		data: JSON.parse(r.data),
 		at: r.created_at.includes('T') ? r.created_at : `${r.created_at.replace(' ', 'T')}Z`
 	}));
+}
+
+/** PRs whose agent was last told they need attention (`held`), and not released since. */
+export function heldPRs(repoId: number): number[] {
+	const rows = getDb()
+		.prepare(
+			`SELECT pr_number, kind FROM queue_events e WHERE repo_id = ? AND kind IN ('held', 'released') AND pr_number IS NOT NULL
+			 AND id = (SELECT MAX(id) FROM queue_events f WHERE f.repo_id = e.repo_id AND f.pr_number = e.pr_number AND f.kind IN ('held', 'released'))`
+		)
+		.all(repoId) as Array<{ pr_number: number; kind: string }>;
+	return rows.filter((r) => r.kind === 'held').map((r) => r.pr_number);
 }
 
 /** The newest event id for a repo (the cursor to start from when there are no events yet). */

@@ -30,7 +30,7 @@ export const BATCH_FIELDS: SettingField[] = [
 	{ name: 'config.stopOnFirstFailure', label: 'Stop a red run early', help: 'A run of several PRs counts as failed at its first failed job, and the rest of it is cancelled. A PR tested alone still runs to the end, so its author sees every failure.', kind: 'boolean' },
 	{ name: 'config.requireApproval', label: 'Require approval', help: 'Only approved PRs enter a batch.', kind: 'boolean' },
 	{ name: 'config.approvalOnHead', label: 'Approval on the current head', help: 'A push after the approval needs a new one.', kind: 'boolean' },
-	{ name: 'config.requirePRChecks', label: "Require the PR's own checks", help: "The PR's required check must pass on its head first.", kind: 'boolean' },
+	{ name: 'config.requirePRChecks', label: "Hold PRs whose own checks failed", help: "A PR whose required check failed on its head waits for a fix. Checks still running never hold a PR: the batch's CI tests it.", kind: 'boolean' },
 	{ name: 'config.autoRebase', label: 'Restack automatically', help: 'Rebase PRs whose parent was rebased or merged, when that needs no conflict resolution.', kind: 'boolean' },
 	{ name: 'config.masterRun', label: 'Run CI on the default branch after landing', help: 'Saves caches and runs what the repo runs there.', kind: 'boolean' },
 	{ name: 'config.masterRunMinGapMs', label: 'Least time between those runs', help: '0 runs one per landed batch.', kind: 'duration', unitMs: MIN, unit: 'min' }

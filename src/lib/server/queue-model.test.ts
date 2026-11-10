@@ -25,7 +25,6 @@ function model(
 /** The model in a compact form: stacks as their members, and the held PRs with their reasons. */
 const shape = (m: QueueModel) => ({
 	stacks: m.stacks.map((s) => ({ members: s.members, on: s.on, priority: s.priority })),
-	waiting: m.waiting.map((h) => `#${h.pr} ${h.reason}`),
 	attention: m.attention.map((h) => `#${h.pr} ${h.reason}`)
 });
 
@@ -37,7 +36,6 @@ describe('the queue model: entries are stacks of queued PRs', () => {
 				{ members: [1], on: null, priority: 'normal' },
 				{ members: [2], on: null, priority: 'normal' }
 			],
-			waiting: [],
 			attention: []
 		});
 		expect(m.stacks[0].parentOf).toEqual(new Map([[1, null]]));
@@ -76,12 +74,11 @@ describe('the queue model: entries are stacks of queued PRs', () => {
 		expect(shape(m).stacks.map((s) => s.members)).toEqual([[4], [2], [1, 3]]);
 	});
 
-	test("a child whose parent isn't queued waits for it, and so does everything stacked on the child", () => {
+	test("a child whose parent isn't queued needs someone to queue it, and so does everything stacked on the child", () => {
 		const m = model([entry(2, 20), entry(3, 10), entry(9, 5)], stacks([1, 2, 3, 9], { 2: 1, 3: 2 }));
 		expect(shape(m)).toEqual({
 			stacks: [{ members: [9], on: null, priority: 'normal' }],
-			waiting: ["#2 Stacked on #1, which isn't queued; queue #1 first", "#3 Waits for #2: stacked on #1, which isn't queued; queue #1 first"],
-			attention: []
+			attention: ["#2 Stacked on #1, which isn't queued; queue #1 first", "#3 Waits for #2: stacked on #1, which isn't queued; queue #1 first"]
 		});
 	});
 
@@ -92,26 +89,23 @@ describe('the queue model: entries are stacks of queued PRs', () => {
 		});
 		expect(shape(m)).toEqual({
 			stacks: [{ members: [1, 2, 5], on: null, priority: 'normal' }],
-			waiting: [],
 			attention: ["#3 #3's own checks failed on its head", "#4 Waits for #3: #3's own checks failed on its head"]
 		});
 	});
 
-	test('a PR that will be ready by itself waits, with its branch; the stack below it stays', () => {
-		const m = model([entry(1, 50), entry(2, 40), entry(3, 30)], stacks([1, 2, 3], { 2: 1, 3: 2 }), { states: [ready(2, { ciGreen: null })] });
+	test("a PR whose own checks still run is not held: the batch's CI tests it", () => {
+		const m = model([entry(1, 50), entry(2, 40), entry(3, 30)], stacks([1, 2, 3], { 2: 1, 3: 2 }), { states: [ready(2, { ciGreen: null })], config: { requirePRChecks: true } });
 		expect(shape(m)).toEqual({
-			stacks: [{ members: [1], on: null, priority: 'normal' }],
-			waiting: ["#2 #2's checks are still running", "#3 Waits for #2: #2's checks are still running"],
+			stacks: [{ members: [1, 2, 3], on: null, priority: 'normal' }],
 			attention: []
 		});
 	});
 
-	test('a held root holds the whole stack', () => {
+	test('a held root holds the whole stack; a draft needs its author', () => {
 		const m = model([entry(1, 50), entry(2, 40), entry(3, 30), entry(4, 20)], stacks([1, 2, 3, 4], { 2: 1, 3: 1 }), { states: [ready(1, { draft: true })] });
 		expect(shape(m)).toEqual({
 			stacks: [{ members: [4], on: null, priority: 'normal' }],
-			waiting: ['#1 #1 is a draft', '#2 Waits for #1: #1 is a draft', '#3 Waits for #1: #1 is a draft'],
-			attention: []
+			attention: ['#1 #1 is a draft', '#2 Waits for #1: #1 is a draft', '#3 Waits for #1: #1 is a draft']
 		});
 	});
 
@@ -123,7 +117,6 @@ describe('the queue model: entries are stacks of queued PRs', () => {
 		// #2's checks run, and it conflicts: the conflict is what needs someone.
 		expect(shape(m)).toEqual({
 			stacks: [{ members: [1], on: null, priority: 'normal' }],
-			waiting: [],
 			attention: ['#2 Conflicts with main in src/a.ts', '#3 Conflicts with #1 in src/b.ts']
 		});
 	});
@@ -159,7 +152,7 @@ describe('filling a new batch from the queue model', () => {
 
 	test('fills up to maxBatch, skipping what is held', () => {
 		const q = Array.from({ length: 12 }, (_, k) => entry(k + 1, 100 - k));
-		const m = model(q, stacks(q.map((e) => e.pr)), { states: [ready(2, { ciGreen: null }), ready(5, { draft: true })] });
+		const m = model(q, stacks(q.map((e) => e.pr)), { states: [ready(2, { ciGreen: false }), ready(5, { draft: true })] });
 		expect(fill(m)).toEqual({ batch: [1, 3, 4, 6, 7, 8, 9, 10], express: false, waitUntil: null });
 	});
 
@@ -274,11 +267,11 @@ describe('queue model properties, 300 random queues', () => {
 		const parentOf = (n: number) => q.parents[n] ?? null;
 		const queued = new Map(q.queue.map((e) => [e.pr, e]));
 
-		// Every queued PR is in exactly one place: a stack, waiting, or needing attention.
-		const placed = [...m.stacks.flatMap((s) => s.members), ...m.waiting.map((h) => h.pr), ...m.attention.map((h) => h.pr)];
+		// Every queued PR is in exactly one place: a stack, or needing attention.
+		const placed = [...m.stacks.flatMap((s) => s.members), ...m.attention.map((h) => h.pr)];
 		expect([...placed].sort((a, b) => a - b)).toEqual([...queued.keys()].sort((a, b) => a - b));
 
-		const held = new Set([...m.waiting, ...m.attention].map((h) => h.pr));
+		const held = new Set(m.attention.map((h) => h.pr));
 		for (const s of m.stacks) {
 			expect(s.members.length).toBeGreaterThan(0);
 			expect(s.root).toBe(s.members[0]);
@@ -319,7 +312,7 @@ describe('queue model properties, 300 random queues', () => {
 			expect(cmp, `stack #${m.stacks[k - 1].root} before #${m.stacks[k].root}`).toBeLessThan(0);
 		}
 		// A held PR's branch is held with it; a held PR has a reason.
-		for (const h of [...m.waiting, ...m.attention]) {
+		for (const h of m.attention) {
 			expect(h.reason.length).toBeGreaterThan(0);
 			for (const c of q.queue.map((e) => e.pr).filter((c) => parentOf(c) === h.pr)) expect(held.has(c), `#${c} on held #${h.pr}`).toBe(true);
 		}
@@ -388,23 +381,22 @@ describe('the queue page: the model from what the planner recorded', () => {
 					]
 				}
 			],
-			waiting: [],
 			attention: []
 		});
 	});
 
 	test("a PR the planner holds is held for the planner's reason, and its branch with it", () => {
 		const b = queueBoard(
-			[item(1, 50), item(2, 40, { hold: { code: 'ci-pending', wait: true, reason: "#2's checks are still running" }, message: "#2's checks are still running" }), item(3, 30), item(4, 20, { hold: { code: 'not-approved', wait: false, reason: '#4 is not approved' }, message: '#4 is not approved' })],
+			[item(1, 50), item(2, 40, { hold: { code: 'draft', reason: '#2 is a draft' }, message: '#2 is a draft' }), item(3, 30), item(4, 20, { hold: { code: 'not-approved', reason: '#4 is not approved' }, message: '#4 is not approved' })],
 			stacks([1, 2, 3, 4], { 2: 1, 3: 2 }),
 			new Set()
 		);
 		expect(b.stacks.map((s) => s.rows.map((r) => r.pr))).toEqual([[1]]);
-		expect(b.waiting).toEqual([
-			{ pr: 2, code: 'ci-pending', reason: "#2's checks are still running", wait: true, cause: null },
-			{ pr: 3, code: 'parent-held', reason: "Waits for #2: #2's checks are still running", wait: true, cause: 2 }
+		expect(b.attention).toEqual([
+			{ pr: 2, code: 'draft', reason: '#2 is a draft', cause: null },
+			{ pr: 3, code: 'parent-held', reason: 'Waits for #2: #2 is a draft', cause: 2 },
+			{ pr: 4, code: 'not-approved', reason: '#4 is not approved', cause: null }
 		]);
-		expect(b.attention).toEqual([{ pr: 4, code: 'not-approved', reason: '#4 is not approved', wait: false, cause: null }]);
 	});
 
 	test('a conflict or a failure needs someone, whatever the PR is stacked on', () => {
@@ -415,20 +407,20 @@ describe('the queue page: the model from what the planner recorded', () => {
 		);
 		expect(b.stacks).toEqual([]);
 		expect(b.attention).toEqual([
-			{ pr: 1, code: 'conflict', reason: 'Conflicts with main in src/a.ts', wait: false, cause: null },
-			{ pr: 2, code: 'parent-held', reason: 'Waits for #1: conflicts with main in src/a.ts', wait: false, cause: 1 },
-			{ pr: 3, code: 'failed', reason: 'Failed', wait: false, cause: null }
+			{ pr: 1, code: 'conflict', reason: 'Conflicts with main in src/a.ts', cause: null },
+			{ pr: 2, code: 'parent-held', reason: 'Waits for #1: conflicts with main in src/a.ts', cause: 1 },
+			{ pr: 3, code: 'failed', reason: 'Failed', cause: null }
 		]);
 	});
 
-	test('a deferred PR waits for the reason it was deferred', () => {
+	test('a deferred PR needs someone, for the reason it was deferred', () => {
 		const b = queueBoard([item(1, 50, { message: 'Waits for #7 to land: they change the same lines' })], stacks([1]), new Set());
-		expect(b.waiting).toEqual([{ pr: 1, code: 'deferred', reason: 'Waits for #7 to land: they change the same lines', wait: true, cause: null }]);
+		expect(b.attention).toEqual([{ pr: 1, code: 'deferred', reason: 'Waits for #7 to land: they change the same lines', cause: null }]);
 	});
 
 	test('PRs being tested are left out; a stack on one of them sits on it', () => {
 		const b = queueBoard([item(1, 50, { status: 'checking' }), item(2, 40), item(3, 30, { status: 'merged' })], stacks([1, 2, 3], { 2: 1 }), new Set([1]));
-		expect(b).toEqual({ stacks: [{ root: 2, on: 1, priority: 'normal', rows: [{ pr: 2, depth: 0, parent: null }] }], waiting: [], attention: [] });
+		expect(b).toEqual({ stacks: [{ root: 2, on: 1, priority: 'normal', rows: [{ pr: 2, depth: 0, parent: null }] }], attention: [] });
 	});
 
 	test('a PR left checking by an interrupted run is in line again', () => {

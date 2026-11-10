@@ -34,10 +34,10 @@
 	// The server checks the role on every action anyway; this only hides what would be refused.
 	const readonly = $derived(!data.can.queue);
 	// The queue as the planners see it (built on the server by their queue model): stacks in the
-	// order the queue takes them, and the PRs held back, waiting or needing someone, with why.
+	// order the queue takes them, and the PRs held back until someone acts, with why.
 	const items = $derived(new Map(data.queueItems.map((i) => [i.pr_number, i])));
 	type BoardStack = NonNullable<typeof board>['stacks'][number];
-	type BoardHeld = NonNullable<typeof board>['waiting'][number];
+	type BoardHeld = NonNullable<typeof board>['attention'][number];
 	const needle = $derived(search.trim().toLowerCase().replace(/^#/, ''));
 	const matchesPr = (n: number) => {
 		const i = items.get(n);
@@ -46,7 +46,6 @@
 	// A stack shows whole while any of its PRs matches the search.
 	const shownStacks = $derived((board?.stacks ?? []).filter((s: BoardStack) => s.rows.some((r) => matchesPr(r.pr))));
 	const inLine = $derived((board?.stacks ?? []).reduce((n: number, s: BoardStack) => n + s.rows.length, 0));
-	const waiting = $derived((board?.waiting ?? []).filter((h: BoardHeld) => items.has(h.pr)));
 	const attention = $derived((board?.attention ?? []).filter((h: BoardHeld) => items.has(h.pr)));
 	// What runs CI now: the batches and their bisection steps. What comes next is not guessed.
 	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false }) : []);
@@ -262,20 +261,18 @@
 
 		<!-- Main column: Up next and the queue. -->
 		<div class="min-w-0 space-y-5 lg:order-1">
-			{#snippet held(title: string, list: BoardHeld[], tone: string, needsSomeone: boolean)}
-				<section aria-label={title}>
-					<h2 class="mb-2 text-base font-semibold {needsSomeone ? 'text-red-800' : 'text-gray-900'}">{title} · {list.length}</h2>
-					<div class="overflow-hidden rounded-xl border {tone} bg-surface-raised" role="list">
-						{#each list as h (h.pr)}
+			{#if attention.length > 0}
+				<section aria-label="Needs attention">
+					<h2 class="mb-2 text-base font-semibold text-red-800">Needs attention · {attention.length}</h2>
+					<div class="overflow-hidden rounded-xl border border-red-200 bg-surface-raised" role="list">
+						{#each attention as h (h.pr)}
 							<div role="listitem">
-								<QueueItem {readonly} canUrgent={data.can.urgent} item={items.get(h.pr)!} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} why={h.reason} {needsSomeone} warnings={board?.warnings[h.pr] ?? []} />
+								<QueueItem {readonly} canUrgent={data.can.urgent} item={items.get(h.pr)!} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} why={h.reason} needsSomeone warnings={board?.warnings[h.pr] ?? []} />
 							</div>
 						{/each}
 					</div>
 				</section>
-			{/snippet}
-
-			{#if attention.length > 0}{@render held('Needs attention', attention, 'border-red-200', true)}{/if}
+			{/if}
 
 			{#if data.queueItems.length === 0}
 				<div class="rounded-xl border border-dashed border-gray-300 bg-surface-raised p-12 text-center">
@@ -287,7 +284,7 @@
 				</div>
 			{:else}
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-					<h2 class="text-base font-semibold text-gray-900">Queue · {inLine}</h2>
+					<h2 class="text-base font-semibold text-gray-900">In line · {inLine}</h2>
 					<span class="text-xs text-gray-500">
 						{batchMode ? 'urgent first, then in line order; a stack goes as one' : data.can.reorder ? 'drag to reorder; a stack goes as one' : 'in line order; a stack goes as one'}
 					</span>
@@ -341,7 +338,6 @@
 					<p class="text-sm text-gray-500">Nothing can go now.</p>
 				{/if}
 
-				{#if waiting.length > 0}{@render held('Waiting', waiting, 'border-border-subtle', false)}{/if}
 			{/if}
 
 			{#if pipe && pipe.recent.length > 0}

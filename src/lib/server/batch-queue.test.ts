@@ -7,6 +7,7 @@ const { tickBatchQueue, startTry, retireBatches, recoverInterrupted, cancelBatch
 const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
+const events = await import('./events');
 import { GitSandbox } from './testing/git-sandbox';
 import { writeFileSync } from 'node:fs';
 import type { LivePR, QueueDeps } from './batch-queue';
@@ -635,7 +636,7 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1]);
 		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, '#2 has changes requested']]);
 		// The dashboard shows it as needing someone, not as waiting for its turn.
-		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', wait: false, reason: '#2 has changes requested' });
+		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: '#2 has changes requested' });
 	});
 
 	test('marks the PR head as tested right before merging it', async () => {
@@ -875,6 +876,85 @@ describe('batch queue runtime', () => {
 		expect(item(3).error_message).toBe('Waits for #2: conflicts with #1 ahead of it; waits for them to land');
 	});
 
+	test('a held PR is told on GitHub what it needs, once, and an event says so; then it is released', async () => {
+		pr(1);
+		pr(2);
+		world.changesRequested.add(2);
+		await run(3);
+		expect(world.merged).toEqual([1]);
+		const told = () => world.prStatuses.filter((x) => x.sha === git.sha('pr2') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		// Told once, however many ticks hold it.
+		expect(told()).toEqual([['failure', 'Needs attention: #2 has changes requested']]);
+		const kinds = () => events.listEvents(repo.id, { pr: 2 }).map((e) => e.kind);
+		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'held').map((e) => e.data)).toEqual([{ code: 'changes-requested', reason: '#2 has changes requested' }]);
+		world.changesRequested.delete(2);
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		expect(kinds().filter((k) => k === 'held' || k === 'released' || k === 'batched')).toEqual(['held', 'released', 'batched']);
+	});
+
+	test('a PR held while a batch bisects is told then, not once the bisection ends', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		// The bisection's runs (one PR each) take long.
+		world.hold = (prs) => prs.length === 1;
+		await run(5);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('bisecting');
+		pr(5);
+		world.changesRequested.add(5);
+		await run(2);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr5') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([['failure', 'Needs attention: #5 has changes requested']]);
+	});
+
+	test('a status that could not be posted is posted on the next tick', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		const deps = world.deps();
+		const post = deps.github.setPRStatus;
+		let down = true;
+		deps.github.setPRStatus = async (...a) => {
+			if (down) {
+				down = false;
+				throw new Error('GitHub is down');
+			}
+			return post(...a);
+		};
+		await tickBatchQueue(deps);
+		await tickBatchQueue(deps);
+		await tickBatchQueue(deps);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+	});
+
+	test('a held PR taken out of the queue is no longer told it needs attention', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		await run(2);
+		const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!;
+		db.removeFromQueue(item.id);
+		await run(2);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([
+			['failure', 'Needs attention: #1 has changes requested'],
+			['pending', 'Not in the merge queue']
+		]);
+		expect(events.listEvents(repo.id, { pr: 1 }).map((e) => e.kind).filter((k) => k === 'held' || k === 'released')).toEqual(['held', 'released']);
+	});
+
+	test('a PR stacked on a queued PR in conflict says that its parent conflicts, not that it is unqueued', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		db.updateQueueItemHeadSha(item(1).id, git.sha('pr1'));
+		db.updateQueueItemStatus(item(1).id, 'conflict', 'Conflicts with main in src/a.ts');
+		await tickBatchQueue(world.deps());
+		expect(world.started).toEqual([]);
+		expect(item(2).error_message).toBe('Waits for #1: conflicts with main in src/a.ts');
+	});
+
 	test('a deferred PR says only what it still waits for, not PRs that landed since', async () => {
 		pr(1, { file: 'same.txt' });
 		pr(2);
@@ -1021,6 +1101,20 @@ describe('batch queue runtime', () => {
 		// urgent ones go alone: one try each
 		expect(world.started.map((x) => x.prs)).toEqual([[1], [2]]);
 		expect(world.comments).toEqual([]);
+	});
+
+	test('on a red default branch with the pipeline full, a PR held meanwhile is told', async () => {
+		store.updateQueueSettings(repo.id, { config: { depth: 1 } });
+		redMain();
+		pr(1);
+		world.hold = () => true;
+		await run(2);
+		expect(world.started.map((x) => x.prs)).toEqual([[1]]);
+		pr(5);
+		world.changesRequested.add(5);
+		await run(2);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr5') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([['failure', 'Needs attention: #5 has changes requested']]);
 	});
 
 	test('a PR held back on a red default branch does not stop the others from being tried alone', async () => {

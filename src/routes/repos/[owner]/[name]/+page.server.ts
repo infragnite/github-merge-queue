@@ -64,7 +64,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 	// Links are built here, never taken from what was stored: a stored URL came from a form once.
 	const rawItems = getQueueItems(repo.id);
 	const queueItems = rawItems.map((i) => {
-		const item = { ...i, pr_url: prUrl(repo, i.pr_number), holdWait: currentHold(i)?.wait ?? null, deferred: deferredFor(i as typeof i & { deferred_for?: string | null }).length > 0 };
+		const item = { ...i, pr_url: prUrl(repo, i.pr_number), held: currentHold(i) !== null, deferred: deferredFor(i as typeof i & { deferred_for?: string | null }).length > 0 };
 		return readonly ? publicQueueItem(item) : item;
 	});
 	// The queue as the planners see it: the rows, with the holds the planner recorded. A read-only
@@ -77,7 +77,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 			priority: i.priority ?? 'normal',
 			position: i.position,
 			enqueuedAt: Date.parse(i.created_at.replace(' ', 'T') + (i.created_at.includes('Z') ? '' : 'Z')),
-			hold: hold ? { code: hold.code as HoldCode, wait: hold.wait, reason: hold.reason } : null,
+			hold: hold ? { code: hold.code as HoldCode, reason: hold.reason } : null,
 			message: queueItems[k].error_message
 		};
 	});
