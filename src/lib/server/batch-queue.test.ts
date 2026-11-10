@@ -1022,13 +1022,33 @@ describe('batch queue runtime', () => {
 		pr(2);
 		world.changesRequested.add(2);
 		await run(3);
-		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/^Needs attention in the merge queue: #2 has changes requested/) }]);
+		expect(world.comments).toEqual([
+			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'changes-requested', reason: '#2 has changes requested' }) }
+		]);
 		world.changesRequested.delete(2);
 		await run();
 		expect(world.merged).toEqual([1, 2]);
 		expect(world.comments).toHaveLength(1);
-		// The status still says it is back in line.
-		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr2') && x.context === 'merge-queue').map((x) => x.description)).toContain('In line in the merge queue');
+		// The check still says it is back in line.
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2') && x.name === 'merge-queue').map((x) => x.state)).toContain('queued');
+	});
+
+	test('a hold not commented on under "none" is commented on once after switching to "attention"', async () => {
+		store.updateQueueSettings(repo.id, { config: { comments: 'none' } });
+		pr(1);
+		world.changesRequested.add(1);
+		await run(3);
+		expect(world.comments).toEqual([]);
+		const checks = () => world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').length;
+		// Not told by a comment, but the check is not posted again every tick either.
+		const posted = checks();
+		await run(3);
+		expect(checks()).toBe(posted);
+		store.updateQueueSettings(repo.id, { config: { comments: 'attention' } });
+		await run(3);
+		expect(world.comments).toEqual([
+			{ pr: 1, body: holdNotice({ pr: 1, head: git.sha('pr1'), code: 'changes-requested', reason: '#1 has changes requested' }) }
+		]);
 	});
 
 	test('with comments off, a hold, a conflict and an ejection post nothing; statuses and labels still tell', async () => {
@@ -1047,8 +1067,9 @@ describe('batch queue runtime', () => {
 		]);
 		expect(world.comments).toEqual([]);
 		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
-		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr3')).at(-1)).toMatchObject({ state: 'failure', description: expect.stringMatching(/^Left the queue/) });
-		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr4')).at(-1)).toMatchObject({ state: 'failure', description: 'Needs attention: #4 has changes requested' });
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr3')).at(-1)).toMatchObject({ state: 'failure', title: expect.stringMatching(/^Left the queue/) });
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr4')).at(-1)).toMatchObject({ state: 'action_required', title: '#4 has changes requested' });
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required' });
 	});
 
 	test('comments only when action is needed: an ejection and a conflict are told', async () => {
@@ -1059,8 +1080,8 @@ describe('batch queue runtime', () => {
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run(60);
 		expect(world.merged).toEqual([1]);
-		expect(world.comments.filter((c) => c.pr === 3)).toEqual([{ pr: 3, body: expect.stringMatching(/^Removed from the merge queue/) }]);
-		expect(world.comments.filter((c) => c.pr === 2).map((c) => c.body)).toContainEqual(expect.stringMatching(/can't apply this PR/));
+		expect(world.comments.filter((c) => c.pr === 3).map((c) => readNotice(c.body))).toEqual([expect.objectContaining({ kind: 'ejected', pr: 3 })]);
+		expect(world.comments.filter((c) => c.pr === 2).map((c) => readNotice(c.body))).toContainEqual(expect.objectContaining({ kind: 'hold', code: 'conflict' }));
 	});
 
 	test('a PR whose parent is not queued is told to queue it', async () => {
