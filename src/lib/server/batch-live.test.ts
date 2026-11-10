@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { approvalsFrom, checkResult, earlyFailure } from './batch-live';
+import { approvalsFrom, checkResult, earlyFailure, gateFeeds } from './batch-live';
 import type { GhReview } from './github';
 
 const review = (login: string, state: string, sha: string, at: string, assoc = 'COLLABORATOR'): GhReview => ({
@@ -96,5 +96,72 @@ describe('stopping at the first failed job', () => {
 		const notBefore = Date.parse('2026-11-10T11:00:00Z');
 		expect(earlyFailure(required, [job('tests', 'completed', 'failure', 7, '2026-11-10T10:00:00Z')], notBefore)).toBe(false);
 		expect(earlyFailure(required, [job('tests', 'completed', 'failure', 7, '2026-11-10T11:05:00Z')], notBefore)).toBe(true);
+	});
+});
+
+describe('the jobs the required check waits for', () => {
+	// Like krusty's: a routing job no gate needs, a matrix, a reusable workflow, and a gate that
+	// runs always and checks what it needs.
+	const workflow = `
+name: ci
+on:
+  push:
+    branches: ['mq/**']
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  test:
+    name: "Test \${{ matrix.os }}"
+    needs: build
+    strategy:
+      matrix:
+        os: [linux, mac]
+    runs-on: \${{ matrix.os }}
+    steps: [{ run: echo }]
+  conformance:
+    needs: [build]
+    uses: ./.github/workflows/conformance.yml
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  ci-and-conformance:
+    if: always()
+    needs:
+      - test
+      - conformance
+      - lint
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+`;
+
+	test('every job the gate needs, directly or not, by its check run name', () => {
+		const feeds = gateFeeds(workflow, 'ci-and-conformance')!;
+		for (const name of ['Build', 'Test linux', 'Test mac', 'conformance / suite', 'lint', 'ci-and-conformance']) expect(feeds(name), name).toBe(true);
+		expect(feeds('route')).toBe(false);
+	});
+
+	test('a gate named by its name, not its id', () => {
+		const feeds = gateFeeds(workflow, 'Build')!;
+		expect(feeds('Build')).toBe(true);
+		expect(feeds('lint')).toBe(false);
+	});
+
+	test('no such gate, or a workflow it cannot read: unknown, so nothing fails early', () => {
+		expect(gateFeeds(workflow, 'nope')).toBeNull();
+		expect(gateFeeds('not: [valid', 'ci-and-conformance')).toBeNull();
+		expect(gateFeeds('', 'ci-and-conformance')).toBeNull();
+	});
+
+	test('a failure in a job the gate does not wait for never fails it early', () => {
+		const feeds = gateFeeds(workflow, 'ci-and-conformance')!;
+		const job = (name: string, conclusion: string) => ({ name, status: 'completed', conclusion, completed_at: null, check_suite: { id: 7 } });
+		const required = [{ check_suite: { id: 7 } }];
+		expect(earlyFailure(required, [job('route', 'failure')], null, feeds)).toBe(false);
+		expect(earlyFailure(required, [job('Test mac', 'failure')], null, feeds)).toBe(true);
 	});
 });
