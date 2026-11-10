@@ -375,6 +375,22 @@ describe('bisection', () => {
 		expect([b1.land, b1.eject.map((e) => e.pr).sort()]).toEqual([[], [1, 2, 3]]);
 	});
 
+	test('a shared PR that passed before runs alone, not with a branch that never passed', () => {
+		const parent = (n: number) => (n === 1 ? null : 1);
+		const runs: BisectRun[] = [
+			{ context: [], members: [1, 2, 3], baseTree: 'm', result: 'failure' },
+			{ context: [], members: [1, 2], baseTree: 'm', result: 'failure' },
+			{ context: [], members: [1], baseTree: 'older', result: 'success' }
+		];
+		expect(planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm', parentOf: parent, slots: 1 })).toMatchObject({ start: [[1]] });
+	});
+
+	test('with free slots, the second path of a fork waits for the first (they share their root)', () => {
+		const parent = (n: number) => (n === 1 ? null : 1);
+		const runs: BisectRun[] = [{ context: [], members: [1, 2, 3], baseTree: 'm', result: 'failure' }];
+		expect(planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm', parentOf: parent })).toMatchObject({ start: [[1, 2]] });
+	});
+
 	test('forkSplit shares out the branches above the first fork, with the PRs under it in both halves', () => {
 		const parent = (n: number) => ({ 2: 1, 3: 2, 4: 2, 5: 4 })[n] ?? null;
 		expect(forkSplit([1, 2, 3, 4, 5], parent)).toEqual({ left: [1, 2, 3], right: [1, 2, 4, 5] });
