@@ -297,7 +297,7 @@ function linkIssue(pr: PRSnapshot, r: Relation): StackIssue | null {
 				parent: p,
 				severity: 'warning',
 				evidence: r.evidence,
-				message: `#${p} has new commits that #${pr.number} doesn't include yet`
+				message: `#${p} has new commits this PR doesn't include yet`
 			};
 		case 'rebased':
 			return {
@@ -307,7 +307,7 @@ function linkIssue(pr: PRSnapshot, r: Relation): StackIssue | null {
 				severity: 'blocking',
 				evidence: r.evidence,
 				staleCommits: r.stale,
-				message: `#${p} was rebased or force-pushed; #${pr.number} still carries ${r.stale.length} old commit(s) from it and must be restacked onto #${p}`
+				message: `#${p} was rebased or force-pushed; this PR still carries ${r.stale.length} old commit${r.stale.length === 1 ? '' : 's'} from it`
 			};
 		case 'parent-merged':
 			return {
@@ -316,7 +316,7 @@ function linkIssue(pr: PRSnapshot, r: Relation): StackIssue | null {
 				parent: p,
 				severity: 'warning',
 				evidence: r.evidence,
-				message: `#${p} was merged but #${pr.number} still carries its original commits; rebase #${pr.number} onto the default branch`
+				message: `#${p} was merged, and this PR still carries its original commits; rebase it onto the default branch`
 			};
 		case 'parent-closed':
 			return {
@@ -325,7 +325,7 @@ function linkIssue(pr: PRSnapshot, r: Relation): StackIssue | null {
 				parent: p,
 				severity: 'blocking',
 				evidence: r.evidence,
-				message: `#${p} was closed without merging but #${pr.number} still contains its commits`
+				message: `#${p} was closed without merging, and this PR still contains its commits`
 			};
 	}
 }
@@ -373,7 +373,7 @@ export function detectAutoClose(
 		parent: parent?.number,
 		severity: 'blocking',
 		evidence,
-		message: `GitHub ${likely}closed #${pr.number} because its base branch '${pr.baseRef}' was deleted${via}; reopen it against ${input.defaultBranch} to queue it again`
+		message: `GitHub ${likely}closed it because its base branch '${pr.baseRef}' was deleted${via}; reopen it against ${input.defaultBranch} to queue it again`
 	};
 }
 
@@ -409,7 +409,7 @@ export function analyzeStacks(input: StackInput): StackAnalysis {
 				kind: 'commits-truncated',
 				pr: pr.number,
 				severity: 'warning',
-				message: `#${pr.number} has more commits than could be fetched; stack detection may be incomplete`
+				message: 'More commits than could be fetched; stack detection may be incomplete'
 			});
 		}
 
@@ -427,12 +427,13 @@ export function analyzeStacks(input: StackInput): StackAnalysis {
 			// Targeting some non-PR branch (e.g. a release branch) with no stack
 			// underneath is a legitimate setup, not a mismatch.
 			if (info.parent !== null || declared) {
-				const why =
-					info.parent !== null && byNumber.get(info.parent)!.state === 'open'
-						? `its commits sit on #${info.parent}`
-						: declared
-							? `it doesn't contain #${declared.number}'s commits`
-							: `#${info.parent} is no longer open`;
+				// No ancestry link: it sits on the declared PR's branch without that PR's latest commit.
+				const message =
+					info.parent === null
+						? `Not on #${declared!.number}'s latest commit`
+						: byNumber.get(info.parent)!.state === 'open'
+							? `Targets '${pr.baseRef}' but its commits sit on #${info.parent}; point it at '${info.expectedBase}'`
+							: `Targets '${pr.baseRef}' but #${info.parent} is no longer open; point it at '${info.expectedBase}'`;
 				info.issues.push({
 					kind: 'base-mismatch',
 					pr: pr.number,
@@ -440,7 +441,7 @@ export function analyzeStacks(input: StackInput): StackAnalysis {
 					// Merging would either drag the parent's commits into the base
 					// or land this PR on the parent's branch instead of the base.
 					severity: info.link === 'parent-merged' ? 'warning' : 'blocking',
-					message: `#${pr.number} targets '${pr.baseRef}' but should target '${info.expectedBase}': ${why}`
+					message
 				});
 			}
 		}
@@ -451,7 +452,7 @@ export function analyzeStacks(input: StackInput): StackAnalysis {
 				pr: pr.number,
 				severity: 'blocking',
 				evidence: 'branch-missing',
-				message: `#${pr.number}'s base branch '${pr.baseRef}' no longer exists`
+				message: `Its base branch '${pr.baseRef}' no longer exists`
 			});
 		}
 	}

@@ -255,6 +255,8 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 	}
 
 	const info = analysis.prs.get(n);
+	const own = info ? stopper(info) : null;
+	if (own) return { ok: false, code: 'stack-broken', reason: own };
 	if (state.targetsDefault === false && (info?.parent ?? null) === null) {
 		// Only the default branch is batched; a PR into another branch is merged some other way.
 		return { ok: false, code: 'wrong-base', reason: 'Does not target the default branch' };
@@ -264,8 +266,6 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 		return { ok: false, code: 'wrong-base', reason: 'Stacked on another PR from a fork; retarget it to the default branch once its parent lands' };
 	}
 	if (info) {
-		const own = stopper(info);
-		if (own) return { ok: false, code: 'stack-broken', reason: own };
 		for (let p = info.parent; p !== null; ) {
 			const up = analysis.prs.get(p);
 			if (!up) break;
@@ -273,7 +273,7 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 				return {
 					ok: false,
 					code: 'parent-not-ready',
-					reason: `The stack under #${n} is broken at #${p}`
+					reason: `The stack under it is broken at #${p}`
 				};
 			}
 			p = up.parent;
