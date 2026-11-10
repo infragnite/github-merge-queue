@@ -16,6 +16,8 @@ import { closedPRReason } from '$lib/server/stack-runtime';
 import { getActiveBatches, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
 import { forgetVisibility } from '$lib/server/public-view';
 import { bumpGeneration, markDirty } from '$lib/server/wake';
+import { commentFromPayload } from '$lib/server/pr-commands';
+import { runLiveCommand } from '$lib/server/pr-commands-live';
 import type { RequestHandler } from './$types';
 
 function verifySignature(payload: string, signature: string | null, secret: string): boolean {
@@ -201,6 +203,18 @@ export const POST: RequestHandler = async ({ request }) => {
 				}
 			} catch (err) {
 				console.error(`[webhook] Error handling pull_request event:`, err instanceof Error ? err.message : err);
+			}
+			break;
+		}
+
+		case 'issue_comment': {
+			// A `/mq` command. It runs after GitHub has its answer: role lookups, the try run's
+			// build and the reply can take longer than GitHub waits for a webhook.
+			const comment = commentFromPayload(payload);
+			if (comment) {
+				void runLiveCommand(repo, comment).catch((err) =>
+					console.error(`[webhook] /mq command on ${owner}/${name}#${comment.pr}:`, err instanceof Error ? err.message : err)
+				);
 			}
 			break;
 		}

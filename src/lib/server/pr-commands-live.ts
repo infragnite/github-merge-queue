@@ -1,7 +1,34 @@
-// `/mq` commands wired to GitHub and the live queue. Not implemented yet.
-import type { PRComment } from './pr-commands';
+// `/mq` commands wired to GitHub and the live queue.
+import { env } from '$env/dynamic/private';
+import * as github from './github';
+import { roleFromPermission } from './api-auth';
+import { analyzeRepoStacks } from './stack-runtime';
+import { startTry } from './batch-queue';
+import { liveDeps } from './batch-live';
+import { withRepoLock } from './repo-lock';
+import { markDirty } from './wake';
+import { runCommand, type CommandDeps, type PRComment } from './pr-commands';
 import type { Repo } from '$lib/types';
 
-export async function runLiveCommand(_repo: Repo, _c: PRComment): Promise<void> {
-	throw new Error('not implemented');
+function liveCommandDeps(repo: Repo): CommandDeps {
+	const { owner, name } = repo;
+	return {
+		role: async (login) => roleFromPermission(await github.collaboratorRole(owner, name, login)),
+		pr: (n) => github.getPR(owner, name, n),
+		analysis: () => analyzeRepoStacks(repo),
+		startTry: (n) => withRepoLock(repo.id, () => startTry(liveDeps(repo), n)),
+		react: async (id, content) => {
+			await github.reactToComment(owner, name, id, content);
+		},
+		reply: async (n, body) => {
+			await github.commentOnPR(owner, name, n, body);
+		},
+		wake: () => markDirty(repo.id),
+		queueUrl: `${(env.APP_URL || 'http://localhost:3000').replace(/\/$/, '')}/repos/${owner}/${name}`
+	};
+}
+
+export async function runLiveCommand(repo: Repo, c: PRComment): Promise<void> {
+	const r = await runCommand(repo, liveCommandDeps(repo), c);
+	if (r) console.log(`[commands] ${repo.owner}/${repo.name}#${c.pr}: /mq ${r.command} by ${c.login}: ${r.ok ? 'done' : 'refused'}`);
 }

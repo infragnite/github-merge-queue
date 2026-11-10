@@ -37,9 +37,13 @@ function inBatchNow(b: BatchRow): number[] {
 	return b.members.filter((n) => !b.landed.includes(n) && !b.left_prs.includes(n));
 }
 
-function queueEntry(repoId: number, n: number) {
+/** Statuses of a PR still waiting in line or being tested. */
+export const WAITING_STATUSES = ['queued', 'checking', 'updating', 'merging', 'conflict'];
+
+/** Where a PR stands in the queue; null when it isn't in it. */
+export function queueEntry(repoId: number, n: number) {
 	const items = db.getQueueItems(repoId) as Q[];
-	const waiting = items.filter((i) => ['queued', 'checking', 'updating', 'merging', 'conflict'].includes(i.status));
+	const waiting = items.filter((i) => WAITING_STATUSES.includes(i.status));
 	const idx = waiting.findIndex((i) => i.pr_number === n);
 	if (idx < 0) return null;
 	const it = waiting[idx];
