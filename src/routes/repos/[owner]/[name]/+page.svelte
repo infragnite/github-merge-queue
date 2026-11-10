@@ -31,8 +31,9 @@
 	let search = $state('');
 
 	const batchMode = $derived(data.mode === 'batch');
-	// Signed out on a public page: everything shows, nothing can be changed.
-	const readonly = $derived(data.anonymous);
+	// Without write access (or signed out on a public page): everything shows, nothing can be changed.
+	// The server checks the role on every action anyway; this only hides what would be refused.
+	const readonly = $derived(!data.can.queue);
 	const view = $derived(
 		queueView({
 			items: data.queueItems,
@@ -140,7 +141,7 @@
 	<!-- Header -->
 	<div class="flex flex-wrap items-center justify-between gap-3">
 		<div class="flex min-w-0 items-center gap-3">
-			{#if !readonly}
+			{#if !data.anonymous}
 				<a href="/" class="shrink-0 text-gray-400 transition-colors hover:text-gray-600" aria-label="Back to dashboard">
 					<svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
 						<path stroke-linecap="round" stroke-linejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
@@ -163,7 +164,7 @@
 			</div>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
-			{#if readonly}
+			{#if !data.can.mode}
 				<span class="rounded-lg border border-border-subtle px-3 py-1.5 text-sm text-gray-600">{batchMode ? 'Merging in batches' : 'Merging one by one'}</span>
 			{:else}
 			<form method="POST" action="?/setMode" use:enhance={confirmMode} class="flex overflow-hidden rounded-lg border border-border-subtle text-sm" aria-label="Merge mode">
@@ -202,6 +203,7 @@
 	</div>
 
 	{#if pipe?.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
+	{#if form?.error}<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{form.error}</p>{/if}
 	{#if pipe?.tickError && !pipe.rateLimitedUntil}
 		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
 			The queue's last step failed: <span class="font-mono text-xs">{pipe.tickError.message}</span>
@@ -216,8 +218,8 @@
 	{/if}
 	{#if pipe?.paused}
 		<form method="POST" action="?/resume" use:enhance class="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-			<span class="min-w-0 flex-1">{readonly ? pipe.paused : `Paused: ${pipe.paused}`}</span>
-			{#if !readonly}<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>{/if}
+			<span class="min-w-0 flex-1">{data.readonly ? pipe.paused : `Paused: ${pipe.paused}`}</span>
+			{#if data.can.resume}<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>{/if}
 		</form>
 	{/if}
 
@@ -240,7 +242,6 @@
 					{#each pipe.active as batch (batch.id)}
 						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} />
 					{/each}
-					{#if form?.error}<p class="text-sm text-red-600" role="alert">{form.error}</p>{/if}
 				</section>
 			{/if}
 
@@ -254,7 +255,7 @@
 					<div class="overflow-hidden rounded-xl border border-red-200 bg-surface-raised" role="list">
 						{#each view.attention as a (a.item.id)}
 							<div role="listitem">
-								<QueueItem {readonly} item={a.item} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={a.stack} why={a.item.status === 'conflict' ? null : a.why} />
+								<QueueItem {readonly} canUrgent={data.can.urgent} item={a.item} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={a.stack} why={a.item.status === 'conflict' ? null : a.why} />
 							</div>
 						{/each}
 					</div>
@@ -273,7 +274,7 @@
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
 					<h2 class="text-base font-semibold text-gray-900">Queue · {inLine}</h2>
 					<span class="text-xs text-gray-500">
-						{batchMode ? 'urgent first, then in line order' : readonly ? 'in line order' : 'drag to reorder'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
+						{batchMode ? 'urgent first, then in line order' : data.can.reorder ? 'drag to reorder' : 'in line order'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
 					</span>
 					<input
 						type="search"
@@ -305,7 +306,7 @@
 						<div class="overflow-hidden rounded-xl border border-indigo-200 bg-surface-raised" role="list">
 							{#each shownNext as r (r.item.id)}
 								<div role="listitem">
-									<QueueItem {readonly} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} batchMode stack={r.stack} />
+									<QueueItem {readonly} canUrgent={data.can.urgent} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} batchMode stack={r.stack} />
 								</div>
 							{/each}
 						</div>
@@ -317,9 +318,9 @@
 						{#if batchMode && view.upNext.length > 0}<h3 class="mb-1 text-sm font-medium text-gray-700">After that</h3>{/if}
 						<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
 							{#each shownRows as r, index (r.item.id)}
-								{#if batchMode || needle || readonly}
+								{#if batchMode || needle || !data.can.reorder}
 									<div role="listitem">
-										<QueueItem {readonly} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={r.stack} />
+										<QueueItem {readonly} canUrgent={data.can.urgent} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={r.stack} />
 									</div>
 								{:else}
 									<div
@@ -331,7 +332,7 @@
 										class="{dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
 										role="listitem"
 									>
-										<QueueItem {readonly} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} reorderable batchMode={false} stack={r.stack} />
+										<QueueItem {readonly} canUrgent={data.can.urgent} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} reorderable batchMode={false} stack={r.stack} />
 									</div>
 								{/if}
 							{/each}
@@ -387,7 +388,7 @@
 				</details>
 			{/if}
 
-			{#if data.settings}<QueueSettings settings={data.settings} canEdit={data.can.settings} error={form?.settingsError ?? null} saved={!!form?.settingsSaved} />{/if}
+			{#if data.settings}<QueueSettings settings={data.settings} canEdit={data.can.settings} error={(form?.settingsError as string | undefined) ?? null} saved={!!form?.settingsSaved} />{/if}
 
 			<!-- History -->
 			{#if data.history.length > 0}
