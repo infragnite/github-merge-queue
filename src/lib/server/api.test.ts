@@ -176,6 +176,29 @@ describe('stack state for agents', () => {
 		]);
 		expect(api.stackState(repo, 1, analysis([1])).queue).toMatchObject({ status: 'testing', batch: { prs: [1] } });
 	});
+
+	test('a PR that left a bisecting batch is back in line, not testing', () => {
+		api.enqueue(repo, writer, pull(1), {});
+		api.enqueue(repo, writer, pull(2), {});
+		const b = store.insertBatch({
+			repoId: repo.id,
+			kind: 'batch',
+			branch: 'mq/batch-1',
+			baseSha: 'b',
+			headSha: 'h',
+			treeSha: 't',
+			baseTree: 'bt',
+			members: [1, 2],
+			heads: { 1: 'x', 2: 'y' }
+		});
+		store.setBatchStatus(b.id, 'bisecting');
+		store.leaveBatch(b.id, [2]);
+		expect(api.queueState(repo).waiting.map((w) => [w.pr, w.status])).toEqual([
+			[1, 'testing'],
+			[2, 'queued']
+		]);
+		expect(api.stackState(repo, 2, analysis([2])).queue).toMatchObject({ status: 'queued' });
+	});
 });
 
 describe('queue control', () => {

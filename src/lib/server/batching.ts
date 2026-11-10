@@ -376,6 +376,33 @@ export interface TestGroup {
  * whole. `independent` means the right half has no ancestor in the left and
  * can be tested on its own; otherwise it can only be tested on top of the left.
  */
+/**
+ * Whether a group of `k` PRs known to fail is narrowed down faster by running each PR alone than
+ * by halving it, when each PR breaks with probability `p`. Expected runs, under the queue's rules
+ * (a PR is ejected only on a run of it alone; a passing half lands; the other half is then known
+ * to fail): halving wins on large groups with few breakers, running alone on small groups or when
+ * breakers are common (from about 30%, on any size). So bisection never costs more than one run
+ * per PR.
+ */
+export function aloneIsCheaper(k: number, p: number): boolean {
+	if (k <= 1) return true;
+	const q = 1 - Math.min(Math.max(p, 0.001), 0.999);
+	// U: runs for k PRs not known to fail (one run together; if it fails, P). P: known to fail.
+	const U = [0, 1];
+	const P = [0, 1];
+	let alone = true;
+	for (let n = 2; n <= k; n++) {
+		const a = Math.ceil(n / 2);
+		const b = n - a;
+		const pa = (1 - q ** a) / (1 - q ** n);
+		const halve = 1 + pa * ((a === 1 ? 0 : P[a]) + U[b]) + (1 - pa) * P[b];
+		alone = n <= halve;
+		P[n] = Math.min(n, halve);
+		U[n] = 1 + (1 - q ** n) * P[n];
+	}
+	return alone;
+}
+
 export function splitPoint(
 	members: number[],
 	parentOf: (n: number) => number | null
@@ -534,9 +561,22 @@ export function planBisection(input: {
 		});
 		return { left: a, right: b, independent };
 	};
+	// How often a PR of this batch breaks, from what the runs showed: each failing group and each
+	// ejected PR holds a breaker, each PR in a passing run none (with a prior of one in ten).
+	const breakers = proven.size + failing.length;
+	const breakRate = (breakers + 1) / (breakers + passedWith.size + 10);
 	for (const f of failing) {
 		const g = inOrder(f.set);
 		for (const n of g) suspects.add(n);
+		// Small groups, or many breakers: each PR runs alone (one at a time; the first to fail alone
+		// is ejected and explains the group's failure), which then costs no more than one run per PR.
+		// Not where some passed before: those are split off by evidence and pooled to land.
+		const set = new Set(g);
+		const fresh = g.every((n) => !passedWith.has(n)) && g.every((n) => parentOf(n) === null || !set.has(parentOf(n)!));
+		if (g.length > 1 && fresh && aloneIsCheaper(g.length, breakRate)) {
+			for (const n of g) if (whole([n]) && want([n])) retryAlone.push([n]);
+			continue;
+		}
 		if (g.length === 1) {
 			// Eject only on a run of this PR alone (on top of its passing context, if any), on a branch
 			// known green; on any other, it runs alone again on the current one.

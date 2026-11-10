@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { parseSettingsForm, shown, BATCH_FIELDS } from './settings-form';
+import { parseSettingsForm, shown, BATCH_FIELDS, ALL_FIELDS, SETTING_GROUPS } from './settings-form';
 
 const form = (entries: Record<string, string>) => {
 	const f = new FormData();
@@ -54,4 +54,9 @@ test('with the current settings, only changed fields are sent, so a rounded dura
 	expect(body.config).not.toHaveProperty('collectWindowMs');
 	expect(body.config).not.toHaveProperty('retryFailed');
 	expect(body.ci).toEqual({});
+});
+
+test('the settings page shows every field exactly once (a boolean left off would be saved as off)', () => {
+	const shownNames = SETTING_GROUPS.flatMap((g) => g.fields.map((f) => f.name));
+	expect([...shownNames].sort()).toEqual(ALL_FIELDS.map((f) => f.name).sort());
 });

@@ -85,3 +85,19 @@ export function parseSettingsForm(form: FormData, current?: { config: object; ci
 	}
 	return { config, ci };
 }
+
+/** The settings page's sections, in order: each a heading, an anchor and its fields. */
+export const SETTING_GROUPS: { id: string; title: string; help: string; fields: SettingField[] }[] = [
+	{ id: 'batching', title: 'Batches', help: 'How PRs are grouped and tested together.', fields: pick('config.maxBatch', 'config.depth', 'config.collectWindowMs') },
+	{ id: 'failures', title: 'Urgent PRs and failures', help: 'Urgent PRs skip ahead; a failed batch is narrowed down to the PR that breaks it.', fields: pick('config.expressMax', 'config.bisectRuns', 'config.retryFailed') },
+	{ id: 'rules', title: 'Who can enter a batch', help: 'What a PR needs before the queue tests it.', fields: pick('config.requireApproval', 'config.approvalOnHead', 'config.requirePRChecks', 'config.autoRebase') },
+	{ id: 'ci', title: 'CI', help: 'How the queue starts and reads CI.', fields: [...pick('config.ciTimeoutMs', 'config.masterRun', 'config.masterRunMinGapMs'), ...CI_FIELDS] }
+];
+
+function pick(...names: string[]): SettingField[] {
+	return names.map((n) => {
+		const f = BATCH_FIELDS.find((x) => x.name === n);
+		if (!f) throw new Error(`No setting ${n}`);
+		return f;
+	});
+}
