@@ -28,6 +28,7 @@ import { getQueueSettings, getRecentBatches } from '$lib/server/batch-store';
 import { cancelBatch, retireBatches, startTry } from '$lib/server/batch-queue';
 import { withRepoLock } from '$lib/server/repo-lock';
 import { liveDeps } from '$lib/server/batch-live';
+import { withActivity } from '$lib/server/activity';
 import { requireRole } from '$lib/server/api-auth';
 import { analyzeRepoStacks } from '$lib/server/stack-runtime';
 import { AuthError, bearer, resolveCaller, type AuthGitHub } from '$lib/server/api-auth';
@@ -132,7 +133,7 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 				const limit = (await github.rateLimitOf(repo.owner).catch(() => null))?.blockedUntil;
 				if (limit) throw new api.ApiError(409, `GitHub rate limit reached; cancel again after ${new Date(limit).toISOString()}`);
 				try {
-					return json(await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), batch.id, caller.login)));
+					return json(await withRepoLock(repo.id, () => withActivity(liveDeps(repo), (d) => cancelBatch(d, batch.id, caller.login))));
 				} catch (e) {
 					if (e instanceof Error && /only a batch being tested/.test(e.message)) throw new api.ApiError(409, e.message);
 					throw e;
@@ -156,7 +157,7 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 				requireRole(caller, 'write', 'Starting a try run');
 				if (getQueueSettings(repo.id).mode !== 'batch') throw new api.ApiError(409, 'Try runs need the queue in batch mode');
 				try {
-					return json(api.tryRunState(await withRepoLock(repo.id, () => startTry(liveDeps(repo), n))), { status: 201 });
+					return json(api.tryRunState(await withRepoLock(repo.id, () => withActivity(liveDeps(repo), (d) => startTry(d, n), { buildKind: () => 'try' }))), { status: 201 });
 				} catch (e) {
 					if (e instanceof Error && /is not open|does not apply/.test(e.message)) throw new api.ApiError(409, e.message);
 					throw e;

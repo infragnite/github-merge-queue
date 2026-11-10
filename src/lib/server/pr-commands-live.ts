@@ -6,6 +6,7 @@ import { analyzeRepoStacks } from './stack-runtime';
 import { startTry } from './batch-queue';
 import { liveDeps } from './batch-live';
 import { withRepoLock } from './repo-lock';
+import { withActivity } from './activity';
 import { markDirty } from './wake';
 import { runCommand, type CommandDeps, type PRComment } from './pr-commands';
 import type { Repo } from '$lib/types';
@@ -16,7 +17,7 @@ function liveCommandDeps(repo: Repo): CommandDeps {
 		role: async (login) => roleFromPermission(await github.collaboratorRole(owner, name, login)),
 		pr: (n) => github.getPR(owner, name, n),
 		analysis: () => analyzeRepoStacks(repo),
-		startTry: (n) => withRepoLock(repo.id, () => startTry(liveDeps(repo), n)),
+		startTry: (n) => withRepoLock(repo.id, () => withActivity(liveDeps(repo), (d) => startTry(d, n), { buildKind: () => 'try' })),
 		react: async (id, content) => {
 			await github.reactToComment(owner, name, id, content);
 		},

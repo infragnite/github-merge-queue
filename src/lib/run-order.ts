@@ -3,10 +3,12 @@
 // steps of a bisection, which is planned again from its runs on whatever master is current.
 
 import type { BatchCard } from './server/batch-view';
+import type { ActivityView } from './server/activity';
 
 export interface RunSlot {
 	key: string;
-	state: 'running' | 'next';
+	/** `failed`: a step of the queue's own work (forming a batch, a restack) failed. */
+	state: 'running' | 'next' | 'failed';
 	/** The batch the run belongs to, for a link to its card. */
 	batch: number | null;
 	label: string;
@@ -36,8 +38,54 @@ const minutes = (ms: number) => {
 	return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
 };
 
-export function runOrder(input: { active: BatchCard[]; upNext: number[]; express: boolean; master?: MasterRun | null; now?: number }): RunSlot[] {
-	const running: RunSlot[] = [];
+/** How long, to the second under a minute: the queue's own steps take seconds to minutes. */
+const elapsed = (ms: number) => {
+	const s = Math.max(0, Math.floor(ms / 1000));
+	if (s < 60) return `${s} s`;
+	if (s < 3600) return s % 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s / 60} min`;
+	return minutes(ms);
+};
+
+const capital = (t: string) => t.charAt(0).toUpperCase() + t.slice(1);
+
+/** A pass over the queue with no batch work in it shows once it has run this long. */
+const ROUTINE_SHOWN_AFTER_MS = 10_000;
+
+/**
+ * What the queue itself is doing (forming a batch, restacking, landing), before the CI runs: it
+ * changes nothing else on the page until it ends. A step that failed comes first.
+ */
+function ownWork(a: ActivityView, now: number): RunSlot[] {
+	const out: RunSlot[] = [];
+	if (a.failure) {
+		const f = a.failure;
+		const ago = now - f.at < 60_000 ? 'just now' : `${minutes(now - f.at)} ago`;
+		const what = [f.phase ? f.step : null, f.message].filter(Boolean).join(': ');
+		out.push({
+			key: 'failure',
+			state: 'failed',
+			batch: null,
+			label: `${f.phase ?? capital(f.step)} failed`,
+			branch: null,
+			detail: what ? `${what} (${ago})` : capital(ago),
+			prs: f.prs,
+			urgent: false
+		});
+	}
+	const { phase, step } = a;
+	if (phase) {
+		const took = elapsed(now - phase.since);
+		// No Actions link: CI starts only once its branch is pushed, and the run's own row links it then.
+		out.push({ key: 'activity', state: 'running', batch: null, label: phase.label, branch: null, detail: step ? `${step.label}, ${took}` : took, prs: phase.prs, urgent: false });
+	} else if (a.since !== null && now - a.since >= ROUTINE_SHOWN_AFTER_MS) {
+		const took = elapsed(now - a.since);
+		out.push({ key: 'activity', state: 'running', batch: null, label: 'Updating the queue', branch: null, detail: step ? `${step.label}, ${took}` : took, prs: step?.prs ?? [], urgent: false });
+	}
+	return out;
+}
+
+export function runOrder(input: { active: BatchCard[]; upNext: number[]; express: boolean; master?: MasterRun | null; activity?: ActivityView | null; now?: number }): RunSlot[] {
+	const running: RunSlot[] = input.activity ? ownWork(input.activity, input.now ?? Date.now()) : [];
 	const next: RunSlot[] = [];
 	// While the default branch is checked, nobody is ejected: its check is what they wait for.
 	const m = input.master;

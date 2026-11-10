@@ -15,9 +15,23 @@
 	type Loaded<T> = T extends Promise<infer V> ? V : never;
 	let pipe = $state<Loaded<typeof data.pipeline> | null>(null);
 	let board = $state<Loaded<typeof data.board> | null>(null);
+	// How far the server's clock is ahead of this browser's, so a step's running time is right.
+	let skew = $state(0);
+	// Ticks every second, so how long a step has been running counts up between refreshes.
+	let clock = $state(Date.now());
+	$effect(() => {
+		const id = setInterval(() => (clock = Date.now()), 1000);
+		return () => clearInterval(id);
+	});
 	$effect(() => {
 		let current = true;
-		data.pipeline.then((v) => current && (pipe = v)).catch(() => {});
+		data.pipeline
+			.then((v) => {
+				if (!current) return;
+				pipe = v;
+				skew = v.serverTime ? v.serverTime - Date.now() : 0;
+			})
+			.catch(() => {});
 		data.board.then((v) => current && (board = v)).catch(() => {});
 		return () => {
 			current = false;
@@ -50,7 +64,9 @@
 	const attention = $derived((board?.attention ?? []).filter((h: BoardHeld) => items.has(h.pr)));
 	// What runs CI now: the batches and their bisection steps. What comes next is not guessed.
 	// The check of the default branch is a run too: ejections wait for it.
-	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false, master: pipe.master ? { ...pipe.master, branch: data.repo.default_branch } : null }) : []);
+	// The queue's own work (forming a batch, a restack, landing) goes first: it shows nowhere else while it runs.
+	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false, master: pipe.master ? { ...pipe.master, branch: data.repo.default_branch } : null, activity: pipe.activity, now: clock + skew }) : []);
+	const forming = $derived(pipe?.activity?.phase?.kind === 'forming' ? pipe.activity.phase : null);
 
 	const MASTER: Record<string, { label: string; tone: string; hint: string }> = {
 		green: { label: 'green', tone: 'bg-green-100 text-green-800', hint: 'Batches build on it' },
@@ -227,18 +243,21 @@
 					<h2 id="run-order" class="mb-2 text-base font-semibold text-gray-900">Run order</h2>
 					<ol class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised text-sm">
 						{#each runs as r, i (r.key)}
-							<li class="flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 last:border-b-0 {r.state === 'running' ? 'bg-amber-50/60' : ''}">
+							<!-- The queue's own work: its step and running time go on a line of their own. -->
+							{@const own = r.key === 'activity' || r.state === 'failed'}
+							<li class="flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 last:border-b-0 {r.state === 'running' ? 'bg-amber-50/60' : r.state === 'failed' ? 'bg-red-50' : ''} {own ? 'flex-wrap' : ''}" role={r.state === 'failed' ? 'alert' : undefined}>
 								<span class="w-4 shrink-0 text-center text-xs text-gray-400">
-									{#if r.state === 'running'}<span class="inline-block h-2 w-2 rounded-full bg-amber-400 motion-safe:animate-pulse" role="img" aria-label="running"></span>{:else}{i + 1 - runs.filter((x) => x.state === 'running').length}{/if}
+									{#if r.state === 'running'}<span class="inline-block h-2 w-2 rounded-full bg-amber-400 motion-safe:animate-pulse" role="img" aria-label="running"></span>{:else if r.state === 'failed'}<span class="inline-block h-2 w-2 rounded-full bg-red-500" role="img" aria-label="failed"></span>{:else}{i + 1 - runs.filter((x) => x.state !== 'next').length}{/if}
 								</span>
 								{#if r.batch !== null}
 									<a href="#batch-{r.batch}" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600">{r.label}</a>
 								{:else}
-									<span class="shrink-0 font-medium {r.urgent ? 'text-indigo-700' : 'text-gray-900'}">{r.label}</span>
+									<span class="shrink-0 font-medium {r.state === 'failed' ? 'text-red-800' : r.urgent ? 'text-indigo-700' : 'text-gray-900'}">{r.label}</span>
 								{/if}
-								<span class="shrink-0 text-xs text-gray-500">{r.detail}</span>
+								{#if !own}<span class="shrink-0 text-xs text-gray-500">{r.detail}</span>{/if}
 								<span class="min-w-0 truncate text-xs text-gray-400" title={r.prs.map((n) => `#${n}`).join(' ')}>{r.prs.map((n) => `#${n}`).join(' ')}</span>
 								{#if r.branch}<a href={actionsUrl(data.repo.owner, data.repo.name, r.branch)} target="_blank" rel="noopener" class="ml-auto shrink-0 text-xs text-gray-500 hover:text-indigo-600" title="GitHub Actions runs of {r.branch}">Actions</a>{/if}
+								{#if own}<span class="min-w-0 basis-full break-words pl-6 text-xs tabular-nums {r.state === 'failed' ? 'font-mono text-red-700' : 'text-gray-600'}">{r.detail}</span>{/if}
 							</li>
 						{/each}
 					</ol>
@@ -251,7 +270,7 @@
 					</h2>
 					{#if pipe.active.length === 0}
 						<p class="text-sm text-gray-500">
-							{batchMode && inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.'}
+							{forming ? `Forming a batch of ${forming.prs.map((n) => `#${n}`).join(' ')}; its CI starts once its branch is pushed.` : batchMode && inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.'}
 						</p>
 					{/if}
 					{#each pipe.active as batch (batch.id)}

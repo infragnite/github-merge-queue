@@ -1,7 +1,8 @@
 import { env } from '$env/dynamic/private';
 import * as db from './db';
 import * as github from './github';
-import { getQueueSettings, updateQueueSettings } from './batch-store';
+import { getActiveBatches, getQueueSettings, updateQueueSettings } from './batch-store';
+import { withActivity } from './activity';
 import { GitHubError } from './github-retry';
 import { emitEvent } from './events';
 import { tickBatchQueue } from './batch-queue';
@@ -164,7 +165,9 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	lastBatchTick.set(repo.id, Date.now());
 	const started = Date.now();
 	try {
-		await withRepoLock(repo.id, () => tickBatchQueue(liveDeps(repo)));
+		// Tracked, so the queue page shows the step running (forming a batch, a restack) and a failed one.
+		const buildKind = () => (getActiveBatches(repo.id).some((b) => b.status === 'bisecting') ? ('bisect' as const) : ('forming' as const));
+		await withRepoLock(repo.id, () => withActivity(liveDeps(repo), tickBatchQueue, { buildKind }));
 		clearTickError(repo.id);
 	} catch (err) {
 		noteTickError(repo.id, err);

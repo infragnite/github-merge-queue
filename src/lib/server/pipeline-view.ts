@@ -5,6 +5,7 @@ import * as github from './github';
 import * as store from './batch-store';
 import { dashboardStackAnalysis } from './stack-runtime';
 import { tickError, type TickError } from './tick-errors';
+import { activityOf, type ActivityView } from './activity';
 import { batchCard, ciMayStillRun, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
 import type { StackAnalysis } from './stacks';
 
@@ -23,6 +24,10 @@ export interface PipelineView {
 	tickError: TickError | null;
 	/** Batch heads whose CI progress could not be read, with why (the last known progress is shown). */
 	progressErrors: Record<string, string>;
+	/** What the queue itself is doing now (forming a batch, restacking, landing), and its last failed step. */
+	activity: ActivityView;
+	/** The server's clock when this was read (epoch ms), so the page times steps by it, not its own. */
+	serverTime: number;
 }
 
 /**
@@ -95,6 +100,8 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 		error: null,
 		rateLimitedUntil: budget?.blockedUntil ?? null,
 		tickError: tickError(repo.id),
+		activity: activityOf(repo.id),
+		serverTime: Date.now(),
 		progressErrors: Object.fromEntries(
 			running.flatMap((b) => {
 				const why = progressErrors.get(`${repo.owner}/${repo.name}@${b.head_sha}`);
@@ -119,6 +126,13 @@ export function publicPipeline(p: PipelineView): PipelineView {
 		error: p.error ? 'Batches could not be loaded' : null,
 		rateLimitedUntil: p.rateLimitedUntil,
 		tickError: null,
-		progressErrors: {}
+		progressErrors: {},
+		activity: publicActivity(p.activity),
+		serverTime: p.serverTime
 	};
+}
+
+/** Which step runs and on which PRs is what the page already shows; why one failed is not (App internals). */
+export function publicActivity(a: ActivityView): ActivityView {
+	return { since: a.since, phase: a.phase, step: a.step, failure: a.failure ? { ...a.failure, message: null } : null };
 }
