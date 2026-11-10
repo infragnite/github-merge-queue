@@ -529,42 +529,58 @@ class Tick {
 	// --- landing ---
 
 	/**
-	 * How many of `prs`, from the first, may still land exactly as tested. The first one that can't
-	 * (pushed to, closed, left the queue, lost its approval) stops it: what comes after it was tested
-	 * on top of it as it was, so it is rebuilt.
+	 * The PRs of `prs` that can no longer land as tested (pushed to, closed, left the queue, lost
+	 * their approval), with the PRs stacked on them: those go back in line, the rest still land.
 	 */
-	async landablePrefix(batch: BatchRow, prs: number[]): Promise<number> {
+	async notLandable(batch: BatchRow, prs: number[], src: BatchRow): Promise<Set<number>> {
 		const config = this.settings().config;
 		const a = await this.analysis();
-		for (const [i, n] of prs.entries()) {
+		const out = new Set<number>();
+		for (const n of prs) {
 			const it = this.item(n);
 			if (!it || it.status !== 'checking') {
-				this.log(`#${n} left the queue while batch ${batch.id} was testing; rebuilding from it`);
-				return i;
+				this.log(`#${n} left the queue while batch ${batch.id} was testing; the rest lands without it`);
+				this.skip(out, prs, src, n);
+				continue;
 			}
 			const s = await this.state(n, true);
 			const p = await this.pr(n);
 			if (p.state !== 'open' || p.headSha !== batch.heads[n]) {
 				// The author pushed or closed it after the batch was built: what we tested is stale.
-				this.log(`#${n} changed after batch ${batch.id} was built; rebuilding from it`);
-				return i;
+				this.log(`#${n} changed after batch ${batch.id} was built; the rest lands without it`);
+				this.skip(out, prs, src, n);
+				continue;
 			}
 			// Reviews and drafts may have changed while the batch was testing; the batch's own CI stands in for the PR's.
 			const adm = admit({ ...s, ciGreen: true }, a, config);
 			if (!adm.ok) {
 				db.updateQueueItemStatus(it.id, 'checking', adm.reason);
-				this.log(`#${n} can no longer land: ${adm.reason}; rebuilding from it`);
-				return i;
+				this.log(`#${n} can no longer land: ${adm.reason}; the rest lands without it`);
+				this.skip(out, prs, src, n);
 			}
 		}
-		return prs.length;
+		return out;
+	}
+
+	/** Adds `n` to `out`, with every PR of `prs` stacked on it (directly or not). */
+	skip(out: Set<number>, prs: number[], src: BatchRow, n: number) {
+		out.add(n);
+		for (const m of prs) {
+			for (let p = src.steps[m]?.parent ?? null; p !== null && p !== undefined; p = src.steps[p]?.parent ?? null) {
+				if (out.has(p)) {
+					out.add(m);
+					break;
+				}
+			}
+		}
 	}
 
 	/**
-	 * Set when a landing stopped before a PR that changed since it was tested: the PRs before it
-	 * landed, but master then holds a tree no run tested on its own, so it is checked (not trusted).
+	 * PRs of the landing under way that are left out of it (changed, or no longer apply without
+	 * one that changed). Once any is, master holds a tree no run tested on its own: the rest still
+	 * lands, but master is then checked alone rather than trusted.
 	 */
-	stoppedEarly = false;
+	skipped = new Set<number>();
 
 	/**
 	 * Lands `prs` from `src` (the batch, or the bisection run that proved
@@ -572,25 +588,24 @@ class Tick {
 	 * before it, and after each merge the tree tested for that step.
 	 */
 	async land(batch: BatchRow, prs: number[], src: BatchRow): Promise<boolean> {
-		// The PRs before one that can no longer land as tested still land; it and the rest are rebuilt.
-		const k = await this.landablePrefix(batch, prs);
-		if (k === 0) return false;
-		const part = prs.slice(0, k);
-		this.stoppedEarly = k < prs.length;
+		// A PR that can no longer land as tested goes back in line, with what is stacked on it; the
+		// rest of the group was tested as one tree with it, so no subset is safer than another: all
+		// of the rest lands, and master is then checked alone.
+		this.skipped = await this.notLandable(batch, prs, src);
+		const part = prs.filter((n) => !this.skipped.has(n));
+		if (!part.length) return false;
 		// Recorded before the first merge: a crash before it is cleared is finished by `recoverLanding`.
 		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs: part });
 		const merged: number[] = [];
-		const ok = (await this.landNow(batch, part, src, merged)) && !this.stoppedEarly;
+		const ok = (await this.landNow(batch, part, src, merged)) && this.skipped.size === 0;
 		// What landed is recorded together with clearing the intent, so a crash can't split them.
-		// A landing that stopped part way still merged its first PRs: master holds the tree tested
-		// for the last of them, so it is known green, and a bisection carries those PRs as landed.
-		const tested = merged.length ? src.steps[merged.at(-1)!].tree : null;
-		const partialGreen = !ok && !this.stoppedEarly && tested !== null && this.partialSha !== null && (await this.d.git.tree(this.partialSha).catch(() => null)) === tested;
+		// A landing of part of the group (one stopped, or left PRs out) puts on master a tree no run
+		// tested on its own (only the whole group was), so it is not marked green; the next tick
+		// checks it alone, and a bisection carries those PRs as landed.
 		const record = () => {
-			if (partialGreen) store.setMasterHealth(this.repoId, { sha: this.partialSha!, tree: tested!, state: 'green', since: this.d.now() });
 			if (merged.length && batch.status === 'bisecting') {
 				// Unless master is known to hold what landed, the batch keeps its base; the master move is handled next tick.
-				const h = ok || partialGreen ? store.getMasterHealth(this.repoId)! : { sha: batch.base_sha, tree: batch.base_tree };
+				const h = ok ? store.getMasterHealth(this.repoId)! : { sha: batch.base_sha, tree: batch.base_tree };
 				store.recordBisectLanding(batch.id, merged, h.sha, h.tree);
 				if (ok) store.setBatchStatus(src.id, 'landed');
 			}
@@ -647,11 +662,15 @@ class Tick {
 			await this.d.git.fetch([master]);
 			const tree = await this.d.git.tree(master);
 			const last = intent.prs.filter((n) => merged.includes(n)).at(-1)!;
+			const all = merged.length === intent.prs.length;
 			if (src.steps[last]?.tree === tree) {
-				// Master holds exactly the tested tree: it is the queue's landing, known green.
-				store.setMasterHealth(this.repoId, { sha: master, tree, state: 'green', since: this.d.now() });
-				if (batch.status === 'bisecting') store.recordBisectLanding(batch.id, merged.filter((n) => !batch.landed.includes(n)), master, tree);
-				else if (merged.length === intent.prs.length && batch.status === 'passed') {
+				// Master holds the queue's landing. Only all of it is a tree a run tested; part of it is
+				// checked alone next tick (master's health is left as it was, for an older tree).
+				if (all) store.setMasterHealth(this.repoId, { sha: master, tree, state: 'green', since: this.d.now() });
+				if (batch.status === 'bisecting') {
+					const h = all ? { sha: master, tree } : { sha: batch.base_sha, tree: batch.base_tree };
+					store.recordBisectLanding(batch.id, merged.filter((n) => !batch.landed.includes(n)), h.sha, h.tree);
+				} else if (all && batch.status === 'passed') {
 					store.setBatchStatus(batch.id, 'landed');
 					await this.retire(batch);
 				}
@@ -663,35 +682,34 @@ class Tick {
 	}
 
 	/**
-	 * `n` changed (pushed to or closed) while the PRs before it were landing. No pause: what landed
-	 * stays, master is checked alone (it holds a tree no run tested), `n` goes back in line with its
-	 * new head and the PRs after it are rebuilt, by the caller, on the new master.
+	 * `n` changed (pushed to or closed) while its batch was landing. No pause: it goes back in line
+	 * with its new head, with what is stacked on it; the rest still lands, and master is then
+	 * checked alone (it holds a tree no run tested).
 	 */
-	changedWhileLanding(batch: BatchRow, n: number, now: LivePR) {
-		this.stoppedEarly = true;
-		this.log(`#${n} ${now.state !== 'open' ? 'was closed' : 'was pushed to'} while batch ${batch.id} was landing; landing stops before it, the rest is rebuilt`);
+	changedWhileLanding(batch: BatchRow, n: number, now: LivePR, prs: number[], src: BatchRow) {
+		this.skip(this.skipped, prs, src, n);
+		this.log(`#${n} ${now.state !== 'open' ? 'was closed' : 'was pushed to'} while batch ${batch.id} was landing; the rest lands without it`);
 		this.event(n, 'changed', { batch: batch.id, from: batch.heads[n], to: now.headSha });
 	}
-
-	/** The default branch after the last merge of a landing that stopped part way. */
-	partialSha: string | null = null;
 
 	/** Lands `prs` in order; each PR it merges is appended to `merged`, whatever the result. */
 	async landNow(batch: BatchRow, prs: number[], src: BatchRow, merged: number[] = []): Promise<boolean> {
 		const def = this.d.repo.default_branch;
-		this.partialSha = null;
 
 		let master = await this.d.github.defaultBranchSha();
 		await this.d.git.fetch([master]);
 		let expected = src.base_tree;
 		for (const n of prs) {
 			if (this.settings().pausedReason) return false;
+			if (this.skipped.has(n)) continue;
 			if (!this.item(n)) {
-				// Dequeued while the PRs before it were landing: stop here; the rest is rebuilt on the new master.
-				this.log(`#${n} left the queue while batch ${batch.id} was landing; rebuilding the rest`);
-				return false;
+				// Dequeued while the PRs before it were landing: the rest lands without it.
+				this.log(`#${n} left the queue while batch ${batch.id} was landing; the rest lands without it`);
+				this.skip(this.skipped, prs, src, n);
+				continue;
 			}
-			if ((await this.d.git.tree(master)) !== expected) {
+			// Each merge lands exactly the tree tested for its step, unless a PR was left out.
+			if (!this.skipped.size && (await this.d.git.tree(master)) !== expected) {
 				this.pause(`Master changed while batch ${batch.id} was landing (before #${n}); was something merged outside the queue?`);
 				return false;
 			}
@@ -700,15 +718,21 @@ class Tick {
 			const p = await this.pr(n, true);
 			let head = batch.heads[n];
 			if (p.state !== 'open' || p.headSha !== head) {
-				this.changedWhileLanding(batch, n, p);
-				return false;
+				this.changedWhileLanding(batch, n, p, prs, src);
+				continue;
 			}
 			if (step.fork) {
 				// A stacked child: its parent just landed as a squash commit, so restack the child's own
 				// commits onto master; GitHub's squash of the restacked head is then the tested tree.
 				await this.d.git.fetch([head, step.fork]);
 				const r = await this.d.git.restack(head, step.fork, master);
-				if (!r.ok || r.tree !== step.tree) {
+				if (this.skipped.size && !r.ok) {
+					// It only applied on top of a PR left out: back in line with it.
+					this.log(`#${n} does not apply without the PRs left out of batch ${batch.id}; back in line`);
+					this.skip(this.skipped, prs, src, n);
+					continue;
+				}
+				if (!r.ok || (!this.skipped.size && r.tree !== step.tree)) {
 					this.pause(`Could not restack #${n} onto master to land it: ${r.ok ? 'the result differs from the tested tree' : r.reason}`);
 					return false;
 				}
@@ -750,11 +774,21 @@ class Tick {
 			}
 			if (!m.merged) {
 				// Pushed to between the check above and the merge: GitHub refuses a merge at a stale head.
-				const now = await this.pr(n, true).catch(() => null);
+				const now = await this.pr(n, true).catch((e) => {
+					if (e instanceof RateLimitedError) throw e;
+					return null;
+				});
 				if (now && (now.state !== 'open' || now.headSha !== head)) {
 					await this.d.github.setPRStatus(head, 'pending', short(`Changed while batch ${batch.id} was landing; back in line`)).catch(this.bestEffort('github.setPRStatus'));
-					this.changedWhileLanding(batch, n, now);
-					return false;
+					this.changedWhileLanding(batch, n, now, prs, src);
+					continue;
+				}
+				if (this.skipped.size) {
+					// With a PR left out it may no longer apply (it was tested on top of that one): back in line.
+					await this.d.github.setPRStatus(head, 'pending', short(`Did not merge without the PRs left out of batch ${batch.id}; back in line`)).catch(this.bestEffort('github.setPRStatus'));
+					this.log(`#${n} did not merge without the PRs left out of batch ${batch.id} (${m.message ?? 'merge refused'}); back in line`);
+					this.skip(this.skipped, prs, src, n);
+					continue;
 				}
 				await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (landing stopped)`)).catch(this.bestEffort('github.setPRStatus'));
 				this.pause(`Landing batch ${batch.id} stopped at #${n}: ${m.message ?? 'merge refused'}`);
@@ -762,7 +796,6 @@ class Tick {
 			}
 			merged.push(n);
 			master = m.sha ?? (await this.d.github.defaultBranchSha());
-			this.partialSha = master;
 			await this.d.git.fetch([master]);
 			const it = this.item(n);
 			if (it) {
@@ -772,17 +805,17 @@ class Tick {
 			this.event(n, 'merged', { batch: batch.id, sha: master });
 			expected = step.tree;
 		}
+		if (this.skipped.size) {
+			// Part of the group: this tree was never tested on its own. Master is left unknown, so the
+			// next tick checks it alone; what was left out goes back in line.
+			this.log(`batch ${batch.id} landed ${merged.map((n) => `#${n}`).join(' ') || 'nothing'}; back in line: ${[...this.skipped].map((n) => `#${n}`).join(' ')}`);
+			this.analysisCache = null;
+			this.forgetPRs();
+			return merged.length > 0;
+		}
 		if ((await this.d.git.tree(master)) !== expected) {
 			this.pause(`Master after batch ${batch.id} does not match the tested tree; was something merged outside the queue?`);
 			return false;
-		}
-		if (this.stoppedEarly) {
-			// Only the PRs before one that changed: this tree was never tested on its own. Master is
-			// left unknown, so the next tick checks it alone while the rest is rebuilt on top of it.
-			this.log(`batch ${batch.id} landed ${prs.map((n) => `#${n}`).join(' ')}; the rest is rebuilt`);
-			this.analysisCache = null;
-			this.forgetPRs();
-			return true;
 		}
 		await this.d.github.setStatus(master, 'success', `Tree tested in ${src.branch} (${src.head_sha.slice(0, 7)})`);
 		this.log(`batch ${batch.id} landed: ${prs.map((n) => `#${n}`).join(' ')}`);
