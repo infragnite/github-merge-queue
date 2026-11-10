@@ -303,7 +303,8 @@ class Tick {
 		this.log(`ejected #${n}: ${reason}`);
 	}
 
-	async ejectWithStack(culprits: { pr: number; reason: string; link?: string }[]) {
+	/** Ejects the culprits and the PRs stacked on them; returns every PR it ejected. */
+	async ejectWithStack(culprits: { pr: number; reason: string; link?: string }[]): Promise<number[]> {
 		const a = await this.analysis();
 		const done = new Set<number>();
 		for (const c of culprits) {
@@ -314,7 +315,9 @@ class Tick {
 			if (done.has(n) || !this.item(n)) continue;
 			const p = a.prs.get(n)?.parent;
 			await this.eject(n, `Stacked on #${p}, which failed in the queue`);
+			done.add(n);
 		}
+		return [...done];
 	}
 
 	requeue(prs: number[]) {
@@ -1172,8 +1175,10 @@ class Tick {
 				const landed = batch.landed.length ? `, which landed ${batch.landed.map((n) => `#${n}`).join(', ')}` : '';
 				culprits.push({ pr: e.pr, reason: `${e.reason} (batch ${batch.id}${landed})`, link: await this.runLink(all[e.run]) });
 			}
-			store.leaveBatch(batch.id, plan.eject.map((e) => e.pr));
-			await this.ejectWithStack(culprits);
+			store.leaveBatch(batch.id, plan.eject.map((e) => e.pr), { ejected: true });
+			const out = await this.ejectWithStack(culprits);
+			// Children in the batch went with their parent: ejected too, not back in line.
+			store.leaveBatch(batch.id, out.filter((n) => batch.members.includes(n)), { ejected: true });
 		}
 		if (plan.requeue.length) {
 			store.leaveBatch(batch.id, plan.requeue);

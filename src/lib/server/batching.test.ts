@@ -452,9 +452,10 @@ describe('bisection', () => {
 			requeue: [],
 			done: false
 		});
-		// Not failed alone on a branch known green: the batch's failure still points at what's left of it.
+		// Not failed alone on a branch known green: the batch's failure still points at what's left
+		// of it, split in two; both halves passed, so they run as one pool to land together.
 		expect(planBisection({ runs, remaining: [2, 3, 4], masterTree: 'm1', parentOf: () => null, trusted: (t) => t === 'm1' })).toMatchObject({
-			start: [[2], [3, 4]]
+			start: [[2, 3, 4]]
 		});
 	});
 
@@ -475,7 +476,7 @@ describe('bisection', () => {
 		expect(plan(2)).toMatchObject({ start: [[1, 2]] });
 	});
 
-	test('batch 13 on krusty: with one slot, one run, and no passed group re-tested on its own', () => {
+	test('batch 13 on krusty: with one slot, one run, all that passed pooled in it', () => {
 		// The recorded runs (trees shortened) when seven ran at once, three of them groups that had passed.
 		const r = (members: number[], baseTree: string, result: BisectRun['result']): BisectRun => ({ context: [], members, baseTree, result });
 		const runs: BisectRun[] = [
@@ -507,8 +508,9 @@ describe('bisection', () => {
 			trusted: (t) => ['fb72', '6b83', '2731', '7154'].includes(t),
 			slots: 1
 		});
-		// #3280 passed and no failure left points at it: it goes first, and lands if it passes.
-		expect(step).toEqual({ kind: 'step', eject: [], start: [[3280]], requeue: [], done: false });
+		// Everything that passed goes first, as one run: #3280 (no failure left points at it) and both
+		// halves of [3309 3292 3257], each of which passed. It lands them all if it passes.
+		expect(step).toEqual({ kind: 'step', eject: [], start: [[3280, 3309, 3292, 3257]], requeue: [], done: false });
 	});
 
 	test('a PR that never passed is not pooled with PRs that passed: it runs after them, apart', () => {
@@ -558,6 +560,18 @@ describe('bisection', () => {
 		];
 		const step = planBisection({ runs, remaining: [3280, 3345, 3342, 3309, 3296, 3288, 2600], masterTree: 'm1', parentOf, trusted: () => true, slots: 1 });
 		expect(step).toMatchObject({ start: [[3280, 3345, 3342, 3309]] });
+	});
+
+	test('a pool of PRs that passed which fails on this branch is not run again: its groups run apart', () => {
+		const runs: BisectRun[] = [
+			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [1, 2], baseTree: 'm0', result: 'success' },
+			{ context: [], members: [3, 4], baseTree: 'm0', result: 'success' },
+			// Pooled on the new branch: they fail together (an interaction).
+			{ context: [], members: [1, 2, 3, 4], baseTree: 'm1', result: 'failure' }
+		];
+		const step = planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm1', parentOf: () => null, trusted: () => true, slots: 1 });
+		expect(step).toMatchObject({ start: [[1, 2]] });
 	});
 
 	test('a single-PR group with a failure only in a larger run is run alone first', () => {
