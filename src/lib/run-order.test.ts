@@ -5,6 +5,7 @@ import type { BatchCard, BatchPR } from './server/batch-view';
 const pr = (n: number, extra: Partial<BatchPR> = {}): BatchPR => ({ pr: n, title: '', url: '', depth: 0, parent: null, link: null, ...extra });
 const card = (id: number, over: Partial<BatchCard>): BatchCard => ({
 	id,
+	number: id,
 	kind: 'batch',
 	branch: `mq/${id}`,
 	status: 'testing',
