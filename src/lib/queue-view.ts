@@ -30,6 +30,8 @@ export interface StackPlace {
 export interface FlightGroup {
 	/** The batch the PRs are being tested in. */
 	batch: number;
+	/** Its number as shown. */
+	number: number;
 	status: string;
 	prs: number[];
 }
@@ -64,7 +66,7 @@ export interface QueueViewInput {
 	items: ViewItem[];
 	mode: 'serial' | 'batch';
 	/** Batches being tested (not bisection or try runs), with their members. */
-	batches: Array<{ id: number; status: string; prs: number[] }>;
+	batches: Array<{ id: number; number?: number; status: string; prs: number[] }>;
 	stacks: Array<{ root: number; rows: Array<{ pr: number; depth: number; broken: boolean; issues: Array<{ severity: string; message: string }> }> }> | null;
 	limits: { maxBatch: number; expressMax: number };
 }
@@ -109,7 +111,7 @@ export function queueView(input: QueueViewInput): QueueView {
 
 	const attention: Attention[] = [];
 	const inFlight: FlightGroup[] = batches
-		.map((b) => ({ batch: b.id, status: b.status, prs: b.prs.filter((n) => items.some((i) => i.pr_number === n)) }))
+		.map((b) => ({ batch: b.id, number: b.number ?? b.id, status: b.status, prs: b.prs.filter((n) => items.some((i) => i.pr_number === n)) }))
 		.filter((g) => g.prs.length > 0);
 	const rest: ViewItem[] = [];
 	for (const i of items) {

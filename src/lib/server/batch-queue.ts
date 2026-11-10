@@ -136,6 +136,9 @@ export interface QueueDeps {
 	log?: (msg: string) => void;
 }
 
+/** Why a PR deferred behind `ahead` waits. */
+const deferredReason = (ahead: number[]) => `Conflicts with ${ahead.map((a) => `#${a}`).join(' ')} ahead of it; waits for them to land`;
+
 const LIVE = ['queued', 'checking', 'updating', 'merging', 'conflict'];
 export const CONFLICT_LABEL = 'needs-rebase';
 
@@ -332,17 +335,17 @@ class Tick {
 	 * to the queue; after a few such failures it leaves, so an unexplained
 	 * (flaky) failure can't loop forever.
 	 */
-	async requeueAfterFailure(prs: number[], batchId: number) {
+	async requeueAfterFailure(prs: number[], batch: BatchRow) {
 		for (const n of prs) {
 			const it = this.item(n);
 			if (!it) continue;
 			if (store.bumpBatchFailures(it.id) >= MAX_BATCH_FAILURES) {
 				await this.ejectWithStack([
-					{ pr: n, reason: `failed in ${MAX_BATCH_FAILURES} batches without a clear culprit (flaky tests?), last batch ${batchId}` }
+					{ pr: n, reason: `failed in ${MAX_BATCH_FAILURES} batches without a clear culprit (flaky tests?), last batch ${batch.number}` }
 				]);
 			} else {
 				db.updateQueueItemStatus(it.id, 'queued');
-				this.event(n, 'requeued', { batch: batchId });
+				this.event(n, 'requeued', { batch: batch.id, number: batch.number });
 			}
 		}
 	}
@@ -442,7 +445,7 @@ class Tick {
 		if (alone.ok && it) {
 			const ahead = [...below, ...prs.slice(0, prs.indexOf(r.pr))];
 			store.setDeferredFor(it.id, ahead);
-			db.updateQueueItemStatus(it.id, 'queued', `Conflicts with ${ahead.map((a) => `#${a}`).join(' ')} ahead of it; waits for them to land`);
+			db.updateQueueItemStatus(it.id, 'queued', deferredReason(ahead));
 			this.event(r.pr, 'deferred', { behind: ahead, reason: r.reason });
 			this.log(`#${r.pr} deferred: ${r.reason}`);
 		} else {
@@ -522,7 +525,7 @@ class Tick {
 					.catch(this.bestEffort('github.setPRStatus'));
 			}
 		}
-		this.log(`batch ${batch.id} started: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
+		this.log(`batch ${batch.number} started: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
 		return 'started';
 	}
 
@@ -539,7 +542,7 @@ class Tick {
 		for (const n of prs) {
 			const it = this.item(n);
 			if (!it || it.status !== 'checking') {
-				this.log(`#${n} left the queue while batch ${batch.id} was testing; the rest lands without it`);
+				this.log(`#${n} left the queue while batch ${batch.number} was testing; the rest lands without it`);
 				this.skip(out, prs, n);
 				continue;
 			}
@@ -547,7 +550,7 @@ class Tick {
 			const p = await this.pr(n);
 			if (p.state !== 'open' || p.headSha !== batch.heads[n]) {
 				// The author pushed or closed it after the batch was built: what we tested is stale.
-				this.log(`#${n} changed after batch ${batch.id} was built; the rest lands without it`);
+				this.log(`#${n} changed after batch ${batch.number} was built; the rest lands without it`);
 				this.skip(out, prs, n);
 				continue;
 			}
@@ -682,7 +685,7 @@ class Tick {
 					await this.retire(batch);
 				}
 			}
-			this.log(`recovered an interrupted landing of batch ${batch.id}: merged ${merged.map((n) => `#${n}`).join(' ')}`);
+			this.log(`recovered an interrupted landing of batch ${batch.number}: merged ${merged.map((n) => `#${n}`).join(' ')}`);
 		}
 		store.setLandingIntent(this.repoId, null);
 		this.forgetPRs();
@@ -695,7 +698,7 @@ class Tick {
 	 */
 	changedWhileLanding(batch: BatchRow, n: number, now: LivePR, prs: number[], src: BatchRow) {
 		this.skip(this.skipped, prs, n);
-		this.log(`#${n} ${now.state !== 'open' ? 'was closed' : 'was pushed to'} while batch ${batch.id} was landing; the rest lands without it`);
+		this.log(`#${n} ${now.state !== 'open' ? 'was closed' : 'was pushed to'} while batch ${batch.number} was landing; the rest lands without it`);
 		this.event(n, 'changed', { batch: batch.id, from: batch.heads[n], to: now.headSha });
 	}
 
@@ -711,14 +714,14 @@ class Tick {
 			if (this.skipped.has(n)) continue;
 			if (!this.item(n)) {
 				// Dequeued while the PRs before it were landing: the rest lands without it.
-				this.log(`#${n} left the queue while batch ${batch.id} was landing; the rest lands without it`);
+				this.log(`#${n} left the queue while batch ${batch.number} was landing; the rest lands without it`);
 				this.skip(this.skipped, prs, n);
 				continue;
 			}
 			// Each merge lands exactly the tree tested for its step; once a PR is left out, only the
 			// first merge still has one (the group's base): something merged around the queue is a pause.
 			if ((!this.skipped.size || !merged.length) && (await this.d.git.tree(master)) !== expected) {
-				this.pause(`Master changed while batch ${batch.id} was landing (before #${n}); was something merged outside the queue?`);
+				this.pause(`Master changed while batch ${batch.number} was landing (before #${n}); was something merged outside the queue?`);
 				return false;
 			}
 			const step = src.steps[n];
@@ -736,7 +739,7 @@ class Tick {
 				const r = await this.d.git.restack(head, step.fork, master);
 				if (this.skipped.size && !r.ok) {
 					// It only applied on top of a PR left out: back in line with it.
-					this.log(`#${n} does not apply without the PRs left out of batch ${batch.id}; back in line`);
+					this.log(`#${n} does not apply without the PRs left out of batch ${batch.number}; back in line`);
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
@@ -787,19 +790,19 @@ class Tick {
 					return null;
 				});
 				if (now && (now.state !== 'open' || now.headSha !== head)) {
-					await this.d.github.setPRStatus(head, 'pending', short(`Changed while batch ${batch.id} was landing; back in line`)).catch(this.bestEffort('github.setPRStatus'));
+					await this.d.github.setPRStatus(head, 'pending', short(`Changed while batch ${batch.number} was landing; back in line`)).catch(this.bestEffort('github.setPRStatus'));
 					this.changedWhileLanding(batch, n, now, prs, src);
 					continue;
 				}
 				if (this.skipped.size) {
 					// With a PR left out it may no longer apply (it was tested on top of that one): back in line.
-					await this.d.github.setPRStatus(head, 'pending', short(`Did not merge without the PRs left out of batch ${batch.id}; back in line`)).catch(this.bestEffort('github.setPRStatus'));
-					this.log(`#${n} did not merge without the PRs left out of batch ${batch.id} (${m.message ?? 'merge refused'}); back in line`);
+					await this.d.github.setPRStatus(head, 'pending', short(`Did not merge without the PRs left out of batch ${batch.number}; back in line`)).catch(this.bestEffort('github.setPRStatus'));
+					this.log(`#${n} did not merge without the PRs left out of batch ${batch.number} (${m.message ?? 'merge refused'}); back in line`);
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
 				await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (landing stopped)`)).catch(this.bestEffort('github.setPRStatus'));
-				this.pause(`Landing batch ${batch.id} stopped at #${n}: ${m.message ?? 'merge refused'}`);
+				this.pause(`Landing batch ${batch.number} stopped at #${n}: ${m.message ?? 'merge refused'}`);
 				return false;
 			}
 			merged.push(n);
@@ -816,17 +819,17 @@ class Tick {
 		if (this.skipped.size) {
 			// Part of the group: this tree was never tested on its own. Master is left unknown, so the
 			// next tick checks it alone; what was left out goes back in line.
-			this.log(`batch ${batch.id} landed ${merged.map((n) => `#${n}`).join(' ') || 'nothing'}; back in line: ${[...this.skipped].map((n) => `#${n}`).join(' ')}`);
+			this.log(`batch ${batch.number} landed ${merged.map((n) => `#${n}`).join(' ') || 'nothing'}; back in line: ${[...this.skipped].map((n) => `#${n}`).join(' ')}`);
 			this.analysisCache = null;
 			this.forgetPRs();
 			return merged.length > 0;
 		}
 		if ((await this.d.git.tree(master)) !== expected) {
-			this.pause(`Master after batch ${batch.id} does not match the tested tree; was something merged outside the queue?`);
+			this.pause(`Master after batch ${batch.number} does not match the tested tree; was something merged outside the queue?`);
 			return false;
 		}
 		await this.d.github.setStatus(master, 'success', `Tree tested in ${src.branch} (${src.head_sha.slice(0, 7)})`);
-		this.log(`batch ${batch.id} landed: ${prs.map((n) => `#${n}`).join(' ')}`);
+		this.log(`batch ${batch.number} landed: ${prs.map((n) => `#${n}`).join(' ')}`);
 		// The tree on master passed CI. The default-branch run started now confirms it in that
 		// branch's environment; until it does, failures on top of it wait rather than eject.
 		// (Only a run on the default branch itself reports on this commit.)
@@ -1077,7 +1080,7 @@ class Tick {
 			if (await this.land(passed, b.members, passed)) {
 				store.setBatchStatus(b.id, 'landed');
 				await this.retire(b);
-				this.log(`batch ${b.id} fixed ${this.d.repo.default_branch}`);
+				this.log(`batch ${b.number} fixed ${this.d.repo.default_branch}`);
 			} else if (!this.settings().pausedReason) {
 				await this.supersede([b]);
 			}
@@ -1100,7 +1103,7 @@ class Tick {
 			if (r === 'pending') {
 				if (this.timedOut(head)) {
 					await this.supersede([head, ...rest]);
-					this.pause(`Batch ${head.id} (${head.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
+					this.pause(`Batch ${head.number} (${head.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
 				}
 				return;
 			}
@@ -1127,7 +1130,7 @@ class Tick {
 			} else if (rerun === 'rerun') {
 				store.setBatchStatus(head.id, 'retrying');
 				store.setBatchRetried(head.id, this.d.now());
-				this.log(`batch ${head.id} failed; re-running failed jobs`);
+				this.log(`batch ${head.number} failed; re-running failed jobs`);
 				return;
 			} else {
 				// Everything built on top of a failed batch has to be rebuilt.
@@ -1212,7 +1215,7 @@ class Tick {
 			if (!p || p.state !== 'open' || p.headSha !== batch.heads[n]) changed.push(n);
 		}
 		if (gone.length || changed.length) {
-			if (changed.length) this.log(`batch ${batch.id}: ${changed.map((n) => `#${n}`).join(' ')} changed since it was batched; back in line`);
+			if (changed.length) this.log(`batch ${batch.number}: ${changed.map((n) => `#${n}`).join(' ')} changed since it was batched; back in line`);
 			const out = await this.leaveBisection(batch, [...gone, ...changed]);
 			remaining.splice(0, remaining.length, ...remaining.filter((n) => !out.includes(n)));
 		}
@@ -1238,7 +1241,7 @@ class Tick {
 		if (plan.kind === 'land') {
 			const proof = all[plan.run];
 			if (await this.land(batch, plan.prs, proof)) {
-				this.log(`batch ${batch.id}: landed ${plan.prs.map((n) => `#${n}`).join(' ')} from ${proof.branch} while bisecting`);
+				this.log(`batch ${batch.number}: landed ${plan.prs.map((n) => `#${n}`).join(' ')} from ${proof.branch} while bisecting`);
 				if (remaining.every((n) => plan.prs.includes(n))) await this.finishBisection(batch, runs, true);
 			} else if (!this.settings().pausedReason) {
 				// It can no longer land as tested (a PR was pushed to, closed, or lost its approval):
@@ -1259,7 +1262,7 @@ class Tick {
 			const culprits = [];
 			for (const e of plan.eject) {
 				const landed = batch.landed.length ? `, which landed ${batch.landed.map((n) => `#${n}`).join(', ')}` : '';
-				culprits.push({ pr: e.pr, reason: `${e.reason} (batch ${batch.id}${landed})`, link: await this.runLink(all[e.run]) });
+				culprits.push({ pr: e.pr, reason: `${e.reason} (batch ${batch.number}${landed})`, link: await this.runLink(all[e.run]) });
 			}
 			store.leaveBatch(batch.id, plan.eject.map((e) => e.pr), { ejected: true });
 			const out = await this.ejectWithStack(culprits);
@@ -1268,7 +1271,7 @@ class Tick {
 		}
 		if (plan.requeue.length) {
 			store.leaveBatch(batch.id, plan.requeue);
-			await this.requeueAfterFailure(plan.requeue, batch.id);
+			await this.requeueAfterFailure(plan.requeue, batch);
 			await this.leaveBisection(batch, plan.requeue);
 		}
 		if (plan.done) {
@@ -1278,7 +1281,7 @@ class Tick {
 		// Between two steps, urgent PRs go first: each step is planned again on whatever master is
 		// then, so the bisection picks up where it was once they land.
 		if (interleave && plan.start.length && (await this.plan([batch], masterSha, { urgentOnly: true })) === 'started') {
-			this.log(`batch ${batch.id}: bisection waits for an urgent batch`);
+			this.log(`batch ${batch.number}: bisection waits for an urgent batch`);
 			return;
 		}
 		for (const g of plan.start) await this.startBisectRun(batch, { context: [], members: g }, runs.length, masterSha, masterTree);
@@ -1337,7 +1340,7 @@ class Tick {
 			// They don't apply on the default branch as it is now (something landed meanwhile): not a
 			// CI failure, and no run; they go back in line, where a conflict is handled the usual way.
 			await this.leaveBisection(batch, g.members);
-			this.log(`batch ${batch.id}: ${g.members.map((n) => `#${n}`).join(' ')} no longer build on the default branch; back in line`);
+			this.log(`batch ${batch.number}: ${g.members.map((n) => `#${n}`).join(' ')} no longer build on the default branch; back in line`);
 			return;
 		}
 		const branch = `${batch.branch}-bisect-${seq + 1}-${this.d.now()}`;
@@ -1375,7 +1378,7 @@ class Tick {
 		const link = this.branchRuns(branch);
 		for (const n of g.members) {
 			await this.d.github
-				.setPRStatus(batch.heads[n], 'pending', short(`Batch ${batch.id} failed; testing ${g.members.length === 1 ? `#${n} alone` : `${g.members.length} of its PRs`} in ${branch}`), { url: link })
+				.setPRStatus(batch.heads[n], 'pending', short(`Batch ${batch.number} failed; testing ${g.members.length === 1 ? `#${n} alone` : `${g.members.length} of its PRs`} in ${branch}`), { url: link })
 				.catch(this.bestEffort('github.setPRStatus'));
 		}
 	}
@@ -1593,8 +1596,19 @@ class Tick {
 		const waiting = this.items().filter((i) => {
 			if (i.status !== 'queued') return false;
 			const behind = store.deferredFor(i as QueueItem & { deferred_for?: string | null });
-			if (behind.some((b) => blocking.has(b))) return false;
-			if (behind.length) store.setDeferredFor(i.id, null);
+			const still = behind.filter((b) => blocking.has(b));
+			if (still.length) {
+				// Say what it still waits for: PRs it was deferred behind that have landed since don't count.
+				if (still.length < behind.length) {
+					store.setDeferredFor(i.id, still);
+					db.updateQueueItemStatus(i.id, 'queued', deferredReason(still));
+				}
+				return false;
+			}
+			if (behind.length) {
+				store.setDeferredFor(i.id, null);
+				if (i.error_message === deferredReason(behind) || i.error_message?.startsWith('Conflicts with #')) db.updateQueueItemStatus(i.id, 'queued');
+			}
 			return true;
 		});
 		if (waiting.length === 0) return 'idle';
@@ -1665,7 +1679,7 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 			// what passes is run again on top of the new commit. Batches built on it are rebuilt; an
 			// urgent batch that ran between its steps and is bisecting itself follows it too.
 			for (const b of active.filter((b) => b.status === 'bisecting' && b.base_tree !== tree)) {
-				t.log(`master moved; batch ${b.id} bisects on top of it`);
+				t.log(`master moved; batch ${b.number} bisects on top of it`);
 				store.rebaseBatch(b.id, masterSha, tree);
 			}
 			await t.supersede(active.slice(1).filter((b) => b.status !== 'bisecting'));
@@ -1746,16 +1760,16 @@ export async function cancelBatch(deps: QueueDeps, id: number, by: string): Prom
 	const b = store.getBatch(id);
 	if (!b || b.repo_id !== deps.repo.id || b.kind !== 'batch') throw new Error(`Batch ${id} not found`);
 	const active = store.getActiveBatches(deps.repo.id);
-	if (!active.some((x) => x.id === id)) throw new Error(`Batch ${id} is ${b.status}; only a batch being tested or bisected can be cancelled`);
+	if (!active.some((x) => x.id === id)) throw new Error(`Batch ${b.number} is ${b.status}; only a batch being tested or bisected can be cancelled`);
 	const waiting = (x: BatchRow) => x.members.filter((n) => t.item(n)?.status === 'checking');
 	const requeued = waiting(b);
 	const above = active.filter((x) => x.id > id);
-	await t.supersede([b], `batch ${id} was cancelled by ${by}`);
+	await t.supersede([b], `batch ${b.number} was cancelled by ${by}`);
 	store.setBatchStatus(id, 'cancelled');
 	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled');
-	await t.supersede(above, `batch ${id} below it was cancelled`);
-	t.event(null, 'cancelled', { batch: id, by, requeued, rebuilt: above.map((x) => x.id) });
-	t.log(`batch ${id} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
+	await t.supersede(above, `batch ${b.number} below it was cancelled`);
+	t.event(null, 'cancelled', { batch: id, number: b.number, by, requeued, rebuilt: above.map((x) => x.id) });
+	t.log(`batch ${b.number} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
 	return { requeued, rebuilt: above.map((x) => x.id) };
 }
 

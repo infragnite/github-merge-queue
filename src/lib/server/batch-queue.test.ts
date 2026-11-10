@@ -507,7 +507,7 @@ describe('batch queue runtime', () => {
 		expect(of('pr2').map((x) => [x.state, x.description.split(';')[0].split(':')[0], x.url])).toEqual([
 			['pending', `Testing in ${branch} with 1 other PR(s)`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`],
 			['pending', `${branch} failed`, `https://ci.example/${world.started[0].head}`],
-			['pending', `Batch ${store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!.id} failed`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${world.started[2].branch}`)}`],
+			['pending', `Batch ${store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!.number} failed`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${world.started[2].branch}`)}`],
 			['failure', 'Left the queue', `https://ci.example/${world.started[2].head}`]
 		]);
 		expect(of('pr1').at(-1)).toMatchObject({ state: 'success', url: expect.stringMatching(/^https:\/\/ci\.example\//) });
@@ -795,6 +795,21 @@ describe('batch queue runtime', () => {
 		expect(world.files('main').has('late-change.txt')).toBe(true);
 	});
 
+	test('batches are numbered per repository, apart from bisection steps and master checks', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run();
+		pr(3);
+		await run();
+		const batches = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').sort((a, b) => a.id - b.id);
+		// The first one bisected, and its steps took ids of their own, but not numbers.
+		expect(store.getBisectRuns(batches[0].id).length).toBeGreaterThan(0);
+		expect(batches.map((b) => b.number)).toEqual(batches.map((_, i) => i + 1));
+		expect(batches.at(-1)!.id).toBeGreaterThan(batches.length);
+	});
+
 	test('a paused queue does nothing', async () => {
 		store.updateQueueSettings(repo.id, { pausedReason: 'release freeze' });
 		pr(1);
@@ -829,6 +844,19 @@ describe('batch queue runtime', () => {
 		world.approved.delete(1);
 		await run();
 		expect(world.merged).toEqual([2]);
+	});
+
+	test('a deferred PR says only what it still waits for, not PRs that landed since', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2);
+		pr(3, { file: 'same.txt' });
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		// As if #3 had been deferred behind #1 and #2 when they were in a batch ahead of it.
+		store.setDeferredFor(item(3).id, [1, 2]);
+		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #1 #2 ahead of it; waits for them to land');
+		db.removeFromQueue(item(2).id); // #2 has landed since
+		await tickBatchQueue(world.deps());
+		expect(item(3).error_message).toBe('Conflicts with #1 ahead of it; waits for them to land');
 	});
 
 	test('a PR whose changes are already on the default branch leaves the queue instead of an empty batch', async () => {

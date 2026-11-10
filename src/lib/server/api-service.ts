@@ -156,6 +156,8 @@ export function stacksState(analysis: StackAnalysis) {
 export function batchSummary(b: BatchRow) {
 	return {
 		id: b.id,
+		/** As shown in the app: counts only this repository's batches. */
+		number: b.number,
 		branch: b.branch,
 		status: b.status,
 		express: b.express,
@@ -193,12 +195,18 @@ export function queueState(repo: Repo) {
 	};
 }
 
-export function batchDetail(repo: Repo, id: number) {
-	const b = store.getBatch(id);
-	if (!b || b.repo_id !== repo.id || b.kind !== 'batch') throw new ApiError(404, `No batch ${id}`);
+/** A batch by its number, as the app and PR statuses show it (not its `id`). */
+export function batchByNumber(repo: Repo, number: number): BatchRow {
+	const b = store.getBatchByNumber(repo.id, number);
+	if (!b) throw new ApiError(404, `No batch #${number}`);
+	return b;
+}
+
+export function batchDetail(repo: Repo, number: number) {
+	const b = batchByNumber(repo, number);
 	return {
 		...batchSummary(b),
-		bisection: store.getBisectRuns(id).map((r) => ({ ...batchSummary(r), context: r.context }))
+		bisection: store.getBisectRuns(b.id).map((r) => ({ ...batchSummary(r), context: r.context }))
 	};
 }
 
@@ -335,10 +343,10 @@ export async function repoVisibility(lookup: () => Promise<{ private?: boolean }
 	}
 }
 
-export function canCancelBatch(repo: Repo, caller: Caller, id: number) {
+/** The batch `number` names, once the caller may cancel it. */
+export function canCancelBatch(repo: Repo, caller: Caller, number: number): BatchRow {
 	requireRole(caller, 'maintain', 'Cancelling a batch');
-	const b = store.getBatch(id);
-	if (!b || b.repo_id !== repo.id || b.kind !== 'batch') throw new ApiError(404, `Batch ${id} not found`);
+	return batchByNumber(repo, number);
 }
 
 export function pause(repo: Repo, caller: Caller, reason: unknown) {

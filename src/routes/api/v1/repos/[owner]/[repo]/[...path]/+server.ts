@@ -14,8 +14,8 @@
 //                                 lifts a pause; on an unpaused queue whose default branch is
 //                                 red, vouches for the branch (it is treated as green)
 //   GET    batches             recent batches
-//   GET    batches/{id}        one batch with its bisection runs
-//   POST   batches/{id}/cancel stops a batch (and its bisection); its PRs go back in line   (maintain)
+//   GET    batches/{number}    one batch, by the number the app shows, with its bisection runs
+//   POST   batches/{number}/cancel stops a batch (and its bisection); its PRs go back in line   (maintain)
 //   GET    history?limit=      merged and bounced PRs
 //   GET    events?after=&pr=&wait=   queue events after a cursor; waits up to `wait` s (max 60)
 //                                    for the first one (long poll). No `after`: recent events + cursor.
@@ -127,12 +127,12 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 			case 'GET batches/:n':
 				return json(api.batchDetail(repo, n));
 			case 'POST batches/:n/cancel': {
-				api.canCancelBatch(repo, caller, n);
+				const batch = api.canCancelBatch(repo, caller, n);
 				// Its CI could not be stopped nor its branches deleted until the reset.
 				const limit = (await github.rateLimitOf(repo.owner).catch(() => null))?.blockedUntil;
 				if (limit) throw new api.ApiError(409, `GitHub rate limit reached; cancel again after ${new Date(limit).toISOString()}`);
 				try {
-					return json(await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), n, caller.login)));
+					return json(await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), batch.id, caller.login)));
 				} catch (e) {
 					if (e instanceof Error && /only a batch being tested/.test(e.message)) throw new api.ApiError(409, e.message);
 					throw e;
