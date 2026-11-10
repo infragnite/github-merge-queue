@@ -5,7 +5,7 @@ import * as github from './github';
 import * as store from './batch-store';
 import { dashboardStackAnalysis } from './stack-runtime';
 import { tickError, type TickError } from './tick-errors';
-import { batchCard, isRunning, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
+import { batchCard, ciMayStillRun, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
 import type { StackAnalysis } from './stacks';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
@@ -67,7 +67,7 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 	const sideRuns = [...store.getRunningTries(repo.id), ...[store.getRunningBaseline(repo.id)].filter((b) => b !== null)];
 	const bisection = new Map(active.map((b) => [b.id, store.getBisectRuns(b.id)]));
 
-	const running = [...active, ...sideRuns, ...[...bisection.values()].flat()].filter(isRunning);
+	const running = [...active, ...sideRuns, ...[...bisection.values()].flat()].filter((b) => ciMayStillRun(b));
 	const budget = await github.rateLimitOf(repo.owner).catch(() => null);
 	const progress = new Map<string, CIProgress>();
 	await Promise.all(

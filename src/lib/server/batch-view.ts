@@ -119,6 +119,18 @@ export function isRunning(b: Pick<BatchRow, 'status'>): boolean {
 	return b.status === 'testing' || b.status === 'retrying' || b.status === 'bisecting';
 }
 
+const LOG_RUN_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * True while a run's CI may still be moving: it is running, or it is a run of one PR that failed
+ * lately. That run was decided at its first failed job, and its other jobs go on for the log.
+ */
+export function ciMayStillRun(b: Pick<BatchRow, 'status' | 'ci_result' | 'members' | 'finished_at'>, now = Date.now()): boolean {
+	if (isRunning(b)) return true;
+	if (b.status !== 'failed' || b.ci_result !== 'failure' || b.members.length !== 1 || !b.finished_at) return false;
+	return now - Date.parse(b.finished_at.replace(' ', 'T') + 'Z') < LOG_RUN_MS;
+}
+
 export function batchCard(
 	b: BatchRow,
 	bisection: BatchRow[],
