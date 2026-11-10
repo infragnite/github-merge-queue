@@ -23,7 +23,7 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	failed: ['fix-failure']
 };
 
-export type NoticeKind = 'hold' | 'ejected';
+export type NoticeKind = 'hold' | 'ejected' | 'status';
 
 /** The hidden block's content. Version 1. */
 export interface QueueNotice {
@@ -36,6 +36,26 @@ export interface QueueNotice {
 	reason?: string;
 	files?: string[];
 	nextActions: string[];
+	/** A status: where the PR stands in the queue, null when it isn't in it. */
+	queue?: StatusQueue | null;
+	/** A status: each thing to do, with its command or the PR it is about (the agent API's next actions). */
+	steps?: StatusStep[];
+}
+
+/** Where a PR stands in the queue, as the agent API gives it. */
+export interface StatusQueue {
+	status: string;
+	position: number;
+	priority: string;
+	enqueuedAt: string;
+	lastMessage: string | null;
+	batch: unknown;
+}
+
+export interface StatusStep {
+	do: string;
+	why: string;
+	[detail: string]: unknown;
 }
 
 export interface HoldInfo {
@@ -106,7 +126,36 @@ export function ejectedNotice(n: { pr: number; head: string | null; reason: stri
 	return parts.join('\n\n');
 }
 
-const KINDS: ReadonlySet<string> = new Set<NoticeKind>(['hold', 'ejected']);
+/** The hold-notice id for a step of the agent API, so a status and a hold say the same thing the same way. */
+const STEP_IDS: Record<string, string | null> = {
+	restack: 'restack',
+	'retarget-base': 'retarget',
+	queue: 'queue-parent',
+	'resolve-conflict': 'resolve-conflict',
+	'mark-ready': 'mark-ready',
+	'wait-for': null,
+	fix: null
+};
+
+/**
+ * The block of a `/mq status` reply: the queue entry, the hold if there is one, and the steps,
+ * with next-action ids from the hold's and the steps' own, as a hold notice gives them.
+ */
+export function statusBlock(s: { pr: number; head: string | null; queue: StatusQueue | null; code?: string; reason?: string; steps: StatusStep[] }): string {
+	const ids = [...(s.code ? (NEXT_ACTIONS[s.code as HoldCode] ?? []) : []), ...s.steps.map((st) => STEP_IDS[st.do] ?? null)];
+	return marker({
+		v: 1,
+		kind: 'status',
+		pr: s.pr,
+		head: s.head,
+		...(s.code ? { code: s.code as HoldCode, reason: s.reason } : {}),
+		queue: s.queue,
+		steps: s.steps,
+		nextActions: [...new Set(ids.filter((x): x is string => !!x))]
+	});
+}
+
+const KINDS: ReadonlySet<string> = new Set<NoticeKind>(['hold', 'ejected', 'status']);
 
 /** The last merge-queue block in a comment or summary; null when there is none it understands. */
 export function readNotice(body: string): QueueNotice | null {

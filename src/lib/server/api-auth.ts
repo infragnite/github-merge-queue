@@ -56,7 +56,8 @@ export function clearAuthCache() {
 	cache.clear();
 }
 
-function roleFrom(permission: string): Role {
+/** A role from GitHub's name for a repository permission (`push`, `triage`, a role name). */
+export function roleFromPermission(permission: string): Role {
 	switch (permission) {
 		case 'admin':
 			return 'admin';
@@ -118,7 +119,7 @@ export async function resolveCaller(
 	// nothing by themselves. Only a token shown to carry repo access acts with them beyond read.
 	const tokenRole = minRole(roleFromPermissions(asCaller.permissions), tokenCeiling(token, asCaller.scopes));
 	if (user) {
-		const userRole = roleFrom(await gh.permission(owner, repo, user.login));
+		const userRole = roleFromPermission(await gh.permission(owner, repo, user.login));
 		caller = { login: user.login, role: minRole(userRole, tokenRole), app: false };
 	} else {
 		// An installation token has no user; it either sees the repo or not, and gets at most write.

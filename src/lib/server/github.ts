@@ -222,6 +222,15 @@ export async function commentOnPR(owner: string, repo: string, prNumber: number,
 	});
 }
 
+/** Reacts to an issue or PR comment, e.g. to acknowledge a `/mq` command. */
+export async function reactToComment(owner: string, repo: string, commentId: number, content: '+1' | 'confused' | 'eyes') {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ content })
+	});
+}
+
 export async function mergePR(
 	owner: string,
 	repo: string,

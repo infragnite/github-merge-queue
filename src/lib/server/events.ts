@@ -98,6 +98,14 @@ export function heldPRs(repoId: number): number[] {
 	return rows.filter((r) => r.kind === 'held').map((r) => r.pr_number);
 }
 
+/** The kind of the PR's newest event among `kinds`; null when it has none (events are kept 7 days). */
+export function lastEventOf(repoId: number, pr: number, kinds: QueueEventKind[]): { kind: QueueEventKind; data: Record<string, unknown> } | null {
+	const r = getDb()
+		.prepare(`SELECT kind, data FROM queue_events WHERE repo_id = ? AND pr_number = ? AND kind IN (${kinds.map(() => '?').join(', ')}) ORDER BY id DESC LIMIT 1`)
+		.get(repoId, pr, ...kinds) as { kind: QueueEventKind; data: string } | undefined;
+	return r ? { kind: r.kind, data: JSON.parse(r.data) } : null;
+}
+
 /** The newest event id for a repo (the cursor to start from when there are no events yet). */
 export function latestEventId(repoId: number): number {
 	const r = getDb().prepare('SELECT MAX(id) AS id FROM queue_events WHERE repo_id = ?').get(repoId) as { id: number | null };
