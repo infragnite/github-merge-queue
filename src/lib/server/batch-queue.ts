@@ -32,7 +32,7 @@ import {
 	type TestGroup
 } from './batching';
 import { planNextBatch } from './queue-model';
-import { ejectedNotice, holdCheck, holdNotice, releasedNotice } from './hold-format';
+import { ejectedNotice, holdCheck, holdNotice } from './hold-format';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
 import type { StackAnalysis } from './stacks';
@@ -315,7 +315,7 @@ class Tick {
 				.setPRCheck(head, {
 					state: 'failure',
 					title: short(`Left the queue: ${reason}`),
-					summary: notice.replace(/^Removed from the merge queue: /, 'Left the queue: '),
+					summary: notice,
 					...(link ? { url: link } : {})
 				})
 				.catch(this.bestEffort('github.setPRCheck'));
@@ -1671,10 +1671,8 @@ class Tick {
 				// what it was told comes from the stored hold.
 				const told = was ?? (stored?.told && !stored.released ? stored : null);
 				if (!told) continue;
-				const head = await tell(it.pr_number, () => ({ state: 'queued', title: 'In line in the merge queue' }));
-				if (head === false) continue;
-				// A lifted deferral is the planner trying again, not news for the author.
-				if (told.told && told.code !== 'deferred') await this.say(it.pr_number, releasedNotice({ pr: it.pr_number, head }));
+				// No comment: back in line gives no action, and the check going back to queued says it.
+				if ((await tell(it.pr_number, () => ({ state: 'queued', title: 'In line in the merge queue' }))) === false) continue;
 				store.setHold(it.id, told.told ? { ...told, released: true } : null);
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 				this.event(it.pr_number, 'released', { code: told.code });

@@ -13,7 +13,7 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	'not-approved': ['get-approval'],
 	'stale-approval': ['get-approval'],
 	'changes-requested': ['address-review'],
-	'stack-broken': ['retarget'],
+	'stack-broken': ['restack'],
 	'wrong-base': ['retarget'],
 	'parent-not-ready': [],
 	'parent-held': [],
@@ -23,7 +23,7 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	failed: ['fix-failure']
 };
 
-export type NoticeKind = 'hold' | 'released' | 'ejected';
+export type NoticeKind = 'hold' | 'ejected';
 
 /** The hidden block's content. Version 1. */
 export interface QueueNotice {
@@ -98,17 +98,15 @@ export function holdCheck(h: HoldInfo): { title: string; summary: string } {
 	return { title: h.reason.length > MAX_TITLE ? `${h.reason.slice(0, MAX_TITLE - 3)}...` : h.reason, summary: holdNotice(h) };
 }
 
-export function releasedNotice(n: { pr: number; head: string | null }): string {
-	return `${LEAD} back in line.\n\n${marker({ v: 1, kind: 'released', pr: n.pr, head: n.head, nextActions: [] })}`;
-}
-
+/** The comment on an ejected PR: the same lead, what to do, then the CI run. */
 export function ejectedNotice(n: { pr: number; head: string | null; reason: string; link?: string }): string {
-	const run = n.link ? `\n\nCI run: ${n.link}` : '';
-	const block = marker({ v: 1, kind: 'ejected', pr: n.pr, head: n.head, reason: n.reason, nextActions: ['fix-failure', 'requeue'] });
-	return `Removed from the merge queue: ${n.reason}${run}\n\n${block}`;
+	const parts = [`${LEAD} Removed from the queue: ${sentence(n.reason)} Fix the failure, push, and queue it again.`];
+	if (n.link) parts.push(`CI run: ${n.link}`);
+	parts.push(marker({ v: 1, kind: 'ejected', pr: n.pr, head: n.head, reason: n.reason, nextActions: ['fix-failure', 'requeue'] }));
+	return parts.join('\n\n');
 }
 
-const KINDS: ReadonlySet<string> = new Set<NoticeKind>(['hold', 'released', 'ejected']);
+const KINDS: ReadonlySet<string> = new Set<NoticeKind>(['hold', 'ejected']);
 
 /** The last merge-queue block in a comment or summary; null when there is none it understands. */
 export function readNotice(body: string): QueueNotice | null {
