@@ -166,7 +166,7 @@ describe('stack state for agents', () => {
 		expect(api.stackState(repo, 1, a).nextActions).toEqual([{ do: 'mark-ready', why: '#1 is a draft' }]);
 		expect(api.stackState(repo, 2, a).nextActions).toEqual([{ do: 'fix', why: '#2 has changes requested' }]);
 		expect(api.stackState(repo, 3, a).nextActions).toEqual([
-			{ do: 'resolve-conflict', cmd: 'git fetch origin pull/7/head && git rebase FETCH_HEAD && git push --force-with-lease', why: 'Conflicts with #7 ahead of it; waits for them to land' }
+			{ do: 'wait-for', pr: 7, why: 'Conflicts with #7 ahead of it; waits for them to land' }
 		]);
 	});
 
