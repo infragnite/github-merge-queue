@@ -1714,7 +1714,8 @@ class Tick {
 		if (red) {
 			// Siblings go only beside siblings: a stacked pipeline still in flight (built before the
 			// branch turned red) is decided first.
-			if (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha)) return 'idle';
+			// (With `holdsOnly` nothing starts anyway; the plan still says what holds the PRs.)
+			if (!opts.holdsOnly && (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha))) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
 			plan = planRedBatch({
 				queue: queue.filter((e) => !deferred.has(e.pr) && !conflicted.has(e.pr)),
