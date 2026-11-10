@@ -79,7 +79,7 @@ describe('runOrder', () => {
 		const since = Date.parse('2026-11-10T17:03:00Z');
 		const b8 = card(8, {
 			status: 'bisecting',
-			prs: [pr(3241, { verdict: 'failing' }), pr(3309, { verdict: 'unknown' }), pr(3364, { verdict: 'passing', activity: 'landed', settled: true })],
+			prs: [pr(3241, { verdict: 'unknown', awaitingEject: true }), pr(3309, { verdict: 'unknown' }), pr(3364, { verdict: 'passing', activity: 'landed', settled: true })],
 			bisection: []
 		});
 		const rows = runOrder({ active: [b8], upNext: [], express: false, master: { sha: '9db284a0c0ffee', state: 'verifying', since, branch: 'master' }, now: since + 25 * 60_000 });
