@@ -380,7 +380,7 @@ describe('bisection', () => {
 
 	test('finds one breaker in a batch of 8, landing each passing half as soon as it passes', () => {
 		const r = bisect(batch, (t) => t.includes(6));
-		expect(r.eject).toEqual([{ pr: 6, reason: '#6 fails on its own on top of the default branch' }]);
+		expect(r.eject).toEqual([{ pr: 6, reason: 'Fails on its own on top of the default branch' }]);
 		expect([...r.land].sort()).toEqual([1, 2, 3, 4, 5, 7, 8]);
 		expect(r.requeue).toEqual([]);
 		// 1-4 pass in the first round and land then; 5-8 narrow down on top of them.
@@ -405,7 +405,7 @@ describe('bisection', () => {
 	test('finds a semantic conflict between two PRs that pass alone', () => {
 		// #3 adds a field, #6 adds an initializer without it: only the pair fails
 		const r = bisect(batch, (t) => t.includes(3) && t.includes(6));
-		expect(r.eject).toEqual([{ pr: 6, reason: '#6 fails on its own on top of the default branch' }]);
+		expect(r.eject).toEqual([{ pr: 6, reason: 'Fails on its own on top of the default branch' }]);
 		expect([...r.land].sort()).toEqual([1, 2, 3, 4, 5, 7, 8]);
 	});
 
@@ -464,7 +464,7 @@ describe('bisection', () => {
 		const parentOf = (n: number) => (n === 5 ? 4 : n === 6 ? 5 : null);
 		const r = bisect(batch, (t) => t.includes(4), parentOf);
 		expect(r.eject).toEqual([
-			{ pr: 4, reason: '#4 fails on its own on top of the default branch' },
+			{ pr: 4, reason: 'Fails on its own on top of the default branch' },
 			{ pr: 5, reason: 'Stacked on #4, which failed in the queue' },
 			{ pr: 6, reason: 'Stacked on #5, which failed in the queue' }
 		]);
@@ -487,7 +487,7 @@ describe('bisection', () => {
 		const fails = (t: number[]) => t.includes(1) && t.includes(2);
 		const r = bisect([1, 2], fails);
 		expect(r.land).toEqual([1]);
-		expect(r.eject).toEqual([{ pr: 2, reason: '#2 fails on its own on top of the default branch' }]);
+		expect(r.eject).toEqual([{ pr: 2, reason: 'Fails on its own on top of the default branch' }]);
 		expect(r.tested).toEqual([
 			{ base: [], members: [1] },
 			{ base: [], members: [2] },

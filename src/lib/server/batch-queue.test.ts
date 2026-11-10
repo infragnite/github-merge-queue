@@ -310,7 +310,7 @@ describe('batch queue runtime', () => {
 		await run(60);
 		expect(world.merged).toEqual([1, 2, 4]);
 		expect(world.comments).toEqual([
-			{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: #3 fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }
+			{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: Fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }
 		]);
 		expect(queued()).toEqual([]);
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr4.txt']);
@@ -334,7 +334,7 @@ describe('batch queue runtime', () => {
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run(60);
 		expect(world.merged).toEqual([1, 2, 3]);
-		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own on top of the default branch/) }]);
+		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/Fails on its own on top of the default branch/) }]);
 		// Never two at once, and nothing tested twice.
 		const bisect = world.started.filter((x) => x.branch.includes('-bisect-')).map((x) => x.prs);
 		expect(bisect).toEqual([[1, 2], [3], [4]]);
@@ -408,7 +408,7 @@ describe('batch queue runtime', () => {
 		world.hold = () => false;
 		await run(30);
 		expect(world.merged).toEqual([1, 2, 3]);
-		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own on top of the default branch \(batch \d+, which landed #1, #2, #3\)/) }]);
+		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/Fails on its own on top of the default branch \(batch \d+, which landed #1, #2, #3\)/) }]);
 		// The right half failed on the old branch, so it was split on the new one straight away.
 		const bisect = world.started.filter((x) => x.branch.includes('-bisect-')).map((x) => x.prs);
 		expect(bisect).toEqual([[1, 2], [3, 4], [3], [4]]);
@@ -498,7 +498,7 @@ describe('batch queue runtime', () => {
 		// Not rebuilt from scratch: the halves that ran on the old branch still count, #1 runs again on the new one.
 		expect(store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch')).toHaveLength(1);
 		expect(world.merged).toEqual([1]);
-		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/#2 fails on its own/) }]);
+		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/Fails on its own/) }]);
 		expect(world.files('main').has('hotfix.txt')).toBe(true);
 	});
 
@@ -549,7 +549,7 @@ describe('batch queue runtime', () => {
 		world.conflictPairs.push(['x-adds-field.txt', 'x-uses-old-initializer.txt']);
 		await run(60);
 		expect(world.merged).toEqual([1, 2]);
-		expect(world.comments[0]).toMatchObject({ pr: 3, body: expect.stringMatching(/#3 fails on its own on top of the default branch \(batch \d+, which landed #1, #2\)/) });
+		expect(world.comments[0]).toMatchObject({ pr: 3, body: expect.stringMatching(/Fails on its own on top of the default branch \(batch \d+, which landed #1, #2\)/) });
 	});
 
 	test('a PR that conflicts with one ahead of it waits for it, then gets a conflict notice', async () => {
@@ -1526,7 +1526,7 @@ describe('batch queue runtime', () => {
 		world.holdMasterRuns = false;
 		await run(30);
 		expect(world.merged).toEqual([1, 2]);
-		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: #3 fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }]);
+		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: Fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }]);
 	});
 
 	test('an ejection waiting for the default branch to be verified holds only itself: the other groups go on bisecting', async () => {
@@ -1871,7 +1871,7 @@ describe('stopping a red run at its first failed job', () => {
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run(80);
 		expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 3, 5, 6, 7, 8]);
-		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own/) }]);
+		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/Fails on its own/) }]);
 		// Every run is read fail-fast: its first failed job decides it.
 		for (const r of world.resultReads.filter((r) => prsOf(r.head).length > 0)) expect(r.failFast, `run of ${prsOf(r.head).join(' ')}`).toBe(true);
 		// The failing batch and the failing step were cancelled when they failed; the lone run was not.
@@ -1934,7 +1934,7 @@ describe('stopping a red run at its first failed job', () => {
 		expect(world.started.findIndex((x) => x.head === lone2)).toBeGreaterThan(world.started.findIndex((x) => x.head === lone1));
 		expect(world.slowReads.has(lone1)).toBe(false);
 		expect(world.cancelled).not.toContain(lone1);
-		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/#1 fails on its own[\s\S]*CI run: https:\/\/ci\.example\//) }]);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Fails on its own[\s\S]*CI run: https:\/\/ci\.example\//) }]);
 	});
 
 	test('a failed run of one PR waits for its flake re-run while retries are on', async () => {
