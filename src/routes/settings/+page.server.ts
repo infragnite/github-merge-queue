@@ -1,6 +1,9 @@
 import { redirect, fail } from '@sveltejs/kit';
 import { getRepos, getRepoById, addRepo, removeRepo } from '$lib/server/db';
 import { listInstallationRepos, getRepo as getGhRepo } from '$lib/server/github';
+import { atLeast } from '$lib/server/api-auth';
+import { webCaller } from '$lib/server/web-auth';
+import { visibleRepos } from '$lib/server/visible-repos';
 import type { PageServerLoad, Actions } from './$types';
 
 export const load: PageServerLoad = async ({ locals }) => {
@@ -13,7 +16,12 @@ export const load: PageServerLoad = async ({ locals }) => {
 		// GitHub API error — user sees empty list
 	}
 
-	return { repos: getRepos(), availableRepos };
+	const repos = await visibleRepos(getRepos(), locals.user.login);
+	// Who may remove each: repository admins, and whoever added it.
+	const removable = await Promise.all(
+		repos.map(async (r) => r.added_by === locals.user!.id || atLeast((await webCaller(r.owner, r.name, locals.user!.login)).role, 'admin'))
+	);
+	return { repos: repos.map((r, i) => ({ ...r, webhook_secret: null, canRemove: removable[i] })), availableRepos };
 };
 
 export const actions: Actions = {
@@ -30,6 +38,11 @@ export const actions: Actions = {
 		const [owner, name] = fullName.split('/');
 		if (!owner || !name || !/^[a-zA-Z0-9._-]+$/.test(owner) || !/^[a-zA-Z0-9._-]+$/.test(name)) {
 			return fail(400, { error: 'Invalid repository name' });
+		}
+
+		// Managing a repository's queue is its admins' call.
+		if (!atLeast((await webCaller(owner, name, locals.user.login)).role, 'admin')) {
+			return fail(403, { error: `Adding ${owner}/${name} needs admin access to it on GitHub` });
 		}
 
 		let defaultBranch = 'main';
@@ -63,7 +76,10 @@ export const actions: Actions = {
 		if (!repoId) return fail(400);
 
 		const repo = getRepoById(repoId);
-		if (!repo || repo.added_by !== locals.user.id) return fail(403);
+		if (!repo) return fail(404, { error: 'Repository not found' });
+		if (repo.added_by !== locals.user.id && !atLeast((await webCaller(repo.owner, repo.name, locals.user.login)).role, 'admin')) {
+			return fail(403, { error: `Removing ${repo.owner}/${repo.name} needs admin access to it on GitHub` });
+		}
 
 		removeRepo(repoId);
 		return { success: true };

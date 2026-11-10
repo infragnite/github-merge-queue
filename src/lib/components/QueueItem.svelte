@@ -12,7 +12,8 @@
 		batchMode,
 		stack = null,
 		why = null,
-		readonly = false
+		readonly = false,
+		canUrgent = false
 	}: {
 		item: ViewItem;
 		position?: number | null;
@@ -25,6 +26,8 @@
 		why?: string | null;
 		/** A signed-out visitor's view: no controls. */
 		readonly?: boolean;
+		/** Making a PR urgent needs maintain. */
+		canUrgent?: boolean;
 	} = $props();
 
 	const isActive = $derived(['updating', 'checking', 'merging'].includes(item.status));
@@ -96,7 +99,7 @@
 				aria-label="Priority of #{item.pr_number}"
 				title="Urgent PRs go first, in a small express batch"
 			>
-				<option value="urgent">urgent</option>
+				<option value="urgent" disabled={!canUrgent && priority !== 'urgent'}>urgent</option>
 				<option value="normal">normal</option>
 				<option value="low">low</option>
 			</select>
