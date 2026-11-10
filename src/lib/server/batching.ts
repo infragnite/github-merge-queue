@@ -426,6 +426,8 @@ export type BisectPlan =
  * - A PR is ejected only when it failed alone, never by inference: a flake can't eject an innocent PR.
  * - PRs no failure points at (a half that passed on an older branch, the rest of a group explained
  *   by a smaller failing one) run together on the current branch, and land if they pass.
+ * - Runs go one step at a time: nothing starts while a run is going, since it may land and move the
+ *   branch. A pass still lands, and a PR that failed alone is still ejected, as soon as it shows.
  *
  * `runs` includes the failed batch itself; `remaining` are the PRs still to land or eject, in order.
  */
@@ -440,7 +442,7 @@ export function planBisection(input: {
 	 */
 	trusted?: (tree: string) => boolean;
 	/**
-	 * Most runs going at once (unlimited by default). Those to start are taken in turn: first what
+	 * Most runs in one step (unlimited by default). Those to start are taken in turn: first what
 	 * is expected to pass and land, then PRs to retry alone, then both halves of each failing group,
 	 * smallest group first, and last what no failure points at but never passed.
 	 */
@@ -623,9 +625,12 @@ export function planBisection(input: {
 	// Then PRs to retry alone, the halves that narrow a failure, and last what no failure points at
 	// but never passed.
 	const start = [...lead, ...retryAlone, ...narrowing.filter((g) => !expected(g)), ...clearRun.filter((g) => !expected(g))];
-	if (input.slots !== undefined) start.splice(Math.max(0, input.slots - runs.filter((r) => r.result === 'pending').length));
-
 	const pending = runs.some((r) => r.result === 'pending');
+	// One step at a time: a run still going may pass, land and move the default branch, which would
+	// leave runs started beside it on a branch that is gone. The next step waits for every run going.
+	if (pending) start.length = 0;
+	else if (input.slots !== undefined) start.splice(input.slots);
+
 	const stuck = !start.length && !eject.length && !pending;
 	// Nothing to run and nothing running: what's left can't be placed (e.g. waits on a parent that
 	// left); the queue takes it from here.
