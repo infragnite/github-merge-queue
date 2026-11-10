@@ -96,6 +96,9 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 				return json(api.batchDetail(repo, n));
 			case 'POST batches/:n/cancel': {
 				api.canCancelBatch(repo, caller, n);
+				// Its CI could not be stopped nor its branches deleted until the reset.
+				const limit = (await github.rateLimitOf(repo.owner).catch(() => null))?.blockedUntil;
+				if (limit) throw new api.ApiError(409, `GitHub rate limit reached; cancel again after ${new Date(limit).toISOString()}`);
 				try {
 					return json(await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), n, caller.login)));
 				} catch (e) {

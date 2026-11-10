@@ -8,7 +8,7 @@ import {
 	reorderQueue,
 	updateQueueItemStatus
 } from '$lib/server/db';
-import { getOpenPRs, collaboratorRole } from '$lib/server/github';
+import { getOpenPRs, collaboratorRole, rateLimitOf } from '$lib/server/github';
 import { atLeast, type Caller, type Role } from '$lib/server/api-auth';
 import { ApiError, patchConfig } from '$lib/server/api-service';
 import { DEFAULT_BATCH_CONFIG } from '$lib/server/batching';
@@ -29,7 +29,7 @@ const ROLES: Role[] = ['none', 'read', 'write', 'maintain', 'admin'];
 
 // The page refreshes every few seconds per viewer: what it reads from GitHub is shared and reused
 // for a while, so open dashboards don't spend the App's rate limit (the queue needs it).
-const ROLE_TTL_MS = 5 * 60_000;
+const ROLE_TTL_MS = 60_000;
 const OPEN_PRS_TTL_MS = 60_000;
 const roles = new Map<string, { at: number; role: Role }>();
 const openPrsCache = new Map<number, { at: number; value: Awaited<ReturnType<typeof getOpenPRs>> }>();
@@ -163,6 +163,9 @@ export const actions: Actions = {
 		if (!atLeast(me.role, 'maintain')) return fail(403, { error: `Cancelling a batch needs maintain access; you have ${me.role}` });
 		const id = parseInt((await request.formData()).get('batch_id') as string, 10);
 		if (!id) return fail(400, { error: 'batch_id is required' });
+		// Its CI could not be stopped nor its branches deleted until the reset.
+		const limit = (await rateLimitOf(repo.owner).catch(() => null))?.blockedUntil;
+		if (limit) return fail(409, { error: `GitHub's rate limit is used up; cancel again after ${new Date(limit).toLocaleTimeString()}` });
 		try {
 			await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), id, me.login));
 		} catch (e) {
@@ -180,7 +183,7 @@ export const actions: Actions = {
 		const me = await pageCaller(repo.owner, repo.name, locals.user.login);
 		if (!atLeast(me.role, 'admin')) return fail(403, { settingsError: `Changing queue settings needs admin access; you have ${me.role}` });
 		try {
-			const body = parseSettingsForm(await request.formData());
+			const body = parseSettingsForm(await request.formData(), getQueueSettings(repo.id));
 			await withRepoLock(repo.id, async () => patchConfig(repo, me, body));
 		} catch (e) {
 			if (e instanceof ApiError || e instanceof Error) return fail(400, { settingsError: e.message });

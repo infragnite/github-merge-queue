@@ -52,8 +52,11 @@ export function shown(f: SettingField, settings: { config: object; ci: object })
 	return v as string | number | boolean;
 }
 
-/** The settings API body from a submitted form; throws with a message on a bad value. */
-export function parseSettingsForm(form: FormData): { config: Record<string, unknown>; ci: Record<string, string> } {
+/**
+ * The settings API body from a submitted form; throws with a message on a bad value. With
+ * `current`, only what changed is sent: a duration shown rounded is not written back rounded.
+ */
+export function parseSettingsForm(form: FormData, current?: { config: object; ci: object }): { config: Record<string, unknown>; ci: Record<string, string> } {
 	const config: Record<string, unknown> = {};
 	const ci: Record<string, string> = {};
 	for (const f of ALL_FIELDS) {
@@ -72,7 +75,12 @@ export function parseSettingsForm(form: FormData): { config: Record<string, unkn
 		const n = Number(text);
 		if (text === '' || !Number.isFinite(n) || n < (f.min ?? 0)) throw new Error(`${f.label} must be a number of at least ${f.min ?? 0}`);
 		if (f.kind === 'number' && !Number.isInteger(n)) throw new Error(`${f.label} must be a whole number`);
+		if (current && n === shown(f, current)) continue;
 		config[key] = f.kind === 'duration' ? Math.round(n * f.unitMs!) : n;
+	}
+	if (current) {
+		for (const [k, v] of Object.entries(config)) if ((current.config as Record<string, unknown>)[k] === v) delete config[k];
+		for (const [k, v] of Object.entries(ci)) if ((current.ci as Record<string, unknown>)[k] === v) delete ci[k];
 	}
 	return { config, ci };
 }

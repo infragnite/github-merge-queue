@@ -10,6 +10,7 @@ const { analyzeStacks } = await import('./stacks');
 import { GitSandbox } from './testing/git-sandbox';
 import { writeFileSync } from 'node:fs';
 import type { LivePR, QueueDeps } from './batch-queue';
+import { RateLimitedError } from './rate-limit';
 
 let git: GitSandbox;
 let repo: { id: number; owner: string; name: string; default_branch: string };
@@ -43,6 +44,10 @@ class World {
 	rerunWaits = 0;
 	/** PRs whose merge GitHub refuses (e.g. a ruleset the queue doesn't satisfy). */
 	refuseMerge = new Set<number>();
+	/** GitHub answers merges with a rate-limit refusal. */
+	rateLimited = false;
+	openListCalls = 0;
+	prCalls = 0;
 	/** PRs GitHub answers 404 for. */
 	deleted = new Set<number>();
 	/** PRs opened from a fork. */
@@ -65,6 +70,25 @@ class World {
 		const f = this.files(sha);
 		if ([...this.breakingFiles].some((b) => f.has(b))) return true;
 		return this.conflictPairs.some((pair) => pair.every((p) => f.has(p)));
+	}
+
+	live(n: number): LivePR {
+		if (this.deleted.has(n)) throw Object.assign(new Error('Not Found'), { status: 404 });
+		const p = git.pr(n);
+		const head = p.frozenHead ?? git.sha(p.headRef);
+		return {
+			pr: n,
+			headSha: head,
+			headRef: p.headRef,
+			sameRepo: !this.forks.has(n),
+			draft: false,
+			title: `PR ${n}`,
+			url: `https://example.test/pull/${n}`,
+			authorLogin: 'dev',
+			baseRef: p.baseRef,
+			state: p.state,
+			merged: p.merged
+		};
 	}
 
 	deps(): QueueDeps {
@@ -115,22 +139,16 @@ class World {
 			github: {
 				defaultBranchSha: async () => git.sha('main'),
 				pr: async (n): Promise<LivePR> => {
-					if (this.deleted.has(n)) throw Object.assign(new Error('Not Found'), { status: 404 });
-					const p = git.pr(n);
-					const head = p.frozenHead ?? git.sha(p.headRef);
-					return {
-						pr: n,
-						headSha: head,
-						headRef: p.headRef,
-						sameRepo: !this.forks.has(n),
-						draft: false,
-						title: `PR ${n}`,
-						url: `https://example.test/pull/${n}`,
-						authorLogin: 'dev',
-						baseRef: p.baseRef,
-						state: p.state,
-						merged: p.merged
-					};
+					this.prCalls++;
+					return this.live(n);
+				},
+				openPRs: async () => {
+					this.openListCalls++;
+					return git.prNumbers().flatMap((n) => {
+						if (this.deleted.has(n)) return [];
+						const p = this.live(n);
+						return p.state === 'open' ? [p] : [];
+					});
 				},
 				readiness: async (n, head) => ({
 					ciGreen: !this.ciRed.has(n),
@@ -160,6 +178,7 @@ class World {
 				retargetBase: async (n, base) => git.retarget(n, base),
 				squashMerge: async (n, _title, expected) => {
 					if (this.refuseMerge.has(n)) return { merged: false, message: 'Repository rule violations found' };
+					if (this.rateLimited) throw new RateLimitedError(Date.now() + 60_000, 'API rate limit exceeded');
 					if (git.sha(git.pr(n).headRef) !== expected) return { merged: false, message: 'Head branch was modified' };
 					try {
 						git.merge(n, 'squash');
@@ -995,6 +1014,34 @@ describe('batch queue runtime', () => {
 		world.hold = () => false;
 		await run();
 		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('a tick reads its PRs from one list of open PRs, not one call per PR', async () => {
+		for (let n = 1; n <= 12; n++) pr(n);
+		world.hold = () => true;
+		await tickBatchQueue(world.deps());
+		expect(store.getActiveBatches(repo.id)).toHaveLength(1);
+		const [lists, calls] = [world.openListCalls, world.prCalls];
+		// a tick with a batch in flight and PRs waiting: the list, and no PR fetched alone
+		await tickBatchQueue(world.deps());
+		expect(world.openListCalls - lists).toBe(1);
+		expect(world.prCalls - calls).toBe(0);
+	});
+
+	test('a rate limit during a landing pauses nothing: the landing is finished after the reset', async () => {
+		pr(1);
+		pr(2);
+		world.rateLimited = true;
+		for (let i = 0; i < 20 && !store.getLandingIntent(repo.id); i++) await tickBatchQueue(world.deps()).catch((e) => expect(e).toBeInstanceOf(RateLimitedError));
+		expect(store.getLandingIntent(repo.id)).not.toBeNull();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([]);
+		// the tested status was taken back, so nobody merges it around the queue meanwhile
+		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr1')).at(-1)?.state).toBe('pending');
+		world.rateLimited = false;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		expect(store.getLandingIntent(repo.id)).toBeNull();
 	});
 
 	test('a superseded batch has its CI cancelled', async () => {

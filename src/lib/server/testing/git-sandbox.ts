@@ -120,6 +120,10 @@ export class GitSandbox {
 		this.observe();
 	}
 
+	prNumbers(): number[] {
+		return [...this.prs.keys()];
+	}
+
 	openPR(number: number, headRef: string, baseRef: string) {
 		this.prs.set(number, {
 			number,
