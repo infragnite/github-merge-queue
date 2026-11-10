@@ -1169,7 +1169,7 @@ describe('batch queue runtime', () => {
 		expect(item(3).error_message).toBe('Conflicts with #1 ahead of it; waits for them to land');
 	});
 
-	test('a deferred PR has nothing to do, so it is never commented on; fewer PRs ahead only update its check', async () => {
+	test('a deferred PR has nothing to do, so it is never told: no comment, no check, however its list changes', async () => {
 		pr(1);
 		pr(2);
 		world.hold = () => true;
@@ -1184,10 +1184,7 @@ describe('batch queue runtime', () => {
 		await tickBatchQueue(world.deps());
 		expect(item(3).error_message).toBe('Conflicts with #1 #2 ahead of it; waits for them to land');
 		const told = () => world.prChecks.filter((x) => x.sha === git.sha('pr3') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
-		expect(told()).toEqual([
-			['action_required', 'Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
-			['action_required', 'Conflicts with #1 #2 ahead of it; waits for them to land']
-		]);
+		expect(told()).toEqual([]);
 		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
 		// The deferral lifts (only #4, held, is left ahead), then comes back: no comment either time.
 		store.setDeferredFor(item(3).id, [4]);
@@ -1197,13 +1194,35 @@ describe('batch queue runtime', () => {
 		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #1 ahead of it; waits for them to land');
 		await tickBatchQueue(world.deps());
 		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
-		// Lifted, it is no longer told it needs attention.
-		expect(told()).toEqual([
-			['action_required', 'Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
-			['action_required', 'Conflicts with #1 #2 ahead of it; waits for them to land'],
-			['queued', 'In line in the merge queue'],
-			['action_required', 'Conflicts with #1 ahead of it; waits for them to land']
-		]);
+		expect(told()).toEqual([]);
+		expect(events.listEvents(repo.id, { pr: 3 }).filter((e) => e.kind === 'held')).toEqual([]);
+	});
+
+	test('a deferral told as needing action by an earlier version is put back in line, without a comment', async () => {
+		pr(1);
+		world.hold = () => true;
+		pr(3);
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		const reason = 'Conflicts with #1 ahead of it; waits for them to land';
+		store.setDeferredFor(item(3).id, [1]);
+		db.updateQueueItemStatus(item(3).id, 'queued', reason);
+		store.setHold(item(3).id, { code: 'deferred', reason, told: true, head: git.sha('pr3') });
+		await tickBatchQueue(world.deps());
+		await tickBatchQueue(world.deps());
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr3') && x.name === 'merge-queue').map((x) => [x.state, x.title])).toEqual([['queued', 'In line in the merge queue']]);
+		expect(world.comments).toEqual([]);
+		// It still waits for #1.
+		expect(item(3).error_message).toBe(reason);
+	});
+
+	test('a PR stacked on a held PR is not told: its parent is', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		await run(3);
+		expect(world.comments.map((c) => c.pr)).toEqual([1]);
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2') && x.name === 'merge-queue')).toEqual([]);
+		expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)!.error_message).toMatch(/^Waits for #1/);
 	});
 
 	test('a push while held for the same reason gets the status on the new head, and no new comment', async () => {
@@ -1219,7 +1238,7 @@ describe('batch queue runtime', () => {
 		expect(world.comments.map((c) => c.pr)).toEqual([1]);
 	});
 
-	test('a deferral is not commented on, even when it comes back after the author pushed', async () => {
+	test('a deferral is not told, even when it comes back after the author pushed', async () => {
 		pr(1);
 		world.hold = () => true;
 		pr(4);
@@ -1234,9 +1253,11 @@ describe('batch queue runtime', () => {
 		await defer([1]);
 		await tickBatchQueue(world.deps()); // #4 is held now
 		await defer([4]); // lifted: only #4, held, is ahead
+		const first = git.sha('pr3');
 		git.commit('pr3', 'a new attempt');
 		await defer([1]);
 		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
+		expect(world.prChecks.filter((x) => x.name === 'merge-queue' && (x.sha === first || x.sha === git.sha('pr3')))).toEqual([]);
 	});
 
 	test('a PR whose changes are already on the default branch leaves the queue instead of an empty batch', async () => {

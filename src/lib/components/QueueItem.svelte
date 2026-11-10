@@ -12,6 +12,7 @@
 		batchMode,
 		depth = 0,
 		parent = null,
+		after = [],
 		why = null,
 		needsSomeone = false,
 		warnings = [],
@@ -28,6 +29,8 @@
 		depth?: number;
 		/** The PR it is stacked on, when that PR is not in line above it (being tested, or held). */
 		parent?: number | null;
+		/** PRs ahead it conflicts with: it goes once they land. */
+		after?: number[];
 		/** Why the planner holds it, for a row under "Waiting" or "Needs attention". */
 		why?: string | null;
 		/** The hold needs someone to act, not only time. */
@@ -77,6 +80,9 @@
 			<p class="min-w-0 truncate text-gray-700" title={item.pr_title}>{item.pr_title}</p>
 			{#if parent !== null}
 				<a href={prLink(parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Stacked on #{parent}; lands after it">on #{parent}</a>
+			{/if}
+			{#if after.length}
+				<span class="shrink-0 rounded bg-gray-100 px-1 text-xs text-gray-600" title="Conflicts with {after.map((n) => `#${n}`).join(', ')}, ahead of it; it goes once they land">after {after.map((n) => `#${n}`).join(' ')}</span>
 			{/if}
 		</div>
 		{#if item.status === 'conflict'}

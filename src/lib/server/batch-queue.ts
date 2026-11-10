@@ -1694,6 +1694,18 @@ class Tick {
 				continue;
 			}
 			const { code, reason } = h;
+			// A hold with nothing for the author to do (it waits for PRs ahead, or for its parent, whose
+			// author is told) is not told: no comment, no check. One told before is put back in line.
+			if (!holdAdvice(code as HoldCode)) {
+				if (stored?.told && !stored.released) {
+					const head = await tell(it.pr_number, () => ({ state: 'queued', title: 'In line in the merge queue' }));
+					if (head === false) continue;
+					store.setHold(it.id, { ...stored, released: true });
+					this.event(it.pr_number, 'released', { code: stored.code });
+				}
+				if (it.error_message !== reason) db.updateQueueItemStatus(it.id, 'queued', reason);
+				continue;
+			}
 			// Told on this head already. A check belongs to a commit: a push needs it again.
 			const current = (await this.pr(it.pr_number).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;

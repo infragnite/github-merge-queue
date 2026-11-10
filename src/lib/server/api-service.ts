@@ -127,9 +127,9 @@ function holdActions(it: QueueItem, hold: store.Hold): NextAction[] {
 		case 'changes-requested':
 			return [{ do: 'fix', why: hold.reason }];
 		case 'deferred': {
-			// It conflicts with PRs ahead of it: rebased onto them, it is stacked on them and follows them.
+			// It conflicts with PRs ahead of it: there is nothing to do but wait for them to land.
 			const ahead = store.deferredFor(it as QueueItem & { deferred_for?: string | null });
-			return ahead.map((p) => ({ do: 'resolve-conflict' as const, cmd: `git fetch origin pull/${p}/head && git rebase FETCH_HEAD && git push --force-with-lease`, why: hold.reason }));
+			return ahead.map((p) => ({ do: 'wait-for' as const, pr: p, why: hold.reason }));
 		}
 		default:
 			return [];

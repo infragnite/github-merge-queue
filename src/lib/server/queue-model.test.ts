@@ -413,9 +413,18 @@ describe('the queue page: the model from what the planner recorded', () => {
 		]);
 	});
 
-	test('a deferred PR needs someone, for the reason it was deferred', () => {
-		const b = queueBoard([item(1, 50, { message: 'Waits for #7 to land: they change the same lines' })], stacks([1]), new Set());
-		expect(b.attention).toEqual([{ pr: 1, code: 'deferred', reason: 'Waits for #7 to land: they change the same lines', cause: null }]);
+	test('a deferred PR needs no one: it is in line, after the PRs it waits for', () => {
+		const why = 'Conflicts with #7 ahead of it; waits for them to land';
+		const b = queueBoard(
+			[item(1, 50, { message: why, after: [7] }), item(2, 40, { hold: { code: 'deferred', reason: why }, message: why, after: [7] }), item(3, 30)],
+			stacks([1, 2, 3], { 3: 2 }),
+			new Set()
+		);
+		expect(b.attention).toEqual([]);
+		expect(b.stacks).toEqual([
+			{ root: 1, on: null, priority: 'normal', rows: [{ pr: 1, depth: 0, parent: null, after: [7] }] },
+			{ root: 2, on: null, priority: 'normal', rows: [{ pr: 2, depth: 0, parent: null, after: [7] }, { pr: 3, depth: 1, parent: 2 }] }
+		]);
 	});
 
 	test('PRs being tested are left out; a stack on one of them sits on it', () => {

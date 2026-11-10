@@ -328,6 +328,7 @@
 											{batchMode}
 											depth={r.depth}
 											parent={k === 0 ? st.on : null}
+											after={r.after ?? []}
 											warnings={board?.warnings[r.pr] ?? []}
 										/>
 									{/each}
