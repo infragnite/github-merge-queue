@@ -26,3 +26,18 @@ test('the pulse is the last merge and the merges of the last day, failures left 
 	expect(pulse.lastLanded?.pr).toBe(3);
 	expect(pulse.lastLanded?.at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
 });
+
+test('work on a PR starts when it leaves the line, with or without an update first', () => {
+	const id = Number(db.addToQueue(repoId, 50, 't', 'u', 'a', '', 'dev').lastInsertRowid);
+	const started = () => (db.getDb().prepare('SELECT started_at FROM queue_items WHERE id = ?').get(id) as { started_at: string | null }).started_at;
+	expect(started()).toBeNull();
+	db.updateQueueItemStatus(id, 'checking');
+	const first = started();
+	expect(first).not.toBeNull();
+	db.getDb().prepare(`UPDATE queue_items SET started_at = datetime('now', '-1 hour') WHERE id = ?`).run(id);
+	db.updateQueueItemStatus(id, 'merging');
+	expect(started()).not.toBe(first); // still the hour-old start: merging continues the same work
+	db.updateQueueItemStatus(id, 'queued');
+	db.updateQueueItemStatus(id, 'checking');
+	expect(Date.parse(started()!.replace(' ', 'T') + 'Z')).toBeGreaterThan(Date.now() - 60_000);
+});

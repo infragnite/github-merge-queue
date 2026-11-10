@@ -236,9 +236,13 @@ export function updateQueueItemStatus(itemId: number, status: string, errorMessa
 			)
 			.run(status, errorMessage ?? null, itemId);
 	} else {
+		// Work on a PR starts when it leaves the line, whether or not it needed an update first.
 		database
-			.prepare('UPDATE queue_items SET status = ?, error_message = ? WHERE id = ?')
-			.run(status, errorMessage ?? null, itemId);
+			.prepare(
+				`UPDATE queue_items SET started_at = CASE WHEN status IN ('queued', 'conflict') AND ? IN ('checking', 'merging') THEN datetime('now') ELSE started_at END,
+				 status = ?, error_message = ? WHERE id = ?`
+			)
+			.run(status, status, errorMessage ?? null, itemId);
 	}
 }
 

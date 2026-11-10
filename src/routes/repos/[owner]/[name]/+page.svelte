@@ -50,10 +50,14 @@
 	const shownNext = $derived(view.upNext.filter(matches));
 	const inLine = $derived(view.rows.length + view.upNext.length);
 	const inFlightCount = $derived(view.inFlight.reduce((n, g) => n + g.prs.length, 0));
-	// One by one: the PR at the front is being worked on and isn't waiting.
-	const serialActive = $derived(batchMode ? 0 : view.rows.filter((r) => ['updating', 'checking', 'merging'].includes(r.item.status)).length);
-	const waiting = $derived(inLine - serialActive);
-	const testing = $derived(batchMode ? inFlightCount : serialActive);
+	// PRs being worked on: in a batch's group, or in line with an active status (one by one, or
+	// batch mode before the batches have loaded).
+	const ACTIVE = ['updating', 'checking', 'merging'];
+	const activeInLine = $derived([...view.rows, ...view.upNext].filter((r) => ACTIVE.includes(r.item.status)).length);
+	const waiting = $derived(inLine - activeInLine);
+	const testing = $derived(inFlightCount + activeInLine);
+	// One by one: a conflicted PR at the front holds up everything behind it.
+	const blockedFront = $derived(!batchMode && !pipe?.current ? (view.attention.find((a) => a.item.status === 'conflict' && a.item.position <= Math.min(...view.rows.map((r) => r.item.position), Infinity))?.item ?? null) : null);
 
 	// Is the queue moving: the last landing, landings in a day, and how long the oldest PR has waited.
 	let now = $state(Date.now());
@@ -76,7 +80,7 @@
 	// Stalled: PRs wait, nothing is being tested, and nothing landed for two hours.
 	const STALL_MS = 2 * 60 * 60_000;
 	const stalled = $derived(
-		waiting > 0 && testing === 0 && (pipe?.active.length ?? 0) === 0 && (lastLandedMs === null ? oldestWaiting !== null && now - oldestWaiting > STALL_MS : now - lastLandedMs > STALL_MS)
+		!!pipe && !pipe.error && waiting > 0 && testing === 0 && pipe.active.length === 0 && (lastLandedMs === null ? oldestWaiting !== null && now - oldestWaiting > STALL_MS : now - lastLandedMs > STALL_MS)
 	);
 	// What runs CI now and next: the queue's own order, apart from the batches it runs for.
 	const runs = $derived(batchMode && pipe ? runOrder({ active: pipe.active, upNext: view.upNext.map((r) => r.item.pr_number), express: view.express }) : []);
@@ -276,11 +280,12 @@
 					</h2>
 					{#if pipe.error}
 						<div class="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-							<p class="font-medium">Can't read the {batchMode ? 'batches' : 'queue'} right now; CI may still be running.</p>
+							<p class="font-medium">{batchMode ? "Can't read the batches right now; CI may still be running." : "Can't read what the queue is doing right now."}</p>
 							<p class="mt-0.5 font-mono text-xs">{pipe.error}</p>
-							{#if pipe.active.length > 0}<p class="mt-0.5 text-xs">Showing what was last loaded.</p>{/if}
+							{#if pipe.active.length > 0 || pipe.current}<p class="mt-0.5 text-xs">Showing what was last loaded.</p>{/if}
 						</div>
-					{:else if !batchMode}
+					{/if}
+					{#if !batchMode}
 						{@const c = pipe.current}
 						{@const item = c ? data.queueItems.find((i) => i.pr_number === c.pr) : undefined}
 						{@const nextUp = view.rows.filter((r) => r.item.status === 'queued').slice(0, 3)}
@@ -308,15 +313,19 @@
 										{#if q.url}<a href={q.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
 									</div>
 								{/if}
-								{#if err}<p class="mt-1 text-xs text-red-600">Could not read CI progress: {err}</p>{/if}
+								{#if err}<p class="mt-1 text-xs text-red-600">{c.progress ? 'Last known progress; reading it now failed' : 'Could not read CI progress'}: {err}</p>{/if}
 							</div>
-						{:else}
+						{:else if blockedFront}
+							<p class="rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 text-sm text-orange-800">
+								Blocked: <a href={blockedFront.pr_url} target="_blank" rel="noopener" class="font-medium underline">#{blockedFront.pr_number}</a> has a merge conflict, and nothing behind it runs until it is resolved or removed.
+							</p>
+						{:else if !pipe.error}
 							<p class="text-sm text-gray-500">Nothing is being tested.</p>
 						{/if}
 						{#if nextUp.length}
 							<p class="text-xs text-gray-500">Then {nextUp.map((r) => `#${r.item.pr_number}`).join(', ')}{waiting > nextUp.length ? ` and ${waiting - nextUp.length} more` : ''}</p>
 						{/if}
-					{:else if pipe.active.length === 0}
+					{:else if pipe.active.length === 0 && !pipe.error}
 						<p class="text-sm text-gray-500">
 							{inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.'}
 						</p>
@@ -410,7 +419,15 @@
 						</div>
 					</section>
 				{:else if needle && shownNext.length === 0}
-					<p class="text-sm text-gray-500">No queued PR matches “{search}”.</p>
+					{@const hit = view.inFlight.find((g) => g.prs.some((n) => String(n).startsWith(needle)))}
+					<p class="text-sm text-gray-500">
+						{#if hit}
+							{@const n = hit.prs.find((x) => String(x).startsWith(needle))}
+							#{n} is being tested in <a href="#batch-{hit.batch}" class="text-indigo-600 hover:underline">Batch #{hit.batch}</a>.
+						{:else}
+							No queued PR matches “{search}”.
+						{/if}
+					</p>
 				{/if}
 			{/if}
 

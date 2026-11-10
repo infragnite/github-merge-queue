@@ -133,7 +133,7 @@
 			<div class="mt-2 rounded-lg bg-amber-50/60 px-2.5 py-2">
 				<p class="mb-1.5 text-xs text-gray-700">
 					<span class="font-semibold">Now: step {step}</span>
-					<span class="text-gray-500">· {run.prs.length === 1 ? `#${run.prs[0].pr} alone` : prList(run.prs.map((x) => x.pr))}</span>
+					<span class="text-gray-500">· {run.prs.length === 1 && !run.context.length ? `#${run.prs[0].pr} alone` : prList(run.prs.map((x) => x.pr))}</span>
 					{#if run.context.length}<span class="text-gray-500"> on top of {prList(run.context)}</span>{/if}
 				</p>
 				{#if run.progress}
@@ -144,7 +144,7 @@
 				{/if}
 			</div>
 		{:else}
-			<p class="mt-2 text-xs text-gray-500">Between steps: the next one starts when runners are free.</p>
+			<p class="mt-2 text-xs text-gray-500">Between steps: the queue starts the next one on its next run, after any urgent batch.</p>
 		{/each}
 		<p class="mt-1.5 text-xs text-gray-500">
 			The batch's own run failed{p && p.failed > 0 ? `: ${p.failedJobs.join(', ')}` : ''}{#if p?.url}&nbsp;·&nbsp;<a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}

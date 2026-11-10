@@ -1100,7 +1100,7 @@ class Tick {
 				await this.retire(batch);
 				store.setBatchStatus(batch.id, 'failed');
 				this.requeue(batch.members);
-				this.pause(`Bisection run ${run.branch} got no CI result in time`);
+				this.pause(`Bisection step ${run.branch} got no CI result in time`);
 				return;
 			}
 		}
@@ -1283,7 +1283,7 @@ class Tick {
 			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			store.branchPushed(this.repoId, branch);
-			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}`);
+			this.pause(`Could not start bisection step ${branch}: ${e instanceof Error ? e.message : e}`);
 			return;
 		}
 		const link = this.branchRuns(branch);
