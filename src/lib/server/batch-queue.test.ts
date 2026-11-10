@@ -1046,6 +1046,36 @@ describe('batch queue runtime', () => {
 		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #1 ahead of it; waits for them to land');
 		await tickBatchQueue(world.deps());
 		expect(world.comments.filter((c) => c.pr === 3)).toEqual([deferredComment]);
+		// Lifted, it is no longer told it needs attention.
+		expect(told()).toEqual([
+			['failure', 'Needs attention: Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
+			['failure', 'Needs attention: Conflicts with #1 #2 ahead of it; waits for them to land'],
+			['pending', 'In line in the merge queue'],
+			['failure', 'Needs attention: Conflicts with #1 ahead of it; waits for them to land']
+		]);
+	});
+
+	test('a deferral that comes back after the author pushed is commented on again', async () => {
+		pr(1);
+		world.hold = () => true;
+		pr(4);
+		world.changesRequested.add(4);
+		pr(3);
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		const defer = async (behind: number[]) => {
+			store.setDeferredFor(item(3).id, behind);
+			db.updateQueueItemStatus(item(3).id, 'queued', `Conflicts with ${behind.map((n) => `#${n}`).join(' ')} ahead of it; waits for them to land`);
+			await tickBatchQueue(world.deps());
+		};
+		await defer([1]);
+		await tickBatchQueue(world.deps()); // #4 is held now
+		await defer([4]); // lifted: only #4, held, is ahead
+		git.commit('pr3', 'a new attempt');
+		await defer([1]);
+		expect(world.comments.filter((c) => c.pr === 3).map((c) => c.body.split('\n')[0])).toEqual([
+			'Needs attention in the merge queue: Conflicts with #1 ahead of it; waits for them to land',
+			'Needs attention in the merge queue: Conflicts with #1 ahead of it; waits for them to land'
+		]);
 	});
 
 	test('a PR whose changes are already on the default branch leaves the queue instead of an empty batch', async () => {
