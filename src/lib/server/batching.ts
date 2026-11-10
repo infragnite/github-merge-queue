@@ -128,6 +128,38 @@ export type AdmissionCode =
 /** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
 export type HoldCode = AdmissionCode | 'conflict' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
 
+/** What a held PR's author does about its hold, for the comment that tells them. Empty: nothing to say. */
+export function holdAdvice(code: HoldCode): string {
+	switch (code) {
+		case 'draft':
+			return 'mark it ready for review.';
+		case 'ci-failed':
+			return 'fix its failing checks and push.';
+		case 'not-approved':
+			return 'get an approving review.';
+		case 'stale-approval':
+			return 'get it approved again on its current head.';
+		case 'changes-requested':
+			return 'address the requested changes, and get the review approved or dismissed.';
+		case 'stack-broken':
+		case 'wrong-base':
+			return "retarget it onto its parent's branch, or the default branch when it has none, and rebase it there.";
+		case 'parent-not-ready':
+		case 'parent-held':
+			return 'fix what holds the PR it is stacked on; it then goes with it.';
+		case 'parent-not-queued':
+			return 'queue the PR it is stacked on; a stacked PR goes only with the PRs under it.';
+		case 'deferred':
+			return 'rebase it onto the PRs it conflicts with (it then goes with them), or wait for them to land and rebase it onto the default branch.';
+		case 'conflict':
+			return 'resolve the conflict and push.';
+		case 'failed':
+			return 'fix the failure and push.';
+		case 'not-fetched':
+			return '';
+	}
+}
+
 export interface Hold {
 	ok: false;
 	code: HoldCode;

@@ -533,6 +533,12 @@ export function deferredFor(item: { deferred_for?: string | null }): number[] {
 export interface Hold {
 	code: string;
 	reason: string;
+	/** Its agent was told on GitHub. A hold saved before agents were told is told again. */
+	told?: boolean;
+	/** The PR was free again after it; kept so a deferral that comes back isn't commented on again. */
+	released?: boolean;
+	/** The PR's head when it was told: after a new push, a hold of the same kind is news again. */
+	head?: string;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {
@@ -541,12 +547,22 @@ export function setHold(itemId: number, hold: Hold | null) {
 		.run(hold ? JSON.stringify(hold) : null, itemId);
 }
 
+/** The last hold saved for the item, current or not. */
+export function storedHold(item: { hold?: string | null }): Hold | null {
+	if (!item.hold) return null;
+	try {
+		return JSON.parse(item.hold) as Hold;
+	} catch {
+		return null;
+	}
+}
+
 /** The item's hold, when it still describes the item's current message. */
 export function currentHold(item: { hold?: string | null; status: string; error_message: string | null }): Hold | null {
 	if (item.status !== 'queued' || !item.hold || !item.error_message) return null;
 	try {
 		const h = JSON.parse(item.hold) as Hold;
-		return h.reason === item.error_message ? h : null;
+		return h.reason === item.error_message && !h.released ? h : null;
 	} catch {
 		return null;
 	}

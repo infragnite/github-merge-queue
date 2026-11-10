@@ -125,8 +125,22 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 		for (const n of typeof needs === 'string' ? [needs] : Array.isArray(needs) ? needs : []) if (typeof n === 'string') visit(n);
 	};
 	visit(start);
-	const prefixes = [...closure].map(label);
-	return (name) => prefixes.some((p) => name === p || name.startsWith(`${p} (`) || name.startsWith(`${p} /`) || (name.startsWith(p) && p !== name && /[\s(]/.test(name[p.length] ?? '')));
+	// A check run is named by its job's name with each expression replaced by its value (a matrix
+	// job without a name adds its values in parentheses); a reusable workflow's jobs add ` / callee`.
+	const escape = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	const matchers = [...closure].map((id) => {
+		const n = jobs[id]?.name;
+		const template = typeof n === 'string' && n.trim() ? n.trim() : id;
+		const pattern = template
+			.split(/\$\{\{[\s\S]*?\}\}/)
+			.map(escape)
+			.join('.+?');
+		// A name that is only expressions says nothing about the check run's name: it matches none.
+		if (!template.replace(/\$\{\{[\s\S]*?\}\}/g, '').trim()) return /(?!)/;
+		const values = template.includes('${{') ? '' : '(?: \\(.+\\))?';
+		return new RegExp(`^${pattern}${values}(?: / .+)?$`);
+	});
+	return (name) => matchers.some((m) => m.test(name));
 }
 
 /** A fetch or push gives up after this long. */
