@@ -219,3 +219,25 @@ export function plannedAdmission(input: Pick<PlanInput, 'states' | 'analysis' | 
 		return s ? admit(s, input.analysis, input.config) : { ok: false, code: 'ci-pending', reason: `#${n} has not been fetched yet`, wait: true };
 	};
 }
+
+/** A queue row as the queue page reads it from the database. */
+export interface BoardItem {
+	pr: number;
+	status: 'queued' | 'updating' | 'checking' | 'merging' | 'merged' | 'failed' | 'cancelled' | 'conflict';
+	priority: Priority;
+	position: number;
+	enqueuedAt: number;
+	/** What the planner recorded when it held the PR, while still current. */
+	hold: { code: string; wait: boolean; reason: string } | null;
+	message: string | null;
+}
+
+export interface QueueBoard {
+	stacks: Array<{ root: number; on: number | null; priority: Priority; rows: Array<{ pr: number; depth: number; parent: number | null }> }>;
+	waiting: Held[];
+	attention: Held[];
+}
+
+export function queueBoard(_items: BoardItem[], _analysis: StackAnalysis, _inflight: Set<number>): QueueBoard {
+	return { stacks: [], waiting: [], attention: [] };
+}

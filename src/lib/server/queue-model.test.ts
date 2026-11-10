@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import { DEFAULT_BATCH_CONFIG, type BatchConfig, type PRState, type Priority, type QueueEntry } from './batching';
-import { fillBatch, plannedAdmission, queueModel, serialPick, type QueueModel } from './queue-model';
+import { fillBatch, plannedAdmission, queueBoard, queueModel, serialPick, type BoardItem, type QueueModel } from './queue-model';
 import { entry, MIN, NOW, ready, stacks } from './testing/stack-fixture';
 import type { StackAnalysis } from './stacks';
 
@@ -356,5 +356,83 @@ describe('queue model properties, 300 random queues', () => {
 		const s = serialPick(m, { inflight: 0 });
 		const head = m.stacks.find((x) => x.on === null);
 		expect(s).toEqual(head ? head.members : null);
+	});
+});
+
+describe('the queue page: the model from what the planner recorded', () => {
+	const item = (pr: number, minutesAgo: number, over: Partial<BoardItem> = {}): BoardItem => ({
+		pr,
+		status: 'queued',
+		priority: 'normal',
+		position: 0,
+		enqueuedAt: NOW - minutesAgo * MIN,
+		hold: null,
+		message: null,
+		...over
+	});
+
+	test('stacks as grouped rows, each with its depth and parent, in the order the queue takes them', () => {
+		const b = queueBoard([item(1, 50), item(2, 40), item(3, 30), item(4, 20), item(5, 10, { priority: 'urgent' })], stacks([1, 2, 3, 4, 5], { 2: 1, 3: 2, 4: 1 }), new Set());
+		expect(b).toEqual({
+			stacks: [
+				{ root: 5, on: null, priority: 'urgent', rows: [{ pr: 5, depth: 0, parent: null }] },
+				{
+					root: 1,
+					on: null,
+					priority: 'normal',
+					rows: [
+						{ pr: 1, depth: 0, parent: null },
+						{ pr: 2, depth: 1, parent: 1 },
+						{ pr: 3, depth: 2, parent: 2 },
+						{ pr: 4, depth: 1, parent: 1 }
+					]
+				}
+			],
+			waiting: [],
+			attention: []
+		});
+	});
+
+	test("a PR the planner holds is held for the planner's reason, and its branch with it", () => {
+		const b = queueBoard(
+			[item(1, 50), item(2, 40, { hold: { code: 'ci-pending', wait: true, reason: "#2's checks are still running" }, message: "#2's checks are still running" }), item(3, 30), item(4, 20, { hold: { code: 'not-approved', wait: false, reason: '#4 is not approved' }, message: '#4 is not approved' })],
+			stacks([1, 2, 3, 4], { 2: 1, 3: 2 }),
+			new Set()
+		);
+		expect(b.stacks.map((s) => s.rows.map((r) => r.pr))).toEqual([[1]]);
+		expect(b.waiting).toEqual([
+			{ pr: 2, code: 'ci-pending', reason: "#2's checks are still running", wait: true, cause: null },
+			{ pr: 3, code: 'parent-held', reason: "Waits for #2: #2's checks are still running", wait: true, cause: 2 }
+		]);
+		expect(b.attention).toEqual([{ pr: 4, code: 'not-approved', reason: '#4 is not approved', wait: false, cause: null }]);
+	});
+
+	test('a conflict or a failure needs someone, whatever the PR is stacked on', () => {
+		const b = queueBoard(
+			[item(1, 50, { status: 'conflict', message: 'Conflicts with main in src/a.ts' }), item(2, 40), item(3, 30, { status: 'failed', message: null })],
+			stacks([1, 2, 3], { 2: 1 }),
+			new Set()
+		);
+		expect(b.stacks).toEqual([]);
+		expect(b.attention).toEqual([
+			{ pr: 1, code: 'conflict', reason: 'Conflicts with main in src/a.ts', wait: false, cause: null },
+			{ pr: 2, code: 'parent-held', reason: 'Waits for #1: conflicts with main in src/a.ts', wait: false, cause: 1 },
+			{ pr: 3, code: 'failed', reason: 'Failed', wait: false, cause: null }
+		]);
+	});
+
+	test('a deferred PR waits for the reason it was deferred', () => {
+		const b = queueBoard([item(1, 50, { message: 'Waits for #7 to land: they change the same lines' })], stacks([1]), new Set());
+		expect(b.waiting).toEqual([{ pr: 1, code: 'deferred', reason: 'Waits for #7 to land: they change the same lines', wait: true, cause: null }]);
+	});
+
+	test('PRs being tested are left out; a stack on one of them sits on it', () => {
+		const b = queueBoard([item(1, 50, { status: 'checking' }), item(2, 40), item(3, 30, { status: 'merged' })], stacks([1, 2, 3], { 2: 1 }), new Set([1]));
+		expect(b).toEqual({ stacks: [{ root: 2, on: 1, priority: 'normal', rows: [{ pr: 2, depth: 0, parent: null }] }], waiting: [], attention: [] });
+	});
+
+	test('a PR left checking by an interrupted run is in line again', () => {
+		const b = queueBoard([item(1, 50, { status: 'checking' })], stacks([1]), new Set());
+		expect(b.stacks.map((s) => s.root)).toEqual([1]);
 	});
 });
