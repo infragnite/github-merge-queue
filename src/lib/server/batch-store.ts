@@ -71,6 +71,9 @@ export interface BatchStep {
 	parent?: number | null;
 }
 
+export const PR_REPORTS = ['check-run', 'status', 'both'] as const;
+export type PRReport = (typeof PR_REPORTS)[number];
+
 export interface CISettings {
 	/** Workflow file the queue dispatches on batch branches. */
 	workflow: string;
@@ -78,8 +81,13 @@ export interface CISettings {
 	requiredCheck: string;
 	/** Commit status the queue sets on master when its tree was already tested. */
 	testedStatus: string;
-	/** Commit status the queue keeps on each queued PR's head; make it the one required check on the default branch. */
+	/** Check (and status) the queue keeps on each queued PR's head; make it the one required check on the default branch. */
 	prStatus: string;
+	/**
+	 * How the queue reports on a PR: a check run (room for what to do, "action required" on a hold),
+	 * a commit status (140 characters), or both while a ruleset still requires the status.
+	 */
+	prReport: PRReport;
 	/** Ref the cache-refresh run is dispatched on; empty means the default branch. */
 	dispatchRef: string;
 }
@@ -89,6 +97,7 @@ export const DEFAULT_CI: CISettings = {
 	requiredCheck: 'ci',
 	testedStatus: 'merge-queue/tested',
 	prStatus: 'merge-queue',
+	prReport: 'both',
 	dispatchRef: ''
 };
 

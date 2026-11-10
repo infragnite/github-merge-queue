@@ -350,7 +350,7 @@ describe("the queue's check run on a PR", () => {
 
 describe('the same state as a commit status, for a ruleset that still requires one', () => {
 	test('only success passes; a hold and an ejection fail; the rest are pending', () => {
-		const state = (s: Parameters<typeof statusFromCheck>[0]['state']) => statusFromCheck({ state, title: 't' }, 'merge-queue', 'u').state;
+		const state = (s: Parameters<typeof statusFromCheck>[0]['state']) => statusFromCheck({ state: s, title: 't' }, 'merge-queue', 'u').state;
 		expect(state('success')).toBe('success');
 		expect(state('action_required')).toBe('failure');
 		expect(state('failure')).toBe('failure');
