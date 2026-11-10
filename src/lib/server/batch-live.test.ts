@@ -322,8 +322,8 @@ describe("the queue's check run on a PR", () => {
 	});
 
 	test('a hold says "action required" and carries the fix in its summary', () => {
-		const r = checkRunRequest('s1', { state: 'action_required', title: 'Needs attention: #2 is a draft', summary: '**What to do:** mark it ready' }, at);
-		expect(r).toMatchObject({ conclusion: 'action_required', output: { title: 'Needs attention: #2 is a draft', summary: '**What to do:** mark it ready' } });
+		const r = checkRunRequest('s1', { state: 'action_required', title: 'Draft', summary: '**Merge queue:** Draft. Mark it ready for review.' }, at);
+		expect(r).toMatchObject({ conclusion: 'action_required', output: { title: 'Draft', summary: '**Merge queue:** Draft. Mark it ready for review.' } });
 	});
 
 	test('Details opens the queue page; a CI run link goes in the summary', () => {

@@ -3,27 +3,35 @@ import { HOLD_CODES, type HoldCode } from './batching';
 import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice, releasedNotice } from './hold-format';
 
 describe('the hold comment', () => {
-	test('says what holds the PR, its stable code, and what to do', () => {
-		const body = holdNotice({ pr: 2, head: 'abc123', code: 'changes-requested', reason: '#2 has changes requested' });
+	test('says what holds the PR and the one thing to do, in one line; the code is in the hidden block', () => {
+		const body = holdNotice({ pr: 2, head: 'abc123', code: 'changes-requested', reason: 'Changes requested' });
 		expect(body).toBe(
 			[
-				'### Needs attention in the merge queue',
+				'**Merge queue:** Changes requested. Address them, then get the review approved or dismissed.',
 				'',
-				'**#2 has changes requested** · `changes-requested`',
-				'',
-				'**What to do:** address the requested changes, and get the review approved or dismissed.',
-				'',
-				'<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"abc123","code":"changes-requested","reason":"#2 has changes requested","nextActions":["address-review"]} -->'
+				'<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"abc123","code":"changes-requested","reason":"Changes requested","nextActions":["address-review"]} -->'
 			].join('\n')
 		);
 	});
 
+	test('no heading and no "needs attention": a comment from the queue is one already', () => {
+		for (const code of HOLD_CODES) {
+			const body = holdNotice({ pr: 5, head: 'h', code, reason: 'Some reason', files: ['a'], fix: 'git x' });
+			expect(body, code).not.toMatch(/Needs attention|###|What to do/i);
+			expect(body.split('\n\n').length, code).toBeLessThanOrEqual(4);
+		}
+	});
+
+	test("a reason that ends a sentence itself gets no second period", () => {
+		expect(holdNotice({ pr: 1, head: 'h', code: 'failed', reason: 'Failed in batch 3.' })).toMatch(/^\*\*Merge queue:\*\* Failed in batch 3\. Fix/);
+	});
+
 	test('gives a command to run where there is one', () => {
-		const body = holdNotice({ pr: 7, head: 'h', code: 'draft', reason: '#7 is a draft' });
-		expect(body).toContain('**To fix:**\n\n```sh\ngh pr ready 7\n```');
-		expect(holdNotice({ pr: 7, head: 'h', code: 'ci-failed', reason: '#7 failed ci' })).toContain('```sh\ngh pr checks 7\n```');
+		const body = holdNotice({ pr: 7, head: 'h', code: 'draft', reason: 'Draft' });
+		expect(body).toMatch(/^\*\*Merge queue:\*\* Draft\. Mark it ready for review\.\n\n```sh\ngh pr ready 7\n```\n\n<!-- merge-queue /);
+		expect(holdNotice({ pr: 7, head: 'h', code: 'ci-failed', reason: 'Checks failed' })).toContain('```sh\ngh pr checks 7\n```');
 		// No command we can be sure of: no block.
-		expect(holdNotice({ pr: 7, head: 'h', code: 'not-approved', reason: '#7 needs an approval' })).not.toContain('To fix');
+		expect(holdNotice({ pr: 7, head: 'h', code: 'not-approved', reason: 'Not approved' })).not.toContain('```');
 	});
 
 	test('a conflict lists its files and the commands that fix it, in the same format', () => {
@@ -35,17 +43,15 @@ describe('the hold comment', () => {
 			files: ['a.ts', 'b.ts'],
 			fix: 'git fetch origin main && git rebase FETCH_HEAD'
 		});
-		expect(body).toContain('**conflicts with main** · `conflict`');
-		expect(body).toContain('Conflicting files:\n- `a.ts`\n- `b.ts`');
-		expect(body).toContain('**To fix:**\n\n```sh\ngit fetch origin main && git rebase FETCH_HEAD\n# resolve the conflicts, then\ngit push --force-with-lease\n```');
-		expect(body).toContain('The PR stays queued and is picked up again after the push.');
+		expect(body).toMatch(/^\*\*Merge queue:\*\* conflicts with main\. Resolve the conflict and push; it stays queued\.\n\nConflicting files: `a\.ts`, `b\.ts`\.\n\n/);
+		expect(body).toContain('```sh\ngit fetch origin main && git rebase FETCH_HEAD\n# resolve the conflicts, then\ngit push --force-with-lease\n```');
 		expect(readNotice(body)).toMatchObject({ kind: 'hold', code: 'conflict', files: ['a.ts', 'b.ts'], nextActions: ['resolve-conflict'] });
 	});
 
 	test('lists at most 20 conflicting files, and says how many more there are', () => {
 		const files = Array.from({ length: 25 }, (_, i) => `f${i}.ts`);
 		const body = holdNotice({ pr: 3, head: 'h', code: 'conflict', reason: 'r', files, fix: 'x' });
-		expect(body).toContain('- `f19.ts`\n- and 5 more');
+		expect(body).toContain('`f18.ts`, `f19.ts` and 5 more.');
 		expect(body).not.toContain('`f20.ts`');
 		expect(readNotice(body)?.files).toEqual(files);
 	});
@@ -53,7 +59,8 @@ describe('the hold comment', () => {
 	test('every hold code has advice, a next action, and reads back from its comment', () => {
 		for (const code of HOLD_CODES.filter((c) => c !== 'not-fetched')) {
 			const body = holdNotice({ pr: 5, head: 'h5', code, reason: `held for ${code}` });
-			expect(body, code).toMatch(/\*\*What to do:\*\* \S/);
+			// The reason, then one action as a sentence.
+			expect(body, code).toMatch(new RegExp(`^\\*\\*Merge queue:\\*\\* held for ${code}\\. [A-Z][^\\n]+\\.(\\n|$)`));
 			expect(NEXT_ACTIONS[code].length, code).toBeGreaterThan(0);
 			expect(readNotice(body), code).toEqual({
 				v: 1,
@@ -91,7 +98,7 @@ describe('the hidden block', () => {
 		expect(readNotice('<!-- merge-queue not json -->')).toBeNull();
 		expect(readNotice('<!-- merge-queue {"v":2,"kind":"hold","pr":1} -->')).toBeNull();
 		expect(readNotice('<!-- merge-queue {"v":1,"kind":"other","pr":1} -->')).toBeNull();
-		const quoted = `> ${holdNotice({ pr: 1, head: 'a', code: 'draft', reason: 'old' })}\n\n${releasedNotice({ pr: 1, head: 'b' })}`;
+		const quoted = `> ${holdNotice({ pr: 1, head: 'a', code: 'draft', reason: 'Draft' })}\n\n${releasedNotice({ pr: 1, head: 'b' })}`;
 		expect(readNotice(quoted)).toMatchObject({ kind: 'released', head: 'b' });
 	});
 });
@@ -99,7 +106,7 @@ describe('the hidden block', () => {
 describe('the other comments carry the block too', () => {
 	test('back in line', () => {
 		const body = releasedNotice({ pr: 4, head: 'h4' });
-		expect(body.split('\n')[0]).toBe('Back in line in the merge queue.');
+		expect(body.split('\n')[0]).toBe('**Merge queue:** back in line.');
 		expect(readNotice(body)).toEqual({ v: 1, kind: 'released', pr: 4, head: 'h4', nextActions: [] });
 	});
 
@@ -112,11 +119,11 @@ describe('the other comments carry the block too', () => {
 });
 
 describe('the hold on the check run', () => {
-	test('the title keeps the one-line reason; the summary is the comment without its heading', () => {
-		const h = { pr: 7, head: 'h7', code: 'draft' as HoldCode, reason: '#7 is a draft' };
+	test('the title is the reason (the conclusion already says action required); the summary is the comment', () => {
+		const h = { pr: 7, head: 'h7', code: 'draft' as HoldCode, reason: 'Draft' };
 		const c = holdCheck(h);
-		expect(c.title).toBe('Needs attention: #7 is a draft');
-		expect(c.summary).toBe(holdNotice(h).replace('### Needs attention in the merge queue\n\n', ''));
+		expect(c.title).toBe('Draft');
+		expect(c.summary).toBe(holdNotice(h));
 	});
 
 	test('a very long reason is cut in the title, never in the summary', () => {
