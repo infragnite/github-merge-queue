@@ -1008,7 +1008,7 @@ class Tick {
 		return this.d.now() - store.batchCreatedMs(b) > this.settings().config.ciTimeoutMs;
 	}
 
-	async advanceHead(head: BatchRow, rest: BatchRow[]) {
+	async advanceHead(head: BatchRow, rest: BatchRow[], interleave = false) {
 		if (head.status === 'testing' || head.status === 'retrying') {
 			const r = await this.d.ci.result(head.head_sha, head.retried_at);
 			if (r === 'pending') {
@@ -1071,7 +1071,7 @@ class Tick {
 			}
 			return;
 		}
-		if (head.status === 'bisecting') await this.bisect(head);
+		if (head.status === 'bisecting') await this.bisect(head, interleave);
 	}
 
 	/**
@@ -1079,7 +1079,7 @@ class Tick {
 	 * branch lands at once, failing groups are split and run again on top of it. Everything is
 	 * planned from the recorded runs, so a restart picks it up where it was.
 	 */
-	async bisect(batch: BatchRow) {
+	async bisect(batch: BatchRow, interleave = false) {
 		const runs = store.getBisectRuns(batch.id);
 		for (const run of runs) {
 			if (run.ci_result !== 'pending') continue;
@@ -1187,6 +1187,12 @@ class Tick {
 		}
 		if (plan.done) {
 			await this.finishBisection(batch, runs, batch.landed.length > 0);
+			return;
+		}
+		// Between two steps, urgent PRs go first: each step is planned again on whatever master is
+		// then, so the bisection picks up where it was once they land.
+		if (interleave && plan.start.length && (await this.plan([batch], masterSha, { urgentOnly: true })) === 'started') {
+			this.log(`batch ${batch.id}: bisection waits for an urgent batch`);
 			return;
 		}
 		for (const g of plan.start) await this.startBisectRun(batch, { context: [], members: g }, runs.length, masterSha, masterTree);
@@ -1483,7 +1489,11 @@ class Tick {
 		return pushed;
 	}
 
-	async plan(active: BatchRow[], masterSha: string): Promise<'started' | 'conflict' | 'error' | 'idle'> {
+	/**
+	 * Plans and starts the next batch on top of `active`. With `urgentOnly` it starts an express
+	 * batch of urgent PRs on `masterSha` itself, beside a bisection (see `bisect`), or nothing.
+	 */
+	async plan(active: BatchRow[], masterSha: string, opts: { urgentOnly?: boolean } = {}): Promise<'started' | 'conflict' | 'error' | 'idle'> {
 		const settings = this.settings();
 		// A deferred PR waits while a PR it conflicts with is in a batch or about to be. One that is
 		// held back (unapproved, deferred itself, in conflict: it then has a reason or another
@@ -1514,6 +1524,7 @@ class Tick {
 		// stacked) until one passes: that batch carries a fix and lands. When no untried PR can be
 		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
 		const red = this.masterState(await this.d.git.tree(masterSha)) === 'red';
+		if (red && opts.urgentOnly) return 'idle';
 		const analysis = await this.analysis();
 		let plan: Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express' | 'held'>;
 		if (red) {
@@ -1530,9 +1541,12 @@ class Tick {
 				live: new Set(this.items().map((i) => i.pr_number))
 			});
 		} else {
-			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: active.map((b) => b.members), config: settings.config });
+			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config });
+			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
+			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
+			if (opts.urgentOnly && !plan.express) return 'idle';
 		}
-		for (const h of plan.held) {
+		for (const h of opts.urgentOnly ? [] : plan.held) {
 			const it = this.item(h.pr);
 			if (!it) continue;
 			const { code, wait, reason } = h.admission;
@@ -1540,8 +1554,8 @@ class Tick {
 			store.setHold(it.id, { code, wait, reason });
 		}
 		if (!plan.batch) return 'idle';
-		const below = red ? [] : active.flatMap((b) => b.members);
-		const base = red || !active.length ? masterSha : active[active.length - 1].head_sha;
+		const below = red || opts.urgentOnly ? [] : active.flatMap((b) => b.members);
+		const base = red || opts.urgentOnly || !active.length ? masterSha : active[active.length - 1].head_sha;
 		return this.startBatch(base, plan.batch, below, plan.express, masterSha);
 	}
 }
@@ -1562,10 +1576,13 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		const tree = await deps.git.tree(masterSha);
 		if (active[0].base_tree !== tree && active[0].status === 'bisecting') {
 			// A bisection follows the default branch: its failures still point at the same PRs, and
-			// what passes is run again on top of the new commit. Batches built on it are rebuilt.
-			t.log(`master moved outside the queue; batch ${active[0].id} bisects on top of it`);
-			store.rebaseBatch(active[0].id, masterSha, tree);
-			await t.supersede(active.slice(1));
+			// what passes is run again on top of the new commit. Batches built on it are rebuilt; an
+			// urgent batch that ran between its steps and is bisecting itself follows it too.
+			for (const b of active.filter((b) => b.status === 'bisecting' && b.base_tree !== tree)) {
+				t.log(`master moved; batch ${b.id} bisects on top of it`);
+				store.rebaseBatch(b.id, masterSha, tree);
+			}
+			await t.supersede(active.slice(1).filter((b) => b.status !== 'bisecting'));
 			active = store.getActiveBatches(deps.repo.id);
 			await t.checkMaster(masterSha);
 		} else if (active[0].base_tree !== tree) {
@@ -1579,12 +1596,16 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	} else if (active.length) {
 		// Batches side by side on a branch that is no longer red (it was vouched for) aren't a
 		// pipeline: keep the head, rebuild the rest on top of it.
-		const loose = active.findIndex((b, i) => i > 0 && b.base_sha !== active[i - 1].head_sha);
+		// An urgent batch run between two steps of a bisection is built on master beside it, not on
+		// top of it: it goes first, and the bisection waits for it.
+		const between = active[0].status === 'bisecting' ? active.find((b, i) => i > 0 && b.express && b.base_sha !== active[0].head_sha) : undefined;
+		const loose = active.findIndex((b, i) => i > 0 && b !== between && b.base_sha !== active[i - 1].head_sha);
 		if (loose > 0) {
 			await t.supersede(active.slice(loose));
 			active = active.slice(0, loose);
 		}
-		await t.advanceHead(active[0], active.slice(1));
+		if (between && active.includes(between)) await t.advanceHead(between, []);
+		else await t.advanceHead(active[0], active.slice(1), true);
 		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 		active = store.getActiveBatches(deps.repo.id);
 	}
