@@ -64,6 +64,8 @@ class World {
 	holdMasterRuns = false;
 	/** Runs of these PRs keep running while it says so. */
 	hold: (prs: number[]) => boolean = () => false;
+	/** Called as each PR is about to be merged (before GitHub checks its head). */
+	beforeMerge: (n: number) => void = () => {};
 
 	ciFails(sha: string) {
 		if (this.everythingFails) return true;
@@ -177,6 +179,7 @@ class World {
 				},
 				retargetBase: async (n, base) => git.retarget(n, base),
 				squashMerge: async (n, _title, expected) => {
+					this.beforeMerge(n);
 					if (this.refuseMerge.has(n)) return { merged: false, message: 'Repository rule violations found' };
 					if (this.rateLimited) throw new RateLimitedError(Date.now() + 60_000, 'API rate limit exceeded');
 					if (git.sha(git.pr(n).headRef) !== expected) return { merged: false, message: 'Head branch was modified' };
@@ -719,13 +722,75 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 2]);
 	});
 
-	test('a PR pushed to after its batch was built is rebuilt, not landed stale', async () => {
+	test('a PR pushed to after its batch was built is rebuilt, not landed stale; the rest of the batch lands', async () => {
 		pr(1);
 		pr(2);
 		await tickBatchQueue(world.deps());
 		git.commit('pr2', 'late change');
 		await run();
-		expect(world.started).toHaveLength(2);
+		// #1 lands from the batch; master (#1 alone, never tested so) is checked; #2 is tested as it is now.
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['1,2', 'master', '2']);
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.files('main').has('late-change.txt')).toBe(true);
+	});
+
+	test('a PR pushed to while its batch lands: the rest still lands, it is rebuilt, master is checked, no pause', async () => {
+		pr(1);
+		pr(2);
+		pr(3);
+		await tickBatchQueue(world.deps());
+		// #3 is pushed to just as #1 merges: #2 still lands, #3 is retested as it is now.
+		world.beforeMerge = (n) => {
+			if (n === 1) git.commit('pr3', 'late change');
+			world.beforeMerge = () => {};
+		};
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([1, 2, 3]);
+		expect(world.files('main').has('late-change.txt')).toBe(true);
+		// The batch, a check of master alone (it holds #1 #2 without #3, never tested), and #3 again.
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['1,2,3', 'master', '3']);
+	});
+
+	test('a batch has no order: a change to its first PR still lands all the others', async () => {
+		pr(1);
+		pr(2);
+		pr(3);
+		await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change');
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([2, 3, 1]);
+		// The batch, master alone (#2 #3 without #1, never tested so), then #1 as it is now.
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['1,2,3', 'master', '1']);
+	});
+
+	test('a PR stacked on one that changed goes back in line with it; the rest lands', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		pr(3);
+		await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change');
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged.slice(0, 1)).toEqual([3]);
+		expect(world.merged.slice(1).sort()).toEqual([1, 2]);
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))[1]).toBe('master');
+	});
+
+	test('a PR pushed to between the check and its merge is not a pause either', async () => {
+		pr(1);
+		pr(2);
+		await tickBatchQueue(world.deps());
+		// Pushed after the queue read #2's head, before GitHub merges it: the merge is refused.
+		world.beforeMerge = (n) => {
+			if (n === 2) {
+				git.commit('pr2', 'late change');
+				world.beforeMerge = () => {};
+			}
+		};
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
 		expect(world.merged).toEqual([1, 2]);
 		expect(world.files('main').has('late-change.txt')).toBe(true);
 	});
@@ -1031,30 +1096,78 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([]);
 	});
 
-	test('a landing that stops part way keeps what it merged as known green, and the rest lands without a recheck of the default branch', async () => {
+	test('a landing that stops part way does not trust what it merged: master is checked alone before anyone is blamed on it', async () => {
 		pr(1);
 		pr(2);
 		world.refuseMerge.add(2);
 		await run();
 		expect(world.merged).toEqual([1]);
 		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #2/);
-		const h = store.getMasterHealth(repo.id)!;
-		expect(h.state).toBe('green');
-		expect(h.sha).toBe(git.sha('main'));
+		// Master holds #1 without #2: no run tested that tree, so it is not marked green.
+		const h = store.getMasterHealth(repo.id);
+		expect(h?.sha === git.sha('main') && h.state === 'green').toBe(false);
 		world.refuseMerge.delete(2);
 		store.updateQueueSettings(repo.id, { pausedReason: null });
 		const before = world.started.length;
 		await run();
 		expect(world.merged).toEqual([1, 2]);
-		// one batch of #2 on the new default branch, no check of the default branch alone
-		expect(world.started.slice(before).map((x) => x.prs)).toEqual([[2]]);
+		// a check of the default branch alone, and #2 on top of it
+		expect(world.started.slice(before).map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['master', '2']);
+	});
+
+	test('an interrupted landing that merged only part of its PRs does not mark master green', async () => {
+		pr(1);
+		pr(2);
+		world.refuseMerge.add(2);
+		await run();
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		expect(world.merged).toEqual([1]);
+		// As if the app stopped after merging #1 of [1, 2], before it recorded anything.
+		store.setMasterHealth(repo.id, { sha: 'old', tree: 'old-tree', state: 'green', since: 0 });
+		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1, 2], group: [1, 2] });
+		await recoverInterrupted(world.deps());
+		expect(store.getLandingIntent(repo.id)).toBeNull();
+		expect(store.getMasterHealth(repo.id)).toMatchObject({ sha: 'old', tree: 'old-tree' });
+	});
+
+	test('an interrupted landing that left PRs out does not mark master green, even when all it set out to merge merged', async () => {
+		pr(1);
+		pr(2);
+		pr(3);
+		await tickBatchQueue(world.deps());
+		git.commit('pr3', 'late change');
+		// #3 is left out; later its own merge is refused, so only #1 #2 ever land.
+		world.refuseMerge.add(3);
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		// As if the app stopped right after merging #1 #2 of the group [1, 2, 3], before recording it.
+		store.setMasterHealth(repo.id, { sha: 'old', tree: 'old-tree', state: 'green', since: 0 });
+		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1, 2], group: [1, 2, 3] });
+		await recoverInterrupted(world.deps());
+		expect(store.getMasterHealth(repo.id)).toMatchObject({ sha: 'old', tree: 'old-tree' });
+	});
+
+	test('with a PR left out, a PR that GitHub then refuses goes back in line too, no pause', async () => {
+		pr(1);
+		pr(2);
+		pr(3);
+		await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change');
+		world.refuseMerge.add(3);
+		await run(2);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([2]);
+		world.refuseMerge.delete(3);
+		await run();
+		expect(world.merged.slice(1).sort()).toEqual([1, 3]);
 	});
 
 	test('an interrupted landing of a PR that was deleted meanwhile is settled, not retried forever', async () => {
 		pr(1);
 		await tickBatchQueue(world.deps());
 		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
-		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1] });
+		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1], group: [1] });
 		world.deleted.add(1);
 		await recoverInterrupted(world.deps());
 		expect(store.getLandingIntent(repo.id)).toBeNull();
