@@ -1462,6 +1462,29 @@ describe('stopping a red run at its first failed job', () => {
 		for (const h of failing) expect(world.slowReads.has(h)).toBe(false);
 	});
 
+	for (const mode of ['batch', 'serial'] as const)
+		test(`${mode}: the run that ejects a stacked PR is read to its end`, async () => {
+			// 1 <- 2 <- 3 <- 4, with #3 the breaker, and #5 on its own.
+			store.updateQueueSettings(repo.id, { mode, config: { retryFailed: false } });
+			world.slowFailures = true;
+			pr(1);
+			pr(2, { from: 'pr1', base: 'pr1' });
+			pr(3, { from: 'pr2', base: 'pr2', file: 'x-breaks-3.txt' });
+			pr(4, { from: 'pr3', base: 'pr3' });
+			pr(5);
+			world.breakingFiles.add('x-breaks-3.txt');
+			await run(80);
+			expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 5]);
+			expect(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr).sort()).toEqual([3, 4]);
+			// The last run with #3 in it decided its eject: read to the end, never cancelled, whatever
+			// else is on its branch.
+			const decisive = world.started.filter((x) => x.prs.includes(3)).at(-1)!;
+			expect(world.cancelled).not.toContain(decisive.head);
+			expect(world.slowReads.get(decisive.head), `run of ${decisive.prs.join(' ')}`).toBe(4);
+			// Earlier failing runs with #3 and other suspects stopped at their first failure.
+			for (const x of world.started.filter((x) => x.prs.includes(3) && x !== decisive)) expect(world.cancelled, `run of ${x.prs.join(' ')}`).toContain(x.head);
+		});
+
 	test('off, a red run is read to its end', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false, stopOnFirstFailure: false } });
 		pr(1);
