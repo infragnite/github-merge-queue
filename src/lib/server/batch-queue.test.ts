@@ -635,7 +635,7 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1]);
 		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, '#2 has changes requested']]);
 		// The dashboard shows it as needing someone, not as waiting for its turn.
-		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', wait: false, reason: '#2 has changes requested' });
+		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: '#2 has changes requested' });
 	});
 
 	test('marks the PR head as tested right before merging it', async () => {
@@ -873,6 +873,17 @@ describe('batch queue runtime', () => {
 		// One more tick plans the rest: #2 is queued, only deferred; #3 waits for it.
 		await tickBatchQueue(world.deps());
 		expect(item(3).error_message).toBe('Waits for #2: conflicts with #1 ahead of it; waits for them to land');
+	});
+
+	test('a PR stacked on a queued PR in conflict says that its parent conflicts, not that it is unqueued', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		db.updateQueueItemHeadSha(item(1).id, git.sha('pr1'));
+		db.updateQueueItemStatus(item(1).id, 'conflict', 'Conflicts with main in src/a.ts');
+		await tickBatchQueue(world.deps());
+		expect(world.started).toEqual([]);
+		expect(item(2).error_message).toBe('Waits for #1: conflicts with main in src/a.ts');
 	});
 
 	test('a deferred PR says only what it still waits for, not PRs that landed since', async () => {
