@@ -1103,6 +1103,20 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([]);
 	});
 
+	test('on a red default branch with the pipeline full, a PR held meanwhile is told', async () => {
+		store.updateQueueSettings(repo.id, { config: { depth: 1 } });
+		redMain();
+		pr(1);
+		world.hold = () => true;
+		await run(2);
+		expect(world.started.map((x) => x.prs)).toEqual([[1]]);
+		pr(5);
+		world.changesRequested.add(5);
+		await run(2);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr5') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([['failure', 'Needs attention: #5 has changes requested']]);
+	});
+
 	test('a PR held back on a red default branch does not stop the others from being tried alone', async () => {
 		redMain();
 		pr(1);
