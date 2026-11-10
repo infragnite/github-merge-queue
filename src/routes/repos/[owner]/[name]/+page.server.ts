@@ -231,7 +231,8 @@ export const actions: Actions = {
 			} catch {
 				throw new ApiError(404, `#${n} was not found on GitHub`);
 			}
-			enqueue(repo, me, pr, {});
+			// Urgent needs maintain; enqueue checks it.
+			enqueue(repo, me, pr, { priority: form.get('priority') ?? undefined });
 			markDirty(repo.id);
 		}),
 

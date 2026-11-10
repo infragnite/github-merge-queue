@@ -5,6 +5,7 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import BatchCard from '$lib/components/BatchCard.svelte';
 	import SavingsCard from '$lib/components/SavingsCard.svelte';
+	import AddPrDialog from '$lib/components/AddPrDialog.svelte';
 	import { queueView, type Row } from '$lib/queue-view';
 	import { runOrder } from '$lib/run-order';
 
@@ -433,63 +434,4 @@
 	</div>
 </div>
 
-<!-- Add PR Dialog -->
-{#if showAddDialog}
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div
-		class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-		onkeydown={(e) => e.key === 'Escape' && (showAddDialog = false)}
-	>
-		<!-- svelte-ignore a11y_click_events_have_key_events -->
-		<div class="fixed inset-0" onclick={() => (showAddDialog = false)}></div>
-		<div class="relative w-full max-w-lg rounded-xl bg-surface-raised p-6 shadow-2xl">
-			<h2 class="mb-4 text-lg font-semibold text-gray-900">Add Pull Request to Queue</h2>
-
-			{#if data.openPrs.length === 0}
-				<p class="text-sm text-gray-500">No open pull requests available.</p>
-			{:else}
-				<div class="max-h-96 space-y-2 overflow-y-auto">
-					{#each data.openPrs as pr (pr.number)}
-						<form method="POST" action="?/addToQueue" use:enhance={() => {
-							return async ({ update }) => {
-								showAddDialog = false;
-								await update();
-							};
-						}}>
-							<input type="hidden" name="pr_number" value={pr.number} />
-							<input type="hidden" name="pr_title" value={pr.title} />
-							<input type="hidden" name="pr_url" value={pr.url} />
-							<input type="hidden" name="author_login" value={pr.author} />
-							<input type="hidden" name="author_avatar" value={pr.authorAvatar} />
-							<button
-								type="submit"
-								class="flex w-full items-center gap-3 rounded-lg border border-border-subtle p-3 text-left transition-colors hover:border-indigo-300 hover:bg-indigo-50/50"
-							>
-								<img src={pr.authorAvatar} alt="" class="h-8 w-8 rounded-full" />
-								<div class="min-w-0 flex-1">
-									<div class="flex items-center gap-2">
-										<span class="font-medium text-gray-900">#{pr.number}</span>
-										{#if pr.draft}
-											<span class="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-500">Draft</span>
-										{/if}
-									</div>
-									<p class="truncate text-sm text-gray-500">{pr.title}</p>
-								</div>
-								<span class="text-xs text-gray-400">{pr.author}</span>
-							</button>
-						</form>
-					{/each}
-				</div>
-			{/if}
-
-			<div class="mt-4 flex justify-end">
-				<button
-					onclick={() => (showAddDialog = false)}
-					class="rounded-lg border border-border-subtle px-4 py-2 text-sm text-gray-600 hover:bg-surface-sunken"
-				>
-					Cancel
-				</button>
-			</div>
-		</div>
-	</div>
-{/if}
+<AddPrDialog bind:open={showAddDialog} prs={data.openPrs} canUrgent={data.can.urgent && batchMode} />

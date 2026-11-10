@@ -6,6 +6,7 @@
 
 	let saving = $state(false);
 	let switching = $state(false);
+	let removing = $state(false);
 	const base = $derived(`/repos/${data.repo.owner}/${data.repo.name}`);
 	const isDefault = (f: SettingField) => shown(f, data.settings) === shown(f, data.settings.defaults);
 	const fmt = (f: SettingField, v: string | number | boolean) => (f.kind === 'boolean' ? (v ? 'on' : 'off') : f.kind === 'duration' ? `${v} ${f.unit}` : v === '' ? 'empty' : String(v));
@@ -37,6 +38,15 @@
 		return async ({ update }) => {
 			await update({ reset: false });
 			switching = false;
+		};
+	};
+
+	const confirmRemove: import('@sveltejs/kit').SubmitFunction = ({ cancel }) => {
+		if (!confirm(`Remove ${data.repo.owner}/${data.repo.name} from the merge queue? Its queue, batches and settings are deleted; PRs and branches on GitHub stay.`)) return cancel();
+		removing = true;
+		return async ({ update }) => {
+			await update();
+			removing = false;
 		};
 	};
 </script>
@@ -158,4 +168,21 @@
 			</div>
 		{/if}
 	</form>
+
+	{#if data.canRemove}
+		<section id="danger" class="scroll-mt-4 rounded-xl border border-red-200 bg-surface-raised p-4 sm:p-5" aria-labelledby="danger-title">
+			<h2 id="danger-title" class="text-base font-semibold text-red-800">Danger zone</h2>
+			<div class="mt-2 flex flex-wrap items-center justify-between gap-3">
+				<p class="min-w-0 flex-1 text-sm text-gray-600">
+					Remove this repository from the merge queue. Its queue, batches and settings are deleted; PRs and branches on GitHub stay. You can add it again from the dashboard.
+				</p>
+				<form method="POST" action="?/remove" use:enhance={confirmRemove}>
+					<button type="submit" disabled={removing} class="rounded-md border border-red-300 px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50">
+						{removing ? 'Removing…' : 'Remove repository'}
+					</button>
+				</form>
+			</div>
+			{#if form?.removeError}<p class="mt-2 text-sm text-red-600" role="alert">{form.removeError}</p>{/if}
+		</section>
+	{/if}
 </div>
