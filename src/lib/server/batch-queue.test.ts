@@ -11,7 +11,7 @@ const events = await import('./events');
 import { GitSandbox } from './testing/git-sandbox';
 import { writeFileSync } from 'node:fs';
 import type { LivePR, PRCheckState, QueueDeps } from './batch-queue';
-import { ejectedNotice, holdCheck, holdNotice, readNotice, releasedNotice } from './hold-format';
+import { ejectedNotice, holdCheck, holdNotice, readNotice } from './hold-format';
 import { RateLimitedError } from './rate-limit';
 
 let git: GitSandbox;
@@ -310,7 +310,7 @@ describe('batch queue runtime', () => {
 		await run(60);
 		expect(world.merged).toEqual([1, 2, 4]);
 		expect(world.comments).toEqual([
-			{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }
+			{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: #3 fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }
 		]);
 		expect(queued()).toEqual([]);
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr4.txt']);
@@ -956,7 +956,7 @@ describe('batch queue runtime', () => {
 		expect(last).toMatchObject({ state: 'failure', title: expect.stringMatching(/^Left the queue: CI failed in mq\//), url: expect.stringMatching(/^https:\/\/ci\.example\//) });
 		const c = world.comments.find((x) => x.pr === 1)!;
 		expect(c.body).toBe(ejectedNotice({ pr: 1, head: git.sha('pr1'), reason: readNotice(c.body)!.reason!, link: last.url }));
-		expect(last.summary).toBe(c.body.replace(/^Removed from the merge queue: /, 'Left the queue: '));
+		expect(last.summary).toBe(c.body);
 	});
 
 	test('a conflict is told on the check run in the hold format: action required and the commands, its files only in the block', async () => {
@@ -986,7 +986,7 @@ describe('batch queue runtime', () => {
 		]);
 	});
 
-	test('a held PR gets one comment saying what to do, and one when it is back in line', async () => {
+	test('a held PR gets one comment saying what to do, and none when it is back in line', async () => {
 		pr(1);
 		pr(2);
 		world.changesRequested.add(2);
@@ -998,7 +998,10 @@ describe('batch queue runtime', () => {
 		world.changesRequested.delete(2);
 		await run();
 		expect(world.merged).toEqual([1, 2]);
-		expect(world.comments.slice(1)).toEqual([{ pr: 2, body: releasedNotice({ pr: 2, head: git.sha('pr2') }) }]);
+		// Back in line gives no action: its check goes back to queued, and the event is kept.
+		expect(world.comments.slice(1)).toEqual([]);
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).map((x) => x.state)).toContain('queued');
+		expect(events.listEvents(repo.id, { pr: 2 }).map((e) => e.kind)).toContain('released');
 	});
 
 	test('a PR whose parent is not queued is told to queue it', async () => {
@@ -1193,7 +1196,7 @@ describe('batch queue runtime', () => {
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run();
 		expect(world.reruns.size).toBe(0);
-		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the merge queue/) }]);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the queue/) }]);
 	});
 
 	test('a failed check whose workflow still runs other jobs is re-run once it finishes, not bisected', async () => {
@@ -1421,7 +1424,7 @@ describe('batch queue runtime', () => {
 		world.holdMasterRuns = false;
 		await run(30);
 		expect(world.merged).toEqual([1, 2]);
-		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }]);
+		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: #3 fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }]);
 	});
 
 	test('an ejection waiting for the default branch to be verified holds only itself: the other groups go on bisecting', async () => {
@@ -1794,7 +1797,7 @@ describe('stopping a red run at its first failed job', () => {
 			world.breakingFiles.add('x-breaks-3.txt');
 			await run(80);
 			expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 5]);
-			expect(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr).sort()).toEqual([3, 4]);
+			expect(world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr).sort()).toEqual([3, 4]);
 			// The last run with #3 in it decided its eject at its first failure, whatever else is on its
 			// branch, and was never cancelled: its jobs go on for the author's log.
 			const decisive = world.started.filter((x) => x.prs.includes(3)).at(-1)!;
@@ -1842,7 +1845,7 @@ describe('stopping a red run at its first failed job', () => {
 		const head = world.started[0].head;
 		// It failed early, but a re-run of its failed jobs could still pass: it waited for it.
 		expect(world.reruns.get(head)).toBe(1);
-		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/^Removed from the merge queue: CI failed[\s\S]*CI run: https:\/\/ci\.example\//) }]);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: CI failed[\s\S]*CI run: https:\/\/ci\.example\//) }]);
 	});
 
 	test('a fail-fast failure is still re-run once when flake retries are on', async () => {
@@ -1893,7 +1896,7 @@ describe('batch queue runtime, randomised', () => {
 				expect(world.ciFails(git.sha('main')), `main broke after tick ${tick}`).toBe(false);
 			}
 			expect(queued()).toEqual([]);
-			const ejected = new Set(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr));
+			const ejected = new Set(world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr));
 			expect([...world.merged, ...ejected].sort((a, b) => a - b)).toEqual(prs);
 			for (const b of breakers) expect(ejected).toContain(b);
 			// Of an interacting pair, at most one is ejected; every other PR merges, but for what is
@@ -1916,7 +1919,7 @@ describe('one by one, on the batch runtime', () => {
 			expect(store.getActiveBatches(repo.id).length, `runs in flight after tick ${i}`).toBeLessThanOrEqual(1);
 		}
 	}
-	const ejected = () => world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr);
+	const ejected = () => world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr);
 
 	test('tests the head stack whole, one run at a time, without waiting to collect more', async () => {
 		pr(1);
@@ -1988,7 +1991,7 @@ describe('both planners, the same queue', () => {
 			expect(world.ciFails(git.sha('main')), `${mode}: main broke after tick ${tick}`).toBe(false);
 		}
 		expect(queued(), mode).toEqual([]);
-		const ejected = world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr);
+		const ejected = world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr);
 		return { merged: [...world.merged].sort((a, b) => a - b), ejected: ejected.sort((a, b) => a - b), runs: world.started.length };
 	}
 

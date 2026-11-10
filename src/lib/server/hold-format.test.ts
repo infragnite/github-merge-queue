@@ -3,7 +3,8 @@ import { HOLD_CODES, holdAdvice, type HoldCode } from './batching';
 
 /** Waiting on other PRs or on the queue: nothing for the author to do. */
 const SILENT: HoldCode[] = ['deferred', 'parent-held', 'parent-not-ready', 'not-fetched'];
-import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice, releasedNotice } from './hold-format';
+import * as format from './hold-format';
+import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice } from './hold-format';
 
 describe('the hold comment', () => {
 	test('says what holds the PR and the one thing to do, in one line; the code is in the hidden block', () => {
@@ -98,6 +99,9 @@ describe('the hold comment', () => {
 		for (const a of all) expect(a).toMatch(/^[a-z]+(-[a-z]+)*$/);
 		expect(NEXT_ACTIONS['parent-not-queued']).toEqual(['queue-parent']);
 		expect(NEXT_ACTIONS.draft).toEqual(['mark-ready']);
+		// Rebasing onto the parent's head is not retargeting the base: an agent tells them apart.
+		expect(NEXT_ACTIONS['stack-broken']).toEqual(['restack']);
+		expect(NEXT_ACTIONS['wrong-base']).toEqual(['retarget']);
 		expect(NEXT_ACTIONS['not-fetched']).toEqual([]);
 	});
 });
@@ -117,22 +121,29 @@ describe('the hidden block', () => {
 		expect(readNotice('<!-- merge-queue not json -->')).toBeNull();
 		expect(readNotice('<!-- merge-queue {"v":2,"kind":"hold","pr":1} -->')).toBeNull();
 		expect(readNotice('<!-- merge-queue {"v":1,"kind":"other","pr":1} -->')).toBeNull();
-		const quoted = `> ${holdNotice({ pr: 1, head: 'a', code: 'draft', reason: 'Draft' })}\n\n${releasedNotice({ pr: 1, head: 'b' })}`;
-		expect(readNotice(quoted)).toMatchObject({ kind: 'released', head: 'b' });
+		const quoted = `> ${holdNotice({ pr: 1, head: 'a', code: 'draft', reason: 'Draft' })}\n\n${ejectedNotice({ pr: 1, head: 'b', reason: 'Failed' })}`;
+		expect(readNotice(quoted)).toMatchObject({ kind: 'ejected', head: 'b' });
 	});
 });
 
-describe('the other comments carry the block too', () => {
-	test('back in line', () => {
-		const body = releasedNotice({ pr: 4, head: 'h4' });
-		expect(body.split('\n')[0]).toBe('**Merge queue:** back in line.');
-		expect(readNotice(body)).toEqual({ v: 1, kind: 'released', pr: 4, head: 'h4', nextActions: [] });
+describe('the other comments', () => {
+	test('there is no "back in line" comment: it gives no action, and the check going back to queued says it', () => {
+		expect(format).not.toHaveProperty('releasedNotice');
 	});
 
-	test('removed from the queue, with the CI run', () => {
-		const body = ejectedNotice({ pr: 4, head: 'h4', reason: 'failed in batch 3', link: 'https://ci/run/1' });
-		expect(body).toMatch(/^Removed from the merge queue: failed in batch 3\n\nCI run: https:\/\/ci\/run\/1\n\n<!-- merge-queue /);
-		expect(readNotice(body)).toEqual({ v: 1, kind: 'ejected', pr: 4, head: 'h4', reason: 'failed in batch 3', nextActions: ['fix-failure', 'requeue'] });
+	test('removed from the queue: the same lead, the action, then the CI run', () => {
+		const body = ejectedNotice({ pr: 4, head: 'h4', reason: 'Fails on its own on top of main', link: 'https://ci/run/1' });
+		expect(body).toBe(
+			[
+				'**Merge queue:** Removed from the queue: Fails on its own on top of main. Fix the failure, push, and queue it again.',
+				'',
+				'CI run: https://ci/run/1',
+				'',
+				'<!-- merge-queue {"v":1,"kind":"ejected","pr":4,"head":"h4","reason":"Fails on its own on top of main","nextActions":["fix-failure","requeue"]} -->'
+			].join('\n')
+		);
+		expect(ejectedNotice({ pr: 4, head: 'h4', reason: 'Failed.' })).toMatch(/^\*\*Merge queue:\*\* Removed from the queue: Failed\. Fix the failure/);
+		expect(readNotice(body)).toEqual({ v: 1, kind: 'ejected', pr: 4, head: 'h4', reason: 'Fails on its own on top of main', nextActions: ['fix-failure', 'requeue'] });
 		expect(ejectedNotice({ pr: 4, head: null, reason: 'r' })).not.toContain('CI run');
 	});
 });
