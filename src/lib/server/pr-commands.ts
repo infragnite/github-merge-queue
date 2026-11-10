@@ -18,6 +18,7 @@ import * as store from './batch-store';
 import * as api from './api-service';
 import { atLeast, AuthError, requireRole, type Caller, type Role } from './api-auth';
 import { lastEventOf } from './events';
+import { statusBlock } from './hold-format';
 import { RequestLimiter } from './request-limit';
 import type { Priority } from './batching';
 import type { StackAnalysis } from './stacks';
@@ -270,9 +271,7 @@ async function status(repo: Repo, deps: CommandDeps, n: number): Promise<string>
 		for (const a of next) lines.push(actionLine(a));
 	}
 	lines.push('', `[Queue page](${deps.queueUrl})`);
-	const data = { pr: n, queue: entry, hold, nextActions: next };
-	// `--` can only occur inside JSON strings; escaped, it can't end the comment early.
-	lines.push(`<!-- merge-queue:status ${JSON.stringify(data).replace(/--/g, '-\\u002d')} -->`);
+	lines.push('', statusBlock({ pr: n, head: it?.head_sha ?? null, queue: entry, ...(hold ? { code: hold.code, reason: hold.reason } : {}), steps: next }));
 	return lines.join('\n');
 }
 
