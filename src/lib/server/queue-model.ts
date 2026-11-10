@@ -8,7 +8,7 @@
 //
 // Pure: the runtime gathers the queue, PR states, the stack analysis and known conflicts.
 
-import { admit, type AdmissionCode, type BatchConfig, type PRState, type Priority, type QueueEntry } from './batching';
+import { admit, type BatchConfig, type HoldCode, type Plan, type PlanInput, type PRState, type Priority, type QueueEntry } from './batching';
 import type { StackAnalysis } from './stacks';
 
 const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
@@ -40,12 +40,12 @@ export interface QueueStack {
 	enqueuedAt: number;
 }
 
-export type HoldCode = AdmissionCode | 'conflict' | 'parent-not-queued' | 'parent-held';
-
 export interface Held {
 	pr: number;
 	code: HoldCode;
 	reason: string;
+	/** It will be ready by itself (else someone must act). */
+	wait: boolean;
 	/** The held PR below this one that holds it, or null when the reason is its own. */
 	cause: number | null;
 }
@@ -110,7 +110,9 @@ export function queueModel(input: QueueModelInput): QueueModel {
 			continue;
 		}
 		const c = mine ?? own.get(cause!)!;
-		const held: Held = mine ? { pr: n, code: mine.code, reason: mine.reason, cause: null } : { pr: n, code: 'parent-held', reason: `Waits for #${cause}: ${lowerFirst(c.reason)}`, cause };
+		const held: Held = mine
+			? { pr: n, code: mine.code, reason: mine.reason, wait: mine.wait, cause: null }
+			: { pr: n, code: 'parent-held', reason: `Waits for #${cause}: ${lowerFirst(c.reason)}`, wait: c.wait, cause };
 		// What holds a PR decides where it waits: by itself, or for someone.
 		(c.wait ? waiting : attention).push(held);
 	}
@@ -188,4 +190,18 @@ export function fillBatch(model: QueueModel, opts: { config: BatchConfig; inflig
 export function serialPick(model: QueueModel, opts: { inflight: number }): number[] | null {
 	if (opts.inflight > 0) return null;
 	return model.stacks.find((s) => s.on === null)?.members ?? null;
+}
+
+/** The next batch for the batch planner: the queue model, filled. */
+export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string> }): Plan {
+	const inflight = new Set(input.inflight.flat());
+	const model = queueModel({ queue: input.queue, states: input.states, analysis: input.analysis, config: input.config, inflight, conflicts: input.conflicts });
+	const fill = fillBatch(model, { config: input.config, inflightBatches: input.inflight.length, now: input.now });
+	const effectivePriority = new Map<number, Priority>(input.queue.map((e) => [e.pr, e.priority]));
+	for (const s of model.stacks) for (const m of s.members) effectivePriority.set(m, s.priority);
+	return {
+		...fill,
+		held: [...model.waiting, ...model.attention].map((h) => ({ pr: h.pr, admission: { ok: false, code: h.code, reason: h.reason, wait: h.wait } })),
+		effectivePriority
+	};
 }

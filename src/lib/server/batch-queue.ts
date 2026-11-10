@@ -22,13 +22,13 @@ import {
 	admit,
 	planBisection,
 	descendants,
-	planNextBatch,
 	planRedBatch,
 	type PRState,
 	type Priority,
 	type QueueEntry,
 	type TestGroup
 } from './batching';
+import { planNextBatch } from './queue-model';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
 import type { StackAnalysis } from './stacks';
