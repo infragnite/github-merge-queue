@@ -360,19 +360,34 @@ export function branchIntents(repoId: number): Array<{ branch: string; sha: stri
 	return getDb().prepare('SELECT branch, sha FROM branch_intents WHERE repo_id = ?').all(repoId) as Array<{ branch: string; sha: string }>;
 }
 
-export function setLandingIntent(repoId: number, i: { batchId: number; srcId: number; prs: number[] } | null) {
+/**
+ * A landing under way: `prs` are the PRs it merges, `group` all the PRs tested together (more
+ * when some were left out). Only a merge of the whole group puts on master a tree a run tested.
+ */
+export interface LandingIntent {
+	batchId: number;
+	srcId: number;
+	prs: number[];
+	group: number[];
+}
+
+export function setLandingIntent(repoId: number, i: LandingIntent | null) {
 	if (!i) getDb().prepare('DELETE FROM landing_intents WHERE repo_id = ?').run(repoId);
 	else
 		getDb()
 			.prepare('INSERT OR REPLACE INTO landing_intents (repo_id, batch_id, src_id, prs) VALUES (?, ?, ?, ?)')
-			.run(repoId, i.batchId, i.srcId, JSON.stringify(i.prs));
+			.run(repoId, i.batchId, i.srcId, JSON.stringify({ prs: i.prs, group: i.group }));
 }
 
-export function getLandingIntent(repoId: number): { batchId: number; srcId: number; prs: number[] } | null {
+export function getLandingIntent(repoId: number): LandingIntent | null {
 	const r = getDb().prepare('SELECT batch_id, src_id, prs FROM landing_intents WHERE repo_id = ?').get(repoId) as
 		| { batch_id: number; src_id: number; prs: string }
 		| undefined;
-	return r ? { batchId: r.batch_id, srcId: r.src_id, prs: JSON.parse(r.prs) } : null;
+	if (!r) return null;
+	// An intent written before `group` was recorded is a plain array: it landed its whole group.
+	const v = JSON.parse(r.prs) as number[] | { prs: number[]; group: number[] };
+	const prs = Array.isArray(v) ? v : v.prs;
+	return { batchId: r.batch_id, srcId: r.src_id, prs, group: Array.isArray(v) ? v : v.group };
 }
 
 export function getBatchByBranch(repoId: number, branch: string): BatchRow | undefined {
