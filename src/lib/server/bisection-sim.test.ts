@@ -130,12 +130,15 @@ function simulate(w: World): Outcome {
 			return { landed, ejected, requeued: step.requeue, runs: runs.length - 1, time, landedAt, settledAt, violations };
 		}
 		if (w.slots !== undefined && pending.length + step.start.length > w.slots) fail(`${pending.length + step.start.length} runs at once on ${w.slots} slots`);
-		// No slot idles while a failure can be narrowed. The failing groups are what is left of each
+		// One step at a time: a run still going may pass, land and move the default branch, so the
+		// next runs wait for every run going to end, and are planned on the branch that results.
+		if (pending.length && step.start.length) fail(`${JSON.stringify(step.start)} starts while ${pending.length} run${pending.length > 1 ? 's are' : ' is'} going`);
+		// Once nothing runs, no slot idles while a failure can be narrowed. The failing groups are what is left of each
 		// failed run, unless a later green run holds all of it or a PR ejected since explains it;
 		// of overlapping ones only the smallest. With a slot to spare, each with two PRs or more and
 		// none of them running starts a part of it; an independent half starts with its other half,
 		// unless that other half already ran on this tree.
-		if (w.slots === undefined || pending.length + step.start.length < w.slots) {
+		if (!pending.length && (w.slots === undefined || step.start.length < w.slots)) {
 			const gone = new Set(ejected.map((e) => e.pr));
 			const groups: Set<number>[] = [];
 			runs
@@ -359,7 +362,7 @@ describe('bisection simulation: efficiency', { timeout: 60_000 }, () => {
 });
 
 describe('bisection replays from krusty', () => {
-	test('batch 49: the first split is 7 | 8 with the #3241 stack whole, and both halves run', () => {
+	test('batch 49: the first split is 7 | 8 with the #3241 stack whole, and the next step waits for both', () => {
 		const members = [3342, 3039, 3296, 3309, 3241, 3308, 3364, 3365, 3334, 3366, 3358, 3286, 3234, 3356, 3352];
 		// #3308 and #3286 sit on #3241; #3296 on #3280 and #3039 on a PR, both merged before the batch.
 		const parents: Record<number, number> = { 3308: 3241, 3286: 3241, 3296: 3280 };
@@ -376,24 +379,25 @@ describe('bisection replays from krusty', () => {
 				[3364, 3365, 3334, 3366, 3358, 3234, 3356, 3352]
 			]
 		});
-		// The 7 failed first while the 8 still runs: the 7 splits 3 | 4 (the stack whole), and the
-		// free slot takes one half...
+		// The 7 failed first while the 8 still runs. Nothing starts yet: the 8 may pass and land, and
+		// the 7's halves would then have run on a branch that is gone.
 		runs.push({ context: [], members: [3342, 3039, 3296, 3309, 3241, 3308, 3286], baseTree: 'bf9d', result: 'failure' });
 		runs.push({ context: [], members: [3364, 3365, 3334, 3366, 3358, 3234, 3356, 3352], baseTree: 'bf9d', result: 'pending' });
 		const next = planBisection({ runs, remaining: members, masterTree: 'bf9d', parentOf, slots: 2 });
-		expect(next.kind === 'step' && next.start).toEqual([[3241, 3308, 3286]]);
-		// ...and the other takes the next one, before the 8's halves: the smaller group settles first.
-		runs.push({ context: [], members: [3241, 3308, 3286], baseTree: 'bf9d', result: 'pending' });
+		expect(next).toEqual({ kind: 'step', eject: [], start: [], requeue: [], done: false });
+		// The 8 failed too. Both halves of the 7 (3 | 4, the stack whole) take the two slots: the
+		// smaller group settles first.
 		runs[2].result = 'failure';
 		const then = planBisection({ runs, remaining: members, masterTree: 'bf9d', parentOf, slots: 2 });
-		expect(then.kind === 'step' && then.start).toEqual([[3342, 3039, 3296, 3309]]);
-		// With four slots, once the 3 failed too (and before the 4 started): the stack forks into its two paths, the 8 splits 4 | 4,
-		// and all four halves run at once. The 7's other four wait: the stack's failure explains the 7's.
-		runs[3].result = 'failure';
+		expect(then.kind === 'step' && then.start).toEqual([
+			[3241, 3308, 3286],
+			[3342, 3039, 3296, 3309]
+		]);
+		// With four slots, the 8's halves (4 | 4) run beside them, all four on the same branch.
 		const all = planBisection({ runs, remaining: members, masterTree: 'bf9d', parentOf, slots: 4 });
 		expect(all.kind === 'step' && all.start).toEqual([
-			[3241, 3308],
-			[3241, 3286],
+			[3241, 3308, 3286],
+			[3342, 3039, 3296, 3309],
 			[3364, 3365, 3334, 3366],
 			[3358, 3234, 3356, 3352]
 		]);
