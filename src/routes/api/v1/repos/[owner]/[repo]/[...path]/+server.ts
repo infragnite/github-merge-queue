@@ -8,7 +8,7 @@
 //   PATCH  pulls/{n}/queue     {priority?, jumpTo?: "front"}
 //   DELETE pulls/{n}/queue     dequeue
 //   GET    queue/config        settings
-//   PATCH  queue/config        {mode?, config?, ci?}            (admin)
+//   PATCH  queue/config        {mode?, config?, ci?, publicView?}  (admin; publicView only on a public repo)
 //   POST   queue/pause         {reason?}                         (maintain)
 //   POST   queue/resume                                          (maintain)
 //                                 lifts a pause; on an unpaused queue whose default branch is
@@ -76,11 +76,12 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 				return json(api.getConfig(repo));
 			case 'PATCH queue/config': {
 				const b = await body();
+				const visibility = b.publicView === true ? await api.repoVisibility(() => github.getRepo(repo.owner, repo.name)) : null;
 				// Under the repo lock, so a running tick finishes before the mode flips and none
 				// starts a batch after the retire.
 				const r = await withRepoLock(repo.id, async () => {
 					const was = getQueueSettings(repo.id).mode;
-					const out = api.patchConfig(repo, caller, b);
+					const out = api.patchConfig(repo, caller, b, visibility);
 					if (was === 'batch' && getQueueSettings(repo.id).mode !== 'batch') await retireBatches(liveDeps(repo));
 					return out;
 				});

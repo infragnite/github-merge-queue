@@ -11,6 +11,7 @@ import { takeDirty } from './wake';
 import { withRepoLock } from './repo-lock';
 import { RateLimitedError } from './rate-limit';
 import { clearTickError, noteTickError } from './tick-errors';
+import { recordRunCosts } from './ci-savings';
 
 /** The reset time last logged per repo, so a rate limit is logged once, not every cycle. */
 const loggedLimit = new Map<number, number>();
@@ -93,6 +94,22 @@ async function recordOpenPRHeads(repo: RepoRef) {
 	}
 }
 
+// What finished queue runs cost, for the time-saved card: a few calls a minute at most, and
+// none while the rate-limit budget is low (the queue needs it more).
+const RUN_COST_MS = 60_000;
+const lastRunCost = new Map<number, number>();
+
+async function recordCosts(repo: RepoRef) {
+	if (Date.now() - (lastRunCost.get(repo.id) ?? 0) < RUN_COST_MS) return;
+	lastRunCost.set(repo.id, Date.now());
+	if ((await github.rateLimitOf(repo.owner).catch(() => null))?.low) return;
+	try {
+		await recordRunCosts(repo, (sha) => github.actionsJobTimesForSha(repo.owner, repo.name, sha));
+	} catch (err) {
+		console.warn(`[merge-queue] Recording CI run times for ${repo.owner}/${repo.name} failed:`, err instanceof Error ? err.message : err);
+	}
+}
+
 // A batch tick costs several GitHub calls per queued PR, so it runs at most
 // once a minute, or sooner when a webhook says something changed.
 const BATCH_TICK_MS = 60_000;
@@ -111,6 +128,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	// Every call would fail until GitHub's reset; the queue picks up where it stopped then.
 	if (await rateLimited(repo)) return;
 	await recordOpenPRHeads(repo);
+	await recordCosts(repo);
 
 	if (getQueueSettings(repo.id).mode === 'batch') {
 		const last = lastBatchTick.get(repo.id) ?? 0;
