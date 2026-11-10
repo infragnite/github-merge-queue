@@ -30,7 +30,7 @@ vi.mock('$lib/server/stack-runtime', async (orig) => ({
 }));
 vi.mock('$lib/server/pipeline-view', async (orig) => ({
 	...(await orig<typeof import('$lib/server/pipeline-view')>()),
-	pipelineView: vi.fn(async () => ({ mode: 'serial', paused: 'App lacks permission X', master: null, active: [], recent: [], error: null, rateLimitedUntil: null, tickError: { message: 'boom', count: 1, since: 0 }, progressErrors: { a: 'b' } }))
+	pipelineView: vi.fn(async () => ({ mode: 'serial', paused: 'App lacks permission X', master: null, active: [], recent: [], error: null, rateLimitedUntil: null, tickError: { message: 'boom', count: 1, since: 0 }, progressErrors: { a: 'b' }, activity: { since: 1, phase: { kind: 'forming', label: 'Forming a batch', prs: [1], branch: 'mq/batch-1', since: 1 }, step: { label: 'pushing mq/batch-1', prs: [1], since: 1 }, failure: { phase: 'Forming a batch', step: 'pushing mq/batch-1', prs: [1], message: 'App lacks the workflows permission', at: 1 } } }))
 }));
 
 const db = await import('$lib/server/db');
@@ -151,6 +151,9 @@ describe('who sees the page', () => {
 		expect(d.repo).toEqual({ id: repoId, owner: 'acme', name: 'repo', default_branch: 'main' });
 		const pipe = (await d.pipeline) as Record<string, unknown>;
 		expect(pipe).toMatchObject({ paused: 'The queue is paused', tickError: null, progressErrors: {} });
+		// What the queue is doing shows; why a step failed can name App internals, so it doesn't.
+		expect(pipe.activity).toMatchObject({ phase: { label: 'Forming a batch', prs: [1] }, step: { label: 'pushing mq/batch-1' }, failure: { phase: 'Forming a batch', step: 'pushing mq/batch-1', prs: [1], message: null } });
+		expect(JSON.stringify(pipe)).not.toMatch(/workflows permission/);
 		expect(((await d.board) as { error: string }).error).not.toMatch(/secret/);
 		for (const i of d.queueItems as Array<Record<string, unknown>>) expect(i).toMatchObject({ queued_by: '', head_sha: null });
 	});

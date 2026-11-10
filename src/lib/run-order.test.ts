@@ -107,3 +107,76 @@ describe('runOrder', () => {
 			expect(runOrder({ active: [], upNext: [], express: false, master: { sha: 'abc1234ff', state, since, branch: 'master' }, now: since })).toEqual([]);
 	});
 });
+
+describe('runOrder: what the queue is doing now', () => {
+	const at = Date.parse('2026-11-10T22:40:00Z');
+	const idle = { since: null, phase: null, step: null, failure: null };
+
+	test('forming a batch goes first, with its PRs, the step running and how long the batch has been forming', () => {
+		const b = card(4, { prs: [pr(9)] });
+		const activity = {
+			since: at,
+			phase: { kind: 'forming' as const, label: 'Forming a batch', prs: [1, 2, 3], branch: 'mq/batch-5', since: at },
+			step: { label: 'pushing mq/batch-5', prs: [1, 2, 3], since: at + 40_000 },
+			failure: null
+		};
+		expect(runOrder({ active: [b], upNext: [], express: false, activity, now: at + 72_000 })).toEqual([
+			{ key: 'activity', state: 'running', batch: null, label: 'Forming a batch', branch: null, detail: 'pushing mq/batch-5, 1 min 12 s', prs: [1, 2, 3], urgent: false },
+			{ key: 'b4', state: 'running', batch: 4, label: 'Batch #4', branch: 'mq/4', detail: '1 PR', prs: [9], urgent: false }
+		]);
+	});
+
+	test('under a minute it counts seconds; between steps it says what it is doing', () => {
+		const activity = { since: at, phase: { kind: 'restack' as const, label: 'Restacking #4', prs: [4], branch: null, since: at }, step: null, failure: null };
+		expect(runOrder({ active: [], upNext: [], express: false, activity, now: at + 8_400 })).toEqual([
+			{ key: 'activity', state: 'running', batch: null, label: 'Restacking #4', branch: null, detail: '8 s', prs: [4], urgent: false }
+		]);
+	});
+
+	test('a routine pass over the queue shows only once it has run for 10 seconds, with the step it is on', () => {
+		const activity = { since: at, phase: null, step: { label: 'reading the reviews and checks of #12', prs: [12], since: at + 9_000 }, failure: null };
+		expect(runOrder({ active: [], upNext: [], express: false, activity, now: at + 9_999 })).toEqual([]);
+		expect(runOrder({ active: [], upNext: [], express: false, activity, now: at + 14_000 })).toEqual([
+			{ key: 'activity', state: 'running', batch: null, label: 'Updating the queue', branch: null, detail: 'reading the reviews and checks of #12, 14 s', prs: [12], urgent: false }
+		]);
+	});
+
+	test('a failed step is shown first, with its PRs, the step, the error and when', () => {
+		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1, 2], message: 'refusing to allow a GitHub App to create or update workflow', at };
+		const rows = runOrder({ active: [card(4, { prs: [pr(9)] })], upNext: [], express: false, activity: { ...idle, failure }, now: at + 5 * 60_000 });
+		expect(rows[0]).toEqual({
+			key: 'failure',
+			state: 'failed',
+			batch: null,
+			label: 'Forming a batch failed',
+			branch: null,
+			detail: 'pushing mq/batch-5: refusing to allow a GitHub App to create or update workflow (5 min ago)',
+			prs: [1, 2],
+			urgent: false
+		});
+		expect(rows.map((r) => r.key)).toEqual(['failure', 'b4']);
+	});
+
+	test('a failed step outside a batch is named by the step', () => {
+		const failure = { phase: null, step: 'fetching #3 from GitHub', prs: [3], message: 'timeout', at };
+		expect(runOrder({ active: [], upNext: [], express: false, activity: { ...idle, failure }, now: at + 20_000 })[0]).toMatchObject({ label: 'Fetching #3 from GitHub failed', detail: 'timeout (just now)' });
+	});
+
+	test('a failure and the retry of it both show while the retry runs', () => {
+		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], message: 'boom', at };
+		const activity = { since: at + 60_000, phase: { kind: 'forming' as const, label: 'Forming a batch', prs: [1], branch: null, since: at + 60_000 }, step: { label: 'merging #1', prs: [1], since: at + 60_000 }, failure };
+		expect(runOrder({ active: [], upNext: [], express: false, activity, now: at + 61_000 }).map((r) => [r.key, r.state])).toEqual([
+			['failure', 'failed'],
+			['activity', 'running']
+		]);
+	});
+
+	test('without its error (the public page), a failed step says only what failed and when', () => {
+		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], message: null, at };
+		expect(runOrder({ active: [], upNext: [], express: false, activity: { ...idle, failure }, now: at + 120_000 })[0]).toMatchObject({ label: 'Forming a batch failed', detail: 'pushing mq/batch-5 (2 min ago)' });
+	});
+
+	test('nothing running and nothing failed adds nothing', () => {
+		expect(runOrder({ active: [], upNext: [], express: false, activity: idle, now: at })).toEqual([]);
+	});
+});
