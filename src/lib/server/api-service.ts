@@ -276,6 +276,7 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 	}
 	if (config.maxBatch !== undefined && config.maxBatch < 1) throw new ApiError(400, 'maxBatch must be >= 1');
 	if (config.depth !== undefined && config.depth < 1) throw new ApiError(400, 'depth must be >= 1');
+	if (config.bisectRuns !== undefined && (config.bisectRuns < 1 || !Number.isInteger(config.bisectRuns))) throw new ApiError(400, 'bisectRuns must be a whole number >= 1');
 	const mode = body.mode;
 	if (mode !== undefined && mode !== 'serial' && mode !== 'batch') throw new ApiError(400, 'mode must be serial or batch');
 	const ci = body.ci as Record<string, unknown> | undefined;
