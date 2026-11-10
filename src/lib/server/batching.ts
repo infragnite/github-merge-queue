@@ -80,6 +80,13 @@ export interface BatchConfig {
 	 * real. Off for a repo without flaky tests: a failure then goes straight to bisection.
 	 */
 	retryFailed: boolean;
+	/**
+	 * Count a run of several PRs as failed at its first failed job and cancel the rest, instead of
+	 * waiting for every job: a failure only has to be narrowed down, and the rest of the run would
+	 * hold runners for nothing. A PR's run alone, whose failure ejects it, still runs to the end, so
+	 * its author sees every failure.
+	 */
+	stopOnFirstFailure: boolean;
 	/** At least this long between those runs (0: one per landed batch). */
 	masterRunMinGapMs: number;
 	/**
@@ -102,6 +109,7 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	requirePRChecks: false,
 	masterRun: true,
 	retryFailed: true,
+	stopOnFirstFailure: true,
 	masterRunMinGapMs: 0,
 	bisectRuns: 1
 };

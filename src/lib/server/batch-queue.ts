@@ -103,8 +103,9 @@ export interface QueueCI {
 	/**
 	 * The required check's result on `headSha`. With `notBefore` (epoch ms, when failed jobs were
 	 * re-run), a check run that finished before it is stale: the result is pending until a newer one finishes.
+	 * With `failFast`, a failed job the required check waits for makes it a failure at once.
 	 */
-	result(headSha: string, notBefore?: number | null): Promise<'pending' | 'success' | 'failure'>;
+	result(headSha: string, notBefore?: number | null, opts?: { failFast?: boolean }): Promise<'pending' | 'success' | 'failure'>;
 	/** Cancels workflow runs still going on `headSha` (a superseded batch). */
 	cancel(headSha: string): Promise<void>;
 	/** Re-runs only the failed jobs; false when there is nothing to re-run. */
@@ -848,6 +849,19 @@ class Tick {
 		return true;
 	}
 
+	/** Whether `b`'s run counts as failed at its first failed job: a run of several PRs, if the repo stops early. */
+	failFast(b: BatchRow): boolean {
+		return this.settings().config.stopOnFirstFailure && b.members.length > 1;
+	}
+
+	/** The required check's result on `b`; a failure found early stops the rest of its run. */
+	async ciResult(b: BatchRow): Promise<'pending' | 'success' | 'failure'> {
+		const failFast = this.failFast(b);
+		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast });
+		if (r === 'failure' && failFast) await this.d.ci.cancel(b.head_sha).catch(this.bestEffort('ci.cancel'));
+		return r;
+	}
+
 	/** Re-runs a failed check's jobs once, unless the repo turned flake retries off. */
 	async retry(headSha: string): Promise<RerunResult> {
 		if (!this.settings().config.retryFailed) return 'none';
@@ -1099,7 +1113,7 @@ class Tick {
 
 	async advanceHead(head: BatchRow, rest: BatchRow[], interleave = false) {
 		if (head.status === 'testing' || head.status === 'retrying') {
-			const r = await this.d.ci.result(head.head_sha, head.retried_at);
+			const r = await this.ciResult(head);
 			if (r === 'pending') {
 				if (this.timedOut(head)) {
 					await this.supersede([head, ...rest]);
@@ -1172,7 +1186,7 @@ class Tick {
 		const runs = store.getBisectRuns(batch.id);
 		for (const run of runs) {
 			if (run.ci_result !== 'pending') continue;
-			let res = await this.d.ci.result(run.head_sha, run.retried_at);
+			let res = await this.ciResult(run);
 			const rerun = res === 'failure' && run.status !== 'retrying' ? await this.retry(run.head_sha) : 'none';
 			if (rerun === 'wait') res = 'pending';
 			else if (rerun === 'rerun') {

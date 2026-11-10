@@ -31,7 +31,8 @@ test('a submitted form becomes the settings API body, durations in milliseconds 
 		approvalOnHead: false,
 		requirePRChecks: false,
 		autoRebase: false,
-		masterRun: false
+		masterRun: false,
+		stopOnFirstFailure: false
 	});
 	expect(body.ci).toEqual({ workflow: 'ci.yml', dispatchRef: '' });
 });

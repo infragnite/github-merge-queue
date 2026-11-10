@@ -63,6 +63,27 @@ export function checkResult(
 	return runs.every((r) => r.conclusion === 'success') ? 'success' : 'failure';
 }
 
+/**
+ * Whether the required check already failed though its run still goes on: a job in the same
+ * workflow run as the required check (the jobs it waits for) failed or timed out. Skipped and
+ * cancelled jobs don't count, nor a job that finished before `notBefore` (a re-run's start).
+ */
+export function earlyFailure(
+	required: Array<{ check_suite?: { id: number } }>,
+	jobs: Array<{ status: string; conclusion: string | null; completed_at?: string | null; check_suite?: { id: number } }>,
+	notBefore?: number | null
+): boolean {
+	const suites = new Set(required.flatMap((r) => (r.check_suite ? [r.check_suite.id] : [])));
+	return jobs.some(
+		(j) =>
+			j.status === 'completed' &&
+			(j.conclusion === 'failure' || j.conclusion === 'timed_out') &&
+			!!j.check_suite &&
+			suites.has(j.check_suite.id) &&
+			(!notBefore || !j.completed_at || Date.parse(j.completed_at) >= notBefore)
+	);
+}
+
 /** A fetch or push gives up after this long. */
 const NETWORK_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -177,8 +198,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			refreshCaches: async () => {
 				await github.dispatchWorkflow(owner, name, ci().workflow, dispatchRef(), {});
 			},
-			result: async (headSha, notBefore) =>
-				checkResult(await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck), notBefore),
+			result: async (headSha, notBefore, opts) => {
+				const required = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
+				const r = checkResult(required, notBefore);
+				if (r !== 'pending' || !opts?.failFast || !required.length) return r;
+				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore) ? 'failure' : 'pending';
+			},
 			cancel: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);
 				for (const r of runs.filter((r) => r.status !== 'completed')) await github.cancelWorkflowRun(owner, name, r.id);

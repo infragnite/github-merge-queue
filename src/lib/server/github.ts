@@ -415,7 +415,14 @@ export async function checkRunsNamed(owner: string, repo: string, sha: string, n
 /** Every Actions job on a commit (latest attempt), for showing a batch's progress. */
 export async function actionsJobsForSha(owner: string, repo: string, sha: string) {
 	const data = await ghFetchAsApp(`/repos/${owner}/${repo}/commits/${sha}/check-runs?filter=latest&app_id=${ACTIONS_APP_ID}&per_page=100`);
-	return data.check_runs as Array<{ name: string; status: string; conclusion: string | null; html_url: string }>;
+	return data.check_runs as Array<{
+		name: string;
+		status: string;
+		conclusion: string | null;
+		html_url: string;
+		completed_at: string | null;
+		check_suite?: { id: number };
+	}>;
 }
 
 /** Every Actions job ever run on a commit, every attempt, with its times (for what CI cost). */

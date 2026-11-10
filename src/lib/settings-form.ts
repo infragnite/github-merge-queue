@@ -27,6 +27,7 @@ export const BATCH_FIELDS: SettingField[] = [
 	{ name: 'config.collectWindowMs', label: 'Wait for a fuller batch', help: 'How long a partial batch waits for more PRs before it is tested.', kind: 'duration', unitMs: MIN, unit: 'min' },
 	{ name: 'config.ciTimeoutMs', label: 'CI timeout', help: 'A batch with no CI result after this long pauses the queue.', kind: 'duration', unitMs: HOUR, unit: 'h' },
 	{ name: 'config.retryFailed', label: 'Re-run failed jobs once', help: 'Before a failure counts, its failed jobs run again (for flaky tests).', kind: 'boolean' },
+	{ name: 'config.stopOnFirstFailure', label: 'Stop a red run early', help: 'A run of several PRs counts as failed at its first failed job, and the rest of it is cancelled. A PR tested alone still runs to the end, so its author sees every failure.', kind: 'boolean' },
 	{ name: 'config.requireApproval', label: 'Require approval', help: 'Only approved PRs enter a batch.', kind: 'boolean' },
 	{ name: 'config.approvalOnHead', label: 'Approval on the current head', help: 'A push after the approval needs a new one.', kind: 'boolean' },
 	{ name: 'config.requirePRChecks', label: "Require the PR's own checks", help: "The PR's required check must pass on its head first.", kind: 'boolean' },
@@ -101,7 +102,7 @@ export function parseSettingsForm(
 /** The settings page's sections, in order: each a heading, an anchor and its fields. */
 export const SETTING_GROUPS: { id: string; title: string; help: string; fields: SettingField[] }[] = [
 	{ id: 'batching', title: 'Batches', help: 'How PRs are grouped and tested together.', fields: pick('config.maxBatch', 'config.depth', 'config.collectWindowMs') },
-	{ id: 'failures', title: 'Urgent PRs and failures', help: 'Urgent PRs skip ahead; a failed batch is narrowed down to the PR that breaks it.', fields: pick('config.expressMax', 'config.bisectRuns', 'config.retryFailed') },
+	{ id: 'failures', title: 'Urgent PRs and failures', help: 'Urgent PRs skip ahead; a failed batch is narrowed down to the PR that breaks it.', fields: pick('config.expressMax', 'config.bisectRuns', 'config.retryFailed', 'config.stopOnFirstFailure') },
 	{ id: 'rules', title: 'Who can enter a batch', help: 'What a PR needs before the queue tests it.', fields: pick('config.requireApproval', 'config.approvalOnHead', 'config.requirePRChecks', 'config.autoRebase') },
 	{ id: 'ci', title: 'CI', help: 'How the queue starts and reads CI.', fields: [...pick('config.ciTimeoutMs', 'config.masterRun', 'config.masterRunMinGapMs'), ...CI_FIELDS] },
 	{ id: 'visibility', title: 'Visibility', help: 'Who can see the queue page.', fields: VIEW_FIELDS }
