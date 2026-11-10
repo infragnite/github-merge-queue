@@ -27,7 +27,7 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 	const bisecting = input.active.filter((b) => b.kind === 'batch' && b.status === 'bisecting').sort((a, b) => Number(b.express) - Number(a.express));
 	for (const b of input.active) {
 		if (b.kind !== 'batch') continue;
-		const name = `${b.express ? 'Urgent batch' : 'Batch'} #${b.id}`;
+		const name = `${b.express ? 'Urgent batch' : 'Batch'} #${b.number}`;
 		if (b.status === 'testing' || b.status === 'retrying') {
 			const prs = b.prs.map((p) => p.pr);
 			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, detail: b.status === 'retrying' ? 're-running failed jobs' : `${prs.length} PR${prs.length === 1 ? '' : 's'}`, prs, urgent: b.express });
@@ -59,7 +59,7 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 			key: `n${b.id}`,
 			state: 'next',
 			batch: b.id,
-			label: `${b.express ? 'Urgent batch' : 'Batch'} #${b.id}, next bisection step`,
+			label: `${b.express ? 'Urgent batch' : 'Batch'} #${b.number}, next bisection step`,
 			detail: `${open.length} PR${open.length === 1 ? '' : 's'} still to settle`,
 			prs: open.map((p) => p.pr),
 			urgent: b.express

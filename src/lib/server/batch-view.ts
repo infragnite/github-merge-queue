@@ -79,6 +79,8 @@ export interface CIProgress {
 
 export interface BatchCard {
 	id: number;
+	/** The batch's number in its repository, as shown. */
+	number: number;
 	kind: BatchRow['kind'];
 	branch: string;
 	status: BatchRow['status'];
@@ -156,6 +158,7 @@ export function batchCard(
 	const rows = [...order.filter((n) => !settled(n)), ...order.filter(settled)];
 	return {
 		id: b.id,
+		number: b.number,
 		kind: b.kind,
 		branch: b.branch,
 		status: b.status,

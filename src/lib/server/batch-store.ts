@@ -54,6 +54,8 @@ export interface BatchRow {
 	left_prs: number[];
 	/** Those of them ejected: shown to fail (or stacked on one that was). */
 	ejected: number[];
+	/** Shown as "batch #N": counts only this repository's batches (a run of another kind has its id). */
+	number: number;
 	status: BatchStatus;
 	express: boolean;
 	ci_result: 'pending' | 'success' | 'failure';
@@ -205,13 +207,20 @@ export function migrateBatches(database: Database.Database) {
 		['landed', `TEXT NOT NULL DEFAULT '[]'`],
 		// PRs that left a bisecting batch without landing (ejected, or back in the queue).
 		['left_prs', `TEXT NOT NULL DEFAULT '[]'`],
-		['ejected', `TEXT NOT NULL DEFAULT '[]'`]
+		['ejected', `TEXT NOT NULL DEFAULT '[]'`],
+		// A batch's number within its repository, counting only batches (not bisection or baseline runs).
+		['number', 'INTEGER']
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
 	// Batches from before `ejected` was recorded: a PR that left one and was then ejected, with no
 	// later batch it was in, was ejected from it. Once only, in one go: later batches record it.
 	database.exec(`CREATE TABLE IF NOT EXISTS done_migrations (name TEXT PRIMARY KEY)`);
+	if (!database.prepare(`SELECT 1 FROM done_migrations WHERE name = 'batch-numbers'`).get())
+		database.transaction(() => {
+			database.exec(`UPDATE batches SET number = (SELECT COUNT(*) FROM batches b2 WHERE b2.repo_id = batches.repo_id AND b2.kind = 'batch' AND b2.id <= batches.id) WHERE kind = 'batch'`);
+			database.exec(`INSERT INTO done_migrations (name) VALUES ('batch-numbers')`);
+		})();
 	const backfill = 'backfill-ejected';
 	const pending = !database.prepare(`SELECT 1 FROM done_migrations WHERE name = ?`).get(backfill);
 	const before = !pending ? [] : database
@@ -294,7 +303,8 @@ export function setQueuePriority(repoId: number, prNumber: number, priority: Pri
 
 // --- batches ---
 
-type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs' | 'ejected'> & {
+type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs' | 'ejected' | 'number'> & {
+	number: number | null;
 	members: string;
 	landed: string | null;
 	left_prs: string | null;
@@ -313,6 +323,7 @@ function parse(r: RawBatch): BatchRow {
 		landed: JSON.parse(r.landed ?? '[]'),
 		left_prs: JSON.parse(r.left_prs ?? '[]'),
 		ejected: JSON.parse(r.ejected ?? '[]'),
+		number: r.number ?? r.id,
 		heads: JSON.parse(r.heads),
 		steps: JSON.parse(r.steps),
 		express: !!r.express
@@ -336,8 +347,8 @@ export function insertBatch(b: {
 }): BatchRow {
 	const r = getDb()
 		.prepare(
-			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 		.run(
 			b.repoId,
@@ -352,7 +363,10 @@ export function insertBatch(b: {
 			JSON.stringify(b.heads),
 			JSON.stringify(b.steps ?? {}),
 			JSON.stringify(b.context ?? []),
-			b.express ? 1 : 0
+			b.express ? 1 : 0,
+			b.kind === 'batch'
+				? (getDb().prepare(`SELECT COALESCE(MAX(number), 0) + 1 AS n FROM batches WHERE repo_id = ? AND kind = 'batch'`).get(b.repoId) as { n: number }).n
+				: null
 		);
 	return getBatch(Number(r.lastInsertRowid))!;
 }

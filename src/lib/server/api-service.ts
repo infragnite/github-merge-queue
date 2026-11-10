@@ -156,6 +156,8 @@ export function stacksState(analysis: StackAnalysis) {
 export function batchSummary(b: BatchRow) {
 	return {
 		id: b.id,
+		/** As shown in the app: counts only this repository's batches. */
+		number: b.number,
 		branch: b.branch,
 		status: b.status,
 		express: b.express,

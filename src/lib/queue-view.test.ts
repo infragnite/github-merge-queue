@@ -41,7 +41,7 @@ test('batch mode orders urgent first then oldest, previews the next batch, and f
 	];
 	const v = queueView({ items, mode: 'batch', batches: [{ id: 5, status: 'bisecting', prs: [3, 4] }], stacks: null, limits });
 
-	expect(v.inFlight).toEqual([{ batch: 5, status: 'bisecting', prs: [3, 4] }]);
+	expect(v.inFlight).toEqual([{ batch: 5, number: 5, status: 'bisecting', prs: [3, 4] }]);
 	expect(v.express).toBe(false);
 	expect(nums(v.upNext)).toEqual([1, 2, 5]);
 	expect(v.upNext.map((r) => r.position)).toEqual([1, 2, 3]);
