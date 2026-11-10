@@ -21,7 +21,17 @@ export const load: PageServerLoad = async ({ locals }) => {
 	const removable = await Promise.all(
 		repos.map(async (r) => r.added_by === locals.user!.id || atLeast((await webCaller(r.owner, r.name, locals.user!.login)).role, 'admin'))
 	);
-	return { repos: repos.map((r, i) => ({ ...r, webhook_secret: null, canRemove: removable[i] })), availableRepos };
+	// Only repositories the user administers on GitHub can be added, so only those are listed: the
+	// App's other installations (private repos among them) aren't every org member's business.
+	const addable = await visibleRepos(
+		availableRepos.map((r) => ({ ...r, owner: r.full_name.split('/')[0], name: r.full_name.split('/')[1] })),
+		locals.user.login,
+		'admin'
+	);
+	return {
+		repos: repos.map((r, i) => ({ ...r, webhook_secret: null, canRemove: removable[i] })),
+		availableRepos: addable.map((r) => ({ full_name: r.full_name, default_branch: r.default_branch }))
+	};
 };
 
 export const actions: Actions = {

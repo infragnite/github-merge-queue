@@ -3,6 +3,7 @@ import { env } from '$env/dynamic/private';
 import { createSessionToken } from '$lib/server/auth';
 import { upsertUser } from '$lib/server/db';
 import { getUser, checkOrgMembership } from '$lib/server/github';
+import { safeNext } from '$lib/server/next-path';
 import type { RequestHandler } from './$types';
 
 const ALLOWED_ORG = 'infragnite';
@@ -61,5 +62,5 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		maxAge: 60 * 60 * 24 * 30
 	});
 
-	redirect(302, next && /^\/(?![\/\\])/.test(next) ? next : '/');
+	redirect(302, safeNext(next, env.APP_URL) ?? '/');
 };

@@ -36,6 +36,8 @@ const db = await import('$lib/server/db');
 const store = await import('$lib/server/batch-store');
 const { clearWebRoles } = await import('$lib/server/web-auth');
 const page = await import('./+page.server');
+const github = await import('$lib/server/github');
+const { forgetVisibility } = await import('$lib/server/public-view');
 const settingsPage = await import('./settings/+page.server');
 
 let repoId: number;
@@ -149,6 +151,22 @@ describe('who sees the page', () => {
 		expect(pipe).toMatchObject({ paused: 'The queue is paused', tickError: null, progressErrors: {} });
 		expect(((await d.stacks) as { error: string }).error).not.toMatch(/secret/);
 		for (const i of d.queueItems as Array<Record<string, unknown>>) expect(i).toMatchObject({ queued_by: '', head_sha: null });
+	});
+
+	test('a repository that went private loses its public page', async () => {
+		store.updateQueueSettings(repoId, { publicView: true });
+		forgetVisibility();
+		vi.mocked(github.getRepo).mockResolvedValueOnce({ private: true });
+		expect((await load(null)).thrown).toMatchObject({ status: 302 });
+		expect(store.getQueueSettings(repoId).publicView).toBe(false);
+	});
+
+	test('when GitHub cannot say whether it is still public, the page is refused', async () => {
+		store.updateQueueSettings(repoId, { publicView: true });
+		forgetVisibility();
+		vi.mocked(github.getRepo).mockRejectedValueOnce(new Error('down'));
+		expect((await load(null)).thrown).toMatchObject({ status: 302 });
+		forgetVisibility();
 	});
 
 	test('signed in without access, a public repository shows read-only', async () => {

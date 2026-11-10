@@ -3,7 +3,7 @@ import { verifySessionToken } from '$lib/server/auth';
 import { getUserById } from '$lib/server/db';
 import { drainProcessor, startProcessor } from '$lib/server/processor';
 import { watchEventLoop } from '$lib/server/loop-watch';
-import { RequestLimiter } from '$lib/server/request-limit';
+import { RequestLimiter, addressKey } from '$lib/server/request-limit';
 import { env } from '$env/dynamic/private';
 
 startProcessor();
@@ -16,6 +16,9 @@ process.on('sveltekit:shutdown' as 'beforeExit', () => void drainProcessor());
 // adapter-node's ADDRESS_HEADER (and XFF_DEPTH) so the address is the client's, not the proxy's.
 const anonymous = new RequestLimiter(120, 120);
 const signIn = new RequestLimiter(10, 10);
+// Sign-in for everyone together, whatever their address: a ceiling that address rotation can't lift.
+const signInAll = new RequestLimiter(300, 300);
+if (!env.ADDRESS_HEADER) console.log('[merge-queue] ADDRESS_HEADER is not set: request limits key on the connecting address (a reverse proxy in front makes it one key for everyone)');
 // Signed GitHub deliveries, health probes and the token-authenticated API have their own checks.
 const UNLIMITED = /^\/api\/(webhook|health|v1)\b/;
 
@@ -30,7 +33,7 @@ const SECURITY_HEADERS: Record<string, string> = {
 
 function clientAddress(event: Parameters<Handle>[0]['event']): string {
 	try {
-		return event.getClientAddress();
+		return addressKey(event.getClientAddress());
 	} catch {
 		return 'unknown';
 	}
@@ -70,8 +73,8 @@ const authorize: Handle = async ({ event, resolve }) => {
 
 	const path = event.url.pathname;
 	if (!event.locals.user && !UNLIMITED.test(path)) {
-		const limiter = path.startsWith('/auth/') ? signIn : anonymous;
-		const wait = limiter.take(clientAddress(event));
+		const auth = path.startsWith('/auth/');
+		const wait = Math.max((auth ? signIn : anonymous).take(clientAddress(event)), auth ? signInAll.take('all') : 0);
 		if (wait > 0) return new Response('Too many requests; try again shortly.', { status: 429, headers: { 'retry-after': String(wait), 'content-type': 'text/plain' } });
 	}
 	return resolve(event);

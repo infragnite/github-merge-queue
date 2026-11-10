@@ -13,7 +13,8 @@ import {
 	recordBranchDeleted
 } from '$lib/server/db';
 import { closedPRReason } from '$lib/server/stack-runtime';
-import { getActiveBatches, getQueueSettings } from '$lib/server/batch-store';
+import { getActiveBatches, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
+import { forgetVisibility } from '$lib/server/public-view';
 import { bumpGeneration, markDirty } from '$lib/server/wake';
 import type { RequestHandler } from './$types';
 
@@ -97,6 +98,17 @@ export const POST: RequestHandler = async ({ request }) => {
 	const queueItems = getQueueItems(repo.id);
 
 	switch (event) {
+		case 'repository': {
+			// A repository made private can't keep a public queue page.
+			const action = (payload as { action?: string }).action;
+			if ((action === 'privatized' || (payload.repository as { private?: boolean }).private === true) && getQueueSettings(repo.id).publicView) {
+				updateQueueSettings(repo.id, { publicView: false });
+				forgetVisibility(repo.id);
+				console.warn(`[webhook] ${owner}/${name} is now private: its public queue page is turned off`);
+			}
+			break;
+		}
+
 		case 'check_suite':
 		case 'check_run': {
 			if (queueItems.length === 0) break;
