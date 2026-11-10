@@ -95,6 +95,8 @@ export interface RepoQueueSettings {
 	config: BatchConfig;
 	ci: CISettings;
 	pausedReason: string | null;
+	/** Anyone, signed in or not, may open the repository's page read-only. */
+	publicView: boolean;
 }
 
 export function migrateBatches(database: Database.Database) {
@@ -129,6 +131,17 @@ export function migrateBatches(database: Database.Database) {
 			finished_at TEXT
 		);
 		CREATE INDEX IF NOT EXISTS batches_repo_status ON batches(repo_id, status);
+
+		-- What each queue-started CI run cost, read from its Actions jobs once it is over:
+		-- job_ms is the jobs' summed run time (every attempt), wall_ms first start to last finish.
+		CREATE TABLE IF NOT EXISTS ci_runs (
+			batch_id INTEGER PRIMARY KEY REFERENCES batches(id) ON DELETE CASCADE,
+			repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+			job_ms INTEGER NOT NULL,
+			rerun_ms INTEGER NOT NULL DEFAULT 0,
+			wall_ms INTEGER NOT NULL,
+			jobs INTEGER NOT NULL
+		);
 
 		-- Heads the queue produced by restacking a PR, so the approval and CI of
 		-- the head it replaced carry over (the change itself is the same).
@@ -196,6 +209,8 @@ export function migrateBatches(database: Database.Database) {
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
+	const settingsCols = database.prepare(`PRAGMA table_info(queue_settings)`).all() as Array<{ name: string }>;
+	if (!settingsCols.some((c) => c.name === 'public_view')) database.exec(`ALTER TABLE queue_settings ADD COLUMN public_view INTEGER NOT NULL DEFAULT 0`);
 	// Bisection runs used to keep status 'testing' after their result came in; their status now
 	// follows the result (a run still 'testing' is still running).
 	database.exec(`UPDATE batches SET status = CASE ci_result WHEN 'success' THEN 'passed' ELSE 'failed' END
@@ -217,35 +232,37 @@ export function migrateBatches(database: Database.Database) {
 
 export function getQueueSettings(repoId: number): RepoQueueSettings {
 	const row = getDb()
-		.prepare('SELECT mode, config, ci, paused_reason FROM queue_settings WHERE repo_id = ?')
-		.get(repoId) as { mode: QueueMode; config: string; ci: string; paused_reason: string | null } | undefined;
-	if (!row) return { mode: 'serial', config: { ...DEFAULT_BATCH_CONFIG }, ci: { ...DEFAULT_CI }, pausedReason: null };
+		.prepare('SELECT mode, config, ci, paused_reason, public_view FROM queue_settings WHERE repo_id = ?')
+		.get(repoId) as { mode: QueueMode; config: string; ci: string; paused_reason: string | null; public_view: number } | undefined;
+	if (!row) return { mode: 'serial', config: { ...DEFAULT_BATCH_CONFIG }, ci: { ...DEFAULT_CI }, pausedReason: null, publicView: false };
 	return {
 		mode: row.mode,
 		config: { ...DEFAULT_BATCH_CONFIG, ...(JSON.parse(row.config) as Partial<BatchConfig>) },
 		ci: { ...DEFAULT_CI, ...(JSON.parse(row.ci) as Partial<CISettings>) },
-		pausedReason: row.paused_reason
+		pausedReason: row.paused_reason,
+		publicView: row.public_view === 1
 	};
 }
 
 export function updateQueueSettings(
 	repoId: number,
-	change: { mode?: QueueMode; config?: Partial<BatchConfig>; ci?: Partial<CISettings>; pausedReason?: string | null }
+	change: { mode?: QueueMode; config?: Partial<BatchConfig>; ci?: Partial<CISettings>; pausedReason?: string | null; publicView?: boolean }
 ): RepoQueueSettings {
 	const cur = getQueueSettings(repoId);
 	const next: RepoQueueSettings = {
 		mode: change.mode ?? cur.mode,
 		config: { ...cur.config, ...change.config },
 		ci: { ...cur.ci, ...change.ci },
-		pausedReason: change.pausedReason === undefined ? cur.pausedReason : change.pausedReason
+		pausedReason: change.pausedReason === undefined ? cur.pausedReason : change.pausedReason,
+		publicView: change.publicView ?? cur.publicView
 	};
 	getDb()
 		.prepare(
-			`INSERT INTO queue_settings (repo_id, mode, config, ci, paused_reason) VALUES (?, ?, ?, ?, ?)
+			`INSERT INTO queue_settings (repo_id, mode, config, ci, paused_reason, public_view) VALUES (?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(repo_id) DO UPDATE SET mode = excluded.mode, config = excluded.config,
-			   ci = excluded.ci, paused_reason = excluded.paused_reason`
+			   ci = excluded.ci, paused_reason = excluded.paused_reason, public_view = excluded.public_view`
 		)
-		.run(repoId, next.mode, JSON.stringify(next.config), JSON.stringify(next.ci), next.pausedReason);
+		.run(repoId, next.mode, JSON.stringify(next.config), JSON.stringify(next.ci), next.pausedReason, next.publicView ? 1 : 0);
 	return next;
 }
 

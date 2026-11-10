@@ -5,7 +5,7 @@
 export type FieldKind = 'number' | 'duration' | 'boolean' | 'text';
 
 export interface SettingField {
-	/** `config.<key>` or `ci.<key>`. */
+	/** `config.<key>`, `ci.<key>` or `view.<key>`. */
 	name: string;
 	label: string;
 	help: string;
@@ -43,12 +43,18 @@ export const CI_FIELDS: SettingField[] = [
 	{ name: 'ci.dispatchRef', label: 'Ref for the default-branch run', help: 'Empty: the default branch.', kind: 'text' }
 ];
 
-export const ALL_FIELDS = [...BATCH_FIELDS, ...CI_FIELDS];
+export const VIEW_FIELDS: SettingField[] = [
+	{ name: 'view.publicView', label: 'Public read-only page', help: 'Anyone with the link sees this page without signing in, and can change nothing. Only for public repositories.', kind: 'boolean' }
+];
+
+export const ALL_FIELDS = [...BATCH_FIELDS, ...CI_FIELDS, ...VIEW_FIELDS];
+
+type Shown = { config: object; ci: object; view?: object };
 
 /** The value a field shows, from the stored settings. */
-export function shown(f: SettingField, settings: { config: object; ci: object }): string | number | boolean {
-	const [group, key] = f.name.split('.') as ['config' | 'ci', string];
-	const v = (settings[group] as Record<string, unknown>)[key];
+export function shown(f: SettingField, settings: Shown): string | number | boolean {
+	const [group, key] = f.name.split('.') as ['config' | 'ci' | 'view', string];
+	const v = ((settings[group] ?? {}) as Record<string, unknown>)[key];
 	if (f.kind === 'duration') return Math.round(((v as number) / f.unitMs!) * 100) / 100;
 	return v as string | number | boolean;
 }
@@ -57,11 +63,17 @@ export function shown(f: SettingField, settings: { config: object; ci: object })
  * The settings API body from a submitted form; throws with a message on a bad value. With
  * `current`, only what changed is sent: a duration shown rounded is not written back rounded.
  */
-export function parseSettingsForm(form: FormData, current?: { config: object; ci: object }): { config: Record<string, unknown>; ci: Record<string, string> } {
+export function parseSettingsForm(
+	form: FormData,
+	current?: Shown
+): { config: Record<string, unknown>; ci: Record<string, string>; publicView?: boolean } {
 	const config: Record<string, unknown> = {};
 	const ci: Record<string, string> = {};
+	let publicView: boolean | undefined = form.get('view.publicView') === 'on';
+	if (current && publicView === shown(VIEW_FIELDS[0], current)) publicView = undefined;
 	for (const f of ALL_FIELDS) {
 		const [group, key] = f.name.split('.');
+		if (group === 'view') continue;
 		const raw = form.get(f.name);
 		if (f.kind === 'boolean') {
 			config[key] = raw === 'on';
@@ -83,5 +95,5 @@ export function parseSettingsForm(form: FormData, current?: { config: object; ci
 		for (const [k, v] of Object.entries(config)) if ((current.config as Record<string, unknown>)[k] === v) delete config[k];
 		for (const [k, v] of Object.entries(ci)) if ((current.ci as Record<string, unknown>)[k] === v) delete ci[k];
 	}
-	return { config, ci };
+	return publicView === undefined ? { config, ci } : { config, ci, publicView };
 }

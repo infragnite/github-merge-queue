@@ -261,11 +261,20 @@ const CONFIG_KEYS: (keyof BatchConfig)[] = Object.keys(DEFAULT_BATCH_CONFIG) as 
 
 export function getConfig(repo: Repo) {
 	const s = store.getQueueSettings(repo.id);
-	return { mode: s.mode, config: s.config, ci: s.ci, paused: s.pausedReason };
+	return { mode: s.mode, config: s.config, ci: s.ci, paused: s.pausedReason, publicView: s.publicView };
 }
 
-export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unknown>) {
+/**
+ * Changes the queue's settings. Turning `publicView` on needs `visibility`, the repository's
+ * visibility on GitHub as the caller looked it up: only a public repository's queue can be public.
+ */
+export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unknown>, visibility: 'public' | 'private' | null = null) {
 	requireRole(caller, 'admin', 'Changing queue settings');
+	const publicView = body.publicView;
+	if (publicView !== undefined && typeof publicView !== 'boolean') throw new ApiError(400, 'publicView must be a boolean');
+	if (publicView === true && !store.getQueueSettings(repo.id).publicView && visibility !== 'public') {
+		throw new ApiError(400, visibility === 'private' ? 'A private repository can not have a public queue page' : 'Could not check on GitHub that the repository is public; try again');
+	}
 	const config: Partial<BatchConfig> = {};
 	for (const [k, v] of Object.entries((body.config ?? {}) as Record<string, unknown>)) {
 		if (!CONFIG_KEYS.includes(k as keyof BatchConfig)) throw new ApiError(400, `Unknown setting ${k}`);
@@ -292,11 +301,13 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 	store.updateQueueSettings(repo.id, {
 		mode: mode as 'serial' | 'batch' | undefined,
 		config,
-		ci: ci as Partial<store.CISettings> | undefined
+		ci: ci as Partial<store.CISettings> | undefined,
+		publicView: publicView as boolean | undefined
 	});
 	// Who changed what, from what: on the queue's event log, so a surprising setting can be traced.
 	const changes: Record<string, { from: unknown; to: unknown }> = {};
 	if (mode !== undefined && mode !== before.mode) changes.mode = { from: before.mode, to: mode };
+	if (publicView !== undefined && publicView !== before.publicView) changes.publicView = { from: before.publicView, to: publicView };
 	for (const [k, v] of Object.entries(config)) if (before.config[k as keyof BatchConfig] !== v) changes[k] = { from: before.config[k as keyof BatchConfig], to: v };
 	for (const [k, v] of Object.entries(ci ?? {})) if (before.ci[k as keyof store.CISettings] !== v) changes[`ci.${k}`] = { from: before.ci[k as keyof store.CISettings], to: v };
 	if (Object.keys(changes).length) emitEvent(repo.id, null, 'settings', { by: caller.login, changes });
@@ -304,6 +315,16 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 }
 
 /** Checks who may cancel a batch; the cancel itself runs under the repo lock in the route. */
+/** The repository's visibility on GitHub, for `patchConfig`; null when GitHub can't say. */
+export async function repoVisibility(lookup: () => Promise<{ private?: boolean }>): Promise<'public' | 'private' | null> {
+	try {
+		const r = await lookup();
+		return typeof r.private === 'boolean' ? (r.private ? 'private' : 'public') : null;
+	} catch {
+		return null;
+	}
+}
+
 export function canCancelBatch(repo: Repo, caller: Caller, id: number) {
 	requireRole(caller, 'maintain', 'Cancelling a batch');
 	const b = store.getBatch(id);

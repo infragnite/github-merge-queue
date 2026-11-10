@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
-	import { BATCH_FIELDS, CI_FIELDS, shown, type SettingField } from '$lib/settings-form';
+	import { BATCH_FIELDS, CI_FIELDS, VIEW_FIELDS, shown, type SettingField } from '$lib/settings-form';
 
-	type Settings = { config: object; ci: object };
+	type Settings = { config: object; ci: object; view: object };
 	let {
 		settings,
 		canEdit,
@@ -33,7 +33,7 @@
 		{#if !canEdit}
 			<p class="text-xs text-gray-500">Only repository admins can change these.</p>
 		{/if}
-		{#each [{ title: 'Batching', fields: BATCH_FIELDS }, { title: 'CI', fields: CI_FIELDS }] as group (group.title)}
+		{#each [{ title: 'Batching', fields: BATCH_FIELDS }, { title: 'CI', fields: CI_FIELDS }, { title: 'Visibility', fields: VIEW_FIELDS }] as group (group.title)}
 			<fieldset class="space-y-2" disabled={!canEdit || saving}>
 				<legend class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500">{group.title}</legend>
 				{#each group.fields as f (f.name)}

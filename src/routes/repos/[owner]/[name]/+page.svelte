@@ -5,6 +5,7 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import BatchCard from '$lib/components/BatchCard.svelte';
 	import QueueSettings from '$lib/components/QueueSettings.svelte';
+	import SavingsCard from '$lib/components/SavingsCard.svelte';
 	import { queueView, type Row } from '$lib/queue-view';
 
 	let { data, form } = $props();
@@ -30,6 +31,8 @@
 	let search = $state('');
 
 	const batchMode = $derived(data.mode === 'batch');
+	// Signed out on a public page: everything shows, nothing can be changed.
+	const readonly = $derived(data.anonymous);
 	const view = $derived(
 		queueView({
 			items: data.queueItems,
@@ -137,11 +140,13 @@
 	<!-- Header -->
 	<div class="flex flex-wrap items-center justify-between gap-3">
 		<div class="flex min-w-0 items-center gap-3">
-			<a href="/" class="shrink-0 text-gray-400 transition-colors hover:text-gray-600" aria-label="Back to dashboard">
-				<svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-					<path stroke-linecap="round" stroke-linejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-				</svg>
-			</a>
+			{#if !readonly}
+				<a href="/" class="shrink-0 text-gray-400 transition-colors hover:text-gray-600" aria-label="Back to dashboard">
+					<svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+					</svg>
+				</a>
+			{/if}
 			<div class="min-w-0">
 				<h1 class="truncate text-xl font-bold text-gray-900 sm:text-2xl">
 					<a href="https://github.com/{data.repo.owner}/{data.repo.name}" target="_blank" rel="noopener" class="hover:text-indigo-600">
@@ -158,6 +163,9 @@
 			</div>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
+			{#if readonly}
+				<span class="rounded-lg border border-border-subtle px-3 py-1.5 text-sm text-gray-600">{batchMode ? 'Merging in batches' : 'Merging one by one'}</span>
+			{:else}
 			<form method="POST" action="?/setMode" use:enhance={confirmMode} class="flex overflow-hidden rounded-lg border border-border-subtle text-sm" aria-label="Merge mode">
 				{#each [['serial', 'One by one'], ['batch', 'Batches']] as [value, label] (value)}
 					<button
@@ -170,6 +178,7 @@
 					>{label}</button>
 				{/each}
 			</form>
+			{/if}
 			<button
 				onclick={refresh}
 				disabled={refreshing}
@@ -180,6 +189,7 @@
 					<path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
 				</svg>
 			</button>
+			{#if !readonly}
 			<button
 				onclick={() => (showAddDialog = true)}
 				class="whitespace-nowrap rounded-lg bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-indigo-700"
@@ -187,6 +197,7 @@
 			>
 				+ Add PR
 			</button>
+			{/if}
 		</div>
 	</div>
 
@@ -205,10 +216,12 @@
 	{/if}
 	{#if pipe?.paused}
 		<form method="POST" action="?/resume" use:enhance class="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-			<span class="min-w-0 flex-1">Paused: {pipe.paused}</span>
-			<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>
+			<span class="min-w-0 flex-1">{readonly ? pipe.paused : `Paused: ${pipe.paused}`}</span>
+			{#if !readonly}<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>{/if}
 		</form>
 	{/if}
+
+	<SavingsCard savings={data.savings} />
 
 	<!-- Wide screens: the queue in the wide column (golden ratio), what's happening now beside it. -->
 	<div class="grid grid-cols-1 gap-5 lg:grid-cols-[1.618fr_1fr]">
@@ -241,7 +254,7 @@
 					<div class="overflow-hidden rounded-xl border border-red-200 bg-surface-raised" role="list">
 						{#each view.attention as a (a.item.id)}
 							<div role="listitem">
-								<QueueItem item={a.item} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={a.stack} why={a.item.status === 'conflict' ? null : a.why} />
+								<QueueItem {readonly} item={a.item} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={a.stack} why={a.item.status === 'conflict' ? null : a.why} />
 							</div>
 						{/each}
 					</div>
@@ -254,13 +267,13 @@
 						<path stroke-linecap="round" stroke-linejoin="round" d="M3 4h13M3 8h9m-9 4h6m4 0l4-4m0 0l4 4m-4-4v12" />
 					</svg>
 					<h3 class="mt-4 text-sm font-medium text-gray-900">Queue is empty</h3>
-					<p class="mt-1 text-sm text-gray-500">Add a pull request to start the merge queue.</p>
+					{#if !readonly}<p class="mt-1 text-sm text-gray-500">Add a pull request to start the merge queue.</p>{/if}
 				</div>
 			{:else}
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
 					<h2 class="text-base font-semibold text-gray-900">Queue · {inLine}</h2>
 					<span class="text-xs text-gray-500">
-						{batchMode ? 'urgent first, then in line order' : 'drag to reorder'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
+						{batchMode ? 'urgent first, then in line order' : readonly ? 'in line order' : 'drag to reorder'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
 					</span>
 					<input
 						type="search"
@@ -292,7 +305,7 @@
 						<div class="overflow-hidden rounded-xl border border-indigo-200 bg-surface-raised" role="list">
 							{#each shownNext as r (r.item.id)}
 								<div role="listitem">
-									<QueueItem item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} batchMode stack={r.stack} />
+									<QueueItem {readonly} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} batchMode stack={r.stack} />
 								</div>
 							{/each}
 						</div>
@@ -304,9 +317,9 @@
 						{#if batchMode && view.upNext.length > 0}<h3 class="mb-1 text-sm font-medium text-gray-700">After that</h3>{/if}
 						<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
 							{#each shownRows as r, index (r.item.id)}
-								{#if batchMode || needle}
+								{#if batchMode || needle || readonly}
 									<div role="listitem">
-										<QueueItem item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={r.stack} />
+										<QueueItem {readonly} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={r.stack} />
 									</div>
 								{:else}
 									<div
@@ -318,7 +331,7 @@
 										class="{dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
 										role="listitem"
 									>
-										<QueueItem item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} reorderable batchMode={false} stack={r.stack} />
+										<QueueItem {readonly} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} reorderable batchMode={false} stack={r.stack} />
 									</div>
 								{/if}
 							{/each}
@@ -374,7 +387,7 @@
 				</details>
 			{/if}
 
-			<QueueSettings settings={data.settings} canEdit={data.can.settings} error={form?.settingsError ?? null} saved={!!form?.settingsSaved} />
+			{#if data.settings}<QueueSettings settings={data.settings} canEdit={data.can.settings} error={form?.settingsError ?? null} saved={!!form?.settingsSaved} />{/if}
 
 			<!-- History -->
 			{#if data.history.length > 0}

@@ -8,9 +8,10 @@ import {
 	reorderQueue,
 	updateQueueItemStatus
 } from '$lib/server/db';
-import { getOpenPRs, collaboratorRole, rateLimitOf } from '$lib/server/github';
+import { getOpenPRs, collaboratorRole, rateLimitOf, getRepo } from '$lib/server/github';
 import { atLeast, type Caller, type Role } from '$lib/server/api-auth';
-import { ApiError, patchConfig } from '$lib/server/api-service';
+import { ApiError, patchConfig, repoVisibility } from '$lib/server/api-service';
+import { savingsFor } from '$lib/server/ci-savings';
 import { DEFAULT_BATCH_CONFIG } from '$lib/server/batching';
 import { DEFAULT_CI } from '$lib/server/batch-store';
 import { parseSettingsForm } from '$lib/settings-form';
@@ -65,10 +66,12 @@ async function openPRsOf(owner: string, name: string, repoId: number) {
 	}
 }
 
-export const load: PageServerLoad = async ({ params, locals }) => {
-	if (!locals.user) redirect(302, '/login');
-
+export const load: PageServerLoad = async ({ params, locals, url }) => {
 	const repo = getRepoByOwnerName(params.owner, params.name);
+	// Signed out: the read-only page of a repository that made it public, else sign in first
+	// (an unknown repository looks the same as a private one).
+	const anonymous = !locals.user;
+	if (anonymous && !(repo && getQueueSettings(repo.id).publicView)) redirect(302, `/login?next=${encodeURIComponent(url.pathname)}`);
 	if (!repo) error(404, 'Repository not found');
 
 	const queueItems = getQueueItems(repo.id).map((i) => ({ ...i, holdWait: currentHold(i)?.wait ?? null, deferred: deferredFor(i as typeof i & { deferred_for?: string | null }).length > 0 }));
@@ -81,7 +84,8 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		draft: boolean;
 	}> = [];
 	try {
-		openPrs = await openPRsOf(repo.owner, repo.name, repo.id);
+		// Signed-out visitors only see what signed-in ones fetched (titles of PRs in stacks).
+		openPrs = anonymous ? (openPrsCache.get(repo.id)?.value ?? []) : await openPRsOf(repo.owner, repo.name, repo.id);
 	} catch {
 		// GitHub API error — user sees empty PR list
 	}
@@ -98,7 +102,10 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 			return { stacks: [], error: `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
 		});
 
-	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta).catch((e) => {
+	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta)
+		// Why the queue stopped can name internals (App permissions, GitHub errors): only signed-in users see it.
+		.then((p) => (anonymous ? { ...p, paused: p.paused ? 'The queue is paused' : null, tickError: null, progressErrors: {} } : p))
+		.catch((e) => {
 		const why = e instanceof Error ? e.message : String(e);
 		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);
 		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {} };
@@ -117,14 +124,23 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		}));
 
 	const settings = getQueueSettings(repo.id);
-	const me = await pageCaller(repo.owner, repo.name, locals.user.login);
+	const me: Caller = locals.user ? await pageCaller(repo.owner, repo.name, locals.user.login) : { login: '', role: 'none', app: false };
 	return {
+		anonymous,
 		role: me.role,
-		can: { cancel: atLeast(me.role, 'maintain'), settings: atLeast(me.role, 'admin') },
-		settings: { config: settings.config, ci: settings.ci, defaults: { config: DEFAULT_BATCH_CONFIG, ci: DEFAULT_CI } },
-		repo,
+		can: { cancel: !anonymous && atLeast(me.role, 'maintain'), settings: !anonymous && atLeast(me.role, 'admin') },
+		settings: anonymous
+			? null
+			: {
+					config: settings.config,
+					ci: settings.ci,
+					view: { publicView: settings.publicView },
+					defaults: { config: DEFAULT_BATCH_CONFIG, ci: DEFAULT_CI, view: { publicView: false } }
+				},
+		repo: { id: repo.id, owner: repo.owner, name: repo.name, default_branch: repo.default_branch },
+		savings: savingsFor(repo.id),
 		queueItems,
-		openPrs: availablePrs,
+		openPrs: anonymous ? [] : availablePrs,
 		stacks,
 		pipeline,
 		mode: settings.mode,
@@ -183,8 +199,10 @@ export const actions: Actions = {
 		const me = await pageCaller(repo.owner, repo.name, locals.user.login);
 		if (!atLeast(me.role, 'admin')) return fail(403, { settingsError: `Changing queue settings needs admin access; you have ${me.role}` });
 		try {
-			const body = parseSettingsForm(await request.formData(), getQueueSettings(repo.id));
-			await withRepoLock(repo.id, async () => patchConfig(repo, me, body));
+			const cur = getQueueSettings(repo.id);
+			const body = parseSettingsForm(await request.formData(), { ...cur, view: { publicView: cur.publicView } });
+			const visibility = body.publicView === true ? await repoVisibility(() => getRepo(repo.owner, repo.name)) : null;
+			await withRepoLock(repo.id, async () => patchConfig(repo, me, body, visibility));
 		} catch (e) {
 			if (e instanceof ApiError || e instanceof Error) return fail(400, { settingsError: e.message });
 			throw e;
