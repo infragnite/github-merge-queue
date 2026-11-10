@@ -466,7 +466,10 @@ class Tick {
 			this.event(r.pr, 'deferred', { behind: ahead, reason: r.reason });
 			this.log(`#${r.pr} deferred: ${r.reason}`);
 		} else {
-			await this.conflict(r.pr, alone.ok ? r.reason : alone.reason.replace(/^#\d+ /, ''), alone.ok ? r.conflicts : alone.conflicts, await this.rebaseCommand(r.pr));
+			// It fails alone on the default branch: that is what it conflicts with. Git names the files
+			// when its author rebases; they stay in the notice's block for agents.
+			const why = alone.ok ? r.reason : /could not be merged/.test(alone.reason) ? alone.reason.replace(/^#\d+ /, '') : `Conflicts with ${this.d.repo.default_branch}`;
+			await this.conflict(r.pr, why, alone.ok ? r.conflicts : alone.conflicts, await this.rebaseCommand(r.pr));
 		}
 		return null;
 	}
