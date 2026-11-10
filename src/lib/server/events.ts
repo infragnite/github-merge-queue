@@ -12,6 +12,8 @@ export type QueueEventKind =
 	| 'rebased'
 	| 'conflict'
 	| 'deferred'
+	| 'held'
+	| 'released'
 	| 'ejected'
 	| 'requeued'
 	| 'changed'

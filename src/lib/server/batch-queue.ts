@@ -1601,6 +1601,36 @@ class Tick {
 	 * Plans and starts the next batch on top of `active`. With `urgentOnly` it starts an express
 	 * batch of urgent PRs on `masterSha` itself, beside a bisection (see `bisect`), or nothing.
 	 */
+	/**
+	 * Records why each held PR can't go and tells its agent on GitHub, once per reason: a failing
+	 * merge-queue status on its head and a `held` event. A PR held before and free now is released.
+	 */
+	async recordHolds(held: { pr: number; admission: Hold }[]) {
+		const now = new Map(held.map((h) => [h.pr, h.admission]));
+		for (const it of this.items()) {
+			// A PR in conflict keeps its status and message: it is held for that, and was told.
+			if (it.status !== 'queued') continue;
+			const was = store.currentHold(it);
+			const h = now.get(it.pr_number);
+			if (!h) {
+				if (!was) continue;
+				store.setHold(it.id, null);
+				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
+				const p = await this.pr(it.pr_number).catch(() => null);
+				if (p) await this.d.github.setPRStatus(p.headSha, 'pending', 'In line in the merge queue').catch(this.bestEffort('github.setPRStatus'));
+				this.event(it.pr_number, 'released', { code: was.code });
+				continue;
+			}
+			const { code, reason } = h;
+			if (was?.code === code && was.reason === reason) continue;
+			db.updateQueueItemStatus(it.id, 'queued', reason);
+			store.setHold(it.id, { code, reason });
+			const p = await this.pr(it.pr_number).catch(() => null);
+			if (p) await this.d.github.setPRStatus(p.headSha, 'failure', short(`Needs attention: ${reason}`)).catch(this.bestEffort('github.setPRStatus'));
+			this.event(it.pr_number, 'held', { code, reason });
+		}
+	}
+
 	async plan(active: BatchRow[], masterSha: string, opts: { urgentOnly?: boolean } = {}): Promise<'started' | 'conflict' | 'error' | 'idle'> {
 		const settings = this.settings();
 		// A deferred PR waits while a PR it conflicts with is in a batch or about to be. One that is
@@ -1672,14 +1702,8 @@ class Tick {
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
 			if (opts.urgentOnly && !plan.express) return 'idle';
 		}
-		for (const h of opts.urgentOnly ? [] : plan.held) {
-			const it = this.item(h.pr);
-			// A PR in conflict keeps its status and message: it is held for that.
-			if (!it || it.status !== 'queued') continue;
-			const { code, reason } = h.admission;
-			if (it.error_message !== reason) db.updateQueueItemStatus(it.id, 'queued', reason);
-			store.setHold(it.id, { code, reason });
-		}
+		// On a red branch the deferred PRs were left out of the plan; they are still held.
+		if (!opts.urgentOnly) await this.recordHolds(red ? [...plan.held, ...[...deferred].map(([pr, admission]) => ({ pr, admission }))] : plan.held);
 		if (!plan.batch) return 'idle';
 		const below = red || opts.urgentOnly ? [] : active.flatMap((b) => b.members);
 		const base = red || opts.urgentOnly || !active.length ? masterSha : active[active.length - 1].head_sha;
