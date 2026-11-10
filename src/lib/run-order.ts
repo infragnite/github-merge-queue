@@ -22,9 +22,40 @@ function unresolved(b: BatchCard) {
 	return b.prs.filter((p) => p.verdict !== 'failing' && p.activity !== 'landed' && p.activity !== 'left');
 }
 
-export function runOrder(input: { active: BatchCard[]; upNext: number[]; express: boolean }): RunSlot[] {
+/** The default branch's health, as the queue records it. `since` is in ms. */
+export interface MasterRun {
+	sha: string;
+	state: string;
+	since: number;
+	/** The default branch's name. */
+	branch: string;
+}
+
+const minutes = (ms: number) => {
+	const m = Math.max(0, Math.round(ms / 60_000));
+	return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+};
+
+export function runOrder(input: { active: BatchCard[]; upNext: number[]; express: boolean; master?: MasterRun | null; now?: number }): RunSlot[] {
 	const running: RunSlot[] = [];
 	const next: RunSlot[] = [];
+	// While the default branch is checked, nobody is ejected: its check is what they wait for.
+	const m = input.master;
+	const checking = m && (m.state === 'verifying' || m.state === 'checking') ? m : null;
+	if (checking) {
+		const sha = checking.sha.slice(0, 7);
+		const baseline = input.active.find((b) => b.kind === 'baseline' && b.ci === 'pending');
+		running.push({
+			key: 'master',
+			state: 'running',
+			batch: null,
+			label: `Check of ${checking.branch}`,
+			branch: checking.state === 'checking' ? (baseline?.branch ?? null) : checking.branch,
+			detail: `${sha}${checking.state === 'checking' ? ', pushed outside the queue' : ''}, running ${minutes((input.now ?? Date.now()) - checking.since)}; ejections wait for it`,
+			prs: [],
+			urgent: false
+		});
+	}
 	// An urgent batch bisecting between two steps of another bisection goes on first.
 	const bisecting = input.active.filter((b) => b.kind === 'batch' && b.status === 'bisecting').sort((a, b) => Number(b.express) - Number(a.express));
 	for (const b of input.active) {
@@ -56,6 +87,18 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 		});
 	}
 	for (const b of bisecting) {
+		const failing = b.prs.filter((p) => p.verdict === 'failing' && !p.settled && p.activity !== 'left');
+		if (checking && failing.length)
+			next.push({
+				key: `e${b.id}`,
+				state: 'next',
+				batch: b.id,
+				label: `${b.express ? 'Urgent batch' : 'Batch'} #${b.number}: eject ${failing.map((p) => `#${p.pr}`).join(' ')}`,
+				branch: null,
+				detail: `waits for the check of ${checking.branch} ${checking.sha.slice(0, 7)}`,
+				prs: failing.map((p) => p.pr),
+				urgent: b.express
+			});
 		const open = unresolved(b).filter((p) => p.activity !== 'checking');
 		if (!open.length) continue;
 		next.push({

@@ -49,7 +49,8 @@
 	const inLine = $derived((board?.stacks ?? []).reduce((n: number, s: BoardStack) => n + s.rows.length, 0));
 	const attention = $derived((board?.attention ?? []).filter((h: BoardHeld) => items.has(h.pr)));
 	// What runs CI now: the batches and their bisection steps. What comes next is not guessed.
-	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false }) : []);
+	// The check of the default branch is a run too: ejections wait for it.
+	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false, master: pipe.master ? { ...pipe.master, branch: data.repo.default_branch } : null }) : []);
 
 	const MASTER: Record<string, { label: string; tone: string; hint: string }> = {
 		green: { label: 'green', tone: 'bg-green-100 text-green-800', hint: 'Batches build on it' },
