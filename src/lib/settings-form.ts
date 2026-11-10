@@ -39,7 +39,8 @@ export const BATCH_FIELDS: SettingField[] = [
 export const CI_FIELDS: SettingField[] = [
 	{ name: 'ci.workflow', label: 'Workflow', help: 'The workflow file the queue starts on its branches.', kind: 'text' },
 	{ name: 'ci.requiredCheck', label: 'Deciding check', help: 'The check run whose result decides a batch.', kind: 'text' },
-	{ name: 'ci.prStatus', label: 'PR status', help: 'The status the queue keeps on each PR; require it on the default branch.', kind: 'text' },
+	{ name: 'ci.prStatus', label: 'PR check', help: 'The check the queue keeps on each PR; require it on the default branch.', kind: 'text' },
+	{ name: 'ci.prReport', label: 'PR check kind', help: 'check-run (says what to do, and "action required" on a hold), status (140 characters), or both while a ruleset still requires the status.', kind: 'text' },
 	{ name: 'ci.testedStatus', label: 'Tested status', help: 'The status set on the default branch when its tree was tested.', kind: 'text' },
 	{ name: 'ci.dispatchRef', label: 'Ref for the default-branch run', help: 'Empty: the default branch.', kind: 'text' }
 ];

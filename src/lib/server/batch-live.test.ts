@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { approvalsFrom, checkResult, earlyFailure, gateFeeds } from './batch-live';
+import { approvalsFrom, checkResult, checkRunRequest, earlyFailure, gateFeeds, postPRReport, prReportCalls, queuePage, statusFromCheck } from './batch-live';
+import { RateLimitedError } from './rate-limit';
 import type { GhReview } from './github';
 
 const review = (login: string, state: string, sha: string, at: string, assoc = 'COLLABORATOR'): GhReview => ({
@@ -298,5 +299,120 @@ jobs:
 		expect(earlyFailure([], jobs, null, feeds, new Set([7]))).toBe(false);
 		// The CI workflow's runs not found: nothing is known to feed the gate.
 		expect(earlyFailure([], jobs, null, feeds, new Set())).toBe(false);
+	});
+});
+
+describe("the queue's check run on a PR", () => {
+	const at = { name: 'merge-queue', detailsUrl: 'https://mq.example/repos/o/r' };
+
+	test('in line and testing are open runs; the rest are completed with their conclusion', () => {
+		expect(checkRunRequest('s1', { state: 'queued', title: 'In line in the merge queue' }, at)).toEqual({
+			name: 'merge-queue',
+			head_sha: 's1',
+			details_url: 'https://mq.example/repos/o/r',
+			status: 'queued',
+			output: { title: 'In line in the merge queue', summary: 'In line in the merge queue' }
+		});
+		expect(checkRunRequest('s1', { state: 'in_progress', title: 'Testing in mq/1' }, at)).toMatchObject({ status: 'in_progress' });
+		expect(checkRunRequest('s1', { state: 'in_progress', title: 't' }, at)).not.toHaveProperty('conclusion');
+		for (const state of ['action_required', 'failure', 'success', 'neutral'] as const) {
+			const r = checkRunRequest('s1', { state, title: 't' }, at);
+			expect(r, state).toMatchObject({ status: 'completed', conclusion: state });
+		}
+	});
+
+	test('a hold says "action required" and carries the fix in its summary', () => {
+		const r = checkRunRequest('s1', { state: 'action_required', title: 'Draft', summary: '**Merge queue:** Draft. Mark it ready for review.' }, at);
+		expect(r).toMatchObject({ conclusion: 'action_required', output: { title: 'Draft', summary: '**Merge queue:** Draft. Mark it ready for review.' } });
+	});
+
+	test('Details opens the queue page; a CI run link goes in the summary', () => {
+		const r = checkRunRequest('s1', { state: 'failure', title: 'Left the queue: failed', url: 'https://ci/run/9' }, at);
+		expect(r.details_url).toBe('https://mq.example/repos/o/r');
+		expect(r.output.summary).toBe('Left the queue: failed\n\nCI run: https://ci/run/9');
+	});
+
+	test('a suffix names a second run beside it (a trial)', () => {
+		expect(checkRunRequest('s1', { state: 'in_progress', title: 't', suffix: '/try' }, at).name).toBe('merge-queue/try');
+	});
+
+	test("a summary over GitHub's 65535 characters is cut, keeping its hidden block", () => {
+		const block = '<!-- merge-queue {"v":1} -->';
+		const r = checkRunRequest('s1', { state: 'action_required', title: 't', summary: `${'x'.repeat(70000)}\n\n${block}` }, at);
+		expect(r.output.summary.length).toBeLessThanOrEqual(65535);
+		expect(r.output.summary.endsWith(block)).toBe(true);
+	});
+
+	test('the queue page, or the commit on GitHub when the app has no address', () => {
+		expect(queuePage('https://mq.example/', 'o', 'r', 's1')).toBe('https://mq.example/repos/o/r');
+		expect(queuePage('', 'o', 'r', 's1')).toBe('https://github.com/o/r/commit/s1');
+	});
+});
+
+describe('the same state as a commit status, for a ruleset that still requires one', () => {
+	test('only success passes; a hold and an ejection fail; the rest are pending', () => {
+		const state = (s: Parameters<typeof statusFromCheck>[0]['state']) => statusFromCheck({ state: s, title: 't' }, 'merge-queue', 'u').state;
+		expect(state('success')).toBe('success');
+		expect(state('action_required')).toBe('failure');
+		expect(state('failure')).toBe('failure');
+		expect(state('queued')).toBe('pending');
+		expect(state('in_progress')).toBe('pending');
+		// A status has no neutral, and a pending one keeps a PR out of the queue unmergeable.
+		expect(state('neutral')).toBe('pending');
+	});
+
+	test('the title is the description, cut at 140 characters; the link is the CI run, else the queue page', () => {
+		const s = statusFromCheck({ state: 'queued', title: 'y'.repeat(200), suffix: '/try' }, 'merge-queue', 'https://mq.example/repos/o/r');
+		expect(s.description.length).toBeLessThanOrEqual(140);
+		expect(s.context).toBe('merge-queue/try');
+		expect(s.target_url).toBe('https://mq.example/repos/o/r');
+		expect(statusFromCheck({ state: 'failure', title: 't', url: 'https://ci/1' }, 'merge-queue', 'q').target_url).toBe('https://ci/1');
+	});
+});
+
+describe('what the PR report setting posts', () => {
+	test('a check run, a status, or both while a ruleset still requires the status', () => {
+		expect(prReportCalls('check-run')).toEqual(['check-run']);
+		expect(prReportCalls('status')).toEqual(['status']);
+		expect(prReportCalls('both')).toEqual(['check-run', 'status']);
+		// A setting from before it existed, or a typo: the status the ruleset requires keeps being posted.
+		expect(prReportCalls(undefined)).toEqual(['check-run', 'status']);
+		expect(prReportCalls('checks' as never)).toEqual(['check-run', 'status']);
+	});
+});
+
+describe('posting both, while a ruleset still requires the status', () => {
+	const calls: string[] = [];
+	const ok = (kind: string) => async () => void calls.push(kind);
+	const fail = (kind: string, e: Error = new Error(`${kind} refused`)) => async () => {
+		calls.push(kind);
+		throw e;
+	};
+
+	test('a refused check run (no Checks permission yet) does not fail the post: the status went out, and retrying every tick would only post it again', async () => {
+		calls.length = 0;
+		const warned: unknown[] = [];
+		await postPRReport('both', fail('check-run'), ok('status'), (e) => warned.push(e));
+		expect(calls).toEqual(['check-run', 'status']);
+		expect(warned).toHaveLength(1);
+	});
+
+	test('a refused status fails it, whatever the check run did', async () => {
+		calls.length = 0;
+		await expect(postPRReport('both', ok('check-run'), fail('status'), () => {})).rejects.toThrow('status refused');
+		expect(calls).toEqual(['check-run', 'status']);
+	});
+
+	test('a rate limit stops it at once', async () => {
+		calls.length = 0;
+		const limited = new RateLimitedError(Date.now() + 1000, 'rate limited');
+		await expect(postPRReport('both', fail('check-run', limited), ok('status'), () => {})).rejects.toBe(limited);
+		expect(calls).toEqual(['check-run']);
+	});
+
+	test('posting only the check run, its refusal fails the post, so it is tried again', async () => {
+		calls.length = 0;
+		await expect(postPRReport('check-run', fail('check-run'), ok('status'), () => {})).rejects.toThrow('check-run refused');
+		expect(calls).toEqual(['check-run']);
 	});
 });

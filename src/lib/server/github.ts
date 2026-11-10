@@ -382,6 +382,24 @@ export async function createCommitStatus(
 	});
 }
 
+/** A check run on `head_sha`, as this app; GitHub shows the latest one of each name. Needs the Checks write permission. */
+export async function createCheckRun(owner: string, repo: string, run: CheckRunRequest) {
+	return ghFetchAsApp(`/repos/${owner}/${repo}/check-runs`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(run)
+	});
+}
+
+export interface CheckRunRequest {
+	name: string;
+	head_sha: string;
+	details_url: string;
+	status: 'queued' | 'in_progress' | 'completed';
+	conclusion?: 'action_required' | 'failure' | 'success' | 'neutral';
+	output: { title: string; summary: string };
+}
+
 export async function dispatchWorkflow(
 	owner: string,
 	repo: string,

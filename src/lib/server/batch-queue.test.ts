@@ -10,7 +10,8 @@ const { analyzeStacks } = await import('./stacks');
 const events = await import('./events');
 import { GitSandbox } from './testing/git-sandbox';
 import { writeFileSync } from 'node:fs';
-import type { LivePR, QueueDeps } from './batch-queue';
+import type { LivePR, PRCheckState, QueueDeps } from './batch-queue';
+import { ejectedNotice, holdCheck, holdNotice, readNotice } from './hold-format';
 import { RateLimitedError } from './rate-limit';
 
 let git: GitSandbox;
@@ -33,10 +34,12 @@ class World {
 	comments: { pr: number; body: string }[] = [];
 	merged: number[] = [];
 	ciPendingOnce = new Set<string>();
-	prStatuses: { sha: string; state: string; description: string; context: string; url?: string }[] = [];
+	/** The queue's check runs on PR heads, in the order posted (GitHub shows the latest of each name). */
+	prChecks: { sha: string; name: string; state: PRCheckState; title: string; summary?: string; url?: string }[] = [];
 	labels = new Map<number, Set<string>>();
 	pushedHeads: { branch: string; sha: string }[] = [];
 	changesRequested = new Set<number>();
+	drafts = new Set<number>();
 	/** Approval given on one specific head SHA only. */
 	approvedOn = new Map<number, string>();
 	cacheRefreshes = 0;
@@ -91,7 +94,7 @@ class World {
 			headSha: head,
 			headRef: p.headRef,
 			sameRepo: !this.forks.has(n),
-			draft: false,
+			draft: this.drafts.has(n),
 			title: `PR ${n}`,
 			url: `https://example.test/pull/${n}`,
 			authorLogin: 'dev',
@@ -182,8 +185,15 @@ class World {
 					git.git('branch', '-f', branch, sha);
 					this.pushedHeads.push({ branch, sha });
 				},
-				setPRStatus: async (sha, state, description, opts) => {
-					this.prStatuses.push({ sha, state, description, context: `merge-queue${opts?.suffix ?? ''}`, ...(opts?.url ? { url: opts.url } : {}) });
+				setPRCheck: async (sha, c) => {
+					this.prChecks.push({
+						sha,
+						name: `merge-queue${c.suffix ?? ''}`,
+						state: c.state,
+						title: c.title,
+						...(c.summary !== undefined ? { summary: c.summary } : {}),
+						...(c.url ? { url: c.url } : {})
+					});
 				},
 				label: async (n, name, on) => {
 					const set = this.labels.get(n) ?? new Set();
@@ -300,7 +310,7 @@ describe('batch queue runtime', () => {
 		await run(60);
 		expect(world.merged).toEqual([1, 2, 4]);
 		expect(world.comments).toEqual([
-			{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }
+			{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: #3 fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }
 		]);
 		expect(queued()).toEqual([]);
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr4.txt']);
@@ -519,16 +529,17 @@ describe('batch queue runtime', () => {
 		pr(2, { file: 'x-breaks-master.txt' });
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run(60);
-		const of = (ref: string) => world.prStatuses.filter((x) => x.sha === git.sha(ref) && x.context === 'merge-queue');
+		const of = (ref: string) => world.prChecks.filter((x) => x.sha === git.sha(ref) && x.name === 'merge-queue');
 		const branch = world.started[0].branch;
-		expect(of('pr2').map((x) => [x.state, x.description.split(';')[0].split(':')[0], x.url])).toEqual([
-			['pending', `Testing in ${branch} with 1 other PR(s)`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`],
-			['pending', `${branch} failed`, `https://ci.example/${world.started[0].head}`],
-			['pending', `Batch ${store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!.number} failed`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${world.started[2].branch}`)}`],
+		expect(of('pr2').map((x) => [x.state, x.title.split(';')[0].split(':')[0], x.url])).toEqual([
+			['in_progress', `Testing in ${branch} with 1 other PR(s)`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`],
+			['in_progress', `${branch} failed`, `https://ci.example/${world.started[0].head}`],
+			['in_progress', `Batch ${store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!.number} failed`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${world.started[2].branch}`)}`],
 			['failure', 'Left the queue', `https://ci.example/${world.started[2].head}`]
 		]);
 		expect(of('pr1').at(-1)).toMatchObject({ state: 'success', url: expect.stringMatching(/^https:\/\/ci\.example\//) });
 		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/\n\nCI run: https:\/\/ci\.example\//) }]);
+		expect(readNotice(world.comments[0].body)).toMatchObject({ kind: 'ejected', pr: 2, head: git.sha('pr2'), nextActions: ['fix-failure', 'requeue'] });
 	});
 
 	test('finds two PRs that only break together and ejects the later one', async () => {
@@ -552,14 +563,13 @@ describe('batch queue runtime', () => {
 		// once #1 is on master, #2 conflicts with master itself: its author is told, and it stays queued
 		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
 		expect(world.comments).toEqual([
-			{
-				pr: 2,
-				body: 'Needs attention in the merge queue: Conflicts with #1 ahead of it; waits for them to land\n\nWhat to do: rebase it onto the PRs it conflicts with (it then goes with them), or wait for them to land and rebase it onto the default branch.'
-			},
-			{ pr: 2, body: expect.stringMatching(/can't apply this PR[\s\S]*same.txt[\s\S]*git rebase origin\/main/) }
+			{ pr: 2, body: expect.stringMatching(/^\*\*Merge queue:\*\* [^\n]+\n\n```sh\n.*git rebase origin\/main[\s\S]*```\n\n<!-- merge-queue /) }
 		]);
+		// One format: the conflict reads back like any other hold, with its files.
+		// Waiting for #1 had nothing for the author to do, so it said nothing.
+		expect(readNotice(world.comments[0].body)).toMatchObject({ kind: 'hold', pr: 2, head: git.sha('pr2'), code: 'conflict', files: ['same.txt'], nextActions: ['resolve-conflict'] });
 		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
-		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'failure', description: expect.stringMatching(/^Conflict/) });
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required', title: expect.not.stringMatching(/Needs attention/), summary: expect.stringContaining('"code":"conflict"') });
 
 		// the author rebases and resolves: the PR is picked up again and lands
 		git.git('checkout', '-q', 'pr2');
@@ -649,7 +659,7 @@ describe('batch queue runtime', () => {
 		pr(1);
 		const head = git.sha('pr1');
 		await run();
-		expect(world.prStatuses.filter((x) => x.sha === head).map((x) => x.state)).toEqual(['pending', 'success']);
+		expect(world.prChecks.filter((x) => x.sha === head).map((x) => x.state)).toEqual(['in_progress', 'success']);
 	});
 
 	test('without PR checks required, a PR with red own checks is still batched', async () => {
@@ -888,15 +898,77 @@ describe('batch queue runtime', () => {
 		world.changesRequested.add(2);
 		await run(3);
 		expect(world.merged).toEqual([1]);
-		const told = () => world.prStatuses.filter((x) => x.sha === git.sha('pr2') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		const told = () => world.prChecks.filter((x) => x.sha === git.sha('pr2') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
 		// Told once, however many ticks hold it.
-		expect(told()).toEqual([['failure', 'Needs attention: #2 has changes requested']]);
+		expect(told()).toEqual([['action_required', '#2 has changes requested']]);
 		const kinds = () => events.listEvents(repo.id, { pr: 2 }).map((e) => e.kind);
 		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'held').map((e) => e.data)).toEqual([{ code: 'changes-requested', reason: '#2 has changes requested' }]);
 		world.changesRequested.delete(2);
 		await run();
 		expect(world.merged).toEqual([1, 2]);
 		expect(kinds().filter((k) => k === 'held' || k === 'released' || k === 'batched')).toEqual(['held', 'released', 'batched']);
+	});
+
+	test("a held PR's check run says action required, with the reason in its title and the fix in its summary", async () => {
+		pr(1);
+		world.drafts.add(1);
+		await run(2);
+		const h = { pr: 1, head: git.sha('pr1'), code: 'draft' as const, reason: '#1 is a draft' };
+		const checks = world.prChecks.filter((x) => x.sha === git.sha('pr1'));
+		expect(checks).toEqual([{ sha: git.sha('pr1'), name: 'merge-queue', state: 'action_required', ...holdCheck(h) }]);
+		expect(checks[0].summary).toContain('```sh\ngh pr ready 1\n```');
+		expect(readNotice(checks[0].summary!)).toMatchObject({ kind: 'hold', code: 'draft', nextActions: ['mark-ready'] });
+		expect(world.comments).toEqual([{ pr: 1, body: holdNotice(h) }]);
+	});
+
+	test('a PR goes from in line to testing to tested, and only tested passes', async () => {
+		pr(1);
+		pr(2);
+		world.changesRequested.add(2);
+		await run(2);
+		world.changesRequested.delete(2);
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		const states = (ref: string) => world.prChecks.filter((x) => x.sha === git.sha(ref) && x.name === 'merge-queue').map((x) => x.state);
+		expect(states('pr1')).toEqual(['in_progress', 'success']);
+		expect(states('pr2')).toEqual(['action_required', 'queued', 'in_progress', 'success']);
+		expect(world.prChecks.find((x) => x.sha === git.sha('pr2') && x.state === 'queued')?.title).toBe('In line in the merge queue');
+	});
+
+	test('a PR that leaves the queue is left with a check that does not pass, so it is not merged around the queue', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		await run(2);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		await run(2);
+		const last = world.prChecks.filter((x) => x.sha === git.sha('pr1')).at(-1)!;
+		// A neutral conclusion would pass a required check.
+		expect(['success', 'neutral', 'skipped']).not.toContain(last.state);
+		expect(last).toMatchObject({ state: 'queued', title: 'Not in the merge queue' });
+	});
+
+	test('an ejected PR gets a failed check with its CI run, and a comment with the same block', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(20);
+		const last = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').at(-1)!;
+		expect(last).toMatchObject({ state: 'failure', title: expect.stringMatching(/^Left the queue: CI failed in mq\//), url: expect.stringMatching(/^https:\/\/ci\.example\//) });
+		const c = world.comments.find((x) => x.pr === 1)!;
+		expect(c.body).toBe(ejectedNotice({ pr: 1, head: git.sha('pr1'), reason: readNotice(c.body)!.reason!, link: last.url }));
+		expect(last.summary).toBe(c.body);
+	});
+
+	test('a conflict is told on the check run in the hold format: action required and the commands, its files only in the block', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		await run();
+		expect(world.merged).toEqual([1]);
+		const last = world.prChecks.filter((x) => x.sha === git.sha('pr2') && x.name === 'merge-queue').at(-1)!;
+		expect(last.state).toBe('action_required');
+		expect(last.summary).toMatch(/```sh\n[\s\S]*git push --force-with-lease\n```/);
+		expect(last.summary).not.toContain('Conflicting files');
+		expect(readNotice(last.summary!)).toMatchObject({ kind: 'hold', code: 'conflict', head: git.sha('pr2'), files: ['same.txt'] });
 	});
 
 	test('a hold recorded before PRs were told about holds is told on the next tick', async () => {
@@ -907,26 +979,29 @@ describe('batch queue runtime', () => {
 		db.updateQueueItemStatus(item.id, 'queued', '#1 has changes requested');
 		store.setHold(item.id, { code: 'changes-requested', reason: '#1 has changes requested' });
 		await run(2);
-		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
-		expect(told).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+		const told = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
+		expect(told).toEqual([['action_required', '#1 has changes requested']]);
 		expect(world.comments).toEqual([
-			{ pr: 1, body: 'Needs attention in the merge queue: #1 has changes requested\n\nWhat to do: address the requested changes, and get the review approved or dismissed.' }
+			{ pr: 1, body: holdNotice({ pr: 1, head: git.sha('pr1'), code: 'changes-requested', reason: '#1 has changes requested' }) }
 		]);
 	});
 
-	test('a held PR gets one comment saying what to do, and one when it is back in line', async () => {
+	test('a held PR gets one comment saying what to do, and none when it is back in line', async () => {
 		pr(1);
 		pr(2);
 		world.changesRequested.add(2);
 		await run(3);
 		expect(world.merged).toEqual([1]);
 		expect(world.comments).toEqual([
-			{ pr: 2, body: 'Needs attention in the merge queue: #2 has changes requested\n\nWhat to do: address the requested changes, and get the review approved or dismissed.' }
+			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'changes-requested', reason: '#2 has changes requested' }) }
 		]);
 		world.changesRequested.delete(2);
 		await run();
 		expect(world.merged).toEqual([1, 2]);
-		expect(world.comments.slice(1)).toEqual([{ pr: 2, body: 'Back in line in the merge queue.' }]);
+		// Back in line gives no action: its check goes back to queued, and the event is kept.
+		expect(world.comments.slice(1)).toEqual([]);
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).map((x) => x.state)).toContain('queued');
+		expect(events.listEvents(repo.id, { pr: 2 }).map((e) => e.kind)).toContain('released');
 	});
 
 	test('a PR whose parent is not queued is told to queue it', async () => {
@@ -935,7 +1010,7 @@ describe('batch queue runtime', () => {
 		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
 		await run(2);
 		expect(world.comments).toEqual([
-			{ pr: 2, body: "Needs attention in the merge queue: Stacked on #1, which isn't queued; queue #1 first\n\nWhat to do: queue the PR it is stacked on; a stacked PR goes only with the PRs under it." }
+			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'parent-not-queued', reason: "Stacked on #1, which isn't queued; queue #1 first" }) }
 		]);
 	});
 
@@ -951,17 +1026,17 @@ describe('batch queue runtime', () => {
 		pr(5);
 		world.changesRequested.add(5);
 		await run(2);
-		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr5') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
-		expect(told).toEqual([['failure', 'Needs attention: #5 has changes requested']]);
+		const told = world.prChecks.filter((x) => x.sha === git.sha('pr5') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
+		expect(told).toEqual([['action_required', '#5 has changes requested']]);
 	});
 
 	test('a status that could not be posted is posted on the next tick', async () => {
 		pr(1);
 		world.changesRequested.add(1);
 		const deps = world.deps();
-		const post = deps.github.setPRStatus;
+		const post = deps.github.setPRCheck;
 		let down = true;
-		deps.github.setPRStatus = async (...a) => {
+		deps.github.setPRCheck = async (...a) => {
 			if (down) {
 				down = false;
 				throw new Error('GitHub is down');
@@ -971,8 +1046,8 @@ describe('batch queue runtime', () => {
 		await tickBatchQueue(deps);
 		await tickBatchQueue(deps);
 		await tickBatchQueue(deps);
-		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
-		expect(told).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+		const told = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
+		expect(told).toEqual([['action_required', '#1 has changes requested']]);
 	});
 
 	test('a held PR taken out of the queue is no longer told it needs attention', async () => {
@@ -982,10 +1057,10 @@ describe('batch queue runtime', () => {
 		const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!;
 		db.removeFromQueue(item.id);
 		await run(2);
-		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		const told = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
 		expect(told).toEqual([
-			['failure', 'Needs attention: #1 has changes requested'],
-			['pending', 'Not in the merge queue']
+			['action_required', '#1 has changes requested'],
+			['queued', 'Not in the merge queue']
 		]);
 		expect(events.listEvents(repo.id, { pr: 1 }).map((e) => e.kind).filter((k) => k === 'held' || k === 'released')).toEqual(['held', 'released']);
 	});
@@ -1014,7 +1089,7 @@ describe('batch queue runtime', () => {
 		expect(item(3).error_message).toBe('Conflicts with #1 ahead of it; waits for them to land');
 	});
 
-	test('a deferred PR is commented on once; fewer PRs ahead only update its status, and a lifted deferral says nothing', async () => {
+	test('a deferred PR has nothing to do, so it is never commented on; fewer PRs ahead only update its check', async () => {
 		pr(1);
 		pr(2);
 		world.hold = () => true;
@@ -1028,16 +1103,12 @@ describe('batch queue runtime', () => {
 		// #4 is held now, so #3 no longer waits for it.
 		await tickBatchQueue(world.deps());
 		expect(item(3).error_message).toBe('Conflicts with #1 #2 ahead of it; waits for them to land');
-		const told = () => world.prStatuses.filter((x) => x.sha === git.sha('pr3') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		const told = () => world.prChecks.filter((x) => x.sha === git.sha('pr3') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
 		expect(told()).toEqual([
-			['failure', 'Needs attention: Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
-			['failure', 'Needs attention: Conflicts with #1 #2 ahead of it; waits for them to land']
+			['action_required', 'Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
+			['action_required', 'Conflicts with #1 #2 ahead of it; waits for them to land']
 		]);
-		const deferredComment = {
-			pr: 3,
-			body: 'Needs attention in the merge queue: Conflicts with #1 #2 #4 ahead of it; waits for them to land\n\nWhat to do: rebase it onto the PRs it conflicts with (it then goes with them), or wait for them to land and rebase it onto the default branch.'
-		};
-		expect(world.comments.filter((c) => c.pr === 3)).toEqual([deferredComment]);
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
 		// The deferral lifts (only #4, held, is left ahead), then comes back: no comment either time.
 		store.setDeferredFor(item(3).id, [4]);
 		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #4 ahead of it; waits for them to land');
@@ -1045,13 +1116,13 @@ describe('batch queue runtime', () => {
 		store.setDeferredFor(item(3).id, [1]);
 		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #1 ahead of it; waits for them to land');
 		await tickBatchQueue(world.deps());
-		expect(world.comments.filter((c) => c.pr === 3)).toEqual([deferredComment]);
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
 		// Lifted, it is no longer told it needs attention.
 		expect(told()).toEqual([
-			['failure', 'Needs attention: Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
-			['failure', 'Needs attention: Conflicts with #1 #2 ahead of it; waits for them to land'],
-			['pending', 'In line in the merge queue'],
-			['failure', 'Needs attention: Conflicts with #1 ahead of it; waits for them to land']
+			['action_required', 'Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
+			['action_required', 'Conflicts with #1 #2 ahead of it; waits for them to land'],
+			['queued', 'In line in the merge queue'],
+			['action_required', 'Conflicts with #1 ahead of it; waits for them to land']
 		]);
 	});
 
@@ -1062,13 +1133,13 @@ describe('batch queue runtime', () => {
 		const first = git.sha('pr1');
 		git.commit('pr1', 'still working on it');
 		await run(2);
-		const on = (sha: string) => world.prStatuses.filter((x) => x.sha === sha && x.context === 'merge-queue').map((x) => [x.state, x.description]);
-		expect(on(first)).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
-		expect(on(git.sha('pr1'))).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+		const on = (sha: string) => world.prChecks.filter((x) => x.sha === sha && x.name === 'merge-queue').map((x) => [x.state, x.title]);
+		expect(on(first)).toEqual([['action_required', '#1 has changes requested']]);
+		expect(on(git.sha('pr1'))).toEqual([['action_required', '#1 has changes requested']]);
 		expect(world.comments.map((c) => c.pr)).toEqual([1]);
 	});
 
-	test('a deferral that comes back after the author pushed is commented on again', async () => {
+	test('a deferral is not commented on, even when it comes back after the author pushed', async () => {
 		pr(1);
 		world.hold = () => true;
 		pr(4);
@@ -1085,10 +1156,7 @@ describe('batch queue runtime', () => {
 		await defer([4]); // lifted: only #4, held, is ahead
 		git.commit('pr3', 'a new attempt');
 		await defer([1]);
-		expect(world.comments.filter((c) => c.pr === 3).map((c) => c.body.split('\n')[0])).toEqual([
-			'Needs attention in the merge queue: Conflicts with #1 ahead of it; waits for them to land',
-			'Needs attention in the merge queue: Conflicts with #1 ahead of it; waits for them to land'
-		]);
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
 	});
 
 	test('a PR whose changes are already on the default branch leaves the queue instead of an empty batch', async () => {
@@ -1128,7 +1196,7 @@ describe('batch queue runtime', () => {
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run();
 		expect(world.reruns.size).toBe(0);
-		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the merge queue/) }]);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the queue/) }]);
 	});
 
 	test('a failed check whose workflow still runs other jobs is re-run once it finishes, not bisected', async () => {
@@ -1236,8 +1304,8 @@ describe('batch queue runtime', () => {
 		pr(5);
 		world.changesRequested.add(5);
 		await run(2);
-		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr5') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
-		expect(told).toEqual([['failure', 'Needs attention: #5 has changes requested']]);
+		const told = world.prChecks.filter((x) => x.sha === git.sha('pr5') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
+		expect(told).toEqual([['action_required', '#5 has changes requested']]);
 	});
 
 	test('a PR held back on a red default branch does not stop the others from being tried alone', async () => {
@@ -1356,7 +1424,7 @@ describe('batch queue runtime', () => {
 		world.holdMasterRuns = false;
 		await run(30);
 		expect(world.merged).toEqual([1, 2]);
-		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }]);
+		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: #3 fails on its own[\s\S]*\. Fix the failure, push, and queue it again\./) }]);
 	});
 
 	test('an ejection waiting for the default branch to be verified holds only itself: the other groups go on bisecting', async () => {
@@ -1387,8 +1455,8 @@ describe('batch queue runtime', () => {
 		world.refuseMerge.add(1);
 		await run();
 		const head = git.sha('pr1');
-		const last = world.prStatuses.filter((s) => s.sha === head).at(-1);
-		expect(last?.state).toBe('pending');
+		const last = world.prChecks.filter((s) => s.sha === head).at(-1);
+		expect(last?.state).toBe('queued');
 		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #1: Repository rule violations found/);
 		expect(world.merged).toEqual([]);
 	});
@@ -1531,7 +1599,7 @@ describe('batch queue runtime', () => {
 		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
 		expect(world.merged).toEqual([]);
 		// the tested status was taken back, so nobody merges it around the queue meanwhile
-		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr1')).at(-1)?.state).toBe('pending');
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr1')).at(-1)?.state).toBe('queued');
 		world.rateLimited = false;
 		await run();
 		expect(world.merged).toEqual([1, 2]);
@@ -1581,7 +1649,7 @@ describe('batch queue runtime', () => {
 
 describe('surviving a crash at any step', () => {
 	const MUTATING = {
-		github: ['pushBranch', 'pushHead', 'deleteBranch', 'retargetBase', 'squashMerge', 'setStatus', 'setPRStatus', 'label', 'comment'],
+		github: ['pushBranch', 'pushHead', 'deleteBranch', 'retargetBase', 'squashMerge', 'setStatus', 'setPRCheck', 'label', 'comment'],
 		ci: ['start', 'refreshCaches', 'cancel', 'rerunFailed']
 	} as const;
 
@@ -1649,7 +1717,7 @@ describe('surviving a crash at any step', () => {
 		// No queue branch is left behind, and no unmerged PR carries the queue's green status.
 		expect(git.git('branch', '--list', 'mq/*').trim()).toBe('');
 		const last = new Map<string, string>();
-		for (const s of world.prStatuses.filter((x) => x.context === 'merge-queue')) last.set(s.sha, s.state);
+		for (const s of world.prChecks.filter((x) => x.name === 'merge-queue')) last.set(s.sha, s.state);
 		expect(last.get(git.sha('pr3'))).toBe('failure');
 		for (const n of [1, 2, 3, 4]) if (!git.pr(n).merged) expect(last.get(git.sha(`pr${n}`))).not.toBe('success');
 	}
@@ -1729,7 +1797,7 @@ describe('stopping a red run at its first failed job', () => {
 			world.breakingFiles.add('x-breaks-3.txt');
 			await run(80);
 			expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 5]);
-			expect(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr).sort()).toEqual([3, 4]);
+			expect(world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr).sort()).toEqual([3, 4]);
 			// The last run with #3 in it decided its eject at its first failure, whatever else is on its
 			// branch, and was never cancelled: its jobs go on for the author's log.
 			const decisive = world.started.filter((x) => x.prs.includes(3)).at(-1)!;
@@ -1777,7 +1845,7 @@ describe('stopping a red run at its first failed job', () => {
 		const head = world.started[0].head;
 		// It failed early, but a re-run of its failed jobs could still pass: it waited for it.
 		expect(world.reruns.get(head)).toBe(1);
-		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/^Removed from the merge queue: CI failed[\s\S]*CI run: https:\/\/ci\.example\//) }]);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: CI failed[\s\S]*CI run: https:\/\/ci\.example\//) }]);
 	});
 
 	test('a fail-fast failure is still re-run once when flake retries are on', async () => {
@@ -1822,13 +1890,13 @@ describe('batch queue runtime, randomised', () => {
 			for (let tick = 0; tick < 120 && queued().length; tick++) {
 				await tickBatchQueue(world.deps());
 				for (const p of prs) {
-					const last = world.prStatuses.filter((x) => x.sha === head(p) && x.context === 'merge-queue').at(-1);
+					const last = world.prChecks.filter((x) => x.sha === head(p) && x.name === 'merge-queue').at(-1);
 					if (last?.state === 'success') expect(world.merged, `#${p} green but not merged after tick ${tick}`).toContain(p);
 				}
 				expect(world.ciFails(git.sha('main')), `main broke after tick ${tick}`).toBe(false);
 			}
 			expect(queued()).toEqual([]);
-			const ejected = new Set(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr));
+			const ejected = new Set(world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr));
 			expect([...world.merged, ...ejected].sort((a, b) => a - b)).toEqual(prs);
 			for (const b of breakers) expect(ejected).toContain(b);
 			// Of an interacting pair, at most one is ejected; every other PR merges, but for what is
@@ -1851,7 +1919,7 @@ describe('one by one, on the batch runtime', () => {
 			expect(store.getActiveBatches(repo.id).length, `runs in flight after tick ${i}`).toBeLessThanOrEqual(1);
 		}
 	}
-	const ejected = () => world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr);
+	const ejected = () => world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr);
 
 	test('tests the head stack whole, one run at a time, without waiting to collect more', async () => {
 		pr(1);
@@ -1923,7 +1991,7 @@ describe('both planners, the same queue', () => {
 			expect(world.ciFails(git.sha('main')), `${mode}: main broke after tick ${tick}`).toBe(false);
 		}
 		expect(queued(), mode).toEqual([]);
-		const ejected = world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr);
+		const ejected = world.comments.filter((c) => /Removed from the queue/.test(c.body)).map((c) => c.pr);
 		return { merged: [...world.merged].sort((a, b) => a - b), ejected: ejected.sort((a, b) => a - b), runs: world.started.length };
 	}
 

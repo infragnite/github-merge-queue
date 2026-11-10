@@ -6,13 +6,15 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
+import { RateLimitedError } from './rate-limit';
 import { baselineCommit, buildBatch, GitRunner } from './batch-builder';
 import { replay } from './rebase';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { currentStackAnalysis } from './stack-runtime';
 import { bumpGeneration, memoByGeneration } from './wake';
-import type { LivePR, QueueDeps, Readiness } from './batch-queue';
-import type { GhReview } from './github';
+import type { LivePR, PRCheck, QueueDeps, Readiness } from './batch-queue';
+import type { CheckRunRequest, GhReview } from './github';
+import type { PRReport } from './batch-store';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -242,6 +244,80 @@ async function canWrite(owner: string, name: string, login: string): Promise<boo
 	return ['write', 'maintain', 'admin'].includes(hit.role);
 }
 
+/** GitHub cuts a check run's summary at 65535 characters. */
+const MAX_SUMMARY = 65535;
+
+/** What Details opens: the repository's queue page, or the commit when the app has no address. */
+export function queuePage(appUrl: string | undefined, owner: string, name: string, sha: string): string {
+	return appUrl ? `${appUrl.replace(/\/+$/, '')}/repos/${owner}/${name}` : `https://github.com/${owner}/${name}/commit/${sha}`;
+}
+
+/** The check run the queue posts for `check`. In line and testing are open runs; the rest are completed. */
+export function checkRunRequest(sha: string, check: PRCheck, at: { name: string; detailsUrl: string }): CheckRunRequest {
+	let summary = check.summary ?? check.title;
+	if (check.url && !summary.includes(check.url)) summary += `\n\nCI run: ${check.url}`;
+	if (summary.length > MAX_SUMMARY) {
+		// Keep the hidden block at the end: agents read it.
+		const i = summary.lastIndexOf('<!-- merge-queue ');
+		const tail = i >= 0 ? summary.slice(i) : '';
+		summary = `${summary.slice(0, MAX_SUMMARY - tail.length - 6)}...\n\n${tail}`.slice(0, MAX_SUMMARY);
+	}
+	const open = check.state === 'queued' || check.state === 'in_progress';
+	return {
+		name: `${at.name}${check.suffix ?? ''}`,
+		head_sha: sha,
+		details_url: at.detailsUrl,
+		...(open ? { status: check.state as 'queued' | 'in_progress' } : { status: 'completed' as const, conclusion: check.state as Exclude<PRCheck['state'], 'queued' | 'in_progress'> }),
+		output: { title: check.title, summary }
+	};
+}
+
+/**
+ * The same state as a commit status. Only success passes; a hold and an ejection fail; the rest,
+ * neutral included (a status has none), are pending, which keeps the PR unmergeable around the queue.
+ */
+export function statusFromCheck(check: PRCheck, name: string, queueUrl: string) {
+	const state: 'success' | 'failure' | 'pending' =
+		check.state === 'success' ? 'success' : check.state === 'failure' || check.state === 'action_required' ? 'failure' : 'pending';
+	const d = check.title;
+	return {
+		state,
+		context: `${name}${check.suffix ?? ''}`,
+		description: d.length > 140 ? `${d.slice(0, 137)}...` : d,
+		target_url: check.url ?? queueUrl
+	};
+}
+
+/** What the PR report setting posts; anything else (unset, a typo) posts both, so a required status keeps coming. */
+export function prReportCalls(report: PRReport | undefined): ('check-run' | 'status')[] {
+	if (report === 'check-run') return ['check-run'];
+	if (report === 'status') return ['status'];
+	return ['check-run', 'status'];
+}
+
+/**
+ * Posts what the PR report setting says. Posting both, the status is what a ruleset still requires:
+ * only its failure fails the post (so it is retried). A refused check run, before the app has the
+ * Checks permission on the installation, is only warned about; a retry would post the status again
+ * every tick. A rate limit stops at once.
+ */
+export async function postPRReport(
+	report: PRReport | undefined,
+	postCheck: () => Promise<unknown>,
+	postStatus: () => Promise<unknown>,
+	warn: (e: unknown) => void
+): Promise<void> {
+	const kinds = prReportCalls(report);
+	for (const kind of kinds) {
+		try {
+			await (kind === 'check-run' ? postCheck() : postStatus());
+		} catch (e) {
+			if (e instanceof RateLimitedError || kind === 'status' || kinds.length === 1) throw e;
+			warn(e);
+		}
+	}
+}
+
 export function liveDeps(repo: RepoRef): QueueDeps {
 	const { owner, name } = repo;
 	const mirror = new Mirror(repo);
@@ -395,13 +471,15 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			setStatus: async (sha, state, description) => {
 				await github.createCommitStatus(owner, name, sha, { state, context: ci().testedStatus, description });
 			},
-			setPRStatus: async (sha, state, description, opts) => {
-				await github.createCommitStatus(owner, name, sha, {
-					state,
-					context: `${ci().prStatus}${opts?.suffix ?? ''}`,
-					description,
-					...(opts?.url ? { target_url: opts.url } : {})
-				});
+			setPRCheck: async (sha, check) => {
+				const { prStatus, prReport } = ci();
+				const page = queuePage(env.APP_URL, owner, name, sha);
+				await postPRReport(
+					prReport,
+					() => github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page })),
+					() => github.createCommitStatus(owner, name, sha, statusFromCheck(check, prStatus, page)),
+					(e) => console.warn(`[merge-queue] ${owner}/${name}: check run not posted (does the app have the Checks write permission?): ${e instanceof Error ? e.message : e}`)
+				);
 			},
 			label: async (n, label, on) => {
 				if (on) await github.addLabel(owner, name, n, label);

@@ -333,8 +333,11 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 	if (mode !== undefined && mode !== 'serial' && mode !== 'batch') throw new ApiError(400, 'mode must be serial or batch');
 	const ci = body.ci as Record<string, unknown> | undefined;
 	if (ci) {
-		const keys = ['workflow', 'requiredCheck', 'testedStatus', 'prStatus', 'dispatchRef'];
+		const keys = ['workflow', 'requiredCheck', 'testedStatus', 'prStatus', 'prReport', 'dispatchRef'];
 		for (const [k, v] of Object.entries(ci)) {
+			if (k === 'prReport' && !(store.PR_REPORTS as readonly unknown[]).includes(v)) {
+				throw new ApiError(400, `ci.prReport must be one of ${store.PR_REPORTS.join(', ')}`);
+			}
 			if (!keys.includes(k) || typeof v !== 'string' || (!v && k !== 'dispatchRef')) {
 				throw new ApiError(400, `ci.${k} must be a non-empty string (${keys.join(', ')})`);
 			}

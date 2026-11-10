@@ -32,6 +32,7 @@ import {
 	type TestGroup
 } from './batching';
 import { planNextBatch } from './queue-model';
+import { ejectedNotice, holdCheck, holdNotice } from './hold-format';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
 import type { StackAnalysis } from './stacks';
@@ -82,17 +83,30 @@ export interface QueueGitHub {
 	/** The queue's "tested" status on master commits. */
 	setStatus(sha: string, state: 'success' | 'failure' | 'pending', description: string): Promise<void>;
 	/**
-	 * The queue's status on a PR head (the configured `prStatus`, `merge-queue` by default, or that
-	 * context plus `suffix`). The default branch should require it, sourced from this app.
+	 * The queue's check run on a PR head (the configured `prStatus`, `merge-queue` by default, or that
+	 * name plus `suffix`). The default branch should require it, sourced from this app.
 	 */
-	setPRStatus(
-		sha: string,
-		state: 'success' | 'failure' | 'pending',
-		description: string,
-		opts?: { suffix?: string; url?: string }
-	): Promise<void>;
+	setPRCheck(sha: string, check: PRCheck): Promise<void>;
 	label(n: number, name: string, on: boolean): Promise<void>;
 	comment(n: number, body: string): Promise<void>;
+}
+
+/**
+ * Where a PR stands in the queue, as its check run says it. Only `success` passes a required check
+ * (and `neutral`, which the queue never posts for that reason).
+ */
+export type PRCheckState = 'queued' | 'in_progress' | 'action_required' | 'failure' | 'success' | 'neutral';
+
+export interface PRCheck {
+	state: PRCheckState;
+	/** One line: lists of checks show it, and a commit status carries only it. */
+	title: string;
+	/** Markdown: the reason, what to do and the hidden block. The title when unset. */
+	summary?: string;
+	/** The CI run behind it. */
+	url?: string;
+	/** A second check beside the main one (`/try`). */
+	suffix?: string;
 }
 
 export interface QueueCI {
@@ -155,7 +169,7 @@ const MASTER_CHECK_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 /** Batch failures without a culprit after which a PR leaves the queue (a flaky test, most likely). */
 const MAX_BATCH_FAILURES = 3;
 
-/** Commit status descriptions are cut at 140 characters. */
+/** Titles stay short: a commit status, for a ruleset that still requires one, carries at most 140 characters. */
 function short(text: string): string {
 	return text.length > 138 ? `${text.slice(0, 135)}...` : text;
 }
@@ -295,16 +309,22 @@ class Tick {
 		const it = this.item(n);
 		if (!it) return;
 		const head = (await this.pr(n).catch(() => null))?.headSha ?? it.head_sha;
+		const notice = ejectedNotice({ pr: n, head: head ?? null, reason, link });
 		if (head) {
 			await this.d.github
-				.setPRStatus(head, 'failure', short(`Left the queue: ${reason}`), link ? { url: link } : undefined)
-				.catch(this.bestEffort('github.setPRStatus'));
+				.setPRCheck(head, {
+					state: 'failure',
+					title: short(`Left the queue: ${reason}`),
+					summary: notice,
+					...(link ? { url: link } : {})
+				})
+				.catch(this.bestEffort('github.setPRCheck'));
 		}
 		db.updateQueueItemStatus(it.id, 'failed', reason);
 		db.addToHistory(this.repoId, n, it.pr_title, it.pr_url, it.author_login, null, 'failed', reason, it.created_at);
 		db.removeFromQueue(it.id);
 		await this.d.github
-			.comment(n, `Removed from the merge queue: ${reason}${link ? `\n\nCI run: ${link}` : ''}`)
+			.comment(n, notice)
 			.catch(this.bestEffort('github.comment'));
 		this.event(n, 'ejected', { reason });
 		this.log(`ejected #${n}: ${reason}`);
@@ -363,8 +383,8 @@ class Tick {
 			for (const n of b.members) {
 				if (this.item(n)?.status !== 'queued') continue;
 				await this.d.github
-					.setPRStatus(b.heads[n], 'pending', short(`Back in line: ${b.branch} was dropped (${why}); it is rebuilt`))
-					.catch(this.bestEffort('github.setPRStatus'));
+					.setPRCheck(b.heads[n], { state: 'queued', title: short(`Back in line: ${b.branch} was dropped (${why}); it is rebuilt`) })
+					.catch(this.bestEffort('github.setPRCheck'));
 			}
 		}
 	}
@@ -392,15 +412,10 @@ class Tick {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
 		}
-		await this.d.github.setPRStatus(p.headSha, 'failure', short(`Conflict: ${reason}`)).catch(this.bestEffort('github.setPRStatus'));
+		const hold = { pr: n, head: p.headSha, code: 'conflict' as const, reason, files, fix };
+		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
 		await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
-		const list = files.length ? `\n\nConflicting files:\n${files.slice(0, 20).map((f) => `- \`${f}\``).join('\n')}` : '';
-		await this.d.github
-			.comment(
-				n,
-				`The merge queue can't apply this PR: ${reason}.${list}\n\nTo fix it:\n\n\`\`\`sh\n${fix}\n# resolve the conflicts, then\ngit push --force-with-lease\n\`\`\`\n\nThe PR stays queued and is picked up again after the push.`
-			)
-			.catch(this.bestEffort('github.comment'));
+		await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
 	}
@@ -525,8 +540,8 @@ class Tick {
 				db.updateQueueItemStatus(it.id, 'checking');
 				this.event(n, 'batched', { batch: batch.id, branch, prs });
 				await this.d.github
-					.setPRStatus(batch.heads[n], 'pending', short(`Testing in ${branch} with ${prs.length - 1} other PR(s)`), { url: this.branchRuns(branch) })
-					.catch(this.bestEffort('github.setPRStatus'));
+					.setPRCheck(batch.heads[n], { state: 'in_progress', title: short(`Testing in ${branch} with ${prs.length - 1} other PR(s)`), url: this.branchRuns(branch) })
+					.catch(this.bestEffort('github.setPRCheck'));
 			}
 		}
 		this.log(`batch ${batch.number} started: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
@@ -664,9 +679,9 @@ class Tick {
 				}
 			} else if (p.state === 'open') {
 				// A rate limit keeps the intent, so the green status is taken back after the reset.
-				await this.d.github.setPRStatus(p.headSha, 'pending', short('Waiting for the merge queue (landing was interrupted)')).catch((e) => {
+				await this.d.github.setPRCheck(p.headSha, { state: 'queued', title: 'Waiting for the merge queue (landing was interrupted)' }).catch((e) => {
 					if (e instanceof RateLimitedError) throw e;
-					this.bestEffort('github.setPRStatus')(e);
+					this.bestEffort('github.setPRCheck')(e);
 				});
 			}
 		}
@@ -776,13 +791,13 @@ class Tick {
 			// tested. Any outcome but a merge takes it back, so nobody can merge around the queue.
 			let m: { merged: boolean; sha?: string | null; message?: string };
 			try {
-				await this.d.github.setPRStatus(head, 'success', short(`Tested in ${src.branch}`), { url: await this.runLink(src) });
+				await this.d.github.setPRCheck(head, { state: 'success', title: short(`Tested in ${src.branch}`), url: await this.runLink(src) });
 				m = await this.mergeWithRetry(n, p.title, head);
 			} catch (e) {
 				if (e instanceof RateLimitedError) {
 					// The landing intent stays (the caller does not clear it on a throw): after the reset,
 					// `recoverLanding` records what merged and takes the green status back from the rest.
-					await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (GitHub rate limit)`)).catch(this.bestEffort('github.setPRStatus'));
+					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (GitHub rate limit)`) }).catch(this.bestEffort('github.setPRCheck'));
 					throw e;
 				}
 				m = { merged: false, message: e instanceof Error ? e.message : String(e) };
@@ -794,18 +809,18 @@ class Tick {
 					return null;
 				});
 				if (now && (now.state !== 'open' || now.headSha !== head)) {
-					await this.d.github.setPRStatus(head, 'pending', short(`Changed while batch ${batch.number} was landing; back in line`)).catch(this.bestEffort('github.setPRStatus'));
+					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Changed while batch ${batch.number} was landing; back in line`) }).catch(this.bestEffort('github.setPRCheck'));
 					this.changedWhileLanding(batch, n, now, prs, src);
 					continue;
 				}
 				if (this.skipped.size) {
 					// With a PR left out it may no longer apply (it was tested on top of that one): back in line.
-					await this.d.github.setPRStatus(head, 'pending', short(`Did not merge without the PRs left out of batch ${batch.number}; back in line`)).catch(this.bestEffort('github.setPRStatus'));
+					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Did not merge without the PRs left out of batch ${batch.number}; back in line`) }).catch(this.bestEffort('github.setPRCheck'));
 					this.log(`#${n} did not merge without the PRs left out of batch ${batch.number} (${m.message ?? 'merge refused'}); back in line`);
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
-				await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (landing stopped)`)).catch(this.bestEffort('github.setPRStatus'));
+				await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
 				this.pause(`Landing batch ${batch.number} stopped at #${n}: ${m.message ?? 'merge refused'}`);
 				return false;
 			}
@@ -1170,8 +1185,8 @@ class Tick {
 				const link = await this.runLink(head);
 				for (const n of head.members) {
 					await this.d.github
-						.setPRStatus(head.heads[n], 'pending', short(`${head.branch} failed; bisecting to find which PR breaks it`), { url: link })
-						.catch(this.bestEffort('github.setPRStatus'));
+						.setPRCheck(head.heads[n], { state: 'in_progress', title: short(`${head.branch} failed; bisecting to find which PR breaks it`), url: link })
+						.catch(this.bestEffort('github.setPRCheck'));
 				}
 			}
 		}
@@ -1403,8 +1418,12 @@ class Tick {
 		const link = this.branchRuns(branch);
 		for (const n of g.members) {
 			await this.d.github
-				.setPRStatus(batch.heads[n], 'pending', short(`Batch ${batch.number} failed; testing ${g.members.length === 1 ? `#${n} alone` : `${g.members.length} of its PRs`} in ${branch}`), { url: link })
-				.catch(this.bestEffort('github.setPRStatus'));
+				.setPRCheck(batch.heads[n], {
+					state: 'in_progress',
+					title: short(`Batch ${batch.number} failed; testing ${g.members.length === 1 ? `#${n} alone` : `${g.members.length} of its PRs`} in ${branch}`),
+					url: link
+				})
+				.catch(this.bestEffort('github.setPRCheck'));
 		}
 	}
 
@@ -1446,8 +1465,8 @@ class Tick {
 		});
 		store.branchPushed(this.repoId, branch);
 		await this.d.github
-			.setPRStatus(p.headSha, 'pending', short(`Trying on ${this.d.repo.default_branch} in ${branch}`), { suffix: '/try', url: this.branchRuns(branch) })
-			.catch(this.bestEffort('github.setPRStatus'));
+			.setPRCheck(p.headSha, { state: 'in_progress', title: short(`Trying on ${this.d.repo.default_branch} in ${branch}`), suffix: '/try', url: this.branchRuns(branch) })
+			.catch(this.bestEffort('github.setPRCheck'));
 		this.event(n, 'tried', { status: 'started', branch, run: run.id });
 		return run;
 	}
@@ -1464,7 +1483,7 @@ class Tick {
 			store.setBatchStatus(t.id, r === 'success' ? 'landed' : 'failed');
 			const n = t.members[0];
 			const desc = r === 'success' ? `Passed on ${this.d.repo.default_branch} in ${t.branch}` : `Failed on ${this.d.repo.default_branch} in ${t.branch}`;
-			await this.d.github.setPRStatus(t.heads[n], r, short(desc), { suffix: '/try', url: await this.runLink(t) }).catch(this.bestEffort('github.setPRStatus'));
+			await this.d.github.setPRCheck(t.heads[n], { state: r, title: short(desc), suffix: '/try', url: await this.runLink(t) }).catch(this.bestEffort('github.setPRCheck'));
 			await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
 			this.event(n, 'tried', { status: r, branch: t.branch, run: t.id, headSha: t.heads[n] });
 		}
@@ -1623,19 +1642,20 @@ class Tick {
 
 	async recordHolds(held: { pr: number; admission: Hold }[]) {
 		const now = new Map(held.map((h) => [h.pr, h.admission]));
-		/** Posts the status; false if it couldn't, else the head it was posted on (none: the PR is gone). */
-		const tell = async (n: number, state: 'failure' | 'pending', description: string): Promise<false | { head?: string }> => {
+		// Posts the check on the PR's head: the head it was posted on, null when the PR is closed or
+		// gone (there is no head to tell), false when it could not be posted.
+		const tell = async (n: number, check: (head: string) => PRCheck): Promise<string | null | false> => {
 			const p = await this.pr(n).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				return null;
 			});
-			if (!p) return {}; // closed or gone: there is no head to tell
+			if (!p) return null;
 			try {
-				await this.d.github.setPRStatus(p.headSha, state, short(description));
-				return { head: p.headSha };
+				await this.d.github.setPRCheck(p.headSha, check(p.headSha));
+				return p.headSha;
 			} catch (e) {
 				if (e instanceof RateLimitedError) throw e;
-				this.bestEffort('github.setPRStatus')(e);
+				this.bestEffort('github.setPRCheck')(e);
 				return false;
 			}
 		};
@@ -1651,39 +1671,39 @@ class Tick {
 				// what it was told comes from the stored hold.
 				const told = was ?? (stored?.told && !stored.released ? stored : null);
 				if (!told) continue;
-				if (!(await tell(it.pr_number, 'pending', 'In line in the merge queue'))) continue;
-				// A lifted deferral is the planner trying again, not news for the author.
-				if (told.told && told.code !== 'deferred') await this.say(it.pr_number, 'Back in line in the merge queue.');
+				// No comment: back in line gives no action, and the check going back to queued says it.
+				if ((await tell(it.pr_number, () => ({ state: 'queued', title: 'In line in the merge queue' }))) === false) continue;
 				store.setHold(it.id, told.told ? { ...told, released: true } : null);
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 				this.event(it.pr_number, 'released', { code: told.code });
 				continue;
 			}
 			const { code, reason } = h;
-			// Told on this head already. A status belongs to a commit: a push needs it again.
-			const head = (await this.pr(it.pr_number).catch((e) => {
+			// Told on this head already. A check belongs to a commit: a push needs it again.
+			const current = (await this.pr(it.pr_number).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				return null;
 			}))?.headSha;
-			if (was?.told && was.code === code && was.reason === reason && (!head || !was.head || was.head === head)) continue;
-			const posted = await tell(it.pr_number, 'failure', `Needs attention: ${reason}`);
-			if (!posted) continue;
+			if (was?.told && was.code === code && was.reason === reason && (!current || !was.head || was.head === current)) continue;
+			const hold = (head: string | null) => ({ pr: it.pr_number, head, code: code as HoldCode, reason });
+			const head = await tell(it.pr_number, (h) => ({ state: 'action_required', ...holdCheck(hold(h)) }));
+			if (head === false) continue;
 			// One comment per kind of hold: it notifies the author, a status doesn't. A new reason of
 			// the same kind (fewer PRs ahead) only updates the status.
 			const advice = holdAdvice(code as HoldCode);
 			// Told this kind on this head already; a deferral that comes back is told again only after a push.
-			const toldThis = !!stored?.told && stored.code === code && (!stored.released || (code === 'deferred' && stored.head === posted.head));
+			const toldThis = !!stored?.told && stored.code === code && (!stored.released || (code === 'deferred' && stored.head === (head ?? undefined)));
 			if (advice && !toldThis)
-				await this.say(it.pr_number, `Needs attention in the merge queue: ${reason}\n\nWhat to do: ${advice}`);
+				await this.say(it.pr_number, holdNotice(hold(head)));
 			db.updateQueueItemStatus(it.id, 'queued', reason);
-			store.setHold(it.id, { code, reason, told: true, head: posted.head });
+			store.setHold(it.id, { code, reason, told: true, head: head ?? undefined });
 			this.event(it.pr_number, 'held', { code, reason });
 		}
 		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).
 		const live = new Set(this.items().map((i) => i.pr_number));
 		for (const n of heldPRs(this.repoId)) {
 			if (live.has(n)) continue;
-			if (await tell(n, 'pending', 'Not in the merge queue')) this.event(n, 'released', { reason: 'left the queue' });
+			if ((await tell(n, () => ({ state: 'queued', title: 'Not in the merge queue' }))) !== false) this.event(n, 'released', { reason: 'left the queue' });
 		}
 	}
 

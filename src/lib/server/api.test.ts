@@ -285,6 +285,12 @@ describe('queue control', () => {
 		expect(() => api.patchConfig(repo, admin, { mode: 'fast' })).toThrow(/mode must be/);
 	});
 
+	test('the PR report is a check run, a status, or both; both by default', () => {
+		expect(api.patchConfig(repo, admin, {}).ci).toMatchObject({ prReport: 'both' });
+		expect(api.patchConfig(repo, admin, { ci: { prReport: 'check-run' } }).ci).toMatchObject({ prReport: 'check-run' });
+		expect(() => api.patchConfig(repo, admin, { ci: { prReport: 'checks' } })).toThrow(/prReport must be one of check-run, status, both/);
+	});
+
 	test('maintainers pause and resume', () => {
 		expect(() => api.pause(repo, writer, 'x')).toThrow(/needs maintain/);
 		expect(api.pause(repo, maintainer, 'release freeze').paused).toBe('release freeze');
