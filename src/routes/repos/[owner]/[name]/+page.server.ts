@@ -7,14 +7,13 @@ import {
 	reorderQueue,
 	updateQueueItemStatus
 } from '$lib/server/db';
-import { getOpenPRs, rateLimitOf, getPR, getRepo } from '$lib/server/github';
+import { getOpenPRs, rateLimitOf, getPR } from '$lib/server/github';
 import { atLeast, AuthError, requireRole, type Caller, type Role } from '$lib/server/api-auth';
 import { ApiError, changeEntry, enqueue } from '$lib/server/api-service';
 import { webCaller } from '$lib/server/web-auth';
-import { publicHistory, publicQueueItem, prUrl, stillPublic } from '$lib/server/public-view';
-import { repoVisibility } from '$lib/server/api-service';
+import { knownPublic, noteReadOnlyView, publicHistory, publicQueueItem, prUrl } from '$lib/server/public-view';
 import { savingsFor } from '$lib/server/ci-savings';
-import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
+import { pipelineView, publicPipeline, type PipelineView } from '$lib/server/pipeline-view';
 import { currentHold, deferredFor, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
 import { withRepoLock } from '$lib/server/repo-lock';
 import { cancelBatch } from '$lib/server/batch-queue';
@@ -44,7 +43,7 @@ async function openPRsOf(owner: string, name: string, repoId: number) {
 	}
 }
 
-export const load: PageServerLoad = async ({ params, locals, url }) => {
+export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) => {
 	const repo = getRepoByOwnerName(params.owner, params.name);
 	const anonymous = !locals.user;
 	// Signed in: the user's own role on the repository, as GitHub says; read access or more sees it all.
@@ -53,14 +52,8 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 	// Anyone else sees the read-only page of a repository that made it public, or nothing: an unknown
 	// repository and one they can't see answer the same.
 	const readonly = !member;
-	const isPublic = async (r: NonNullable<typeof repo>) =>
-		getQueueSettings(r.id).publicView &&
-		(await stillPublic(r, () => repoVisibility(() => getRepo(r.owner, r.name)), () => {
-			updateQueueSettings(r.id, { publicView: false });
-			emitEvent(r.id, null, 'settings', { by: 'merge-queue', changes: { publicView: { from: true, to: false } }, why: 'the repository is private on GitHub' });
-			console.warn(`[merge-queue] ${r.owner}/${r.name} is private on GitHub: its public queue page is turned off`);
-		}));
-	if (readonly && !(repo && (await isPublic(repo)))) {
+	// Public only while the stored setting is on and GitHub last said the repository is public.
+	if (readonly && !(repo && getQueueSettings(repo.id).publicView && knownPublic(repo.id))) {
 		if (anonymous) redirect(302, `/login?next=${encodeURIComponent(url.pathname)}`);
 		error(404, 'Repository not found');
 	}
@@ -91,16 +84,22 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 	const prMeta = new Map(queueItems.map((i) => [i.pr_number, { title: i.pr_title, url: i.pr_url }]));
 	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: prUrl(repo, pr.number) });
 	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
-	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = dashboardStackAnalysis(repo)
+	// A read-only viewer only gets what is cached: none of their loads calls GitHub.
+	if (readonly) {
+		noteReadOnlyView(repo.id);
+		// Only the viewer's own browser may keep it, briefly; a shared cache never (it varies by sign-in).
+		setHeaders({ 'cache-control': 'private, max-age=5', vary: 'Cookie' });
+	}
+	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = dashboardStackAnalysis(repo, { cachedOnly: readonly })
 		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
 		.catch((e) => {
-			console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
+			if (!readonly) console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
 			return { stacks: [], error: readonly ? 'Stacks could not be loaded' : `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
 		});
 
-	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta)
+	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta, { cachedOnly: readonly })
 		// Why the queue stopped can name internals (App permissions, GitHub errors): only signed-in users see it.
-		.then((p) => (readonly ? { ...p, paused: p.paused ? 'The queue is paused' : null, tickError: null, progressErrors: {} } : p))
+		.then((p) => (readonly ? publicPipeline(p) : p))
 		.catch((e) => {
 		const why = e instanceof Error ? e.message : String(e);
 		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);

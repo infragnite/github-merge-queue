@@ -5,6 +5,7 @@
 import * as db from './db';
 import * as store from './batch-store';
 import { emitEvent, waitForEvents } from './events';
+import { noteVisibility } from './public-view';
 import { requireRole, type Caller } from './api-auth';
 import { DEFAULT_BATCH_CONFIG, type BatchConfig, type Priority } from './batching';
 import type { BatchRow } from './batch-store';
@@ -305,6 +306,8 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 		}
 	}
 	const before = store.getQueueSettings(repo.id);
+	// GitHub just said it is public (checked above): the page shows at once, without waiting for the processor.
+	if (publicView === true && visibility === 'public') noteVisibility(repo.id, 'public', () => {});
 	store.updateQueueSettings(repo.id, {
 		mode: mode as 'serial' | 'batch' | undefined,
 		config,

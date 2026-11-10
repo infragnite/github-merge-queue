@@ -103,6 +103,17 @@ describe('recording', () => {
 	});
 });
 
+test('a run over long ago with no jobs is recorded empty, so it cannot hold up the rest', async () => {
+	const user = db.upsertUser(3, 'dev3', null, null);
+	db.addRepo('acme', 'stale', 'main', user);
+	const id = db.getRepoByOwnerName('acme', 'stale')!.id;
+	const old = store.insertBatch({ repoId: id, kind: 'bisect', branch: 'mq/b', baseSha: 'b', headSha: 'old', treeSha: 't', baseTree: 'bt', members: [1], heads: {} });
+	store.setBatchCI(old.id, 'success');
+	db.getDb().prepare(`UPDATE batches SET status = 'passed', created_at = datetime('now', '-2 hours') WHERE id = ?`).run(old.id);
+	expect(await recordRunCosts({ id }, async () => [])).toBe(1);
+	expect(db.getDb().prepare('SELECT job_ms FROM ci_runs WHERE batch_id = ?').get(old.id)).toEqual({ job_ms: 0 });
+});
+
 describe('public view setting', () => {
 	test('is off by default and kept apart from the batch config', async () => {
 		const user = db.upsertUser(2, 'dev2', null, null);

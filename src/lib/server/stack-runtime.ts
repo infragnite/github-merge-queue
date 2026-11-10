@@ -33,8 +33,13 @@ const DASHBOARD_MIN_AGE_MS = 60_000;
  * The analysis for the dashboard: the queue's own, but at most one fresh one a minute, and none
  * while GitHub's rate-limit budget is low (the last one is shown instead).
  */
-export async function dashboardStackAnalysis(repo: RepoRef & { owner: string }): Promise<StackAnalysis> {
+export async function dashboardStackAnalysis(repo: RepoRef & { owner: string }, opts: { cachedOnly?: boolean } = {}): Promise<StackAnalysis> {
 	const last = shown.get(repo.id);
+	// A read-only (public) viewer never makes the app call GitHub: the last analysis, or none yet.
+	if (opts.cachedOnly) {
+		if (last) return last.value;
+		throw new Error('not analysed yet');
+	}
 	if (last && (Date.now() - last.at < DASHBOARD_MIN_AGE_MS || (await github.rateLimitOf(repo.owner).catch(() => null))?.low)) return last.value;
 	const value = await currentStackAnalysis(repo);
 	shown.set(repo.id, { at: Date.now(), value });

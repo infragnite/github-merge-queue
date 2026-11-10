@@ -82,7 +82,10 @@ export async function recordRunCosts(
 		if (calls >= maxCalls) break;
 		calls++;
 		const cost = jobCost(await jobsFor(b.head_sha));
-		const settled = b.finished_at !== null && now - toMs(b.finished_at) > SETTLE_MS;
+		// Over by its status but still showing running jobs, or none at all (a run that never
+		// started, or an old bisection row without a finish time): recorded as it is once it has
+		// been over long enough, so such rows can't hold up the ones behind them.
+		const settled = now - toMs(b.finished_at ?? b.created_at) > SETTLE_MS;
 		if (!cost.done && !settled) continue;
 		getDb()
 			.prepare('INSERT OR REPLACE INTO ci_runs (batch_id, repo_id, job_ms, rerun_ms, wall_ms, jobs) VALUES (?, ?, ?, ?, ?, ?)')
