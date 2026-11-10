@@ -12,7 +12,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.0"
+    "better-sqlite3": "^11.8.0",
+    "yaml": "^2.8.1"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.2.12",

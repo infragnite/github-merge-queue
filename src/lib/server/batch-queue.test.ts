@@ -64,6 +64,13 @@ class World {
 	holdMasterRuns = false;
 	/** Runs of these PRs keep running while it says so. */
 	hold: (prs: number[]) => boolean = () => false;
+	/** Failing runs keep going a few reads after their first failed job, which a fail-fast read sees at once. */
+	slowFailures = false;
+	slowReads = new Map<string, number>();
+	/** Each result read: the head and whether it asked to fail fast. */
+	resultReads: { head: string; failFast: boolean }[] = [];
+	/** Cancels and re-runs, in order, as `cancel <head>` and `rerun <head>`. */
+	ciOps: string[] = [];
 	/** Called as each PR is about to be merged (before GitHub checks its head). */
 	beforeMerge: (n: number) => void = () => {};
 
@@ -113,8 +120,15 @@ class World {
 					this.started.push({ branch, head, prs });
 					this.ciPendingOnce.add(head);
 				},
-				result: async (head) => {
+				result: async (head, _notBefore, opts) => {
+					this.resultReads.push({ head, failFast: !!opts?.failFast });
 					if (this.ciPendingOnce.delete(head) || this.stillRunning.has(head)) return 'pending';
+					if (this.slowFailures && this.ciFails(head) && !this.cancelled.includes(head) && !opts?.failFast) {
+						// The rest of a failing run takes a few more reads to finish.
+						const n = (this.slowReads.get(head) ?? 0) + 1;
+						this.slowReads.set(head, n);
+						if (n <= 3) return 'pending';
+					}
 					if (this.holdMasterRuns && head === git.sha('main')) return 'pending';
 					const started = this.started.find((x) => x.head === head);
 					if (started && this.hold(started.prs)) return 'pending';
@@ -123,6 +137,7 @@ class World {
 				},
 				cancel: async (head) => {
 					this.cancelled.push(head);
+					this.ciOps.push(`cancel ${head}`);
 				},
 				refreshCaches: async () => {
 					this.cacheRefreshes++;
@@ -134,6 +149,7 @@ class World {
 						return 'wait';
 					}
 					this.reruns.set(head, (this.reruns.get(head) ?? 0) + 1);
+					this.ciOps.push(`rerun ${head}`);
 					this.ciPendingOnce.add(head);
 					return 'rerun';
 				}
@@ -1420,6 +1436,57 @@ describe('surviving a crash at any step', () => {
 			expect(failures).toEqual([]);
 		});
 	}
+});
+
+describe('stopping a red run at its first failed job', () => {
+	const prsOf = (head: string) => world.started.find((x) => x.head === head)?.prs ?? [];
+
+	test('a batch and a bisection step of several PRs fail fast and are cancelled; a PR alone runs to the end', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		world.slowFailures = true;
+		for (let n = 1; n <= 8; n++) pr(n, n === 4 ? { file: 'x-breaks-master.txt' } : {});
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(80);
+		expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 3, 5, 6, 7, 8]);
+		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own/) }]);
+		// Every run of several PRs read fail-fast, every run of one PR did not.
+		for (const r of world.resultReads) expect(r.failFast, `run of ${prsOf(r.head).join(' ')}`).toBe(prsOf(r.head).length > 1);
+		// The failing batch and the failing step were cancelled when they failed; the lone run was not.
+		const failing = world.started.filter((x) => x.prs.length > 1 && x.prs.includes(4)).map((x) => x.head);
+		expect(failing.length).toBeGreaterThanOrEqual(2);
+		for (const h of failing) expect(world.cancelled).toContain(h);
+		// The lone run of #4 was read to its end (it took its extra reads) and never cancelled.
+		const lone = world.started.find((x) => x.prs.length === 1 && x.prs[0] === 4)!.head;
+		expect(world.cancelled).not.toContain(lone);
+		expect(world.slowReads.get(lone)).toBe(4);
+		for (const h of failing) expect(world.slowReads.has(h)).toBe(false);
+	});
+
+	test('off, a red run is read to its end', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false, stopOnFirstFailure: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(60);
+		expect(world.merged).toEqual([1]);
+		expect(world.resultReads.every((r) => !r.failFast)).toBe(true);
+		expect(world.cancelled).toEqual([]);
+	});
+
+	test('a fail-fast failure is still re-run once when flake retries are on', async () => {
+		world.slowFailures = true;
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		pr(3);
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(60);
+		expect(world.merged).toEqual([1, 3]);
+		const head = world.started[0].head;
+		expect(world.reruns.get(head)).toBe(1);
+		// It stopped early (read with fail-fast, cancelled), and only then was re-run.
+		expect(world.resultReads.some((r) => r.head === head && r.failFast)).toBe(true);
+		expect(world.ciOps.filter((o) => o.endsWith(head)).slice(0, 2)).toEqual([`cancel ${head}`, `rerun ${head}`]);
+	});
 });
 
 describe('batch queue runtime, randomised', () => {
