@@ -21,7 +21,9 @@ import { liveDeps } from '$lib/server/batch-live';
 import { emitEvent } from '$lib/server/events';
 import { markDirty } from '$lib/server/wake';
 import { dashboardStackAnalysis } from '$lib/server/stack-runtime';
-import { stackView, type StackView } from '$lib/server/stack-view';
+import { queueBoard, type BoardItem, type QueueBoard } from '$lib/server/queue-model';
+import type { HoldCode } from '$lib/server/batching';
+import type { StackAnalysis } from '$lib/server/stacks';
 import type { Repo } from '$lib/types';
 import type { PageServerLoad, Actions } from './$types';
 
@@ -60,9 +62,24 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 	if (!repo) error(404, 'Repository not found');
 
 	// Links are built here, never taken from what was stored: a stored URL came from a form once.
-	const queueItems = getQueueItems(repo.id).map((i) => {
+	const rawItems = getQueueItems(repo.id);
+	const queueItems = rawItems.map((i) => {
 		const item = { ...i, pr_url: prUrl(repo, i.pr_number), holdWait: currentHold(i)?.wait ?? null, deferred: deferredFor(i as typeof i & { deferred_for?: string | null }).length > 0 };
 		return readonly ? publicQueueItem(item) : item;
+	});
+	// The queue as the planners see it: the rows, with the holds the planner recorded. A read-only
+	// viewer gets only the messages the public row keeps.
+	const boardItems: BoardItem[] = rawItems.map((i, k) => {
+		const hold = currentHold(i);
+		return {
+			pr: i.pr_number,
+			status: i.status,
+			priority: i.priority ?? 'normal',
+			position: i.position,
+			enqueuedAt: Date.parse(i.created_at.replace(' ', 'T') + (i.created_at.includes('Z') ? '' : 'Z')),
+			hold: hold ? { code: hold.code as HoldCode, wait: hold.wait, reason: hold.reason } : null,
+			message: queueItems[k].error_message
+		};
 	});
 
 	let openPrs: Array<{
@@ -83,18 +100,17 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 	// Queue items keep a title even when GitHub can't be reached; open PRs have the current one.
 	const prMeta = new Map(queueItems.map((i) => [i.pr_number, { title: i.pr_title, url: i.pr_url }]));
 	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: prUrl(repo, pr.number) });
-	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
 	// A read-only viewer only gets what is cached: none of their loads calls GitHub.
 	if (readonly) {
 		noteReadOnlyView(repo.id);
 		// Only the viewer's own browser may keep it, briefly; a shared cache never (it varies by sign-in).
 		setHeaders({ 'cache-control': 'private, max-age=5', vary: 'Cookie' });
 	}
-	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = dashboardStackAnalysis(repo, { cachedOnly: readonly })
-		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
+	const analysis: Promise<{ analysis: StackAnalysis; error: string | null }> = dashboardStackAnalysis(repo, { cachedOnly: readonly })
+		.then((a) => ({ analysis: a, error: null }))
 		.catch((e) => {
 			if (!readonly) console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
-			return { stacks: [], error: readonly ? 'Stacks could not be loaded' : `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
+			return { analysis: { prs: new Map(), stacks: [], issues: [] }, error: readonly ? 'Stacks could not be loaded' : `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
 		});
 
 	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta, { cachedOnly: readonly })
@@ -104,6 +120,17 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		const why = e instanceof Error ? e.message : String(e);
 		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);
 		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {} };
+	});
+
+	// Built by the planners' own queue model; PRs being tested are in the batches, not in line.
+	const board: Promise<QueueBoard & { warnings: Record<number, string[]>; error: string | null }> = Promise.all([analysis, pipeline]).then(([a, p]) => {
+		const inflight = new Set(p.active.flatMap((b) => b.prs.filter((x) => x.activity !== 'landed' && x.activity !== 'left').map((x) => x.pr)));
+		const warnings: Record<number, string[]> = {};
+		for (const i of boardItems) {
+			const w = a.analysis.prs.get(i.pr)?.issues.filter((x) => x.severity === 'warning').map((x) => x.message) ?? [];
+			if (w.length) warnings[i.pr] = w;
+		}
+		return { ...queueBoard(boardItems, a.analysis, inflight), warnings, error: a.error };
 	});
 
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
@@ -137,7 +164,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		savings: savingsFor(repo.id),
 		queueItems,
 		openPrs: atLeast(role, 'write') ? availablePrs : [],
-		stacks,
+		board,
 		pipeline,
 		mode: settings.mode,
 		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },

@@ -5,7 +5,6 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import BatchCard from '$lib/components/BatchCard.svelte';
 	import SavingsCard from '$lib/components/SavingsCard.svelte';
-	import { queueView, type Row } from '$lib/queue-view';
 	import { runOrder } from '$lib/run-order';
 
 	let { data, form } = $props();
@@ -14,11 +13,11 @@
 	// so the page doesn't empty and relayout every time it refreshes.
 	type Loaded<T> = T extends Promise<infer V> ? V : never;
 	let pipe = $state<Loaded<typeof data.pipeline> | null>(null);
-	let stacks = $state<Loaded<typeof data.stacks> | null>(null);
+	let board = $state<Loaded<typeof data.board> | null>(null);
 	$effect(() => {
 		let current = true;
 		data.pipeline.then((v) => current && (pipe = v)).catch(() => {});
-		data.stacks.then((v) => current && (stacks = v)).catch(() => {});
+		data.board.then((v) => current && (board = v)).catch(() => {});
 		return () => {
 			current = false;
 		};
@@ -34,28 +33,23 @@
 	// Without write access (or signed out on a public page): everything shows, nothing can be changed.
 	// The server checks the role on every action anyway; this only hides what would be refused.
 	const readonly = $derived(!data.can.queue);
-	const view = $derived(
-		queueView({
-			items: data.queueItems,
-			mode: batchMode ? 'batch' : 'serial',
-			batches: (pipe?.active ?? []).filter((b) => b.kind === 'batch').map((b) => ({ id: b.id, number: b.number, status: b.status, prs: b.prs.filter((p) => p.activity !== 'landed' && p.activity !== 'left' && p.verdict !== 'failing').map((p) => p.pr) })),
-			stacks: stacks?.stacks ?? null,
-			limits: data.limits
-		})
-	);
+	// The queue as the planners see it (built on the server by their queue model): stacks in the
+	// order the queue takes them, and the PRs held back, waiting or needing someone, with why.
+	const items = $derived(new Map(data.queueItems.map((i) => [i.pr_number, i])));
+	type BoardStack = NonNullable<typeof board>['stacks'][number];
+	type BoardHeld = NonNullable<typeof board>['waiting'][number];
 	const needle = $derived(search.trim().toLowerCase().replace(/^#/, ''));
-	const matches = (r: Row) =>
-		!needle ||
-		String(r.item.pr_number).startsWith(needle) ||
-		r.item.pr_title.toLowerCase().includes(needle) ||
-		r.item.author_login.toLowerCase().includes(needle);
-	const shownRows = $derived(view.rows.filter(matches));
-	const shownNext = $derived(view.upNext.filter(matches));
-	const inLine = $derived(view.rows.length + view.upNext.length);
-	const inFlightCount = $derived(view.inFlight.reduce((n, g) => n + g.prs.length, 0));
-	// What runs CI now and next: the queue's own order, apart from the batches it runs for.
-	const runs = $derived(batchMode && pipe ? runOrder({ active: pipe.active, upNext: view.upNext.map((r) => r.item.pr_number), express: view.express }) : []);
-	const brokenStacks = $derived((stacks?.stacks ?? []).filter((s) => s.rows.some((r) => r.broken)).length);
+	const matchesPr = (n: number) => {
+		const i = items.get(n);
+		return !needle || String(n).startsWith(needle) || (!!i && (i.pr_title.toLowerCase().includes(needle) || i.author_login.toLowerCase().includes(needle)));
+	};
+	// A stack shows whole while any of its PRs matches the search.
+	const shownStacks = $derived((board?.stacks ?? []).filter((s: BoardStack) => s.rows.some((r) => matchesPr(r.pr))));
+	const inLine = $derived((board?.stacks ?? []).reduce((n: number, s: BoardStack) => n + s.rows.length, 0));
+	const waiting = $derived((board?.waiting ?? []).filter((h: BoardHeld) => items.has(h.pr)));
+	const attention = $derived((board?.attention ?? []).filter((h: BoardHeld) => items.has(h.pr)));
+	// What runs CI now: the batches and their bisection steps. What comes next is not guessed.
+	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false }) : []);
 
 	const MASTER: Record<string, { label: string; tone: string; hint: string }> = {
 		green: { label: 'green', tone: 'bg-green-100 text-green-800', hint: 'Batches build on it' },
@@ -102,10 +96,11 @@
 			return;
 		}
 
-		// Only the rows in line move; the rest keep their place after them.
-		const rows = view.rows.map((r) => r.item.id);
-		const [moved] = rows.splice(dragIndex, 1);
-		rows.splice(dropIndex, 0, moved);
+		// Whole stacks move; everything else keeps its place after them.
+		const order = (board?.stacks ?? []).map((s: BoardStack) => s.rows.map((r) => items.get(r.pr)!.id));
+		const [moved] = order.splice(dragIndex, 1);
+		order.splice(dropIndex, 0, moved);
+		const rows = order.flat();
 		const inRows = new Set(rows);
 		const orderedIds = [...rows, ...[...data.queueItems].sort((a, b) => a.position - b.position).map((i) => i.id).filter((id) => !inRows.has(id))];
 		reordering = true;
@@ -250,11 +245,11 @@
 			{#if pipe}
 				<section class="space-y-3" aria-labelledby="now">
 					<h2 id="now" class="text-base font-semibold text-gray-900">
-						{batchMode ? 'Batches' : 'In progress'}
+						{batchMode ? 'Batches' : 'Being tested'}
 					</h2>
 					{#if pipe.active.length === 0}
 						<p class="text-sm text-gray-500">
-							{batchMode ? (inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.') : 'Batches are off; the queue merges one PR at a time.'}
+							{batchMode && inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.'}
 						</p>
 					{/if}
 					{#each pipe.active as batch (batch.id)}
@@ -267,18 +262,20 @@
 
 		<!-- Main column: Up next and the queue. -->
 		<div class="min-w-0 space-y-5 lg:order-1">
-			{#if view.attention.length > 0}
-				<section aria-labelledby="attention">
-					<h2 id="attention" class="mb-2 text-base font-semibold text-red-800">Needs attention · {view.attention.length}</h2>
-					<div class="overflow-hidden rounded-xl border border-red-200 bg-surface-raised" role="list">
-						{#each view.attention as a (a.item.id)}
+			{#snippet held(title: string, list: BoardHeld[], tone: string, needsSomeone: boolean)}
+				<section aria-label={title}>
+					<h2 class="mb-2 text-base font-semibold {needsSomeone ? 'text-red-800' : 'text-gray-900'}">{title} · {list.length}</h2>
+					<div class="overflow-hidden rounded-xl border {tone} bg-surface-raised" role="list">
+						{#each list as h (h.pr)}
 							<div role="listitem">
-								<QueueItem {readonly} canUrgent={data.can.urgent} item={a.item} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={a.stack} why={a.item.status === 'conflict' ? null : a.why} />
+								<QueueItem {readonly} canUrgent={data.can.urgent} item={items.get(h.pr)!} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} why={h.reason} {needsSomeone} warnings={board?.warnings[h.pr] ?? []} />
 							</div>
 						{/each}
 					</div>
 				</section>
-			{/if}
+			{/snippet}
+
+			{#if attention.length > 0}{@render held('Needs attention', attention, 'border-red-200', true)}{/if}
 
 			{#if data.queueItems.length === 0}
 				<div class="rounded-xl border border-dashed border-gray-300 bg-surface-raised p-12 text-center">
@@ -292,7 +289,7 @@
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
 					<h2 class="text-base font-semibold text-gray-900">Queue · {inLine}</h2>
 					<span class="text-xs text-gray-500">
-						{batchMode ? 'urgent first, then in line order' : data.can.reorder ? 'drag to reorder' : 'in line order'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
+						{batchMode ? 'urgent first, then in line order; a stack goes as one' : data.can.reorder ? 'drag to reorder; a stack goes as one' : 'in line order; a stack goes as one'}
 					</span>
 					<input
 						type="search"
@@ -303,96 +300,48 @@
 					/>
 				</div>
 
-				{#if view.inFlight.length > 0}
-					<div class="space-y-1">
-						{#each view.inFlight as g (g.batch)}
-							<a href="#batch-{g.batch}" class="flex items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50/50 px-3 py-1.5 text-sm hover:bg-indigo-50">
-								<span class="shrink-0 whitespace-nowrap font-medium text-indigo-900">Batch #{g.number}</span>
-								<span class="shrink-0 whitespace-nowrap text-indigo-800">{g.prs.length} PRs · {g.status}</span>
-								<span class="min-w-0 truncate text-xs text-indigo-700/70">{g.prs.map((n) => `#${n}`).join(' ')}</span>
-							</a>
-						{/each}
-					</div>
-				{/if}
+				{#if board?.error}<p class="text-sm text-red-600">{board.error}</p>{/if}
 
-				{#if batchMode && shownNext.length > 0}
-					<section aria-labelledby="next">
-						<h3 id="next" class="mb-1 text-sm font-medium text-gray-700">
-							{view.express ? 'Next: urgent batch' : 'Likely next batch'} · {view.upNext.length}
-							<span class="font-normal text-gray-500">(PRs whose checks or parent aren't ready are skipped)</span>
-						</h3>
-						<div class="overflow-hidden rounded-xl border border-indigo-200 bg-surface-raised" role="list">
-							{#each shownNext as r (r.item.id)}
-								<div role="listitem">
-									<QueueItem {readonly} canUrgent={data.can.urgent} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} batchMode stack={r.stack} />
+				{#if shownStacks.length > 0}
+					<section aria-label="In line">
+						<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
+							{#each shownStacks as st, index (st.root)}
+								{@const drag = !batchMode && !needle && data.can.reorder && !readonly}
+								<div
+									role="listitem"
+									draggable={drag ? 'true' : undefined}
+									ondragstart={drag ? () => handleDragStart(index) : undefined}
+									ondragover={drag ? (e) => handleDragOver(e, index) : undefined}
+									ondrop={drag ? (e) => handleDrop(e, index) : undefined}
+									ondragend={drag ? handleDragEnd : undefined}
+									class="border-b border-border-subtle last:border-b-0 {st.rows.length > 1 ? 'border-l-2 border-l-sky-200' : ''} {dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-t-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
+								>
+									{#each st.rows as r, k (r.pr)}
+										<QueueItem
+											{readonly}
+											canUrgent={data.can.urgent}
+											item={items.get(r.pr)!}
+											position={k === 0 ? index + 1 : null}
+											repoOwner={data.repo.owner}
+											repoName={data.repo.name}
+											reorderable={drag && k === 0}
+											{batchMode}
+											depth={r.depth}
+											parent={k === 0 ? st.on : null}
+											warnings={board?.warnings[r.pr] ?? []}
+										/>
+									{/each}
 								</div>
 							{/each}
 						</div>
 					</section>
-				{/if}
-
-				{#if shownRows.length > 0}
-					<section aria-label="Waiting in line">
-						{#if batchMode && view.upNext.length > 0}<h3 class="mb-1 text-sm font-medium text-gray-700">After that</h3>{/if}
-						<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
-							{#each shownRows as r, index (r.item.id)}
-								{#if batchMode || needle || !data.can.reorder}
-									<div role="listitem">
-										<QueueItem {readonly} canUrgent={data.can.urgent} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} stack={r.stack} />
-									</div>
-								{:else}
-									<div
-										draggable="true"
-										ondragstart={() => handleDragStart(index)}
-										ondragover={(e) => handleDragOver(e, index)}
-										ondrop={(e) => handleDrop(e, index)}
-										ondragend={handleDragEnd}
-										class="{dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
-										role="listitem"
-									>
-										<QueueItem {readonly} canUrgent={data.can.urgent} item={r.item} position={r.position} repoOwner={data.repo.owner} repoName={data.repo.name} reorderable batchMode={false} stack={r.stack} />
-									</div>
-								{/if}
-							{/each}
-						</div>
-					</section>
-				{:else if needle && shownNext.length === 0}
+				{:else if needle}
 					<p class="text-sm text-gray-500">No queued PR matches “{search}”.</p>
+				{:else if board && inLine === 0}
+					<p class="text-sm text-gray-500">Nothing can go now.</p>
 				{/if}
-			{/if}
 
-			<!-- Stacks: open by default when one is broken. -->
-			{#if stacks && (stacks.error || stacks.stacks.length > 0)}
-				<details class="rounded-xl border border-border-subtle bg-surface-raised" open={brokenStacks > 0}>
-					<summary class="cursor-pointer px-4 py-2.5 text-sm font-medium text-gray-700">
-						Stacks · {stacks.stacks.length}{brokenStacks ? ` · ${brokenStacks} broken` : ''}
-					</summary>
-					{#if stacks.error}
-						<p class="px-4 pb-3 text-sm text-red-600">{stacks.error}</p>
-					{/if}
-					<div class="space-y-3 px-3 pb-3">
-						{#each stacks.stacks as stack (stack.root)}
-							<div class="overflow-hidden rounded-lg border border-border-subtle">
-								{#each stack.rows as row (row.pr)}
-									<div class="border-b border-border-subtle px-3 py-1.5 text-sm last:border-b-0" style="padding-left: {0.75 + row.depth * 1.25}rem">
-										<div class="flex min-w-0 items-center gap-2">
-											{#if row.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
-											<a href={row.url || `https://github.com/${data.repo.owner}/${data.repo.name}/pull/${row.pr}`} target="_blank" rel="noopener" class="shrink-0 font-medium hover:text-indigo-600">#{row.pr}</a>
-											<span class="min-w-0 flex-1 truncate text-gray-600">{row.title || 'not queued'}</span>
-											{#if row.link && row.link !== 'healthy'}
-												<span class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">{row.link}</span>
-											{/if}
-											{#if row.queue && row.queue !== 'queued'}<StatusBadge status={row.queue} />{/if}
-										</div>
-										{#each row.issues as issue, i (i)}
-											<p class="mt-0.5 text-xs {issue.severity === 'blocking' ? 'text-red-600' : 'text-amber-700'}">{issue.message}</p>
-										{/each}
-									</div>
-								{/each}
-							</div>
-						{/each}
-					</div>
-				</details>
+				{#if waiting.length > 0}{@render held('Waiting', waiting, 'border-border-subtle', false)}{/if}
 			{/if}
 
 			{#if pipe && pipe.recent.length > 0}

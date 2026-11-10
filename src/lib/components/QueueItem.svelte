@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
 	import StatusBadge from './StatusBadge.svelte';
-	import type { ViewItem, StackPlace } from '$lib/queue-view';
+	import type { ViewItem } from '$lib/types';
 
 	let {
 		item,
@@ -10,8 +10,11 @@
 		repoName,
 		reorderable = false,
 		batchMode,
-		stack = null,
+		depth = 0,
+		parent = null,
 		why = null,
+		needsSomeone = false,
+		warnings = [],
 		readonly = false,
 		canUrgent = false
 	}: {
@@ -21,9 +24,16 @@
 		repoName: string;
 		reorderable?: boolean;
 		batchMode: boolean;
-		stack?: StackPlace | null;
-		/** Set when the row is listed under "Needs attention": what is wrong. */
+		/** Its depth in its stack: children sit indented under their parent. */
+		depth?: number;
+		/** The PR it is stacked on, when that PR is not in line above it (being tested, or held). */
+		parent?: number | null;
+		/** Why the planner holds it, for a row under "Waiting" or "Needs attention". */
 		why?: string | null;
+		/** The hold needs someone to act, not only time. */
+		needsSomeone?: boolean;
+		/** Possible problems the stack analysis sees, short of holding it. */
+		warnings?: string[];
 		/** A signed-out visitor's view: no controls. */
 		readonly?: boolean;
 		/** Making a PR urgent needs maintain. */
@@ -36,10 +46,9 @@
 	const priority = $derived(item.priority ?? 'normal');
 	// Plain queued rows carry no pill: only what differs from "waiting its turn" is shown.
 	const showStatus = $derived(item.status !== 'queued');
-	const note = $derived(
-		why ?? (item.status === 'queued' && item.error_message ? item.error_message : item.status !== 'conflict' ? item.error_message : null)
-	);
-	const noteTone = $derived(why || item.status === 'failed' || item.holdWait === false ? 'text-red-700' : 'text-gray-500');
+	// What the planner says about it: the reason it is held, or nothing for a PR in line.
+	const note = $derived(why);
+	const noteTone = $derived(needsSomeone ? 'text-red-700' : 'text-gray-500');
 	const prLink = (n: number) => `https://github.com/${repoOwner}/${repoName}/pull/${n}`;
 </script>
 
@@ -47,6 +56,7 @@
 	class="group flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 text-sm last:border-b-0 {isActive
 		? 'bg-indigo-50/40'
 		: ''}"
+	style={depth ? `padding-left: ${0.75 + depth * 1.25}rem` : undefined}
 >
 	{#if reorderable}
 		<span class="hidden shrink-0 cursor-grab text-gray-300 hover:text-gray-500 active:cursor-grabbing sm:inline" title="Drag to reorder" aria-hidden="true">
@@ -60,14 +70,13 @@
 	{#if position !== null}
 		<span class="w-6 shrink-0 text-right text-xs tabular-nums text-gray-400" title="Place in line">{position}</span>
 	{/if}
+	{#if depth > 0}<span class="shrink-0 text-gray-400" aria-hidden="true">└</span>{/if}
 	<a href={item.pr_url} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600">#{item.pr_number}</a>
 	<div class="min-w-0 flex-1">
 		<div class="flex min-w-0 items-center gap-1.5">
 			<p class="min-w-0 truncate text-gray-700" title={item.pr_title}>{item.pr_title}</p>
-			{#if stack && stack.parent !== null}
-				<a href={prLink(stack.parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Stacked on #{stack.parent}; lands after it">on #{stack.parent}</a>
-			{:else if stack && stack.children > 0}
-				<span class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700" title="{stack.children} PR(s) stacked on this one">stack base</span>
+			{#if parent !== null}
+				<a href={prLink(parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Stacked on #{parent}; lands after it">on #{parent}</a>
 			{/if}
 		</div>
 		{#if item.status === 'conflict'}
@@ -82,6 +91,9 @@
 		{:else if note}
 			<p class="truncate text-xs {noteTone}" title={note}>{note}</p>
 		{/if}
+		{#each warnings as w, i (i)}
+			<p class="truncate text-xs text-amber-700" title={w}>{w}</p>
+		{/each}
 	</div>
 	<span class="hidden shrink-0 text-xs text-gray-400 md:inline">{item.author_login}</span>
 	{#if batchMode && priority !== 'normal'}

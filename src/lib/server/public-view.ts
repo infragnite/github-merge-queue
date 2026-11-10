@@ -1,8 +1,7 @@
 // What a read-only viewer of a repository page is sent: an allowlist of fields, so a column added
 // to the queue later isn't published by default, and links the server builds itself.
 
-import type { HistoryItem } from '$lib/types';
-import type { ViewItem } from '$lib/queue-view';
+import type { HistoryItem, ViewItem } from '$lib/types';
 
 const NAME = /^[A-Za-z0-9._-]+$/;
 
