@@ -8,17 +8,62 @@ import {
 	reorderQueue,
 	updateQueueItemStatus
 } from '$lib/server/db';
-import { getOpenPRs } from '$lib/server/github';
+import { getOpenPRs, collaboratorRole } from '$lib/server/github';
+import { atLeast, type Caller, type Role } from '$lib/server/api-auth';
+import { ApiError, patchConfig } from '$lib/server/api-service';
+import { DEFAULT_BATCH_CONFIG } from '$lib/server/batching';
+import { DEFAULT_CI } from '$lib/server/batch-store';
+import { parseSettingsForm } from '$lib/settings-form';
 import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
-import { currentHold, getQueueSettings, setQueuePriority, updateQueueSettings } from '$lib/server/batch-store';
+import { currentHold, deferredFor, getQueueSettings, setQueuePriority, updateQueueSettings } from '$lib/server/batch-store';
 import { withRepoLock } from '$lib/server/repo-lock';
-import { retireBatches } from '$lib/server/batch-queue';
+import { cancelBatch, retireBatches } from '$lib/server/batch-queue';
 import { liveDeps } from '$lib/server/batch-live';
 import { emitEvent } from '$lib/server/events';
 import { markDirty } from '$lib/server/wake';
-import { currentStackAnalysis } from '$lib/server/stack-runtime';
+import { dashboardStackAnalysis } from '$lib/server/stack-runtime';
 import { stackView, type StackView } from '$lib/server/stack-view';
 import type { PageServerLoad, Actions } from './$types';
+
+const ROLES: Role[] = ['none', 'read', 'write', 'maintain', 'admin'];
+
+// The page refreshes every few seconds per viewer: what it reads from GitHub is shared and reused
+// for a while, so open dashboards don't spend the App's rate limit (the queue needs it).
+const ROLE_TTL_MS = 5 * 60_000;
+const OPEN_PRS_TTL_MS = 60_000;
+const roles = new Map<string, { at: number; role: Role }>();
+const openPrsCache = new Map<number, { at: number; value: Awaited<ReturnType<typeof getOpenPRs>> }>();
+
+/** The signed-in user as a caller of the queue, with their role on the repository. */
+async function pageCaller(owner: string, name: string, login: string): Promise<Caller> {
+	const key = `${owner}/${name}:${login}`;
+	const hit = roles.get(key);
+	if (hit && Date.now() - hit.at < ROLE_TTL_MS) return { login, role: hit.role, app: false };
+	let role: Role;
+	try {
+		const r = await collaboratorRole(owner, name, login);
+		// triage reads; a custom role's base permission is one of the others
+		role = ROLES.includes(r as Role) ? (r as Role) : r === 'triage' ? 'read' : 'none';
+		roles.set(key, { at: Date.now(), role });
+	} catch {
+		// GitHub unreachable or rate limited: the last known role, else none (nothing to change)
+		role = hit?.role ?? 'none';
+	}
+	return { login, role, app: false };
+}
+
+async function openPRsOf(owner: string, name: string, repoId: number) {
+	const hit = openPrsCache.get(repoId);
+	if (hit && Date.now() - hit.at < OPEN_PRS_TTL_MS) return hit.value;
+	try {
+		const value = await getOpenPRs(owner, name);
+		openPrsCache.set(repoId, { at: Date.now(), value });
+		return value;
+	} catch (e) {
+		if (hit) return hit.value;
+		throw e;
+	}
+}
 
 export const load: PageServerLoad = async ({ params, locals }) => {
 	if (!locals.user) redirect(302, '/login');
@@ -26,7 +71,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const repo = getRepoByOwnerName(params.owner, params.name);
 	if (!repo) error(404, 'Repository not found');
 
-	const queueItems = getQueueItems(repo.id).map((i) => ({ ...i, holdWait: currentHold(i)?.wait ?? null }));
+	const queueItems = getQueueItems(repo.id).map((i) => ({ ...i, holdWait: currentHold(i)?.wait ?? null, deferred: deferredFor(i as typeof i & { deferred_for?: string | null }).length > 0 }));
 
 	let openPrs: Array<{
 		number: number;
@@ -36,7 +81,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		draft: boolean;
 	}> = [];
 	try {
-		openPrs = await getOpenPRs(params.owner, params.name);
+		openPrs = await openPRsOf(repo.owner, repo.name, repo.id);
 	} catch {
 		// GitHub API error — user sees empty PR list
 	}
@@ -46,16 +91,17 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const prMeta = new Map(queueItems.map((i) => [i.pr_number, { title: i.pr_title, url: i.pr_url }]));
 	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: pr.html_url });
 	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
-	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = currentStackAnalysis(repo)
+	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = dashboardStackAnalysis(repo)
 		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
 		.catch((e) => {
 			console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
-			return { stacks: [], error: 'Stack analysis failed; it is retried on the next refresh.' };
+			return { stacks: [], error: `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
 		});
 
 	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta).catch((e) => {
-		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, e instanceof Error ? e.message : e);
-		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: 'Loading batches failed; it is retried on the next refresh.' };
+		const why = e instanceof Error ? e.message : String(e);
+		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);
+		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {} };
 	});
 
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
@@ -71,7 +117,11 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		}));
 
 	const settings = getQueueSettings(repo.id);
+	const me = await pageCaller(repo.owner, repo.name, locals.user.login);
 	return {
+		role: me.role,
+		can: { cancel: atLeast(me.role, 'maintain'), settings: atLeast(me.role, 'admin') },
+		settings: { config: settings.config, ci: settings.ci, defaults: { config: DEFAULT_BATCH_CONFIG, ci: DEFAULT_CI } },
 		repo,
 		queueItems,
 		openPrs: availablePrs,
@@ -102,6 +152,42 @@ export const actions: Actions = {
 			console.log(`[merge-queue] ${repo.owner}/${repo.name} switched to ${mode} mode by ${locals.user!.login}`);
 		});
 		return { success: true };
+	},
+
+	/** Stops a batch (and its bisection); its PRs go back in line, blamed for nothing. */
+	cancelBatch: async ({ request, params, locals }) => {
+		if (!locals.user) return fail(401);
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+		const me = await pageCaller(repo.owner, repo.name, locals.user.login);
+		if (!atLeast(me.role, 'maintain')) return fail(403, { error: `Cancelling a batch needs maintain access; you have ${me.role}` });
+		const id = parseInt((await request.formData()).get('batch_id') as string, 10);
+		if (!id) return fail(400, { error: 'batch_id is required' });
+		try {
+			await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), id, me.login));
+		} catch (e) {
+			return fail(409, { error: e instanceof Error ? e.message : String(e) });
+		}
+		markDirty(repo.id);
+		return { success: true };
+	},
+
+	/** The queue's settings, through the same validation as the settings API. */
+	saveSettings: async ({ request, params, locals }) => {
+		if (!locals.user) return fail(401);
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404);
+		const me = await pageCaller(repo.owner, repo.name, locals.user.login);
+		if (!atLeast(me.role, 'admin')) return fail(403, { settingsError: `Changing queue settings needs admin access; you have ${me.role}` });
+		try {
+			const body = parseSettingsForm(await request.formData());
+			await withRepoLock(repo.id, async () => patchConfig(repo, me, body));
+		} catch (e) {
+			if (e instanceof ApiError || e instanceof Error) return fail(400, { settingsError: e.message });
+			throw e;
+		}
+		markDirty(repo.id);
+		return { settingsSaved: true };
 	},
 
 	/** Batch mode's order: urgent PRs go first, in an express batch. */

@@ -4,9 +4,10 @@
 	import QueueItem from '$lib/components/QueueItem.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import BatchCard from '$lib/components/BatchCard.svelte';
+	import QueueSettings from '$lib/components/QueueSettings.svelte';
 	import { queueView, type Row } from '$lib/queue-view';
 
-	let { data } = $props();
+	let { data, form } = $props();
 
 	// The streamed sections keep showing what they last loaded while a refresh is in flight,
 	// so the page doesn't empty and relayout every time it refreshes.
@@ -190,6 +191,18 @@
 	</div>
 
 	{#if pipe?.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
+	{#if pipe?.tickError && !pipe.rateLimitedUntil}
+		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
+			The queue's last step failed: <span class="font-mono text-xs">{pipe.tickError.message}</span>
+			{#if pipe.tickError.count > 1}<span class="text-xs text-red-600"> · {pipe.tickError.count}× since {new Date(pipe.tickError.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{/if}
+			<span class="block text-xs text-red-600">It tries again on its next step.</span>
+		</p>
+	{/if}
+	{#if pipe?.rateLimitedUntil}
+		<p class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800" role="status">
+			GitHub's rate limit for this app is used up. The queue and CI progress resume at {new Date(pipe.rateLimitedUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}; CI itself keeps running.
+		</p>
+	{/if}
 	{#if pipe?.paused}
 		<form method="POST" action="?/resume" use:enhance class="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
 			<span class="min-w-0 flex-1">Paused: {pipe.paused}</span>
@@ -212,8 +225,9 @@
 						</p>
 					{/if}
 					{#each pipe.active as batch (batch.id)}
-						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} />
+						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} />
 					{/each}
+					{#if form?.error}<p class="text-sm text-red-600" role="alert">{form.error}</p>{/if}
 				</section>
 			{/if}
 
@@ -359,6 +373,8 @@
 					</div>
 				</details>
 			{/if}
+
+			<QueueSettings settings={data.settings} canEdit={data.can.settings} error={form?.settingsError ?? null} saved={!!form?.settingsSaved} />
 
 			<!-- History -->
 			{#if data.history.length > 0}

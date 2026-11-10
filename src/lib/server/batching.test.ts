@@ -134,6 +134,14 @@ describe('planning a batch', () => {
 		expect(p.express).toBe(false);
 	});
 
+	test("follows the queue's own order within a priority, without making a moved PR urgent", () => {
+		// #14 was moved to the front: it goes first among normal PRs, in a normal batch
+		const q = [10, 11, 12, 13, 14].map((n, i) => ({ ...entry(n, 100 - i), position: n === 14 ? 0 : i + 1 }));
+		const p = plan(q, stacks([10, 11, 12, 13, 14]), { config: { maxBatch: 3 } });
+		expect(p.batch).toEqual([14, 10, 11]);
+		expect(p.express).toBe(false);
+	});
+
 	test('waits for the collect window when the batch is not full', () => {
 		const p = plan([entry(1, 10), entry(2, 5)], stacks([1, 2]));
 		expect(p.batch).toBeNull();

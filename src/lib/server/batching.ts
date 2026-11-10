@@ -22,7 +22,13 @@ export interface QueueEntry {
 	/** Epoch ms when the PR entered the queue. */
 	enqueuedAt: number;
 	priority: Priority;
+	/** Place in the queue's own order (moved by a person or "jump to front"); ties fall back to age. */
+	position?: number;
 }
+
+/** Urgent first, then the queue's order, then the oldest. */
+const byQueueOrder = (rank: (e: QueueEntry) => number) => (a: QueueEntry, b: QueueEntry) =>
+	rank(a) - rank(b) || (a.position ?? 0) - (b.position ?? 0) || a.enqueuedAt - b.enqueuedAt || a.pr - b.pr;
 
 /** What the queue knows about a PR's readiness on GitHub. */
 export interface PRState {
@@ -291,14 +297,11 @@ export function planNextBatch(input: PlanInput): Plan {
 
 	if (inflight.length >= config.depth || admitted.size === 0) return result(null);
 
-	const ordered = [...admitted.values()].sort(
-		(a, b) =>
-			PRIORITY_RANK[effective.get(a.pr)!] - PRIORITY_RANK[effective.get(b.pr)!] ||
-			a.enqueuedAt - b.enqueuedAt ||
-			a.pr - b.pr
-	);
+	const ordered = [...admitted.values()].sort(byQueueOrder((e) => PRIORITY_RANK[effective.get(e.pr)!]));
+	// An urgent PR gets an express batch of urgent PRs only, and the next batch is built on top of
+	// it: alone, it gets a clean result in one run (in a big batch it is split with its neighbours
+	// for several rounds), and the batch on top of it loses nothing when it passes.
 	const express = effective.get(ordered[0].pr) === 'urgent';
-	// An express batch is built around the PRs marked urgent; their stacks come along via `chain`.
 	const candidates = express ? ordered.filter((e) => e.priority === 'urgent') : ordered;
 	const limit = express ? config.expressMax : config.maxBatch;
 
@@ -579,9 +582,7 @@ export function planRedBatch(input: {
 		}
 		return out;
 	};
-	const ordered = [...ok.values()].sort(
-		(a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority] || a.enqueuedAt - b.enqueuedAt || a.pr - b.pr
-	);
+	const ordered = [...ok.values()].sort(byQueueOrder((e) => PRIORITY_RANK[e.priority]));
 	const chains = (alone: boolean) =>
 		ordered.filter((e) => !tried(e.pr, alone)).flatMap((e) => {
 			const c = chainOf(e.pr);
