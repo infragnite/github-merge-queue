@@ -7,6 +7,7 @@ const { tickBatchQueue, startTry, retireBatches, recoverInterrupted, cancelBatch
 const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
+const events = await import('./events');
 import { GitSandbox } from './testing/git-sandbox';
 import { writeFileSync } from 'node:fs';
 import type { LivePR, QueueDeps } from './batch-queue';
@@ -873,6 +874,23 @@ describe('batch queue runtime', () => {
 		// One more tick plans the rest: #2 is queued, only deferred; #3 waits for it.
 		await tickBatchQueue(world.deps());
 		expect(item(3).error_message).toBe('Waits for #2: conflicts with #1 ahead of it; waits for them to land');
+	});
+
+	test('a held PR is told on GitHub what it needs, once, and an event says so; then it is released', async () => {
+		pr(1);
+		pr(2);
+		world.changesRequested.add(2);
+		await run(3);
+		expect(world.merged).toEqual([1]);
+		const told = () => world.prStatuses.filter((x) => x.sha === git.sha('pr2') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		// Told once, however many ticks hold it.
+		expect(told()).toEqual([['failure', 'Needs attention: #2 has changes requested']]);
+		const kinds = () => events.listEvents(repo.id, { pr: 2 }).map((e) => e.kind);
+		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'held').map((e) => e.data)).toEqual([{ code: 'changes-requested', reason: '#2 has changes requested' }]);
+		world.changesRequested.delete(2);
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		expect(kinds().filter((k) => k === 'held' || k === 'released' || k === 'batched')).toEqual(['held', 'released', 'batched']);
 	});
 
 	test('a PR stacked on a queued PR in conflict says that its parent conflicts, not that it is unqueued', async () => {
