@@ -385,10 +385,11 @@ describe('bisection', () => {
 		expect(planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm', parentOf: parent, slots: 1 })).toMatchObject({ start: [[1]] });
 	});
 
-	test('with free slots, the second path of a fork waits for the first (they share their root)', () => {
+	test('with free slots, both paths of a failing fork run side by side; with one slot, one at a time', () => {
 		const parent = (n: number) => (n === 1 ? null : 1);
 		const runs: BisectRun[] = [{ context: [], members: [1, 2, 3], baseTree: 'm', result: 'failure' }];
-		expect(planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm', parentOf: parent })).toMatchObject({ start: [[1, 2]] });
+		expect(planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm', parentOf: parent, slots: 2 })).toMatchObject({ start: [[1, 2], [1, 3]] });
+		expect(planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm', parentOf: parent, slots: 1 })).toMatchObject({ start: [[1, 2]] });
 	});
 
 	test('forkSplit shares out the branches above the first fork, with the PRs under it in both halves', () => {
