@@ -36,6 +36,7 @@ const db = await import('$lib/server/db');
 const store = await import('$lib/server/batch-store');
 const { clearWebRoles } = await import('$lib/server/web-auth');
 const page = await import('./+page.server');
+const settingsPage = await import('./settings/+page.server');
 
 let repoId: number;
 const user = { id: 1, login: 'dev', name: null, avatarUrl: null };
@@ -59,22 +60,23 @@ function form(fields: Record<string, string>) {
 }
 
 /** Runs action `name` as `who` (null: signed out); the result, or the failure's status and data. */
-async function act(name: keyof typeof page.actions, who: typeof user | null, fields: Record<string, string> = {}) {
+async function act(name: string, who: typeof user | null, fields: Record<string, string> = {}) {
 	const request = new Request('http://localhost/repos/acme/repo', { method: 'POST', body: form(fields) });
-	const r = await (page.actions[name] as (e: unknown) => Promise<unknown>)({ request, params: { owner: 'acme', name: 'repo' }, locals: { user: who }, url: new URL(request.url) });
+	const actions = { ...settingsPage.actions, ...page.actions } as Record<string, (e: unknown) => Promise<unknown>>;
+	const r = await actions[name]({ request, params: { owner: 'acme', name: 'repo' }, locals: { user: who }, url: new URL(request.url) });
 	return r as { status?: number; data?: Record<string, unknown> } & Record<string, unknown>;
 }
 
-async function load(who: typeof user | null) {
+async function load(who: typeof user | null, from: { load: unknown } = page) {
 	try {
-		return await (page.load as (e: unknown) => Promise<Record<string, unknown>>)({ params: { owner: 'acme', name: 'repo' }, locals: { user: who }, url: new URL('http://localhost/repos/acme/repo') });
+		return await (from.load as (e: unknown) => Promise<Record<string, unknown>>)({ params: { owner: 'acme', name: 'repo' }, locals: { user: who }, url: new URL('http://localhost/repos/acme/repo') });
 	} catch (e) {
 		return { thrown: e as { status: number; location?: string } };
 	}
 }
 
 describe('actions need the same role as the API', () => {
-	const cases: Array<[keyof typeof page.actions, string, Record<string, string>]> = [
+	const cases: Array<[string, string, Record<string, string>]> = [
 		['setMode', 'admin', { mode: 'batch' }],
 		['saveSettings', 'admin', {}],
 		['resume', 'maintain', {}],
@@ -92,7 +94,7 @@ describe('actions need the same role as the API', () => {
 			role.value = below[need];
 			const r = await act(name, user, fields);
 			expect(r.status).toBe(403);
-			expect(String(r.data?.error ?? r.data?.settingsError)).toMatch(`needs ${need}`);
+			expect(String(r.data?.error ?? r.data?.modeError ?? r.data?.settingsError)).toMatch(`needs ${need}`);
 		});
 	}
 
@@ -139,7 +141,8 @@ describe('who sees the page', () => {
 	test('the public page is read-only and leaves internals out', async () => {
 		store.updateQueueSettings(repoId, { publicView: true, pausedReason: 'App lacks permission X' });
 		const d = await load(null);
-		expect(d).toMatchObject({ anonymous: true, readonly: true, role: 'none', settings: null, openPrs: [] });
+		expect(d).toMatchObject({ anonymous: true, readonly: true, role: 'none', openPrs: [] });
+		expect(d).not.toHaveProperty('settings');
 		expect(Object.values(d.can as Record<string, boolean>).every((v) => v === false)).toBe(true);
 		expect(d.repo).toEqual({ id: repoId, owner: 'acme', name: 'repo', default_branch: 'main' });
 		const pipe = (await d.pipeline) as Record<string, unknown>;
@@ -151,7 +154,17 @@ describe('who sees the page', () => {
 	test('signed in without access, a public repository shows read-only', async () => {
 		store.updateQueueSettings(repoId, { publicView: true });
 		role.value = 'none';
-		expect(await load(user)).toMatchObject({ anonymous: false, readonly: true, settings: null });
+		expect(await load(user)).toMatchObject({ anonymous: false, readonly: true, role: 'none' });
+	});
+
+	test('the settings page is for collaborators only, public page or not', async () => {
+		store.updateQueueSettings(repoId, { publicView: true });
+		expect((await load(null, settingsPage)).thrown).toMatchObject({ status: 302 });
+		role.value = 'none';
+		expect((await load(user, settingsPage)).thrown).toMatchObject({ status: 404 });
+		clearWebRoles();
+		role.value = 'read';
+		expect(await load(user, settingsPage)).toMatchObject({ canEdit: false, repo: { owner: 'acme', name: 'repo' } });
 	});
 
 	test('a collaborator sees it all', async () => {
