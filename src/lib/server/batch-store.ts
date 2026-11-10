@@ -209,6 +209,20 @@ export function migrateBatches(database: Database.Database) {
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
+	// Batches from before `ejected` was recorded: a PR that left one and was then ejected, with no
+	// later batch it was in, was ejected from it.
+	const before = database
+		.prepare(`SELECT id, repo_id, created_at, members, left_prs FROM batches WHERE kind = 'batch' AND ejected = '[]' AND left_prs != '[]'`)
+		.all() as Array<{ id: number; repo_id: number; created_at: string; members: string; left_prs: string }>;
+	if (before.length) {
+		const ejectedAfter = database.prepare(`SELECT 1 FROM queue_events WHERE repo_id = ? AND pr_number = ? AND kind = 'ejected' AND created_at >= ? LIMIT 1`);
+		const later = database.prepare(`SELECT members FROM batches WHERE repo_id = ? AND id > ? AND kind = 'batch'`);
+		for (const b of before) {
+			const laterMembers = new Set((later.all(b.repo_id, b.id) as Array<{ members: string }>).flatMap((r) => JSON.parse(r.members) as number[]));
+			const out = (JSON.parse(b.left_prs) as number[]).filter((n) => !laterMembers.has(n) && ejectedAfter.get(b.repo_id, n, b.created_at));
+			if (out.length) database.prepare(`UPDATE batches SET ejected = ? WHERE id = ?`).run(JSON.stringify(out), b.id);
+		}
+	}
 	const settingsCols = database.prepare(`PRAGMA table_info(queue_settings)`).all() as Array<{ name: string }>;
 	if (!settingsCols.some((c) => c.name === 'public_view')) database.exec(`ALTER TABLE queue_settings ADD COLUMN public_view INTEGER NOT NULL DEFAULT 0`);
 	// Bisection runs used to keep status 'testing' after their result came in; their status now
