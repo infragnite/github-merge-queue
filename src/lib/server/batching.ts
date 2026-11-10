@@ -128,6 +128,26 @@ export type AdmissionCode =
 /** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
 export type HoldCode = AdmissionCode | 'conflict' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
 
+const EVERY_HOLD: Record<HoldCode, true> = {
+	draft: true,
+	'not-fetched': true,
+	'ci-failed': true,
+	'not-approved': true,
+	'stale-approval': true,
+	'changes-requested': true,
+	'stack-broken': true,
+	'parent-not-ready': true,
+	'wrong-base': true,
+	conflict: true,
+	failed: true,
+	deferred: true,
+	'parent-not-queued': true,
+	'parent-held': true
+};
+
+/** Every hold code: stable ids, shown on the PR and in its hidden block, so agents can switch on them. */
+export const HOLD_CODES = Object.keys(EVERY_HOLD) as HoldCode[];
+
 /** What a held PR's author does about its hold, for the comment that tells them. Empty: nothing to say. */
 export function holdAdvice(code: HoldCode): string {
 	switch (code) {
@@ -152,7 +172,7 @@ export function holdAdvice(code: HoldCode): string {
 		case 'deferred':
 			return 'rebase it onto the PRs it conflicts with (it then goes with them), or wait for them to land and rebase it onto the default branch.';
 		case 'conflict':
-			return 'resolve the conflict and push.';
+			return 'resolve the conflict and push. The PR stays queued and is picked up again after the push.';
 		case 'failed':
 			return 'fix the failure and push.';
 		case 'not-fetched':
