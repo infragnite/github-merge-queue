@@ -688,6 +688,39 @@ describe('batch queue runtime', () => {
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
 	});
 
+	test('a PR whose parent was rebased, with restacking off, is told the exact restack command', async () => {
+		store.updateQueueSettings(repo.id, { config: { autoRebase: false } });
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		const stale = git.sha('pr1');
+		git.commit('main', 'm1', 'x-main.txt');
+		git.rebase('pr1', 'main');
+		await run(3);
+		const reason = '#1 was rebased or force-pushed; this PR still carries 1 old commit from it';
+		// The first thing it is told; #1 then lands, and the sandbox keeps #2's base where GitHub would retarget it.
+		expect(world.comments.filter((c) => c.pr === 2)[0]).toEqual(
+			{
+				pr: 2,
+				body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'stack-broken', reason, fix: `git fetch origin pull/1/head && git rebase --onto FETCH_HEAD ${stale}` })
+			}
+		);
+		expect(world.comments.find((c) => c.pr === 2)?.body).toContain(`\`\`\`sh\ngit fetch origin pull/1/head && git rebase --onto FETCH_HEAD ${stale}\n`);
+	});
+
+	test("a PR on its parent's branch but not on its latest commit is told to rebase onto it, with the command", async () => {
+		pr(1);
+		pr(2, { base: 'pr1' }); // branched from main, not from #1's head
+		await run(3);
+		// The first thing it is told; #1 then lands, and the sandbox keeps #2's base where GitHub would retarget it.
+		expect(world.comments.filter((c) => c.pr === 2)[0]).toEqual(
+			{
+				pr: 2,
+				body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'stack-broken', reason: "Not on #1's latest commit", fix: 'git fetch origin pull/1/head && git rebase FETCH_HEAD' })
+			}
+		);
+		expect(world.comments.find((c) => c.pr === 2)?.body).toContain('```sh\ngit fetch origin pull/1/head && git rebase FETCH_HEAD\n');
+	});
+
 	test('comments only when action is needed: a clean restack is not told', async () => {
 		store.updateQueueSettings(repo.id, { config: { comments: 'attention' } });
 		pr(1);

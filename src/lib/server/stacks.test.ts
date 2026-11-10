@@ -3,6 +3,7 @@ import {
 	analyzeStacks,
 	detectAutoClose,
 	mergeBlocker,
+	restackCommand,
 	AUTO_CLOSE_WINDOW_MS,
 	type PRSnapshot,
 	type StackAnalysis,
@@ -776,5 +777,38 @@ describe("a stack issue's message doesn't name the PR it is on", () => {
 		const pr = { ...open(1, 'a', 'main', [c('a1')]), commitsTruncated: true };
 		const a = analyzeStacks({ defaultBranch: 'main', prs: [pr] });
 		expect(message(a, 1, 'commits-truncated')).toBe('More commits than could be fetched; stack detection may be incomplete');
+	});
+});
+
+describe('the command that restacks a broken PR', () => {
+	test('onto a rebased parent: replays only its own commits, past the stale copies', () => {
+		git.branch('a', 'main');
+		git.commit('a', 'a1');
+		git.branch('b', 'a');
+		git.commit('b', 'b1');
+		git.openPR(1, 'a', 'main');
+		git.openPR(2, 'b', 'a');
+		const stale = git.sha('a');
+		git.commit('main', 'm2');
+		git.rebase('a', 'main');
+		const a = analyzeStacks(git.input());
+		expect(restackCommand(info(a, 2))).toBe(`git fetch origin pull/1/head && git rebase --onto FETCH_HEAD ${stale}`);
+	});
+
+	test("#3322's shape: a plain rebase onto the parent's head", () => {
+		git.branch('a', 'main');
+		git.commit('a', 'c1');
+		git.branch('b', 'a');
+		git.commit('b', 'd1');
+		git.commit('a', 'c2');
+		git.openPR(1, 'a', 'main');
+		git.openPR(2, 'b', 'a');
+		const a = analyzeStacks({ ...git.input(), knownHeads: new Map() });
+		expect(restackCommand(info(a, 2))).toBe('git fetch origin pull/1/head && git rebase FETCH_HEAD');
+	});
+
+	test('a healthy stack has none', () => {
+		linearStack();
+		expect(restackCommand(info(analyzeStacks(git.input()), 2))).toBeNull();
 	});
 });
