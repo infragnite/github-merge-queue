@@ -548,6 +548,8 @@ export interface Hold {
 	released?: boolean;
 	/** The PR's head when it was told: after a new push, a hold of the same kind is news again. */
 	head?: string;
+	/** Its check was posted but the comment setting kept it from a comment: it is commented on once the setting allows. */
+	quiet?: boolean;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {

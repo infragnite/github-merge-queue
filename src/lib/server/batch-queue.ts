@@ -1639,13 +1639,20 @@ class Tick {
 		return mode === 'all' || (mode === 'attention' && kind === 'attention');
 	}
 
-	/** A comment on PR `n`, best effort, if the repo's comment setting posts this kind; a rate limit stops the tick. */
-	async say(n: number, body: string, kind: 'attention' | 'info') {
-		if (!this.speaks(kind)) return;
-		await this.d.github.comment(n, body).catch((e) => {
-			if (e instanceof RateLimitedError) throw e;
-			this.bestEffort('github.comment')(e);
-		});
+	/**
+	 * A comment on PR `n`, best effort, if the repo's comment setting posts this kind; a rate limit
+	 * stops the tick. Whether it was posted.
+	 */
+	async say(n: number, body: string, kind: 'attention' | 'info'): Promise<boolean> {
+		if (!this.speaks(kind)) return false;
+		return this.d.github.comment(n, body).then(
+			() => true,
+			(e) => {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.comment')(e);
+				return false;
+			}
+		);
 	}
 
 	async recordHolds(held: { pr: number; admission: Hold }[]) {
@@ -1692,7 +1699,9 @@ class Tick {
 				if (e instanceof RateLimitedError) throw e;
 				return null;
 			}))?.headSha;
-			if (was?.told && was.code === code && was.reason === reason && (!current || !was.head || was.head === current)) continue;
+			// Kept quiet by the comment setting, and still not wanted: the check already says it.
+			const settled = !!was?.told || (!!was?.quiet && !this.speaks('attention'));
+			if (settled && was!.code === code && was!.reason === reason && (!current || !was!.head || was!.head === current)) continue;
 			const hold = (head: string | null) => ({ pr: it.pr_number, head, code: code as HoldCode, reason });
 			const head = await tell(it.pr_number, (h) => ({ state: 'action_required', ...holdCheck(hold(h)) }));
 			if (head === false) continue;
@@ -1701,10 +1710,11 @@ class Tick {
 			const advice = holdAdvice(code as HoldCode);
 			// Told this kind on this head already; a deferral that comes back is told again only after a push.
 			const toldThis = !!stored?.told && stored.code === code && (!stored.released || (code === 'deferred' && stored.head === (head ?? undefined)));
-			if (advice && !toldThis)
-				await this.say(it.pr_number, holdNotice(hold(head)), 'attention');
+			// Told once the comment is posted, or when there is nothing to comment on; a hold the setting kept
+			// quiet is commented on if it is made louder.
+			const told = !advice || toldThis || (await this.say(it.pr_number, holdNotice(hold(head)), 'attention'));
 			db.updateQueueItemStatus(it.id, 'queued', reason);
-			store.setHold(it.id, { code, reason, told: true, head: head ?? undefined });
+			store.setHold(it.id, { code, reason, told, head: head ?? undefined, ...(told ? {} : { quiet: true }) });
 			this.event(it.pr_number, 'held', { code, reason });
 		}
 		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).
