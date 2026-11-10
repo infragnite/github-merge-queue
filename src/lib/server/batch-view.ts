@@ -13,49 +13,52 @@ export interface BatchPR {
 	/** The open PR it is stacked on, in this batch or not. */
 	parent: number | null;
 	link: LinkStatus | null;
-	/** Where a bisecting batch stands with this PR (bisecting batches only). */
-	state?: BisectPRState;
-	/** The runs behind that state, for a tooltip. */
-	evidence?: string;
+	/** What a bisecting batch's runs showed about this PR (bisecting batches only). */
+	verdict?: BisectVerdict;
+	/** What is happening to it now, alongside the verdict. */
+	activity?: BisectActivity | null;
+	/** The runs behind the verdict, for a tooltip. */
+	trail?: string;
 }
 
 /**
- * A PR of a bisecting batch: what the runs so far showed about it (`unknown`, `passing` once it
- * was in any run that passed, `failing` once it failed alone), and what follows from that:
- * `landed`, `checking` while it is in a run still going, `left` when it went back in line.
+ * What the runs showed about a PR of a bisecting batch: `passing` once it was in a run that
+ * passed, `failing` when its last run alone failed, else `unknown`.
  */
-export type BisectPRState = 'landed' | 'failing' | 'checking' | 'passing' | 'unknown' | 'left';
+export type BisectVerdict = 'unknown' | 'passing' | 'failing';
+/** And, independently, what is happening to it: in a run still going, merged, or back in line. */
+export type BisectActivity = 'checking' | 'landed' | 'left';
 
 export function bisectStates(b: Pick<BatchRow, 'members' | 'landed' | 'left_prs'>, runs: Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'>[]) {
-	const out = new Map<number, { state: BisectPRState; evidence: string }>();
+	const out = new Map<number, { verdict: BisectVerdict; activity: BisectActivity | null; trail: string }>();
 	const tested = runs.map((r, i) => ({ r, step: i + 1 })).filter(({ r }) => r.status !== 'cancelled');
 	for (const n of b.members) {
 		const inRun = tested.filter(({ r }) => r.members.includes(n) || r.context.includes(n));
-		const green = inRun.filter(({ r }) => r.ci_result === 'success');
-		// Its last finished run alone decides: a failure on a branch not known green is run again.
+		// Its last finished run alone decides over any group: a failure alone on a branch not known
+		// green is run again, and a pass alone after it clears it.
 		const lastAlone = inRun.filter(({ r }) => r.ci_result !== 'pending' && r.members.length === 1 && r.members[0] === n).at(-1);
-		const going = inRun.some(({ r }) => r.ci_result === 'pending');
-		// A run going wins over a failure: a PR run again alone (its failure was on a branch not
-		// known green) is being checked, not failing.
-		const state: BisectPRState = b.landed.includes(n)
-			? 'landed'
-			: going && !b.left_prs.includes(n)
-				? 'checking'
-				: lastAlone?.r.ci_result === 'failure'
+		const landed = b.landed.includes(n);
+		const verdict: BisectVerdict =
+			landed || (lastAlone ? lastAlone.r.ci_result === 'success' : inRun.some(({ r }) => r.ci_result === 'success'))
+				? 'passing'
+				: lastAlone
 					? 'failing'
-					: b.left_prs.includes(n)
-						? 'left'
-						: green.length
-							? 'passing'
-							: 'unknown';
-		const evidence = inRun
+					: 'unknown';
+		const activity: BisectActivity | null = landed
+			? 'landed'
+			: b.left_prs.includes(n)
+				? 'left'
+				: inRun.some(({ r }) => r.ci_result === 'pending')
+					? 'checking'
+					: null;
+		const trail = inRun
 			.map(({ r, step }) => {
 				const result = r.ci_result === 'success' ? 'passed' : r.ci_result === 'failure' ? 'failed' : 'running';
 				const how = r.members.length === 1 && r.members[0] === n ? 'alone' : `with ${r.members.length - 1} other${r.members.length === 2 ? '' : 's'}`;
 				return `run ${step}: ${result} ${how} on ${r.base_sha.slice(0, 7)}`;
 			})
 			.join('\n');
-		out.set(n, { state, evidence });
+		out.set(n, { verdict, activity, trail });
 	}
 	return out;
 }
