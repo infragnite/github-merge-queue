@@ -8,7 +8,7 @@
 //
 // Pure: the runtime gathers the queue, PR states, the stack analysis and known conflicts.
 
-import { admit, type Admission, type BatchConfig, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
+import { admit, type Admission, type BatchConfig, type Hold, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
 import type { StackAnalysis } from './stacks';
 
 const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
@@ -17,7 +17,7 @@ export interface QueueModelInput {
 	/** The queued PRs (not those being tested). */
 	queue: QueueEntry[];
 	/** Whether a queued PR may be tested now, by itself and its stack (see `admit`). */
-	admission: (pr: number) => Admission;
+	admission: (pr: number) => { ok: true } | Hold;
 	analysis: StackAnalysis;
 	/** PRs in a batch being tested: a stack may sit on one of them. */
 	inflight: Set<number>;
@@ -228,7 +228,7 @@ export interface BoardItem {
 	position: number;
 	enqueuedAt: number;
 	/** What the planner recorded when it held the PR, while still current. */
-	hold: { code: string; wait: boolean; reason: string } | null;
+	hold: { code: HoldCode; wait: boolean; reason: string } | null;
 	message: string | null;
 }
 
@@ -238,6 +238,48 @@ export interface QueueBoard {
 	attention: Held[];
 }
 
-export function queueBoard(_items: BoardItem[], _analysis: StackAnalysis, _inflight: Set<number>): QueueBoard {
-	return { stacks: [], waiting: [], attention: [] };
+/**
+ * The queue model as the queue page shows it, from the queue rows and the holds the planner
+ * recorded: the same stacks, order and reasons the planners work from.
+ */
+export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight: Set<number>): QueueBoard {
+	const live = items.filter((i) => i.status !== 'merged' && i.status !== 'cancelled' && !inflight.has(i.pr));
+	const byPr = new Map(live.map((i) => [i.pr, i]));
+	const problems = new Map<number, { code: HoldCode; reason: string }>();
+	for (const i of live) {
+		if (i.status === 'conflict') problems.set(i.pr, { code: 'conflict', reason: i.message ?? 'Merge conflict' });
+		if (i.status === 'failed') problems.set(i.pr, { code: 'failed', reason: i.message ?? 'Failed' });
+	}
+	const admission = (n: number): { ok: true } | Hold => {
+		const i = byPr.get(n)!;
+		if (i.status !== 'queued') return { ok: true };
+		if (i.hold) return { ok: false, code: i.hold.code, reason: i.hold.reason, wait: i.hold.wait };
+		// Held without a planner's hold: deferred behind PRs it conflicts with.
+		if (i.message) return { ok: false, code: 'deferred', reason: i.message, wait: true };
+		return { ok: true };
+	};
+	const model = queueModel({
+		queue: live.map((i) => ({ pr: i.pr, enqueuedAt: i.enqueuedAt, priority: i.priority, position: i.position })),
+		admission,
+		analysis,
+		inflight,
+		problems
+	});
+	return {
+		stacks: model.stacks.map((s) => {
+			const depth = new Map<number, number>();
+			return {
+				root: s.root,
+				on: s.on,
+				priority: s.priority,
+				rows: s.members.map((pr) => {
+					const parent = s.parentOf.get(pr) ?? null;
+					depth.set(pr, parent === null ? 0 : depth.get(parent)! + 1);
+					return { pr, depth: depth.get(pr)!, parent };
+				})
+			};
+		}),
+		waiting: model.waiting,
+		attention: model.attention
+	};
 }
