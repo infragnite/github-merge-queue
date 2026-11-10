@@ -7,6 +7,7 @@
 	import QueueSettings from '$lib/components/QueueSettings.svelte';
 	import SavingsCard from '$lib/components/SavingsCard.svelte';
 	import { queueView, type Row } from '$lib/queue-view';
+	import { runOrder } from '$lib/run-order';
 
 	let { data, form } = $props();
 
@@ -53,6 +54,8 @@
 	const shownNext = $derived(view.upNext.filter(matches));
 	const inLine = $derived(view.rows.length + view.upNext.length);
 	const inFlightCount = $derived(view.inFlight.reduce((n, g) => n + g.prs.length, 0));
+	// What runs CI now and next: the queue's own order, apart from the batches it runs for.
+	const runs = $derived(batchMode && pipe ? runOrder({ active: pipe.active, upNext: view.upNext.map((r) => r.item.pr_number), express: view.express }) : []);
 	const brokenStacks = $derived((stacks?.stacks ?? []).filter((s) => s.rows.some((r) => r.broken)).length);
 
 	const MASTER: Record<string, { label: string; tone: string; hint: string }> = {
@@ -229,10 +232,31 @@
 	<div class="grid grid-cols-1 gap-5 lg:grid-cols-[1.618fr_1fr]">
 		<!-- Side column: Now and Needs attention. On a phone this comes first. -->
 		<aside class="min-w-0 space-y-5 lg:sticky lg:top-4 lg:order-2 lg:max-h-[calc(100vh-2rem)] lg:self-start lg:overflow-y-auto">
+			{#if runs.length > 0}
+				<section aria-labelledby="run-order">
+					<h2 id="run-order" class="mb-2 text-base font-semibold text-gray-900">Run order</h2>
+					<ol class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised text-sm">
+						{#each runs as r, i (r.key)}
+							<li class="flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 last:border-b-0 {r.state === 'running' ? 'bg-amber-50/60' : ''}">
+								<span class="w-4 shrink-0 text-center text-xs text-gray-400">
+									{#if r.state === 'running'}<span class="inline-block h-2 w-2 rounded-full bg-amber-400 motion-safe:animate-pulse" role="img" aria-label="running"></span>{:else}{i + 1 - runs.filter((x) => x.state === 'running').length}{/if}
+								</span>
+								{#if r.batch !== null}
+									<a href="#batch-{r.batch}" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600">{r.label}</a>
+								{:else}
+									<span class="shrink-0 font-medium {r.urgent ? 'text-indigo-700' : 'text-gray-900'}">{r.label}</span>
+								{/if}
+								<span class="shrink-0 text-xs text-gray-500">{r.detail}</span>
+								<span class="min-w-0 truncate text-xs text-gray-400" title={r.prs.map((n) => `#${n}`).join(' ')}>{r.prs.map((n) => `#${n}`).join(' ')}</span>
+							</li>
+						{/each}
+					</ol>
+				</section>
+			{/if}
 			{#if pipe}
 				<section class="space-y-3" aria-labelledby="now">
 					<h2 id="now" class="text-base font-semibold text-gray-900">
-						{batchMode ? 'Testing now' : 'In progress'}
+						{batchMode ? 'Batches' : 'In progress'}
 					</h2>
 					{#if pipe.active.length === 0}
 						<p class="text-sm text-gray-500">
