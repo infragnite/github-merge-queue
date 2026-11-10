@@ -42,6 +42,23 @@ test('draws a PR under its own parent, not under the row before it, and not unde
 	]);
 });
 
+test('in a bisection, what is still to settle comes first, then what landed, was ejected or went back in line', () => {
+	const card = batchCard(
+		row({ status: 'bisecting', members: [1, 2, 3, 4, 5], landed: [1], left_prs: [2, 3], ejected: [3] }),
+		[row({ id: 2, kind: 'bisect', members: [4], ci_result: 'pending', status: 'testing' })],
+		null,
+		new Map(),
+		new Map()
+	);
+	expect(card.prs.map((p) => [p.pr, p.settled])).toEqual([
+		[4, false],
+		[5, false],
+		[1, true],
+		[2, true],
+		[3, true]
+	]);
+});
+
 test('attaches each run its own progress, bisection runs included', () => {
 	const progress = new Map([['h2', { total: 2, done: 1, failed: 0, running: 1, url: 'j', failedJobs: [] }]]);
 	const card = batchCard(row({ status: 'bisecting', members: [1, 2] }), [row({ id: 2, kind: 'bisect', head_sha: 'h2', members: [1] })], null, new Map(), progress);
@@ -74,19 +91,20 @@ test("a bisecting batch shows each PR's verdict and, apart from it, what is happ
 		row({ id: 8, kind: 'bisect', members: [8], ci_result: 'failure', status: 'failed', base_sha: 'outside' })
 	];
 	const card = batchCard(batch, runs, null, new Map(), new Map());
+	// Still to settle first, then what landed, was ejected or went back in line.
 	expect(card.prs.map((p) => [p.pr, p.verdict, p.activity])).toEqual([
-		[1, 'passing', 'landed'],
-		[2, 'failing', null],
 		[3, 'passing', null],
 		[4, 'passing', 'checking'],
 		[5, 'unknown', 'checking'],
 		[6, 'unknown', null],
-		[7, 'unknown', 'left'],
 		// Failed alone on a branch not known green, and run again: still unknown, being checked.
 		[8, 'unknown', 'checking'],
+		[1, 'passing', 'landed'],
+		[2, 'failing', null],
+		[7, 'unknown', 'left'],
 		[9, 'failing', null]
 	]);
-	expect(card.prs[3].trail).toBe('run 3: failed with 4 others on bbbbbbb\nrun 4: passed alone on bbbbbbb\nrun 6: running with 1 other on ccccccc');
+	expect(card.prs.find((p) => p.pr === 4)!.trail).toBe('run 3: failed with 4 others on bbbbbbb\nrun 4: passed alone on bbbbbbb\nrun 6: running with 1 other on ccccccc');
 	// Runs themselves carry none.
 	expect(card.bisection[0].prs[0].verdict).toBeUndefined();
 });
