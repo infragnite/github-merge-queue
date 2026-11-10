@@ -862,6 +862,19 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([2]);
 	});
 
+	test('a PR stacked on a deferred PR waits for it, and says why', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		pr(3, { from: 'pr2', base: 'pr2' });
+		await tickBatchQueue(world.deps());
+		expect(world.started.map((x) => x.prs)).toEqual([[1]]);
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		expect(item(2).error_message).toBe('Conflicts with #1 ahead of it; waits for them to land');
+		// One more tick plans the rest: #2 is queued, only deferred; #3 waits for it.
+		await tickBatchQueue(world.deps());
+		expect(item(3).error_message).toBe('Waits for #2: conflicts with #1 ahead of it; waits for them to land');
+	});
+
 	test('a deferred PR says only what it still waits for, not PRs that landed since', async () => {
 		pr(1, { file: 'same.txt' });
 		pr(2);
