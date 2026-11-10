@@ -22,31 +22,33 @@ export interface BatchPR {
 }
 
 /**
- * What the runs showed about a PR of a bisecting batch: `passing` once it was in a run that
- * passed, `failing` when its last run alone failed, else `unknown`.
+ * What the runs showed about a PR of a bisecting batch: `failing` once ejected (it failed alone
+ * on a branch known green, or is stacked on one that did), `passing` once it was in a run that
+ * passed, else `unknown`.
  */
 export type BisectVerdict = 'unknown' | 'passing' | 'failing';
 /** And, independently, what is happening to it: in a run still going, merged, or back in line. */
 export type BisectActivity = 'checking' | 'landed' | 'left';
 
-export function bisectStates(b: Pick<BatchRow, 'members' | 'landed' | 'left_prs'>, runs: Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'>[]) {
+export function bisectStates(
+	b: Pick<BatchRow, 'members' | 'landed' | 'left_prs' | 'ejected'>,
+	runs: Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'>[]
+) {
 	const out = new Map<number, { verdict: BisectVerdict; activity: BisectActivity | null; trail: string }>();
 	const tested = runs.map((r, i) => ({ r, step: i + 1 })).filter(({ r }) => r.status !== 'cancelled');
 	for (const n of b.members) {
 		const inRun = tested.filter(({ r }) => r.members.includes(n) || r.context.includes(n));
-		// Its last finished run alone decides over any group: a failure alone on a branch not known
-		// green is run again, and a pass alone after it clears it.
-		const lastAlone = inRun.filter(({ r }) => r.ci_result !== 'pending' && r.members.length === 1 && r.members[0] === n).at(-1);
 		const landed = b.landed.includes(n);
-		const verdict: BisectVerdict =
-			landed || (lastAlone ? lastAlone.r.ci_result === 'success' : inRun.some(({ r }) => r.ci_result === 'success'))
+		// Failing only once ejected: a failure alone counts only on a branch known green, which the
+		// queue settles before it ejects. Until then it is unknown (and checked again).
+		const verdict: BisectVerdict = b.ejected.includes(n)
+			? 'failing'
+			: landed || inRun.some(({ r }) => r.ci_result === 'success')
 				? 'passing'
-				: lastAlone
-					? 'failing'
-					: 'unknown';
+				: 'unknown';
 		const activity: BisectActivity | null = landed
 			? 'landed'
-			: b.left_prs.includes(n)
+			: b.left_prs.includes(n) && !b.ejected.includes(n)
 				? 'left'
 				: inRun.some(({ r }) => r.ci_result === 'pending')
 					? 'checking'

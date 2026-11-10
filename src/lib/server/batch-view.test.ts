@@ -5,7 +5,7 @@ import type { StackAnalysis, PRStackInfo } from './stacks';
 
 const row = (o: Partial<BatchRow>): BatchRow => ({
 	id: 1, repo_id: 1, kind: 'batch', parent_batch_id: null, branch: 'mq/1', base_sha: 'b', head_sha: 'h1', tree_sha: 't',
-	base_tree: 'bt', heads: {}, steps: {}, retried_at: null, members: [], context: [], landed: [], left_prs: [], status: 'testing', express: false,
+	base_tree: 'bt', heads: {}, steps: {}, retried_at: null, members: [], context: [], landed: [], left_prs: [], ejected: [], status: 'testing', express: false,
 	ci_result: 'pending', created_at: '2026-11-09 21:00:00', finished_at: null, ...o
 });
 
@@ -45,7 +45,8 @@ test('counts jobs, treating skipped and neutral as passing', () => {
 });
 
 test("a bisecting batch shows each PR's verdict and, apart from it, what is happening to it", () => {
-	const batch = row({ id: 1, status: 'bisecting', members: [1, 2, 3, 4, 5, 6, 7, 8], landed: [1], left_prs: [2, 7] });
+	// #2 failed alone and was ejected, #9 with it (stacked on it); #7 went back in line.
+	const batch = row({ id: 1, status: 'bisecting', members: [1, 2, 3, 4, 5, 6, 7, 8, 9], landed: [1], left_prs: [2, 7, 9], ejected: [2, 9] });
 	const runs = [
 		row({ id: 2, kind: 'bisect', members: [1, 3], ci_result: 'success', status: 'landed', base_sha: 'aaaaaaa1' }),
 		row({ id: 3, kind: 'bisect', members: [2], ci_result: 'failure', status: 'failed', base_sha: 'bbbbbbb2' }),
@@ -58,14 +59,15 @@ test("a bisecting batch shows each PR's verdict and, apart from it, what is happ
 	const card = batchCard(batch, runs, null, new Map(), new Map());
 	expect(card.prs.map((p) => [p.pr, p.verdict, p.activity])).toEqual([
 		[1, 'passing', 'landed'],
-		[2, 'failing', 'left'],
+		[2, 'failing', null],
 		[3, 'passing', null],
 		[4, 'passing', 'checking'],
 		[5, 'unknown', 'checking'],
 		[6, 'unknown', null],
 		[7, 'unknown', 'left'],
-		// Failed alone on a branch not known green, and run again: failing, and being checked.
-		[8, 'failing', 'checking']
+		// Failed alone on a branch not known green, and run again: still unknown, being checked.
+		[8, 'unknown', 'checking'],
+		[9, 'failing', null]
 	]);
 	expect(card.prs[3].trail).toBe('run 3: failed with 4 others on bbbbbbb\nrun 4: passed alone on bbbbbbb\nrun 6: running with 1 other on ccccccc');
 	// Runs themselves carry none.

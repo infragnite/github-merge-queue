@@ -308,6 +308,7 @@ describe('batch queue runtime', () => {
 		// Never two at once, and nothing tested twice.
 		const bisect = world.started.filter((x) => x.branch.includes('-bisect-')).map((x) => x.prs);
 		expect(bisect).toEqual([[1, 2], [3], [4]]);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')).toMatchObject({ landed: [1, 2, 3], ejected: [4] });
 	});
 
 	test('a bisection lands the half that passes at once, while the other half is still running', async () => {
@@ -607,6 +608,8 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([3]);
 		expect(world.comments.map((c) => c.pr).sort()).toEqual([1, 2]);
 		expect(world.comments.find((c) => c.pr === 2)?.body).toMatch(/Stacked on #1, which failed/);
+		// The batch records both as ejected, the child too, not as back in line.
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')).toMatchObject({ ejected: expect.arrayContaining([1, 2]) });
 	});
 
 	test('pipelines a second batch on top of the first', async () => {
