@@ -372,11 +372,6 @@ export interface TestGroup {
 }
 
 /**
- * Where to cut `members` (in landing order) so that the halves keep stacks
- * whole. `independent` means the right half has no ancestor in the left and
- * can be tested on its own; otherwise it can only be tested on top of the left.
- */
-/**
  * Whether a group of `k` PRs known to fail is narrowed down faster by running each PR alone than
  * by halving it, when each PR breaks with probability `p`. Expected runs, under the queue's rules
  * (a PR is ejected only on a run of it alone; a passing half lands; the other half is then known
@@ -403,26 +398,54 @@ export function aloneIsCheaper(k: number, p: number): boolean {
 	return alone;
 }
 
+/**
+ * Splits a failing group in two for bisection. A batch has no order of its own, so the halves
+ * are balanced by size: each stack (a PR with what it sits on, or what sits on it, in the group)
+ * is a unit that stays whole. Stacks are dealt largest first to the lighter half, then single PRs
+ * fill the first half in queue order up to half the group, so the halves differ by at most one
+ * PR unless a stack is bigger than the rest. A group that is one stack is cut at a prefix
+ * (`independent` false: the right half can only run once the left landed).
+ */
 export function splitPoint(
 	members: number[],
 	parentOf: (n: number) => number | null
 ): { left: number[]; right: number[]; independent: boolean } {
-	const ancestorsIn = (n: number, set: Set<number>) => {
-		for (let p = parentOf(n); p !== null; p = parentOf(p)) if (set.has(p)) return true;
-		return false;
+	const set = new Set(members);
+	// Each PR's unit is its topmost ancestor in the group (through ancestors outside it, too).
+	const rootOf = (n: number) => {
+		let r = n;
+		for (let p = parentOf(n), seen = 0; p !== null && seen <= members.length; p = parentOf(p), seen++) if (set.has(p)) r = p;
+		return r;
 	};
-	const mid = Math.floor(members.length / 2);
-	const cuts: number[] = [];
-	for (let d = 0; d < members.length; d++) {
-		for (const c of [mid + d, mid - d]) if (c > 0 && c < members.length && !cuts.includes(c)) cuts.push(c);
+	const units = new Map<number, number[]>();
+	for (const n of members) {
+		const r = rootOf(n);
+		units.set(r, [...(units.get(r) ?? []), n]);
 	}
-	for (const c of cuts) {
-		const left = new Set(members.slice(0, c));
-		if (members.slice(c).every((n) => !ancestorsIn(n, left))) {
-			return { left: members.slice(0, c), right: members.slice(c), independent: true };
+	if (units.size === 1) {
+		const mid = Math.floor(members.length / 2);
+		return { left: members.slice(0, mid), right: members.slice(mid), independent: false };
+	}
+	// Stacks go largest first to the lighter half; single PRs then fill the first half in queue
+	// order up to half the group, the rest go to the second.
+	const left = new Set<number>();
+	let leftSize = 0;
+	let rightSize = 0;
+	const stacks = [...units.values()].filter((u) => u.length > 1).sort((a, b) => b.length - a.length);
+	for (const u of stacks) {
+		if (leftSize <= rightSize) {
+			for (const n of u) left.add(n);
+			leftSize += u.length;
+		} else rightSize += u.length;
+	}
+	for (const u of units.values()) {
+		if (u.length > 1) continue;
+		if (2 * (leftSize + 1) <= members.length) {
+			left.add(u[0]);
+			leftSize++;
 		}
 	}
-	return { left: members.slice(0, mid), right: members.slice(mid), independent: false };
+	return { left: members.filter((n) => left.has(n)), right: members.filter((n) => !left.has(n)), independent: true };
 }
 
 /**
@@ -507,8 +530,8 @@ export function planBisection(input: {
 	trusted?: (tree: string) => boolean;
 	/**
 	 * Most runs going at once (unlimited by default). Those to start are taken in turn: first what
-	 * no failure points at (it is expected to pass and land), then one half of each failing group,
-	 * smallest group first, then the other halves.
+	 * is expected to pass and land, then PRs to retry alone, then both halves of each failing group,
+	 * smallest group first, and last what no failure points at but never passed.
 	 */
 	slots?: number;
 }): BisectPlan {
@@ -567,11 +590,11 @@ export function planBisection(input: {
 
 	const eject: { pr: number; reason: string; run: number }[] = [];
 	// Groups to run, in the order they take free slots: what is expected to pass, PRs to retry
-	// alone, then each failing group's first half, then the second halves.
+	// alone, then both halves of each failing group, smallest group first.
 	const clearRun: number[][] = [];
 	const retryAlone: number[][] = [];
-	const firstHalves: number[][] = [];
-	const secondHalves: number[][] = [];
+	// The halves of each failing group, which narrow it.
+	const splits: number[][][] = [];
 	const busy = new Set(runs.filter((r) => r.result === 'pending').flatMap((r) => r.members));
 	/** Whether `g` should run now. */
 	const want = (g: number[]) => {
@@ -612,7 +635,9 @@ export function planBisection(input: {
 		// Not where some passed before: those are split off by evidence and pooled to land.
 		const set = new Set(g);
 		const fresh = g.every((n) => !passedWith.has(n)) && g.every((n) => parentOf(n) === null || !set.has(parentOf(n)!));
-		if (g.length > 1 && fresh && aloneIsCheaper(g.length, breakRate)) {
+		// With a few slots, halves run side by side and narrow faster than single PRs a few at a time.
+		const slots = input.slots ?? Infinity;
+		if (g.length > 1 && fresh && (slots === 1 || slots >= g.length) && aloneIsCheaper(g.length, breakRate)) {
 			for (const n of g) if (whole([n]) && want([n])) retryAlone.push([n]);
 			continue;
 		}
@@ -655,9 +680,7 @@ export function planBisection(input: {
 		}
 		const halves = [a, ...(independent ? [b] : [])].filter(want);
 		// A right half stacked on the left can only run once the left landed (it is then whole).
-		// The second half waits for a slot behind every group's first one.
-		if (halves[0]) firstHalves.push(halves[0]);
-		if (halves[1]) secondHalves.push(halves[1]);
+		if (halves.length) splits.push(halves);
 	}
 
 	// 3. Everything no failure points at runs together on the current branch, so it can land.
@@ -679,13 +702,16 @@ export function planBisection(input: {
 	// Every group made only of PRs that passed is expected to pass and land: they run first, as one
 	// run (one landing for all), unless that very run already failed on this branch; then apart.
 	const expected = (g: number[]) => g.every((n) => passedWith.has(n));
-	const groups = [...clearRun, ...firstHalves, ...secondHalves];
+	// Both halves of a split take slots together, the smallest failing group's first: one half
+	// lands and the other keeps narrowing, and the smallest group settles soonest.
+	const narrowing = splits.sort((x, y) => x.flat().length - y.flat().length).flat();
+	const groups = [...clearRun, ...narrowing];
 	const passing = groups.filter(expected);
 	const pool = inOrder(new Set(passing.flat()));
 	const lead = passing.length > 1 && whole(pool) && want(pool) ? [pool] : passing;
 	// Then PRs to retry alone, the halves that narrow a failure, and last what no failure points at
 	// but never passed.
-	const start = [...lead, ...retryAlone, ...[...firstHalves, ...secondHalves].filter((g) => !expected(g)), ...clearRun.filter((g) => !expected(g))];
+	const start = [...lead, ...retryAlone, ...narrowing.filter((g) => !expected(g)), ...clearRun.filter((g) => !expected(g))];
 	if (input.slots !== undefined) start.splice(Math.max(0, input.slots - runs.filter((r) => r.result === 'pending').length));
 
 	const pending = runs.some((r) => r.result === 'pending');
