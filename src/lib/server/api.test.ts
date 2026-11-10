@@ -150,6 +150,14 @@ describe('stack state for agents', () => {
 		]);
 	});
 
+	test("a PR on its parent's branch but not on its latest commit is told to rebase onto it", () => {
+		const issue: StackIssue = { kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: "Not on #1's latest commit" };
+		const s = api.stackState(repo, 2, analysis([1, 2], {}, [issue]));
+		expect(s.nextActions).toEqual([
+			{ do: 'restack', onto: '#1', cmd: 'git fetch origin pull/1/head && git rebase FETCH_HEAD', why: "Not on #1's latest commit" }
+		]);
+	});
+
 	test('a held PR lists what to do about its hold', () => {
 		const hold = (n: number, code: string, reason: string) => {
 			api.enqueue(repo, writer, pull(n), {});
