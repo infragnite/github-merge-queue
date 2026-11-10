@@ -852,16 +852,19 @@ class Tick {
 		return true;
 	}
 
-	/** Whether `b`'s run counts as failed at its first failed job: a run of several PRs, if the repo stops early. */
+	/** Whether `b`'s run is cancelled at its first failed job: a run of several PRs, if the repo stops early. */
 	failFast(b: BatchRow): boolean {
 		return this.settings().config.stopOnFirstFailure && b.members.length > 1;
 	}
 
-	/** The required check's result on `b`; a failure found early stops the rest of its run. */
+	/**
+	 * The required check's result on `b`. If the repo stops early, its first failed job decides it.
+	 * A run of several PRs is then cancelled; a run of one PR goes on, only so its author gets every
+	 * error, and holds nothing back: the queue has its verdict.
+	 */
 	async ciResult(b: BatchRow): Promise<'pending' | 'success' | 'failure'> {
-		const failFast = this.failFast(b);
-		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast });
-		if (r === 'failure' && failFast)
+		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast: this.settings().config.stopOnFirstFailure });
+		if (r === 'failure' && this.failFast(b))
 			await this.d.ci.cancel(b.head_sha).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				this.bestEffort('ci.cancel')(e);
