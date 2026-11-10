@@ -544,6 +544,22 @@ describe('bisection', () => {
 		expect(step).toMatchObject({ eject: [], start: [[3280, 3345, 3342, 3309]] });
 	});
 
+	test('a half of PRs that all passed runs before halves that narrow a failure, from any group', () => {
+		// Batch 13 after run 26: the pool of four that passed (and #3296) failed; [3288 2600] failed too.
+		const parentOf = (n: number) => (n === 3296 ? 3280 : null);
+		const runs: BisectRun[] = [
+			{ context: [], members: [3280, 3345, 3342, 3309, 3296, 3288, 2600], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [3280], baseTree: 'm0', result: 'success' },
+			{ context: [], members: [3345], baseTree: 'm0', result: 'success' },
+			{ context: [], members: [3342], baseTree: 'm0', result: 'success' },
+			{ context: [], members: [3309], baseTree: 'm0', result: 'success' },
+			{ context: [], members: [3288, 2600], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [3280, 3345, 3342, 3296, 3309], baseTree: 'm1', result: 'failure' }
+		];
+		const step = planBisection({ runs, remaining: [3280, 3345, 3342, 3309, 3296, 3288, 2600], masterTree: 'm1', parentOf, trusted: () => true, slots: 1 });
+		expect(step).toMatchObject({ start: [[3280, 3345, 3342, 3309]] });
+	});
+
 	test('a single-PR group with a failure only in a larger run is run alone first', () => {
 		const runs: BisectRun[] = [{ context: [], members: [1, 2], baseTree: 'm0', result: 'failure' }];
 		expect(planBisection({ runs, remaining: [2], masterTree: 'm1', parentOf: () => null })).toMatchObject({ eject: [], start: [[2]] });

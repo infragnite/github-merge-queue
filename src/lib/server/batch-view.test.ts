@@ -67,3 +67,12 @@ test("a bisecting batch shows each PR's state: landed, failing, checking, passin
 	// Runs themselves carry no states.
 	expect(card.bisection[0].prs[0].state).toBeUndefined();
 });
+
+test('a PR run again alone after a failure on a branch not known green shows as checking', () => {
+	const batch = row({ id: 1, status: 'bisecting', members: [1, 2] });
+	const runs = [
+		row({ id: 2, kind: 'bisect', members: [1], ci_result: 'failure', status: 'failed', base_sha: 'aaaaaaa' }),
+		row({ id: 3, kind: 'bisect', members: [1], ci_result: 'pending', status: 'testing', base_sha: 'bbbbbbb' })
+	];
+	expect(batchCard(batch, runs, null, new Map(), new Map()).prs.map((p) => p.state)).toEqual(['checking', 'unknown']);
+});

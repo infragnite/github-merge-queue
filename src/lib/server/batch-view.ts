@@ -35,14 +35,16 @@ export function bisectStates(b: Pick<BatchRow, 'members' | 'landed' | 'left_prs'
 		// Its last finished run alone decides: a failure on a branch not known green is run again.
 		const lastAlone = inRun.filter(({ r }) => r.ci_result !== 'pending' && r.members.length === 1 && r.members[0] === n).at(-1);
 		const going = inRun.some(({ r }) => r.ci_result === 'pending');
+		// A run going wins over a failure: a PR run again alone (its failure was on a branch not
+		// known green) is being checked, not failing.
 		const state: BisectPRState = b.landed.includes(n)
 			? 'landed'
-			: lastAlone?.r.ci_result === 'failure'
-				? 'failing'
-				: b.left_prs.includes(n)
-					? 'left'
-					: going
-						? 'checking'
+			: going && !b.left_prs.includes(n)
+				? 'checking'
+				: lastAlone?.r.ci_result === 'failure'
+					? 'failing'
+					: b.left_prs.includes(n)
+						? 'left'
 						: green.length
 							? 'passing'
 							: 'unknown';
