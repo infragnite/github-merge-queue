@@ -228,6 +228,37 @@ jobs:
 		expect(feeds('lint')).toBe(false);
 	});
 
+	test('a job allowed to fail (continue-on-error, or an expression that may allow it) decides nothing early; what it needs still does', () => {
+		const tolerant = `
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  experimental:
+    needs: build
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  nightly:
+    name: Nightly \${{ matrix.toolchain }}
+    continue-on-error: \${{ matrix.toolchain == 'nightly' }}
+    strategy: { matrix: { toolchain: [stable, nightly] } }
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  strict:
+    continue-on-error: false
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  gate:
+    needs: [experimental, nightly, strict]
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+`;
+		const feeds = gateFeeds(tolerant, 'gate')!;
+		for (const name of ['build', 'strict', 'gate']) expect(feeds(name), name).toBe(true);
+		for (const name of ['experimental', 'Nightly stable', 'Nightly nightly']) expect(feeds(name), name).toBe(false);
+	});
+
 	test('no such gate, or a workflow it cannot read: unknown, so nothing fails early', () => {
 		expect(gateFeeds(workflow, 'nope')).toBeNull();
 		expect(gateFeeds('not: [valid', 'ci-and-conformance')).toBeNull();
