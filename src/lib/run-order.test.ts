@@ -23,6 +23,16 @@ const card = (id: number, over: Partial<BatchCard>): BatchCard => ({
 });
 
 describe('runOrder', () => {
+	test('a running batch or bisection step names the branch its CI runs on, for a link to its Actions runs', () => {
+		const b = card(13, { status: 'bisecting', prs: [pr(2, { verdict: 'unknown', activity: 'checking' })], bisection: [card(21, { kind: 'bisect', ci: 'pending', prs: [pr(2)] })] });
+		const t = card(14, { prs: [pr(7)] });
+		expect(runOrder({ active: [b, t], upNext: [9], express: true }).map((s) => [s.label, s.branch])).toEqual([
+			['Batch #13, bisection step 1', 'mq/21'],
+			['Batch #14', 'mq/14'],
+			['Urgent batch', null]
+		]);
+	});
+
 	test('a bisection with its step running, urgent PRs waiting: the urgent batch goes before the next step', () => {
 		const b = card(13, {
 			status: 'bisecting',
