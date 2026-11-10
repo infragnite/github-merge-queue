@@ -99,6 +99,58 @@ describe('stopping at the first failed job', () => {
 	});
 });
 
+describe("the gate's jobs, by krusty's real names", () => {
+	// From krusty's ci.yml: matrix jobs named with expressions inside parentheses.
+	const workflow = `
+jobs:
+  build-tool-bins:
+    name: build-tools (\${{ matrix.kotlin }})
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  build-conformance-bin:
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  conformance:
+    name: conformance (\${{ matrix.version }}, \${{ matrix.target }})
+    needs: [build-conformance-bin, build-tool-bins]
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  conformance-nightly:
+    name: conformance-nightly (\${{ matrix.version }})
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+  ci-and-conformance:
+    if: always()
+    needs: [conformance]
+    runs-on: ubuntu-latest
+    steps: [{ run: echo }]
+`;
+
+	test('a matrix job named with expressions in parentheses feeds the gate by its check run names', () => {
+		const feeds = gateFeeds(workflow, 'ci-and-conformance')!;
+		const names = [
+			'conformance (2.4.10, wasm-js)',
+			'conformance (2.4.0, wasm-wasi)',
+			'build-tools (2.4.21)',
+			'build-conformance-bin',
+			'ci-and-conformance',
+			'conformance (2.4.10)',
+			'conformance-nightly (2.4.10)',
+			'conformance'
+		];
+		expect(names.map((n) => [n, feeds(n)])).toEqual([
+			['conformance (2.4.10, wasm-js)', true],
+			['conformance (2.4.0, wasm-wasi)', true],
+			['build-tools (2.4.21)', true],
+			['build-conformance-bin', true],
+			['ci-and-conformance', true],
+			['conformance (2.4.10)', false],
+			['conformance-nightly (2.4.10)', false],
+			['conformance', false]
+		]);
+	});
+});
+
 describe('the jobs the required check waits for', () => {
 	// Like krusty's: a routing job no gate needs, a matrix, a reusable workflow, and a gate that
 	// runs always and checks what it needs.
