@@ -210,6 +210,20 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				if (!sha) throw new Error(`default branch ${repo.default_branch} not found`);
 				return sha;
 			},
+			openPRs: async (): Promise<LivePR[]> =>
+				(await github.getOpenPRs(owner, name)).map((p) => ({
+					pr: p.number,
+					headSha: p.head.sha,
+					headRef: p.head.ref,
+					sameRepo: p.head.repo?.full_name?.toLowerCase() === `${owner}/${name}`.toLowerCase(),
+					draft: !!p.draft,
+					title: p.title,
+					url: p.html_url,
+					authorLogin: p.user?.login ?? '',
+					baseRef: p.base.ref,
+					state: 'open' as const,
+					merged: false
+				})),
 			pr: async (n): Promise<LivePR> => {
 				const p = await github.getPR(owner, name, n);
 				return {

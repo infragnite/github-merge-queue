@@ -208,7 +208,7 @@ describe('queue control', () => {
 		api.enqueue(repo, writer, pull(1), {});
 		api.enqueue(repo, writer, pull(2), {});
 		expect(() => api.changeEntry(repo, writer, 2, { jumpTo: 'front' })).toThrow(/needs maintain/);
-		expect(api.changeEntry(repo, maintainer, 2, { jumpTo: 'front' })).toMatchObject({ position: 1, priority: 'urgent' });
+		expect(api.changeEntry(repo, maintainer, 2, { jumpTo: 'front' })).toMatchObject({ position: 1, priority: 'normal' });
 	});
 
 	test('admins change settings, with validation', () => {

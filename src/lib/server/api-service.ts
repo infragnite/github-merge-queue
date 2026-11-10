@@ -250,10 +250,9 @@ export function changeEntry(repo: Repo, caller: Caller, n: number, body: { prior
 	if (body.jumpTo !== undefined) {
 		if (body.jumpTo !== 'front') throw new ApiError(400, 'jumpTo must be "front"');
 		requireRole(caller, 'maintain', 'Moving a PR to the front');
+		// The front of its own priority: it does not become urgent (urgent PRs still go first).
 		const order = db.getQueueItems(repo.id).map((i) => i.id);
 		db.reorderQueue(repo.id, [it.id, ...order.filter((id) => id !== it.id)]);
-		// The planner orders by priority then enqueue time; the front is urgent.
-		store.setQueuePriority(repo.id, n, 'urgent');
 	}
 	return queueEntry(repo.id, n);
 }
@@ -288,12 +287,26 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 			}
 		}
 	}
+	const before = store.getQueueSettings(repo.id);
 	store.updateQueueSettings(repo.id, {
 		mode: mode as 'serial' | 'batch' | undefined,
 		config,
 		ci: ci as Partial<store.CISettings> | undefined
 	});
+	// Who changed what, from what: on the queue's event log, so a surprising setting can be traced.
+	const changes: Record<string, { from: unknown; to: unknown }> = {};
+	if (mode !== undefined && mode !== before.mode) changes.mode = { from: before.mode, to: mode };
+	for (const [k, v] of Object.entries(config)) if (before.config[k as keyof BatchConfig] !== v) changes[k] = { from: before.config[k as keyof BatchConfig], to: v };
+	for (const [k, v] of Object.entries(ci ?? {})) if (before.ci[k as keyof store.CISettings] !== v) changes[`ci.${k}`] = { from: before.ci[k as keyof store.CISettings], to: v };
+	if (Object.keys(changes).length) emitEvent(repo.id, null, 'settings', { by: caller.login, changes });
 	return getConfig(repo);
+}
+
+/** Checks who may cancel a batch; the cancel itself runs under the repo lock in the route. */
+export function canCancelBatch(repo: Repo, caller: Caller, id: number) {
+	requireRole(caller, 'maintain', 'Cancelling a batch');
+	const b = store.getBatch(id);
+	if (!b || b.repo_id !== repo.id || b.kind !== 'batch') throw new ApiError(404, `Batch ${id} not found`);
 }
 
 export function pause(repo: Repo, caller: Caller, reason: unknown) {

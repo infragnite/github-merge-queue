@@ -9,6 +9,21 @@ import { recoverInterrupted, tickBatchQueue } from './batch-queue';
 import { liveDeps } from './batch-live';
 import { takeDirty } from './wake';
 import { withRepoLock } from './repo-lock';
+import { RateLimitedError } from './rate-limit';
+import { clearTickError, noteTickError } from './tick-errors';
+
+/** The reset time last logged per repo, so a rate limit is logged once, not every cycle. */
+const loggedLimit = new Map<number, number>();
+async function rateLimited(repo: RepoRef): Promise<boolean> {
+	const until = (await github.rateLimitOf(repo.owner).catch(() => null))?.blockedUntil ?? null;
+	if (!until) return false;
+	noteTickError(repo.id, new Error(`GitHub rate limit for this app is used up; the queue resumes at ${new Date(until).toISOString().slice(11, 16)} UTC`));
+	if (loggedLimit.get(repo.id) !== until) {
+		loggedLimit.set(repo.id, until);
+		console.warn(`[merge-queue] ${repo.owner}/${repo.name}: GitHub rate limit reached; the queue waits until ${new Date(until).toISOString()}`);
+	}
+	return true;
+}
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -93,6 +108,8 @@ export function missingPermission(err: unknown): err is GitHubError {
 }
 
 async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
+	// Every call would fail until GitHub's reset; the queue picks up where it stopped then.
+	if (await rateLimited(repo)) return;
 	await recordOpenPRHeads(repo);
 
 	if (getQueueSettings(repo.id).mode === 'batch') {
@@ -104,7 +121,9 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		const started = Date.now();
 		try {
 			await withRepoLock(repo.id, () => tickBatchQueue(liveDeps(repo)));
+			clearTickError(repo.id);
 		} catch (err) {
+			noteTickError(repo.id, err);
 			if (missingPermission(err)) {
 				// Retrying can't fix it; say so once, where the dashboard shows it, instead of every tick.
 				const reason = `The GitHub App lacks a permission (${err.message}). Grant it in the App's settings, approve it on this account's installation, then resume.`;
@@ -113,6 +132,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 				console.error(`[merge-queue] Paused ${repo.owner}/${repo.name}: ${reason}`);
 				return;
 			}
+			if (err instanceof RateLimitedError) return; // logged once by `rateLimited` on the next cycle
 			// Transient GitHub or git errors: the next cycle picks up where this one stopped.
 			console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
 		} finally {
@@ -164,8 +184,8 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		}
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
-		// Don't fail permanently on transient GitHub API errors — retry next cycle
-		if (/GitHub API (5\d\d|timeout)/i.test(msg)) {
+		// Don't fail permanently on transient GitHub API errors (or a rate limit) — retry next cycle
+		if (err instanceof RateLimitedError || /GitHub API (5\d\d|timeout)/i.test(msg)) {
 			console.warn(`[merge-queue] Transient error for #${item.pr_number}, will retry: ${msg}`);
 			return;
 		}
