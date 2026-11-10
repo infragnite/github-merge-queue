@@ -116,7 +116,7 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 
 export type AdmissionCode =
 	| 'draft'
-	| 'ci-pending'
+	| 'not-fetched'
 	| 'ci-failed'
 	| 'not-approved'
 	| 'stale-approval'
@@ -132,8 +132,6 @@ export interface Hold {
 	ok: false;
 	code: HoldCode;
 	reason: string;
-	/** True when the PR stays queued and may become ready by itself. */
-	wait: boolean;
 }
 
 export type Admission =
@@ -142,8 +140,6 @@ export type Admission =
 			ok: false;
 			code: AdmissionCode;
 			reason: string;
-			/** True when the PR stays queued and may become ready by itself (CI running, parent pending). */
-			wait: boolean;
 	  };
 
 // Blocking stack issues the queue cannot work around. A base-mismatch is
@@ -168,49 +164,46 @@ function stopper(info: PRStackInfo): string | null {
 /** Whether a PR may be tested in a batch now, looking at the PR alone and its stack. */
 export function admit(state: PRState, analysis: StackAnalysis, config: BatchConfig): Admission {
 	const n = state.pr;
-	if (state.draft) return { ok: false, code: 'draft', reason: `#${n} is a draft`, wait: true };
+	if (state.draft) return { ok: false, code: 'draft', reason: `#${n} is a draft` };
 
-	if (state.ciGreen === null) {
-		return { ok: false, code: 'ci-pending', reason: `#${n}'s checks are still running`, wait: true };
-	}
+	// Checks still running don't hold a PR: the batch's own CI tests it.
 	if (state.ciGreen === false) {
-		return { ok: false, code: 'ci-failed', reason: `#${n}'s own checks failed on its head`, wait: false };
+		return { ok: false, code: 'ci-failed', reason: `#${n}'s own checks failed on its head` };
 	}
 
 	if (config.requireApproval) {
 		if (state.changesRequested) {
-			return { ok: false, code: 'changes-requested', reason: `#${n} has changes requested`, wait: false };
+			return { ok: false, code: 'changes-requested', reason: `#${n} has changes requested` };
 		}
 		if (state.approvedShas.length === 0) {
-			return { ok: false, code: 'not-approved', reason: `#${n} is not approved`, wait: false };
+			return { ok: false, code: 'not-approved', reason: `#${n} is not approved` };
 		}
 		if (config.approvalOnHead && !state.approvedShas.includes(state.headSha)) {
 			return {
 				ok: false,
 				code: 'stale-approval',
-				reason: `#${n} was approved on an earlier push; approve its current head ${state.headSha.slice(0, 7)}`,
-				wait: false
+				reason: `#${n} was approved on an earlier push; approve its current head ${state.headSha.slice(0, 7)}`
 			};
 		}
 	}
 
 	if (state.fromFork && !state.approvedShas.includes(state.headSha)) {
 		// Batches run in this repo's CI, with its secrets and runners: outside code needs a writer's look first.
-		return { ok: false, code: 'not-approved', reason: `#${n} comes from a fork; a writer must approve its head first`, wait: false };
+		return { ok: false, code: 'not-approved', reason: `#${n} comes from a fork; a writer must approve its head first` };
 	}
 
 	const info = analysis.prs.get(n);
 	if (state.targetsDefault === false && (info?.parent ?? null) === null) {
 		// Only the default branch is batched; a PR into another branch is merged some other way.
-		return { ok: false, code: 'wrong-base', reason: `#${n} does not target the default branch`, wait: false };
+		return { ok: false, code: 'wrong-base', reason: `#${n} does not target the default branch` };
 	}
 	if (state.fromFork && (info?.parent ?? null) !== null) {
 		// Landing a stacked child restacks and pushes its branch, which the queue can't do in a fork.
-		return { ok: false, code: 'wrong-base', reason: `#${n} is stacked on another PR from a fork; retarget it to the default branch once its parent lands`, wait: false };
+		return { ok: false, code: 'wrong-base', reason: `#${n} is stacked on another PR from a fork; retarget it to the default branch once its parent lands` };
 	}
 	if (info) {
 		const own = stopper(info);
-		if (own) return { ok: false, code: 'stack-broken', reason: own, wait: false };
+		if (own) return { ok: false, code: 'stack-broken', reason: own };
 		for (let p = info.parent; p !== null; ) {
 			const up = analysis.prs.get(p);
 			if (!up) break;
@@ -218,8 +211,7 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 				return {
 					ok: false,
 					code: 'parent-not-ready',
-					reason: `The stack under #${n} is broken at #${p}`,
-					wait: true
+					reason: `The stack under #${n} is broken at #${p}`
 				};
 			}
 			p = up.parent;
@@ -673,8 +665,7 @@ export function planRedBatch(input: {
 					admission: {
 						ok: false,
 						code: 'parent-not-ready',
-						reason: queued.has(p) ? `Stacked on #${p}, which can't be batched yet` : `Stacked on #${p}, which isn't merged or queued; queue #${p} first`,
-						wait: true
+						reason: queued.has(p) ? `Stacked on #${p}, which can't be batched yet` : `Stacked on #${p}, which isn't merged or queued; queue #${p} first`
 					}
 				});
 				return null;

@@ -1,5 +1,5 @@
 // The queue as both planners see it: a list of stacks of queued PRs, in the order the queue takes
-// them, and the queued PRs that can't go yet, with why.
+// them, and the queued PRs that can't go yet, with what someone must do about it.
 //
 // A stack is a tree of queued PRs joined by their open parents; a lone PR is a stack of one. It is
 // taken as one unit by both planners: one by one tests the head stack, and a batch is filled with
@@ -44,8 +44,6 @@ export interface Held {
 	pr: number;
 	code: HoldCode;
 	reason: string;
-	/** It will be ready by itself (else someone must act). */
-	wait: boolean;
 	/** The held PR below this one that holds it, or null when the reason is its own. */
 	cause: number | null;
 }
@@ -53,9 +51,7 @@ export interface Held {
 export interface QueueModel {
 	/** In the order the queue takes them. */
 	stacks: QueueStack[];
-	/** Held, and will be ready by itself (checks running, a draft, a parent not queued yet). */
-	waiting: Held[];
-	/** Held until someone acts (failed checks, approval, a conflict). */
+	/** Held until someone acts: a draft, failed checks, approval, a conflict, a parent to queue. */
 	attention: Held[];
 }
 
@@ -74,17 +70,16 @@ export function queueModel(input: QueueModelInput): QueueModel {
 		return RANK[x.priority] - RANK[y.priority] || (x.position ?? 0) - (y.position ?? 0) || x.enqueuedAt - y.enqueuedAt || a - b;
 	};
 
-	// Each PR's own reason to wait, if any.
-	const own = new Map<number, { code: HoldCode; reason: string; wait: boolean }>();
+	// Each PR's own reason to be held, if any.
+	const own = new Map<number, { code: HoldCode; reason: string }>();
 	for (const n of entries.keys()) {
-		const a = input.admission(n);
 		const problem = input.problems?.get(n);
-		if (!a.ok && !a.wait) own.set(n, { code: a.code, reason: a.reason, wait: false });
-		else if (problem) own.set(n, { ...problem, wait: false });
-		else if (!a.ok) own.set(n, { code: a.code, reason: a.reason, wait: true });
+		const a = problem ? null : input.admission(n);
+		if (problem) own.set(n, problem);
+		else if (a && !a.ok) own.set(n, { code: a.code, reason: a.reason });
 		else {
 			const p = parentOf(n);
-			if (p !== null && !entries.has(p) && !inflight.has(p)) own.set(n, { code: 'parent-not-queued', reason: `Stacked on #${p}, which isn't queued; queue #${p} first`, wait: true });
+			if (p !== null && !entries.has(p) && !inflight.has(p)) own.set(n, { code: 'parent-not-queued', reason: `Stacked on #${p}, which isn't queued; queue #${p} first` });
 		}
 	}
 
@@ -98,7 +93,6 @@ export function queueModel(input: QueueModelInput): QueueModel {
 		return below;
 	};
 
-	const waiting: Held[] = [];
 	const attention: Held[] = [];
 	const free: number[] = [];
 	for (const n of [...entries.keys()].sort(byOrder)) {
@@ -110,10 +104,10 @@ export function queueModel(input: QueueModelInput): QueueModel {
 		}
 		const c = mine ?? own.get(cause!)!;
 		const held: Held = mine
-			? { pr: n, code: mine.code, reason: mine.reason, wait: mine.wait, cause: null }
-			: { pr: n, code: 'parent-held', reason: `Waits for #${cause}: ${lowerFirst(c.reason)}`, wait: c.wait, cause };
-		// What holds a PR decides where it waits: by itself, or for someone.
-		(c.wait ? waiting : attention).push(held);
+			? { pr: n, code: mine.code, reason: mine.reason, cause: null }
+			: { pr: n, code: 'parent-held', reason: `Waits for #${cause}: ${lowerFirst(c.reason)}`, cause };
+		// Every hold waits for someone: the PR's author, or whoever queues its parent.
+		attention.push(held);
 	}
 
 	// Stacks of the free PRs: a free PR whose parent is free joins its parent's stack.
@@ -146,7 +140,7 @@ export function queueModel(input: QueueModelInput): QueueModel {
 	});
 	const place = (s: QueueStack) => Math.min(...s.members.map((m) => entries.get(m)!.position ?? 0));
 	stacks.sort((a, b) => RANK[a.priority] - RANK[b.priority] || place(a) - place(b) || a.enqueuedAt - b.enqueuedAt || a.root - b.root);
-	return { stacks, waiting, attention };
+	return { stacks, attention };
 }
 
 export interface FillResult {
@@ -209,7 +203,7 @@ export function planNextBatch(input: PlanInput & { conflicts?: Map<number, strin
 	for (const s of model.stacks) for (const m of s.members) effectivePriority.set(m, s.priority);
 	return {
 		...fill,
-		held: [...model.waiting, ...model.attention].map((h) => ({ pr: h.pr, admission: { ok: false, code: h.code, reason: h.reason, wait: h.wait } })),
+		held: model.attention.map((h) => ({ pr: h.pr, admission: { ok: false, code: h.code, reason: h.reason } })),
 		effectivePriority
 	};
 }
@@ -218,7 +212,7 @@ export function planNextBatch(input: PlanInput & { conflicts?: Map<number, strin
 export function plannedAdmission(input: Pick<PlanInput, 'states' | 'analysis' | 'config'>): (pr: number) => Admission {
 	return (n) => {
 		const s = input.states.get(n);
-		return s ? admit(s, input.analysis, input.config) : { ok: false, code: 'ci-pending', reason: `#${n} has not been fetched yet`, wait: true };
+		return s ? admit(s, input.analysis, input.config) : { ok: false, code: 'not-fetched', reason: `#${n} has not been fetched yet` };
 	};
 }
 
@@ -230,13 +224,12 @@ export interface BoardItem {
 	position: number;
 	enqueuedAt: number;
 	/** What the planner recorded when it held the PR, while still current. */
-	hold: { code: HoldCode; wait: boolean; reason: string } | null;
+	hold: { code: HoldCode; reason: string } | null;
 	message: string | null;
 }
 
 export interface QueueBoard {
 	stacks: Array<{ root: number; on: number | null; priority: Priority; rows: Array<{ pr: number; depth: number; parent: number | null }> }>;
-	waiting: Held[];
 	attention: Held[];
 }
 
@@ -255,9 +248,9 @@ export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight
 	const admission = (n: number): { ok: true } | Hold => {
 		const i = byPr.get(n)!;
 		if (i.status !== 'queued') return { ok: true };
-		if (i.hold) return { ok: false, code: i.hold.code, reason: i.hold.reason, wait: i.hold.wait };
+		if (i.hold) return { ok: false, code: i.hold.code, reason: i.hold.reason };
 		// Held without a planner's hold: deferred behind PRs it conflicts with.
-		if (i.message) return { ok: false, code: 'deferred', reason: i.message, wait: true };
+		if (i.message) return { ok: false, code: 'deferred', reason: i.message };
 		return { ok: true };
 	};
 	const model = queueModel({
@@ -281,7 +274,6 @@ export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight
 				})
 			};
 		}),
-		waiting: model.waiting,
 		attention: model.attention
 	};
 }

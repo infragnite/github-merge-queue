@@ -1624,7 +1624,7 @@ class Tick {
 					store.setDeferredFor(i.id, still);
 					db.updateQueueItemStatus(i.id, 'queued', deferredReason(still));
 				}
-				deferred.set(i.pr_number, { ok: false, code: 'deferred', reason: deferredReason(still), wait: true });
+				deferred.set(i.pr_number, { ok: false, code: 'deferred', reason: deferredReason(still) });
 				return false;
 			}
 			if (behind.length) {
@@ -1634,14 +1634,17 @@ class Tick {
 			return true;
 		});
 		if (waiting.length === 0) return 'idle';
-		const queue: QueueEntry[] = [...waiting, ...this.items().filter((i) => deferred.has(i.pr_number))].map((i) => ({
+		// PRs in conflict stay in the queue model too (held, with the conflict), so what is stacked
+		// on them says the parent conflicts rather than that it isn't queued.
+		const conflicted = new Map(this.items().filter((i) => i.status === 'conflict').map((i) => [i.pr_number, i.error_message ?? 'Merge conflict']));
+		const queue: QueueEntry[] = [...waiting, ...this.items().filter((i) => deferred.has(i.pr_number) || conflicted.has(i.pr_number))].map((i) => ({
 			pr: i.pr_number,
 			enqueuedAt: sqliteMs(i.created_at),
 			position: i.position,
 			priority: ((i as QueueItem & { priority?: Priority }).priority ?? 'normal') as Priority
 		}));
 		const states = new Map<number, PRState>();
-		for (const e of queue) if (!deferred.has(e.pr)) states.set(e.pr, await this.state(e.pr));
+		for (const e of queue) if (!deferred.has(e.pr) && !conflicted.has(e.pr)) states.set(e.pr, await this.state(e.pr));
 		// On a red default branch, batches of PRs not yet tried there run side by side on it (not
 		// stacked) until one passes: that batch carries a fix and lands. When no untried PR can be
 		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
@@ -1655,7 +1658,7 @@ class Tick {
 			if (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha)) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
 			plan = planRedBatch({
-				queue: queue.filter((e) => !deferred.has(e.pr)),
+				queue: queue.filter((e) => !deferred.has(e.pr) && !conflicted.has(e.pr)),
 				states,
 				analysis,
 				config: settings.config,
@@ -1664,17 +1667,18 @@ class Tick {
 			});
 		} else {
 			if (opts.urgentOnly && settings.mode === 'serial') return 'idle';
-			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode, held: deferred });
+			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode, held: deferred, conflicts: conflicted });
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
 			if (opts.urgentOnly && !plan.express) return 'idle';
 		}
 		for (const h of opts.urgentOnly ? [] : plan.held) {
 			const it = this.item(h.pr);
-			if (!it) continue;
-			const { code, wait, reason } = h.admission;
+			// A PR in conflict keeps its status and message: it is held for that.
+			if (!it || it.status !== 'queued') continue;
+			const { code, reason } = h.admission;
 			if (it.error_message !== reason) db.updateQueueItemStatus(it.id, 'queued', reason);
-			store.setHold(it.id, { code, wait, reason });
+			store.setHold(it.id, { code, reason });
 		}
 		if (!plan.batch) return 'idle';
 		const below = red || opts.urgentOnly ? [] : active.flatMap((b) => b.members);

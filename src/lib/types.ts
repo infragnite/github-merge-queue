@@ -44,8 +44,8 @@ export interface QueueItem {
 
 /** A queue row as the repository page gets it. */
 export interface ViewItem extends QueueItem {
-	/** The planner's hold on a queued PR: true when it waits by itself, false when it needs someone. */
-	holdWait: boolean | null;
+	/** The planner holds this queued PR back, for the reason in its message. */
+	held: boolean;
 	/** It doesn't apply on top of PRs being tested, so it waits for them to land. */
 	deferred?: boolean;
 }

@@ -526,13 +526,11 @@ export function deferredFor(item: { deferred_for?: string | null }): number[] {
 }
 
 /**
- * Why the planner holds a queued PR back, so the dashboard can tell a PR that waits by itself
- * (CI running, parent pending) from one that needs someone. The reason matches the item's
- * error_message while the hold is current.
+ * Why the planner holds a queued PR back, so the dashboard and agents see what must be done.
+ * The reason matches the item's error_message while the hold is current.
  */
 export interface Hold {
 	code: string;
-	wait: boolean;
 	reason: string;
 }
 
