@@ -858,7 +858,11 @@ class Tick {
 	async ciResult(b: BatchRow): Promise<'pending' | 'success' | 'failure'> {
 		const failFast = this.failFast(b);
 		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast });
-		if (r === 'failure' && failFast) await this.d.ci.cancel(b.head_sha).catch(this.bestEffort('ci.cancel'));
+		if (r === 'failure' && failFast)
+			await this.d.ci.cancel(b.head_sha).catch((e) => {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('ci.cancel')(e);
+			});
 		return r;
 	}
 

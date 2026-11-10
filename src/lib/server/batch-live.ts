@@ -4,6 +4,7 @@
 import { env } from '$env/dynamic/private';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import * as github from './github';
 import { baselineCommit, buildBatch, GitRunner } from './batch-builder';
 import { replay } from './rebase';
@@ -70,8 +71,10 @@ export function checkResult(
  */
 export function earlyFailure(
 	required: Array<{ check_suite?: { id: number } }>,
-	jobs: Array<{ status: string; conclusion: string | null; completed_at?: string | null; check_suite?: { id: number } }>,
-	notBefore?: number | null
+	jobs: Array<{ name?: string; status: string; conclusion: string | null; completed_at?: string | null; check_suite?: { id: number } }>,
+	notBefore?: number | null,
+	/** Whether the gate waits for the job of this check run name (see `gateFeeds`); every job when absent. */
+	feeds?: (name: string) => boolean
 ): boolean {
 	const suites = new Set(required.flatMap((r) => (r.check_suite ? [r.check_suite.id] : [])));
 	return jobs.some(
@@ -80,8 +83,43 @@ export function earlyFailure(
 			(j.conclusion === 'failure' || j.conclusion === 'timed_out') &&
 			!!j.check_suite &&
 			suites.has(j.check_suite.id) &&
+			(!feeds || (j.name !== undefined && feeds(j.name))) &&
 			(!notBefore || !j.completed_at || Date.parse(j.completed_at) >= notBefore)
 	);
+}
+
+/**
+ * The jobs a workflow's gate (the job whose name or id is `gate`) waits for, through `needs`,
+ * directly or not, and the gate itself: a predicate on check run names. A job's check runs are
+ * named by its `name` (up to any expression in it: matrix jobs add their values) or its id, and a
+ * reusable workflow's jobs `caller / callee`. Null when the workflow can't be read or has no such
+ * job: nothing is then known to feed the gate.
+ */
+export function gateFeeds(workflow: string, gate: string): ((name: string) => boolean) | null {
+	let doc: unknown;
+	try {
+		doc = parseYaml(workflow);
+	} catch {
+		return null;
+	}
+	const jobs = (doc as { jobs?: Record<string, { name?: unknown; needs?: unknown }> } | null)?.jobs;
+	if (!jobs || typeof jobs !== 'object') return null;
+	const label = (id: string) => {
+		const n = jobs[id]?.name;
+		return typeof n === 'string' ? n.split('${{')[0].trim() || id : id;
+	};
+	const start = Object.keys(jobs).find((id) => id === gate || label(id) === gate);
+	if (!start) return null;
+	const closure = new Set<string>();
+	const visit = (id: string) => {
+		if (closure.has(id) || !jobs[id]) return;
+		closure.add(id);
+		const needs = jobs[id].needs;
+		for (const n of typeof needs === 'string' ? [needs] : Array.isArray(needs) ? needs : []) if (typeof n === 'string') visit(n);
+	};
+	visit(start);
+	const prefixes = [...closure].map(label);
+	return (name) => prefixes.some((p) => name === p || name.startsWith(`${p} (`) || name.startsWith(`${p} /`) || (name.startsWith(p) && p !== name && /[\s(]/.test(name[p.length] ?? '')));
 }
 
 /** A fetch or push gives up after this long. */
@@ -180,6 +218,19 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 	const mirror = new Mirror(repo);
 	const ci = (): CISettings => getQueueSettings(repo.id).ci;
 	const dispatchRef = () => ci().dispatchRef || repo.default_branch;
+	// What the required check waits for, read from the workflow file in the tested commit, by its blob.
+	const gates = new Map<string, ((name: string) => boolean) | null>();
+	const gateAt = (sha: string) => {
+		const path = `${sha}:.github/workflows/${ci().workflow}`;
+		const blob = mirror.git.run(['rev-parse', '--verify', '-q', path], { allowFail: true });
+		if (blob.code !== 0 || !blob.out) return null;
+		const key = `${blob.out}\0${ci().requiredCheck}`;
+		if (!gates.has(key)) {
+			const file = mirror.git.run(['cat-file', 'blob', blob.out], { allowFail: true });
+			gates.set(key, file.code === 0 ? gateFeeds(file.out, ci().requiredCheck) : null);
+		}
+		return gates.get(key)!;
+	};
 
 	return {
 		repo,
@@ -202,7 +253,10 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				const required = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
 				const r = checkResult(required, notBefore);
 				if (r !== 'pending' || !opts?.failFast || !required.length) return r;
-				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore) ? 'failure' : 'pending';
+				// Only a job the required check waits for can decide it early; unknown, then no early stop.
+				const feeds = gateAt(headSha);
+				if (!feeds) return r;
+				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore, feeds) ? 'failure' : 'pending';
 			},
 			cancel: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);

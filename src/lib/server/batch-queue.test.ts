@@ -69,6 +69,8 @@ class World {
 	slowReads = new Map<string, number>();
 	/** Each result read: the head and whether it asked to fail fast. */
 	resultReads: { head: string; failFast: boolean }[] = [];
+	/** Cancels and re-runs, in order, as `cancel <head>` and `rerun <head>`. */
+	ciOps: string[] = [];
 	/** Called as each PR is about to be merged (before GitHub checks its head). */
 	beforeMerge: (n: number) => void = () => {};
 
@@ -135,6 +137,7 @@ class World {
 				},
 				cancel: async (head) => {
 					this.cancelled.push(head);
+					this.ciOps.push(`cancel ${head}`);
 				},
 				refreshCaches: async () => {
 					this.cacheRefreshes++;
@@ -146,6 +149,7 @@ class World {
 						return 'wait';
 					}
 					this.reruns.set(head, (this.reruns.get(head) ?? 0) + 1);
+					this.ciOps.push(`rerun ${head}`);
 					this.ciPendingOnce.add(head);
 					return 'rerun';
 				}
@@ -1477,7 +1481,11 @@ describe('stopping a red run at its first failed job', () => {
 		world.breakingFiles.add('x-breaks-master.txt');
 		await run(60);
 		expect(world.merged).toEqual([1, 3]);
-		expect(world.reruns.get(world.started[0].head)).toBe(1);
+		const head = world.started[0].head;
+		expect(world.reruns.get(head)).toBe(1);
+		// It stopped early (read with fail-fast, cancelled), and only then was re-run.
+		expect(world.resultReads.some((r) => r.head === head && r.failFast)).toBe(true);
+		expect(world.ciOps.filter((o) => o.endsWith(head)).slice(0, 2)).toEqual([`cancel ${head}`, `rerun ${head}`]);
 	});
 });
 
