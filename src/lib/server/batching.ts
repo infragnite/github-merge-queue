@@ -633,11 +633,11 @@ export function planBisection(input: {
 			continue;
 		}
 		// What passed before goes in one half, so it can land without what never did. A fork splits
-		// along its paths: one runs, and the other only once it is known (they share their root, so
-		// both passing at once would waste a run); otherwise at a prefix.
+		// along its paths, which can run side by side: the group failed, so (barring an interaction)
+		// at most one path passes and lands, and the other keeps narrowing. Otherwise at a prefix.
 		const evidence = byEvidence(g);
 		const fork = evidence ? null : forkSplit(g, parentOf);
-		let { left: a, right: b, independent } = evidence ?? (fork ? { ...fork, independent: false } : splitPoint(g, parentOf));
+		let { left: a, right: b, independent } = evidence ?? (fork ? { ...fork, independent: true } : splitPoint(g, parentOf));
 		// Never where the split keeps what passed apart from what never did: that pool lands first.
 		if (!evidence && !fork && !independent) {
 			// The prefix would run alone. Where another branch of it waits outside the group, untested
