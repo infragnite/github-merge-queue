@@ -78,7 +78,8 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 			position: i.position,
 			enqueuedAt: Date.parse(i.created_at.replace(' ', 'T') + (i.created_at.includes('Z') ? '' : 'Z')),
 			hold: hold ? { code: hold.code as HoldCode, reason: hold.reason } : null,
-			message: queueItems[k].error_message
+			message: queueItems[k].error_message,
+			after: deferredFor(i as typeof i & { deferred_for?: string | null })
 		};
 	});
 

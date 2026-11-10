@@ -226,10 +226,12 @@ export interface BoardItem {
 	/** What the planner recorded when it held the PR, while still current. */
 	hold: { code: HoldCode; reason: string } | null;
 	message: string | null;
+	/** The PRs ahead it conflicts with and waits for to land, when deferred. */
+	after?: number[];
 }
 
 export interface QueueBoard {
-	stacks: Array<{ root: number; on: number | null; priority: Priority; rows: Array<{ pr: number; depth: number; parent: number | null }> }>;
+	stacks: Array<{ root: number; on: number | null; priority: Priority; rows: Array<{ pr: number; depth: number; parent: number | null; after?: number[] }> }>;
 	attention: Held[];
 }
 
@@ -248,9 +250,10 @@ export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight
 	const admission = (n: number): { ok: true } | Hold => {
 		const i = byPr.get(n)!;
 		if (i.status !== 'queued') return { ok: true };
+		// Deferred behind PRs it conflicts with: nobody can do anything about it, so it is in line,
+		// after them. A message without a planner's hold is such a deferral too.
+		if (i.hold?.code === 'deferred' || (!i.hold && i.message)) return { ok: true };
 		if (i.hold) return { ok: false, code: i.hold.code, reason: i.hold.reason };
-		// Held without a planner's hold: deferred behind PRs it conflicts with.
-		if (i.message) return { ok: false, code: 'deferred', reason: i.message };
 		return { ok: true };
 	};
 	const model = queueModel({
@@ -270,7 +273,8 @@ export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight
 				rows: s.members.map((pr) => {
 					const parent = s.parentOf.get(pr) ?? null;
 					depth.set(pr, parent === null ? 0 : depth.get(parent)! + 1);
-					return { pr, depth: depth.get(pr)!, parent };
+					const after = byPr.get(pr)?.after ?? [];
+					return { pr, depth: depth.get(pr)!, parent, ...(after.length ? { after } : {}) };
 				})
 			};
 		}),
