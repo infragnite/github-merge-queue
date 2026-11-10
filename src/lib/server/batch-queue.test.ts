@@ -1055,6 +1055,19 @@ describe('batch queue runtime', () => {
 		]);
 	});
 
+	test('a push while held for the same reason gets the status on the new head, and no new comment', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		await run(2);
+		const first = git.sha('pr1');
+		git.commit('pr1', 'still working on it');
+		await run(2);
+		const on = (sha: string) => world.prStatuses.filter((x) => x.sha === sha && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(on(first)).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+		expect(on(git.sha('pr1'))).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+		expect(world.comments.map((c) => c.pr)).toEqual([1]);
+	});
+
 	test('a deferral that comes back after the author pushed is commented on again', async () => {
 		pr(1);
 		world.hold = () => true;
