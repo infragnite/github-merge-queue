@@ -501,6 +501,37 @@ describe('bisection', () => {
 		expect(planBisection({ runs, remaining: [3, 4], masterTree: 'm1', parentOf: none })).toMatchObject({ start: [[3, 4]], done: false });
 	});
 
+	test('a half that fails early waits for its other half: that one may land and move the default branch', () => {
+		const runs: BisectRun[] = [
+			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [1, 2], baseTree: 'm0', result: 'pending' },
+			{ context: [], members: [3, 4], baseTree: 'm0', result: 'failure' }
+		];
+		const none = () => null;
+		const idle = { kind: 'step', eject: [], start: [], requeue: [], done: false };
+		// [3, 4] is to blame, but nothing starts while [1, 2] runs: not with a free slot, not with many.
+		expect(planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: none, slots: 2 })).toEqual(idle);
+		expect(planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: none, slots: 4 })).toEqual(idle);
+		expect(planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: none })).toEqual(idle);
+		// [1, 2] passed and lands; then [3, 4] splits on the branch it landed on.
+		runs[1].result = 'success';
+		expect(planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: none, slots: 2 })).toEqual({ kind: 'land', run: 1, prs: [1, 2] });
+		expect(planBisection({ runs, remaining: [3, 4], masterTree: 'm1', parentOf: none, slots: 2 })).toMatchObject({ start: [[3], [4]], done: false });
+	});
+
+	test('a PR that failed alone is ejected while other runs go on, but nothing new starts', () => {
+		const runs: BisectRun[] = [
+			{ context: [], members: [1, 2, 3, 4], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [1, 2], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [3, 4], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [1], baseTree: 'm0', result: 'failure' },
+			{ context: [], members: [2], baseTree: 'm0', result: 'pending' }
+		];
+		const r = planBisection({ runs, remaining: [1, 2, 3, 4], masterTree: 'm0', parentOf: () => null, slots: 4 });
+		expect(r).toMatchObject({ kind: 'step', start: [], done: false });
+		expect(r.kind === 'step' && r.eject.map((e) => e.pr)).toEqual([1]);
+	});
+
 	test('runs from before landing as it goes (on top of a passing context) are taken as they are', () => {
 		// An older bisection tested [3, 4] on top of [1, 2]: its failure still points at 3, 4.
 		const runs: BisectRun[] = [
@@ -558,10 +589,10 @@ describe('bisection', () => {
 		expect(plan()).toMatchObject({ start: [[9], [1, 2], [3, 4], [5, 6], [7, 8]] });
 		expect(plan(1)).toMatchObject({ start: [[9]] });
 		expect(plan(3)).toMatchObject({ start: [[9], [1, 2], [3, 4]] });
-		// A run going takes its slot.
+		// While a run goes, nothing starts beside it, even with a slot to spare: it may land.
 		runs.push({ context: [], members: [9], baseTree: 'm1', result: 'pending' });
 		expect(plan(1)).toMatchObject({ start: [], done: false });
-		expect(plan(2)).toMatchObject({ start: [[1, 2]] });
+		expect(plan(2)).toMatchObject({ start: [], done: false });
 	});
 
 	test('batch 13 on krusty: with one slot, one run, all that passed pooled in it', () => {
