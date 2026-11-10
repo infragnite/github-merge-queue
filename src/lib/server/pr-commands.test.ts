@@ -272,6 +272,50 @@ describe('acknowledging', () => {
 	});
 });
 
+describe('replies never name their own PR', () => {
+	const own = (pr: number) => new RegExp(`#${pr}(?!\\d)`);
+
+	test('not in any command’s reply, done or refused, nor in the reasons it passes on', async () => {
+		store.updateQueueSettings(repo.id, { mode: 'batch' });
+		deps.parents = { 2: 1 };
+		// #1 is in batch #1, so the batch number and the PR number are the same.
+		api.enqueue(repo, writer, pull(1), {});
+		batchOf([1]);
+		api.enqueue(repo, writer, pull(3), {});
+		const held = item(3)!;
+		db.updateQueueItemStatus(held.id, 'queued', '#3 has changes requested');
+		store.setHold(held.id, { code: 'changes-requested', reason: '#3 has changes requested' });
+		api.enqueue(repo, writer, pull(4), {});
+		eject(4, '#4 failed CI in mq/batch-1');
+		deps.open.delete(5);
+		const bodies = ['/mq queue', '/mq queue --priority urgent', '/mq dequeue', '/mq retry', '/mq try', '/mq status', '/mq help', '/mq nope', '/mq queue --priority asap'];
+		let total = 0;
+		for (const pr of [1, 2, 3, 4, 5, 7]) {
+			for (const b of bodies) {
+				cmd.resetCommandLimits();
+				const before = deps.replies.length;
+				await run(b, 'mia', pr);
+				for (const [on, body] of deps.replies.slice(before)) {
+					total++;
+					expect(on).toBe(pr);
+					expect(body, `${b} on #${pr}`).not.toMatch(own(pr));
+				}
+			}
+		}
+		deps.tryError = new Error('#7 does not apply on main: conflict in a.ts');
+		await run('/mq try', 'mia', 7);
+		expect(deps.replies.at(-1)![1]).not.toMatch(own(7));
+		expect(total).toBeGreaterThan(30);
+	});
+
+	test('other PRs are still named', async () => {
+		deps.parents = { 2: 1 };
+		api.enqueue(repo, writer, pull(2), {});
+		await run('/mq status', 'rae', 2);
+		expect(deps.replies[0][1]).toMatch(/Queue #1\b/);
+	});
+});
+
 describe('who may do what', () => {
 	test('the commenter’s role on the repository decides, as on the API', async () => {
 		expect(await run('/mq status', 'rae')).toMatchObject({ ok: true });
@@ -322,14 +366,14 @@ describe('/mq queue', () => {
 		await run('/mq queue', 'dev', 1);
 		await run('/mq queue', 'dev', 2);
 		expect(await run('/mq queue', 'dev', 1)).toMatchObject({ ok: false });
-		expect(deps.replies[0][1]).toMatch(/already queued/);
+		expect(deps.replies[0][1]).toMatch(/This PR is already queued/);
 		expect(queued()).toEqual([1, 2]);
 	});
 
 	test('a closed PR is refused', async () => {
 		deps.open.delete(5);
 		expect(await run('/mq queue', 'dev', 5)).toMatchObject({ ok: false });
-		expect(deps.replies[0][1]).toMatch(/#5 is not open/);
+		expect(deps.replies[0][1]).toMatch(/This PR is not open/);
 		expect(queued()).toEqual([]);
 	});
 
@@ -351,7 +395,7 @@ describe('/mq dequeue', () => {
 
 	test('a PR not in the queue is refused', async () => {
 		expect(await run('/mq dequeue', 'dev', 4)).toMatchObject({ ok: false });
-		expect(deps.replies[0][1]).toMatch(/#4 is not queued/);
+		expect(deps.replies[0][1]).toMatch(/This PR is not queued/);
 	});
 
 	test('a PR being tested in a batch stays, and the reply says why', async () => {
@@ -392,7 +436,7 @@ describe('/mq retry', () => {
 
 	test('a PR the queue never threw out is refused, pointing to /mq queue', async () => {
 		expect(await run('/mq retry', 'dev', 3)).toMatchObject({ ok: false });
-		expect(deps.replies[0][1]).toMatch(/hasn't been removed from the queue by a failure/);
+		expect(deps.replies[0][1]).toMatch(/^Not removed from the queue by a failure/m);
 		expect(deps.replies[0][1]).toMatch(/`\/mq queue`/);
 		expect(queued()).toEqual([]);
 	});
@@ -411,7 +455,7 @@ describe('/mq retry', () => {
 		api.enqueue(repo, writer, pull(2), {});
 		expect(await run('/mq retry', 'dev', 2)).toMatchObject({ ok: true });
 		expect(queued()).toEqual([1, 2]);
-		expect(deps.replies[0][1]).toMatch(/already in the queue.*position 2/s);
+		expect(deps.replies[0][1]).toMatch(/^Already in the queue.*position 2/ms);
 		expect(deps.woke).toBe(1);
 	});
 
@@ -420,7 +464,7 @@ describe('/mq retry', () => {
 		eject(5);
 		deps.open.delete(5);
 		expect(await run('/mq retry', 'dev', 5)).toMatchObject({ ok: false });
-		expect(deps.replies[0][1]).toMatch(/#5 is not open/);
+		expect(deps.replies[0][1]).toMatch(/This PR is not open/);
 		expect(queued()).toEqual([]);
 	});
 });
@@ -432,7 +476,7 @@ describe('/mq try', () => {
 		batchMode();
 		expect(await run('/mq try', 'dev', 4)).toMatchObject({ ok: true, reaction: '+1' });
 		expect(deps.tries).toEqual([4]);
-		expect(deps.replies[0][1]).toMatch(/mq\/try-4-1700000000000/);
+		expect(deps.replies[0][1]).toMatch(/^Started a try run on top of `main`, on branch `mq\/try-4-1700000000000`/m);
 	});
 
 	test('needs the queue in batch mode', async () => {
@@ -446,10 +490,10 @@ describe('/mq try', () => {
 		batchMode();
 		deps.tryError = new Error('#4 does not apply on main: conflict in a.ts');
 		expect(await run('/mq try', 'dev', 4)).toMatchObject({ ok: false });
-		expect(deps.replies[0][1]).toMatch(/does not apply on main: conflict in a.ts/);
+		expect(deps.replies[0][1]).toMatch(/This PR does not apply on main: conflict in a.ts/);
 		deps.tryError = new Error('#4 comes from a fork; a writer must approve its head first');
 		await run('/mq try', 'dev', 4);
-		expect(deps.replies[1][1]).toMatch(/comes from a fork/);
+		expect(deps.replies[1][1]).toMatch(/This PR comes from a fork/);
 	});
 
 	test('an unexpected failure is not shown in the comment', async () => {
@@ -472,7 +516,7 @@ describe('/mq status', () => {
 	test('a PR not in the queue says so, and how to queue it', async () => {
 		await run('/mq status', 'rae', 3);
 		const body = deps.replies[0][1];
-		expect(body).toMatch(/#3 is not in the merge queue/);
+		expect(body).toMatch(/^Not in the merge queue/m);
 		expect(body).toMatch(/`\/mq queue`/);
 		expect(hidden(body)).toMatchObject({ pr: 3, queue: null, nextActions: [] });
 	});
@@ -482,7 +526,7 @@ describe('/mq status', () => {
 		api.enqueue(repo, writer, pull(2), { priority: 'low' });
 		await run('/mq status', 'rae', 2);
 		const body = deps.replies[0][1];
-		expect(body).toMatch(/position 2 of 2/);
+		expect(body).toMatch(/^In the merge queue: position 2 of 2/m);
 		expect(body).toMatch(/low priority/);
 		expect(body).toMatch(/queued/);
 		expect(body).toContain('https://mq.example.test/repos/acme/r');
@@ -493,7 +537,7 @@ describe('/mq status', () => {
 		api.enqueue(repo, writer, pull(1), {});
 		const b = batchOf([1]);
 		await run('/mq status', 'rae', 1);
-		expect(deps.replies[0][1]).toMatch(new RegExp(`testing in batch #${b.number}`));
+		expect(deps.replies[0][1]).toMatch(new RegExp(`testing in batch ${b.number}\\b`));
 	});
 
 	test('a held PR gives the hold code, the reason and what to do', async () => {
@@ -503,9 +547,9 @@ describe('/mq status', () => {
 		store.setHold(it.id, { code: 'draft', reason: '#2 is a draft' });
 		await run('/mq status', 'rae', 2);
 		const body = deps.replies[0][1];
-		expect(body).toMatch(/Held \(`draft`\): #2 is a draft/);
+		expect(body).toMatch(/Held \(`draft`\): This PR is a draft/);
 		expect(body).toMatch(/mark-ready/);
-		expect(hidden(body)).toMatchObject({ hold: { code: 'draft', reason: '#2 is a draft' }, nextActions: [{ do: 'mark-ready' }] });
+		expect(hidden(body)).toMatchObject({ hold: { code: 'draft', reason: 'This PR is a draft' }, nextActions: [{ do: 'mark-ready' }] });
 	});
 
 	test('a child waiting for a parent nobody queued is told to queue it', async () => {
