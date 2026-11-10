@@ -10,6 +10,8 @@ const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
 export interface ViewItem extends QueueItem {
 	/** The planner's hold on a queued PR: true when it waits by itself, false when it needs someone. */
 	holdWait: boolean | null;
+	/** It doesn't apply on top of PRs being tested, so it waits for them to land. */
+	deferred?: boolean;
 }
 
 /** A PR's place in a stack, for the chip on its row. */
@@ -119,17 +121,17 @@ export function queueView(input: QueueViewInput): QueueView {
 		else rest.push(i);
 	}
 
-	// Batch mode takes urgent PRs first, then the oldest; one by one keeps the queue's own order.
+	// Batch mode takes urgent PRs first, then the queue's own order; one by one keeps that order.
 	const ordered =
 		mode === 'batch'
-			? [...rest].sort((a, b) => RANK[PRIORITY(a)] - RANK[PRIORITY(b)] || enqueued(a) - enqueued(b) || a.pr_number - b.pr_number)
+			? [...rest].sort((a, b) => RANK[PRIORITY(a)] - RANK[PRIORITY(b)] || a.position - b.position || enqueued(a) - enqueued(b) || a.pr_number - b.pr_number)
 			: [...rest].sort((a, b) => a.position - b.position);
 	const rows = ordered.map((item, k) => ({ item, position: k + 1, stack: places.get(item.pr_number) ?? null }));
 
 	if (mode !== 'batch') return { attention, inFlight: [], upNext: [], rows, express: false };
 
 	// The next batch, roughly: the planner also holds back PRs whose CI or parent isn't ready.
-	const ready = rows.filter((r) => r.item.status === 'queued' && r.item.holdWait === null);
+	const ready = rows.filter((r) => r.item.status === 'queued' && r.item.holdWait === null && !r.item.deferred);
 	const express = ready.length > 0 && PRIORITY(ready[0].item) === 'urgent';
 	const upNext = express
 		? ready.filter((r) => PRIORITY(r.item) === 'urgent').slice(0, limits.expressMax)

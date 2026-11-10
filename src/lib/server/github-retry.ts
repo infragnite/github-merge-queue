@@ -45,7 +45,8 @@ export function mergeResultFromData(data: {
 // network errors, JSON parse failures, etc. are re-thrown so callers can
 // distinguish "GitHub said no" from "we couldn't reach GitHub".
 export function mergeResultFromError(e: unknown): MergeResult {
-	if (!(e instanceof GitHubError)) throw e;
+	// A rate limit is not GitHub refusing the merge: the caller waits for the reset (RateLimitedError).
+	if (!(e instanceof GitHubError) || 'until' in e) throw e;
 	return { merged: false, sha: null, message: e.message };
 }
 

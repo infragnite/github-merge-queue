@@ -8,6 +8,7 @@ import {
 } from './github-retry';
 import type { StackGitHub } from './stack-source';
 import { Installations, ownerOfPath } from './installations';
+import { budgetLow, budgetOf, checkBudget, noteResponse } from './rate-limit';
 
 const API = 'https://api.github.com';
 
@@ -19,13 +20,26 @@ function headers(token: string) {
 	};
 }
 
-async function ghFetch(token: string, path: string, init?: RequestInit) {
+/** `budget` names the rate-limit budget the call spends (an installation's); it is tracked when given. */
+async function ghFetch(token: string, path: string, init?: RequestInit, budget?: string) {
+	// REST and GraphQL spend separate budgets.
+	if (budget) budget = `${budget}:${path === '/graphql' ? 'graphql' : 'core'}`;
+	if (budget) checkBudget(budget);
 	const res = await fetch(`${API}${path}`, {
 		...init,
 		headers: { ...headers(token), ...init?.headers }
 	});
-	if (res.status === 204) return null;
+	if (res.status === 204) {
+		if (budget) noteResponse(budget, res.status, res.headers, '');
+		return null;
+	}
 	const body = await res.json().catch(() => ({}));
+	if (budget) {
+		const graphqlLimited = Array.isArray(body?.errors) && body.errors.some((e: { type?: string }) => e?.type === 'RATE_LIMITED');
+		const message = graphqlLimited ? body.errors.map((e: { message?: string }) => e.message).join('; ') : (body.message ?? '');
+		const limited = noteResponse(budget, res.status, res.headers, message, Date.now(), graphqlLimited);
+		if (limited) throw limited;
+	}
 	if (!res.ok) {
 		// A missing App permission names only the symptom; the call says which permission it is.
 		const missingPermission = res.status === 403 && /not accessible by integration/i.test(body.message ?? '');
@@ -87,7 +101,15 @@ async function withInstallation<T>(installationId: number, call: (token: string)
 /** Calls `path` as the installation on the account it acts on; a path that names none passes `owner`. */
 async function ghFetchAsApp(path: string, init?: RequestInit, owner: string | null = ownerOfPath(path)) {
 	if (!owner) throw new Error(`No account to pick an installation token for: ${path}`);
-	return withInstallation(await installations.idFor(owner), (token) => ghFetch(token, path, init));
+	const id = await installations.idFor(owner);
+	return withInstallation(id, (token) => ghFetch(token, path, init, `installation:${id}`));
+}
+
+/** The App's rate-limit budget on `owner`'s installation, as GitHub last reported it. */
+export async function rateLimitOf(owner: string) {
+	// The REST budget: it is what the queue and the dashboard mostly spend.
+	const key = `installation:${await installations.idFor(owner)}:core`;
+	return { ...budgetOf(key), low: budgetLow(key) };
 }
 
 // --- User-token operations (login flow only, token is discarded after) ---

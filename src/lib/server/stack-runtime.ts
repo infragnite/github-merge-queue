@@ -25,6 +25,22 @@ export function currentStackAnalysis(repo: RepoRef): Promise<StackAnalysis> {
 	return analysisMemo(repo.id, 'stacks', () => analyzeRepoStacks(repo));
 }
 
+const shown = new Map<number, { at: number; value: StackAnalysis }>();
+/** A dashboard refresh reuses an analysis this young even after a PR changed. */
+const DASHBOARD_MIN_AGE_MS = 60_000;
+
+/**
+ * The analysis for the dashboard: the queue's own, but at most one fresh one a minute, and none
+ * while GitHub's rate-limit budget is low (the last one is shown instead).
+ */
+export async function dashboardStackAnalysis(repo: RepoRef & { owner: string }): Promise<StackAnalysis> {
+	const last = shown.get(repo.id);
+	if (last && (Date.now() - last.at < DASHBOARD_MIN_AGE_MS || (await github.rateLimitOf(repo.owner).catch(() => null))?.low)) return last.value;
+	const value = await currentStackAnalysis(repo);
+	shown.set(repo.id, { at: Date.now(), value });
+	return value;
+}
+
 /** Why the queue must not merge this PR yet, or null. */
 export async function stackMergeBlocker(repo: RepoRef, prNumber: number): Promise<string | null> {
 	const analysis = await analyzeRepoStacks(repo);

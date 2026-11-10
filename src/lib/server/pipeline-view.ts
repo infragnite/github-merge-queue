@@ -3,7 +3,8 @@
 
 import * as github from './github';
 import * as store from './batch-store';
-import { currentStackAnalysis } from './stack-runtime';
+import { dashboardStackAnalysis } from './stack-runtime';
+import { tickError, type TickError } from './tick-errors';
 import { batchCard, isRunning, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
 import type { StackAnalysis } from './stacks';
 
@@ -16,24 +17,38 @@ export interface PipelineView {
 	active: BatchCard[];
 	recent: BatchCard[];
 	error: string | null;
+	/** Set while GitHub's rate limit holds the queue: when calls resume (epoch ms). */
+	rateLimitedUntil: number | null;
+	/** The queue's last failed step, until a step succeeds. */
+	tickError: TickError | null;
+	/** Batch heads whose CI progress could not be read, with why (the last known progress is shown). */
+	progressErrors: Record<string, string>;
 }
 
-/** Job counts change by the minute; a dashboard refreshing every 10s reuses them briefly. */
-const PROGRESS_TTL_MS = 20_000;
+/**
+ * Job counts change by the minute; dashboards refreshing every 10s share one lookup per minute.
+ * While the rate-limit budget is low, or a lookup fails, the last counts are shown.
+ */
+const PROGRESS_TTL_MS = 60_000;
 const progressCache = new Map<string, { at: number; value: CIProgress }>();
+const progressErrors = new Map<string, string>();
 
-async function progressFor(repo: RepoRef, sha: string): Promise<CIProgress | null> {
+async function progressFor(repo: RepoRef, sha: string, low: boolean): Promise<CIProgress | null> {
 	const key = `${repo.owner}/${repo.name}@${sha}`;
 	const hit = progressCache.get(key);
-	if (hit && Date.now() - hit.at < PROGRESS_TTL_MS) return hit.value;
+	if (hit && (low || Date.now() - hit.at < PROGRESS_TTL_MS)) return hit.value;
+	if (low) return null;
 	try {
 		const value = summarizeJobs(await github.actionsJobsForSha(repo.owner, repo.name, sha));
 		progressCache.set(key, { at: Date.now(), value });
-		for (const [k, v] of progressCache) if (Date.now() - v.at > 10 * PROGRESS_TTL_MS) progressCache.delete(k);
+		progressErrors.delete(key);
+		for (const [k, v] of progressCache) if (Date.now() - v.at > 60 * PROGRESS_TTL_MS) progressCache.delete(k);
 		return value;
 	} catch (e) {
-		console.warn(`[batches] ${repo.owner}/${repo.name}: CI progress for ${sha.slice(0, 8)} failed: ${e instanceof Error ? e.message : e}`);
-		return null;
+		const why = e instanceof Error ? e.message : String(e);
+		console.warn(`[batches] ${repo.owner}/${repo.name}: CI progress for ${sha.slice(0, 8)} failed: ${why}`);
+		progressErrors.set(key, why);
+		return hit?.value ?? null;
 	}
 }
 
@@ -49,17 +64,18 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 	const bisection = new Map(active.map((b) => [b.id, store.getBisectRuns(b.id)]));
 
 	const running = [...active, ...sideRuns, ...[...bisection.values()].flat()].filter(isRunning);
+	const budget = await github.rateLimitOf(repo.owner).catch(() => null);
 	const progress = new Map<string, CIProgress>();
 	await Promise.all(
 		running.map(async (b) => {
-			const p = await progressFor(repo, b.head_sha);
+			const p = await progressFor(repo, b.head_sha, !!budget?.low);
 			if (p) progress.set(b.head_sha, p);
 		})
 	);
 
 	let analysis: StackAnalysis | null = null;
 	try {
-		analysis = await currentStackAnalysis(repo);
+		analysis = await dashboardStackAnalysis(repo);
 	} catch {
 		// Logged by the stacks section; batches still show, just without stack nesting.
 	}
@@ -72,6 +88,14 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 		master: master ? { sha: master.sha, state: master.state, since: master.since } : null,
 		active: [...sideRuns, ...active].map(card),
 		recent: recent.map(card),
-		error: null
+		error: null,
+		rateLimitedUntil: budget?.blockedUntil ?? null,
+		tickError: tickError(repo.id),
+		progressErrors: Object.fromEntries(
+			running.flatMap((b) => {
+				const why = progressErrors.get(`${repo.owner}/${repo.name}@${b.head_sha}`);
+				return why ? [[b.head_sha, why]] : [];
+			})
+		)
 	};
 }

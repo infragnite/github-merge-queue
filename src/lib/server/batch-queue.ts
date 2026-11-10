@@ -33,6 +33,7 @@ import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
 import type { StackAnalysis } from './stacks';
 import type { QueueItem } from '$lib/types';
+import { RateLimitedError } from './rate-limit';
 import { emitEvent, type QueueEventKind } from './events';
 
 /** A PR as the queue sees it; `PRState`'s readiness fields come from `QueueGitHub.readiness`. */
@@ -56,6 +57,11 @@ export type Readiness = Pick<PRState, 'ciGreen' | 'approvedShas' | 'changesReque
 export interface QueueGitHub {
 	defaultBranchSha(): Promise<string>;
 	pr(n: number): Promise<LivePR>;
+	/**
+	 * Every open PR, in one paginated list: a tick reads its PRs from it instead of one call per
+	 * PR, which with a long queue would spend GitHub's hourly rate limit in minutes.
+	 */
+	openPRs?(): Promise<LivePR[]>;
 	/** CI and reviews of a PR at `headSha` (the expensive part, fetched only when needed). */
 	/** `needApprovals`: fetch reviews even when the config doesn't require approval (a fork PR). */
 	readiness(n: number, headSha: string, author: string, opts?: { needApprovals?: boolean; fresh?: boolean }): Promise<Readiness>;
@@ -153,6 +159,8 @@ function sqliteMs(ts: string): number {
 
 class Tick {
 	private readonly prs = new Map<number, LivePR>();
+	/** This tick's list of open PRs, read once (null: not read yet, or stale after a landing). */
+	private open: Map<number, LivePR> | null = null;
 	private readonly ready = new Map<string, Readiness>();
 	private analysisCache: StackAnalysis | null = null;
 
@@ -179,8 +187,24 @@ class Tick {
 		}
 	}
 
+	/** Forgets what this tick read about PRs (after a landing moved them). */
+	forgetPRs() {
+		this.prs.clear();
+		this.open = null;
+	}
+
+	/**
+	 * A PR as GitHub has it. Unless `fresh`, it comes from this tick's one list of open PRs; a PR
+	 * not in it (closed or merged) is fetched alone. `fresh` fetches it alone, for a check right
+	 * before acting on it.
+	 */
 	async pr(n: number, fresh = false): Promise<LivePR> {
 		let p = fresh ? undefined : this.prs.get(n);
+		if (!p && !fresh && this.d.github.openPRs) {
+			this.open ??= new Map((await this.d.github.openPRs()).map((x) => [x.pr, x]));
+			p = this.open.get(n);
+			if (p) this.prs.set(n, p);
+		}
 		if (!p) {
 			p = await this.d.github.pr(n);
 			this.prs.set(n, p);
@@ -321,7 +345,7 @@ class Tick {
 	}
 
 	/** Every active batch from `from` on is rebuilt later; their PRs go back to the queue. */
-	async supersede(batches: BatchRow[]) {
+	async supersede(batches: BatchRow[], why = 'a batch below it failed or master moved') {
 		for (const b of batches) {
 			store.setBatchStatus(b.id, 'superseded');
 			this.requeue(b.members);
@@ -329,7 +353,7 @@ class Tick {
 			for (const n of b.members) {
 				if (this.item(n)?.status !== 'queued') continue;
 				await this.d.github
-					.setPRStatus(b.heads[n], 'pending', short(`Back in line: ${b.branch} was dropped (a batch below it failed or master moved); it is rebuilt`))
+					.setPRStatus(b.heads[n], 'pending', short(`Back in line: ${b.branch} was dropped (${why}); it is rebuilt`))
 					.catch(this.bestEffort('github.setPRStatus'));
 			}
 		}
@@ -461,6 +485,8 @@ class Tick {
 			await this.d.github.pushBranch(branch, result.headSha);
 			await this.d.ci.start(branch, baseSha, result.headSha, prs);
 		} catch (e) {
+			// A rate limit passes by itself: the branch intent stays for the sweep, and the tick stops until the reset.
+			if (e instanceof RateLimitedError) throw e;
 			// A push or dispatch failure is a setup problem (permissions, workflow trigger): stop and say so.
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			this.pause(`Could not start a batch of ${prs.map((n) => `#${n}`).join(' ')}: ${e instanceof Error ? e.message : e}`);
@@ -592,9 +618,11 @@ class Tick {
 					this.event(n, 'merged', { batch: intent.batchId });
 				}
 			} else if (p.state === 'open') {
-				await this.d.github
-					.setPRStatus(p.headSha, 'pending', short('Waiting for the merge queue (landing was interrupted)'))
-					.catch(this.bestEffort('github.setPRStatus'));
+				// A rate limit keeps the intent, so the green status is taken back after the reset.
+				await this.d.github.setPRStatus(p.headSha, 'pending', short('Waiting for the merge queue (landing was interrupted)')).catch((e) => {
+					if (e instanceof RateLimitedError) throw e;
+					this.bestEffort('github.setPRStatus')(e);
+				});
 			}
 		}
 		if (merged.length && batch && src) {
@@ -614,7 +642,7 @@ class Tick {
 			this.log(`recovered an interrupted landing of batch ${batch.id}: merged ${merged.map((n) => `#${n}`).join(' ')}`);
 		}
 		store.setLandingIntent(this.repoId, null);
-		this.prs.clear();
+		this.forgetPRs();
 	}
 
 	/** The default branch after the last merge of a landing that stopped part way. */
@@ -658,6 +686,7 @@ class Tick {
 				try {
 					await this.d.github.pushHead(p.headRef, r.head, head);
 				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
 					this.pause(`Could not push the restacked #${n}: ${e instanceof Error ? e.message : e}`);
 					return false;
 				}
@@ -678,6 +707,12 @@ class Tick {
 				await this.d.github.setPRStatus(head, 'success', short(`Tested in ${src.branch}`), { url: await this.runLink(src) });
 				m = await this.mergeWithRetry(n, p.title, head);
 			} catch (e) {
+				if (e instanceof RateLimitedError) {
+					// The landing intent stays (the caller does not clear it on a throw): after the reset,
+					// `recoverLanding` records what merged and takes the green status back from the rest.
+					await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (GitHub rate limit)`)).catch(this.bestEffort('github.setPRStatus'));
+					throw e;
+				}
 				m = { merged: false, message: e instanceof Error ? e.message : String(e) };
 			}
 			if (!m.merged) {
@@ -717,7 +752,7 @@ class Tick {
 		store.setMasterHealth(this.repoId, { sha: master, tree: expected, state: verifying ? 'verifying' : 'green', since: this.d.now() });
 		// What this tick read before the landing (stacks, PR bases and heads) is stale now.
 		this.analysisCache = null;
-		this.prs.clear();
+		this.forgetPRs();
 		return true;
 	}
 
@@ -850,6 +885,7 @@ class Tick {
 			await this.d.github.pushBranch(branch, head);
 			await this.d.ci.start(branch, masterSha, head, []);
 		} catch (e) {
+			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			this.pause(`Could not start a check of ${this.d.repo.default_branch} alone: ${e instanceof Error ? e.message : e}`);
 			return;
@@ -1079,7 +1115,8 @@ class Tick {
 		// would test is stale, and evidence against it is not evidence against the new head. It goes back in line.
 		const changed: number[] = [];
 		for (const n of remaining) {
-			const p = await this.pr(n, true).catch((e) => {
+			// From this tick's list of open PRs: one call for all of them, not one per PR.
+			const p = await this.pr(n).catch((e) => {
 				if ((e as { status?: number })?.status === 404) return null;
 				throw e;
 			});
@@ -1229,6 +1266,8 @@ class Tick {
 		} catch (e) {
 			// Never ran: not evidence against its PRs. The run is planned again after a resume.
 			store.setBatchStatus(run.id, 'cancelled');
+			// After a rate limit the branch intent stays, so the sweep deletes the branch after the reset.
+			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			store.branchPushed(this.repoId, branch);
 			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}`);
@@ -1459,6 +1498,7 @@ class Tick {
 		const queue: QueueEntry[] = waiting.map((i) => ({
 			pr: i.pr_number,
 			enqueuedAt: sqliteMs(i.created_at),
+			position: i.position,
 			priority: ((i as QueueItem & { priority?: Priority }).priority ?? 'normal') as Priority
 		}));
 		const states = new Map<number, PRState>();
@@ -1578,6 +1618,31 @@ export async function retireBatches(deps: QueueDeps): Promise<void> {
 		store.setBatchStatus(base.id, 'superseded');
 		store.clearMasterHealth(deps.repo.id);
 	}
+}
+
+/**
+ * Cancels a batch in the pipeline, or one being bisected: its CI and its bisection runs' CI stop,
+ * and its PRs that are still in the queue go back in line at their places, blamed for nothing.
+ * The batches built on top of it are rebuilt too. Call it under the repo lock.
+ */
+export async function cancelBatch(deps: QueueDeps, id: number, by: string): Promise<{ requeued: number[]; rebuilt: number[] }> {
+	const t = new Tick(deps);
+	// First, so a landing a crash interrupted is settled before the batch is judged.
+	await t.recoverInterrupted();
+	const b = store.getBatch(id);
+	if (!b || b.repo_id !== deps.repo.id || b.kind !== 'batch') throw new Error(`Batch ${id} not found`);
+	const active = store.getActiveBatches(deps.repo.id);
+	if (!active.some((x) => x.id === id)) throw new Error(`Batch ${id} is ${b.status}; only a batch being tested or bisected can be cancelled`);
+	const waiting = (x: BatchRow) => x.members.filter((n) => t.item(n)?.status === 'checking');
+	const requeued = waiting(b);
+	const above = active.filter((x) => x.id > id);
+	await t.supersede([b], `batch ${id} was cancelled by ${by}`);
+	store.setBatchStatus(id, 'cancelled');
+	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled');
+	await t.supersede(above, `batch ${id} below it was cancelled`);
+	t.event(null, 'cancelled', { batch: id, by, requeued, rebuilt: above.map((x) => x.id) });
+	t.log(`batch ${id} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
+	return { requeued, rebuilt: above.map((x) => x.id) };
 }
 
 /** Starts a one-off CI run of a PR on top of the default branch (the `try` API). */

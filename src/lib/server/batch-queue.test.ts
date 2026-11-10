@@ -3,13 +3,14 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
-const { tickBatchQueue, startTry, retireBatches, recoverInterrupted } = await import('./batch-queue');
+const { tickBatchQueue, startTry, retireBatches, recoverInterrupted, cancelBatch } = await import('./batch-queue');
 const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
 import { GitSandbox } from './testing/git-sandbox';
 import { writeFileSync } from 'node:fs';
 import type { LivePR, QueueDeps } from './batch-queue';
+import { RateLimitedError } from './rate-limit';
 
 let git: GitSandbox;
 let repo: { id: number; owner: string; name: string; default_branch: string };
@@ -43,6 +44,10 @@ class World {
 	rerunWaits = 0;
 	/** PRs whose merge GitHub refuses (e.g. a ruleset the queue doesn't satisfy). */
 	refuseMerge = new Set<number>();
+	/** GitHub answers merges with a rate-limit refusal. */
+	rateLimited = false;
+	openListCalls = 0;
+	prCalls = 0;
 	/** PRs GitHub answers 404 for. */
 	deleted = new Set<number>();
 	/** PRs opened from a fork. */
@@ -65,6 +70,25 @@ class World {
 		const f = this.files(sha);
 		if ([...this.breakingFiles].some((b) => f.has(b))) return true;
 		return this.conflictPairs.some((pair) => pair.every((p) => f.has(p)));
+	}
+
+	live(n: number): LivePR {
+		if (this.deleted.has(n)) throw Object.assign(new Error('Not Found'), { status: 404 });
+		const p = git.pr(n);
+		const head = p.frozenHead ?? git.sha(p.headRef);
+		return {
+			pr: n,
+			headSha: head,
+			headRef: p.headRef,
+			sameRepo: !this.forks.has(n),
+			draft: false,
+			title: `PR ${n}`,
+			url: `https://example.test/pull/${n}`,
+			authorLogin: 'dev',
+			baseRef: p.baseRef,
+			state: p.state,
+			merged: p.merged
+		};
 	}
 
 	deps(): QueueDeps {
@@ -115,22 +139,16 @@ class World {
 			github: {
 				defaultBranchSha: async () => git.sha('main'),
 				pr: async (n): Promise<LivePR> => {
-					if (this.deleted.has(n)) throw Object.assign(new Error('Not Found'), { status: 404 });
-					const p = git.pr(n);
-					const head = p.frozenHead ?? git.sha(p.headRef);
-					return {
-						pr: n,
-						headSha: head,
-						headRef: p.headRef,
-						sameRepo: !this.forks.has(n),
-						draft: false,
-						title: `PR ${n}`,
-						url: `https://example.test/pull/${n}`,
-						authorLogin: 'dev',
-						baseRef: p.baseRef,
-						state: p.state,
-						merged: p.merged
-					};
+					this.prCalls++;
+					return this.live(n);
+				},
+				openPRs: async () => {
+					this.openListCalls++;
+					return git.prNumbers().flatMap((n) => {
+						if (this.deleted.has(n)) return [];
+						const p = this.live(n);
+						return p.state === 'open' ? [p] : [];
+					});
 				},
 				readiness: async (n, head) => ({
 					ciGreen: !this.ciRed.has(n),
@@ -160,6 +178,7 @@ class World {
 				retargetBase: async (n, base) => git.retarget(n, base),
 				squashMerge: async (n, _title, expected) => {
 					if (this.refuseMerge.has(n)) return { merged: false, message: 'Repository rule violations found' };
+					if (this.rateLimited) throw new RateLimitedError(Date.now() + 60_000, 'API rate limit exceeded');
 					if (git.sha(git.pr(n).headRef) !== expected) return { merged: false, message: 'Head branch was modified' };
 					try {
 						git.merge(n, 'squash');
@@ -954,6 +973,74 @@ describe('batch queue runtime', () => {
 		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1] });
 		world.deleted.add(1);
 		await recoverInterrupted(world.deps());
+		expect(store.getLandingIntent(repo.id)).toBeNull();
+	});
+
+	test('cancelling a bisecting batch stops its runs and puts its PRs back in line, blaming nobody', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		expect(b.status).toBe('bisecting');
+		const runs = world.started.filter((x) => x.branch.includes('-bisect-'));
+		const r = await cancelBatch(world.deps(), b.id, 'anton');
+		expect(r).toEqual({ requeued: [1, 2], rebuilt: [] });
+		expect(store.getBatch(b.id)!.status).toBe('cancelled');
+		expect(store.getBisectRuns(b.id).map((x) => x.status)).toEqual(runs.map(() => 'cancelled'));
+		for (const x of runs) expect(world.cancelled).toContain(x.head);
+		expect(queued()).toEqual([
+			{ pr: 1, status: 'queued' },
+			{ pr: 2, status: 'queued' }
+		]);
+		expect(world.comments).toEqual([]);
+		await expect(cancelBatch(world.deps(), b.id, 'anton')).rejects.toThrow(/only a batch being tested or bisected/);
+	});
+
+	test('cancelling a batch in the pipeline rebuilds the one built on it', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 1, depth: 2, collectWindowMs: 0 } });
+		pr(1);
+		pr(2);
+		world.hold = () => true;
+		await run(3);
+		const [first, second] = store.getActiveBatches(repo.id);
+		expect([first.members, second.members]).toEqual([[1], [2]]);
+		const r = await cancelBatch(world.deps(), first.id, 'anton');
+		expect(r).toEqual({ requeued: [1], rebuilt: [second.id] });
+		expect(store.getBatch(second.id)!.status).toBe('superseded');
+		expect(store.getActiveBatches(repo.id)).toEqual([]);
+		world.hold = () => false;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('a tick reads its PRs from one list of open PRs, not one call per PR', async () => {
+		for (let n = 1; n <= 12; n++) pr(n);
+		world.hold = () => true;
+		await tickBatchQueue(world.deps());
+		expect(store.getActiveBatches(repo.id)).toHaveLength(1);
+		const [lists, calls] = [world.openListCalls, world.prCalls];
+		// a tick with a batch in flight and PRs waiting: the list, and no PR fetched alone
+		await tickBatchQueue(world.deps());
+		expect(world.openListCalls - lists).toBe(1);
+		expect(world.prCalls - calls).toBe(0);
+	});
+
+	test('a rate limit during a landing pauses nothing: the landing is finished after the reset', async () => {
+		pr(1);
+		pr(2);
+		world.rateLimited = true;
+		for (let i = 0; i < 20 && !store.getLandingIntent(repo.id); i++) await tickBatchQueue(world.deps()).catch((e) => expect(e).toBeInstanceOf(RateLimitedError));
+		expect(store.getLandingIntent(repo.id)).not.toBeNull();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([]);
+		// the tested status was taken back, so nobody merges it around the queue meanwhile
+		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr1')).at(-1)?.state).toBe('pending');
+		world.rateLimited = false;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
 		expect(store.getLandingIntent(repo.id)).toBeNull();
 	});
 
