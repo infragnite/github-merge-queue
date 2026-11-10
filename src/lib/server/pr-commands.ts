@@ -139,7 +139,7 @@ export async function runCommand(repo: Repo, deps: CommandDeps, c: PRComment): P
 	} catch (e) {
 		ok = false;
 		if (e instanceof AuthError || e instanceof api.ApiError || e instanceof Refused) {
-			text = e.message;
+			text = unname(e.message, c.pr);
 		} else {
 			console.error(`[commands] ${repo.owner}/${repo.name}#${c.pr} ${command.name}:`, e instanceof Error ? e.message : e);
 			text = `Could not ${command.name === 'try' ? 'start a try run' : `run \`/mq ${command.name}\``}: something went wrong in the merge queue. Try again shortly.`;
@@ -156,6 +156,16 @@ export async function runCommand(repo: Repo, deps: CommandDeps, c: PRComment): P
 		});
 	}
 	return { command: command.name, ok, reaction, reply };
+}
+
+/**
+ * `text` with its own PR, `#n`, said as "this PR": a reply sits on that PR, so it never names it.
+ * For reasons the queue words for any page (refusals, holds, next actions); other PRs stay named.
+ */
+export function unname(text: string, n: number): string {
+	return text
+		.replace(new RegExp(`(?<![\\w#])#${n}(?!\\d)`, 'g'), 'this PR')
+		.replace(/(^|\n|[.:;!?]\s+)this PR/g, '$1This PR');
 }
 
 /** The command's first line, quoted: a reply never starts with `/mq`, so it is never run. */
@@ -196,7 +206,7 @@ async function perform(repo: Repo, deps: CommandDeps, n: number, caller: Caller,
 				if (e instanceof Error && /is not open|does not apply|comes from a fork/.test(e.message)) throw new Refused(e.message);
 				throw e;
 			}
-			return `Started a try run of #${n} on top of \`${repo.default_branch}\`, on branch \`${run.branch}\`. Its CI shows on that branch; nothing is merged.`;
+			return `Started a try run on top of \`${repo.default_branch}\`, on branch \`${run.branch}\`. Its CI shows on that branch; nothing is merged.`;
 		}
 	}
 }
@@ -207,11 +217,11 @@ async function retry(repo: Repo, deps: CommandDeps, n: number, caller: Caller): 
 	const entry = api.queueEntry(repo.id, n);
 	if (entry) {
 		deps.wake();
-		return `#${n} is already in the queue (${where(repo, entry)}). It goes into the next batch once nothing holds it; \`/mq status\` says what does.`;
+		return `Already in the queue (${where(repo, entry)}). It goes into the next batch once nothing holds it; \`/mq status\` says what does.`;
 	}
 	const last = lastEventOf(repo.id, n, ['queued', 'dequeued', 'ejected', 'merged', 'cancelled']);
 	if (last?.kind !== 'ejected') {
-		throw new Refused(`#${n} hasn't been removed from the queue by a failure, so there is nothing to retry. Comment \`/mq queue\` to queue it.`);
+		throw new Refused(`Not removed from the queue by a failure, so there is nothing to retry. Comment \`/mq queue\` to queue it.`);
 	}
 	const queuedBefore = lastEventOf(repo.id, n, ['queued']);
 	const had = PRIORITIES.includes(queuedBefore?.data.priority as Priority) ? (queuedBefore!.data.priority as Priority) : 'normal';
@@ -228,7 +238,7 @@ function waitingCount(repo: Repo): number {
 }
 
 function where(repo: Repo, e: Entry): string {
-	const state = e.batch ? `testing in batch #${e.batch.number}` : e.status;
+	const state = e.batch ? `testing in batch ${e.batch.number}` : e.status;
 	return `position ${e.position} of ${waitingCount(repo)}, ${e.priority} priority, ${state}`;
 }
 
@@ -240,18 +250,20 @@ async function status(repo: Repo, deps: CommandDeps, n: number): Promise<string>
 		console.warn(`[commands] status of #${n}: no stack analysis:`, e instanceof Error ? e.message : e);
 	}
 	const known = analysis?.prs.has(n) ? api.stackState(repo, n, analysis) : null;
-	const entry = known?.queue ?? api.queueEntry(repo.id, n);
+	const found = known?.queue ?? api.queueEntry(repo.id, n);
+	const entry = found && { ...found, lastMessage: found.lastMessage && unname(found.lastMessage, n) };
 	const it = db.getQueueItems(repo.id).find((i) => i.pr_number === n);
-	const hold = it ? store.currentHold(it) : null;
-	const next = known?.nextActions ?? [];
+	const held = it ? store.currentHold(it) : null;
+	const hold = held && { ...held, reason: unname(held.reason, n) };
+	const next = (known?.nextActions ?? []).map((a) => ({ ...a, why: unname(a.why, n) }));
 
 	const lines: string[] = [];
 	if (entry) {
-		lines.push(`#${n} is in the merge queue: ${where(repo, entry)}.`);
+		lines.push(`In the merge queue: ${where(repo, entry)}.`);
 		if (hold) lines.push(`Held (\`${hold.code}\`): ${hold.reason}`);
 		else if (entry.lastMessage) lines.push(`Last message: ${entry.lastMessage}`);
 	} else {
-		lines.push(`#${n} is not in the merge queue. Comment \`/mq queue\` to queue it.`);
+		lines.push(`Not in the merge queue. Comment \`/mq queue\` to queue it.`);
 	}
 	if (next.length) {
 		lines.push('', 'What to do:');
