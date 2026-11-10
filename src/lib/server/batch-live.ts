@@ -76,13 +76,15 @@ export function earlyFailure(
 	/** Whether the gate waits for the job of this check run name (see `gateFeeds`); every job when absent. */
 	feeds?: (name: string) => boolean
 ): boolean {
+	// The gate's own workflow run, once the gate has a check run. Before that (GitHub makes it only
+	// when everything it needs has ended), the gate's workflow says which jobs feed it.
 	const suites = new Set(required.flatMap((r) => (r.check_suite ? [r.check_suite.id] : [])));
+	if (!suites.size && !feeds) return false;
 	return jobs.some(
 		(j) =>
 			j.status === 'completed' &&
 			(j.conclusion === 'failure' || j.conclusion === 'timed_out') &&
-			!!j.check_suite &&
-			suites.has(j.check_suite.id) &&
+			(!suites.size || (!!j.check_suite && suites.has(j.check_suite.id))) &&
 			(!feeds || (j.name !== undefined && feeds(j.name))) &&
 			(!notBefore || !j.completed_at || Date.parse(j.completed_at) >= notBefore)
 	);
@@ -252,8 +254,9 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			result: async (headSha, notBefore, opts) => {
 				const required = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
 				const r = checkResult(required, notBefore);
-				if (r !== 'pending' || !opts?.failFast || !required.length) return r;
+				if (r !== 'pending' || !opts?.failFast) return r;
 				// Only a job the required check waits for can decide it early; unknown, then no early stop.
+				// The gate itself may not exist yet: GitHub makes its check run once its needs end.
 				const feeds = gateAt(headSha);
 				if (!feeds) return r;
 				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore, feeds) ? 'failure' : 'pending';
