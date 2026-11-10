@@ -295,8 +295,23 @@ describe('batch queue runtime', () => {
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('landed');
 	});
 
-	test('a bisection lands the half that passes at once, while the other half is still running', async () => {
+	test('one bisection run at a time: a half that passes lands, and the next run is built on it', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(60);
+		expect(world.merged).toEqual([1, 2, 3]);
+		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own on top of the default branch/) }]);
+		// Never two at once, and nothing tested twice.
+		const bisect = world.started.filter((x) => x.branch.includes('-bisect-')).map((x) => x.prs);
+		expect(bisect).toEqual([[1, 2], [3], [4]]);
+	});
+
+	test('a bisection lands the half that passes at once, while the other half is still running', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false, bisectRuns: 2 } });
 		pr(1);
 		pr(2);
 		pr(3);
@@ -359,7 +374,7 @@ describe('batch queue runtime', () => {
 	});
 
 	test('a batch that failed by flake ejects nobody: its halves pass and land', async () => {
-		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false, bisectRuns: 2 } });
 		pr(1);
 		pr(2);
 		pr(3);
@@ -371,6 +386,20 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([]);
 		// The halves passed side by side; the second ran again on top of the first to land.
 		expect(world.started.map((x) => x.prs)).toEqual([[1, 2, 3, 4], [1, 2], [3, 4], [3, 4]]);
+	});
+
+	test('a batch that failed by flake, one run at a time: each run passes and lands, none is repeated', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4);
+		await tickBatchQueue(world.deps());
+		world.flaky.add(world.started[0].head);
+		await run(40);
+		expect(world.merged).toEqual([1, 2, 3, 4]);
+		expect(world.comments).toEqual([]);
+		expect(world.started.map((x) => x.prs)).toEqual([[1, 2, 3, 4], [1, 2], [3], [4]]);
 	});
 
 	test('a bisection follows the default branch when it moves outside the queue', async () => {

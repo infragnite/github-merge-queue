@@ -1141,7 +1141,9 @@ class Tick {
 			parentOf: await this.parentOf(),
 			// Known green: the base the batch failed on (its failure was only acted on once that was
 			// settled), every tree this bisection landed, and the current branch (ejecting waits for it to settle).
-			trusted: (t) => t === masterTree || t === (runs[0]?.base_tree ?? batch.base_tree) || runs.some((r) => r.status === 'landed' && r.tree_sha === t)
+			trusted: (t) => t === masterTree || t === (runs[0]?.base_tree ?? batch.base_tree) || runs.some((r) => r.status === 'landed' && r.tree_sha === t),
+			// The rest wait their turn: runs side by side share the runners, and of two that pass only one can land as tested.
+			slots: Math.max(1, this.settings().config.bisectRuns)
 		});
 
 		if (plan.kind === 'land') {

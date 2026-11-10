@@ -23,6 +23,7 @@ export const BATCH_FIELDS: SettingField[] = [
 	{ name: 'config.maxBatch', label: 'Batch size', help: 'Most PRs tested together in one batch.', kind: 'number', min: 1 },
 	{ name: 'config.depth', label: 'Batches in flight', help: 'Batches tested at once, each built on the one before it.', kind: 'number', min: 1 },
 	{ name: 'config.expressMax', label: 'Urgent batch size', help: 'Most urgent PRs in an express batch, tested on their own with the next batch built on top.', kind: 'number', min: 1 },
+	{ name: 'config.bisectRuns', label: 'Bisection runs at once', help: 'Runs of a failed batch tested at the same time; the rest wait their turn. More only helps with runners to spare.', kind: 'number', min: 1 },
 	{ name: 'config.collectWindowMs', label: 'Wait for a fuller batch', help: 'How long a partial batch waits for more PRs before it is tested.', kind: 'duration', unitMs: MIN, unit: 'min' },
 	{ name: 'config.ciTimeoutMs', label: 'CI timeout', help: 'A batch with no CI result after this long pauses the queue.', kind: 'duration', unitMs: HOUR, unit: 'h' },
 	{ name: 'config.retryFailed', label: 'Re-run failed jobs once', help: 'Before a failure counts, its failed jobs run again (for flaky tests).', kind: 'boolean' },
