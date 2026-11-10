@@ -207,7 +207,6 @@ export const actions: Actions = {
 			const priority = form.get('priority');
 			if (priority !== 'urgent' && priority !== 'normal' && priority !== 'low') throw new ApiError(400, 'priority must be urgent, normal or low');
 			changeEntry(repo, me, n, { priority });
-			emitEvent(repo.id, n, 'priority', { priority, by: me.login });
 			markDirty(repo.id);
 		}),
 

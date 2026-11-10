@@ -480,14 +480,30 @@ export async function userForToken(token: string): Promise<{ login: string } | n
 }
 
 export async function collaboratorRole(owner: string, repo: string, login: string): Promise<string> {
+	let role: string;
 	try {
 		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
 		// role_name distinguishes maintain and triage; permission only says admin/write/read/none.
 		// A custom repository role has its own name: fall back to the base permission it grants.
 		const known = ['admin', 'maintain', 'write', 'triage', 'read'];
-		return known.includes(data.role_name) ? data.role_name : data.permission || 'none';
+		role = known.includes(data.role_name) ? data.role_name : data.permission || 'none';
 	} catch (e) {
 		if (e instanceof GitHubError && e.status === 404) return 'none';
+		throw e;
+	}
+	// On a public repository GitHub reports read for anyone at all. Read is the queue's access, so
+	// it counts only for collaborators (direct, team, org base permission or owner); everyone else
+	// gets the public page, if the repository has one.
+	return role === 'read' && !(await isCollaborator(owner, repo, login)) ? 'none' : role;
+}
+
+/** Whether `login` is a collaborator of the repository in any way GitHub counts one. */
+export async function isCollaborator(owner: string, repo: string, login: string): Promise<boolean> {
+	try {
+		await ghFetchAsApp(`/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}`);
+		return true;
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return false;
 		throw e;
 	}
 }

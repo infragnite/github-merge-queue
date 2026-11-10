@@ -37,13 +37,16 @@ export interface AuthGitHub {
 export class AuthError extends Error {
 	constructor(
 		readonly status: 401 | 403,
-		message: string
+		message: string,
+		/** The token can't see the repository, or GitHub refused it: answered like an unknown repo. */
+		readonly cantSee = false
 	) {
 		super(message);
 	}
 }
 
-const TTL_MS = 5 * 60 * 1000;
+/** As the web pages: a role taken away on GitHub stops working here within a minute. */
+const TTL_MS = 60 * 1000;
 /** Denials are cached too, so a stranger's token can't make the app spend its rate limit. */
 const DENY_TTL_MS = 60 * 1000;
 const MAX_ENTRIES = 5000;
@@ -94,7 +97,11 @@ export async function resolveCaller(
 	}
 	if (cache.size >= MAX_ENTRIES) {
 		for (const [k, v] of cache) if (v.until <= now) cache.delete(k);
-		if (cache.size >= MAX_ENTRIES) cache.clear();
+		// Still full (many tokens at once): the oldest go, rather than everyone's.
+		for (const k of cache.keys()) {
+			if (cache.size < MAX_ENTRIES * 0.9) break;
+			cache.delete(k);
+		}
 	}
 	const deny = (error: AuthError): never => {
 		cache.set(key, { caller: null, error, until: now + DENY_TTL_MS });
@@ -106,7 +113,7 @@ export async function resolveCaller(
 	// a token scoped to other repos, or without repo scope, doesn't carry its user's rights here.
 	const asCaller = await gh.repoAsCaller(token, owner, repo);
 	const user = await gh.user(token);
-	if (!asCaller) return deny(new AuthError(user ? 403 : 401, user ? `This token can't see ${owner}/${repo}` : 'GitHub did not accept this token'));
+	if (!asCaller) return deny(new AuthError(user ? 403 : 401, user ? `This token can't see ${owner}/${repo}` : 'GitHub did not accept this token', true));
 	// GitHub reports the user's permissions on the repo whatever the token may do, so they bound
 	// nothing by themselves. Only a token shown to carry repo access acts with them beyond read.
 	const tokenRole = minRole(roleFromPermissions(asCaller.permissions), tokenCeiling(token, asCaller.scopes));
