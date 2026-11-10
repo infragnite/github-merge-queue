@@ -64,6 +64,8 @@ class World {
 	holdMasterRuns = false;
 	/** Runs of these PRs keep running while it says so. */
 	hold: (prs: number[]) => boolean = () => false;
+	/** Called as each PR is about to be merged (before GitHub checks its head). */
+	beforeMerge: (n: number) => void = () => {};
 
 	ciFails(sha: string) {
 		if (this.everythingFails) return true;
@@ -177,6 +179,7 @@ class World {
 				},
 				retargetBase: async (n, base) => git.retarget(n, base),
 				squashMerge: async (n, _title, expected) => {
+					this.beforeMerge(n);
 					if (this.refuseMerge.has(n)) return { merged: false, message: 'Repository rule violations found' };
 					if (this.rateLimited) throw new RateLimitedError(Date.now() + 60_000, 'API rate limit exceeded');
 					if (git.sha(git.pr(n).headRef) !== expected) return { merged: false, message: 'Head branch was modified' };
@@ -719,13 +722,49 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 2]);
 	});
 
-	test('a PR pushed to after its batch was built is rebuilt, not landed stale', async () => {
+	test('a PR pushed to after its batch was built is rebuilt, not landed stale; the PRs before it land', async () => {
 		pr(1);
 		pr(2);
 		await tickBatchQueue(world.deps());
 		git.commit('pr2', 'late change');
 		await run();
-		expect(world.started).toHaveLength(2);
+		// #1 lands from the batch; master (#1 alone, never tested so) is checked; #2 is tested as it is now.
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['1,2', 'master', '2']);
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.files('main').has('late-change.txt')).toBe(true);
+	});
+
+	test('a PR pushed to while the PRs before it land: those stay landed, it and the rest are rebuilt, master is checked, no pause', async () => {
+		pr(1);
+		pr(2);
+		pr(3);
+		await tickBatchQueue(world.deps());
+		// #3 is pushed to just as #1 merges: #2 still lands (it is before #3), #3 is retested as it is now.
+		world.beforeMerge = (n) => {
+			if (n === 1) git.commit('pr3', 'late change');
+			world.beforeMerge = () => {};
+		};
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([1, 2, 3]);
+		expect(world.files('main').has('late-change.txt')).toBe(true);
+		// The batch, a check of master alone (it holds #1 #2 without #3, never tested), and #3 again.
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['1,2,3', 'master', '3']);
+	});
+
+	test('a PR pushed to between the check and its merge is not a pause either', async () => {
+		pr(1);
+		pr(2);
+		await tickBatchQueue(world.deps());
+		// Pushed after the queue read #2's head, before GitHub merges it: the merge is refused.
+		world.beforeMerge = (n) => {
+			if (n === 2) {
+				git.commit('pr2', 'late change');
+				world.beforeMerge = () => {};
+			}
+		};
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
 		expect(world.merged).toEqual([1, 2]);
 		expect(world.files('main').has('late-change.txt')).toBe(true);
 	});
