@@ -126,6 +126,24 @@ describe('admission', () => {
 		const bogus: StackIssue = { kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: 'bogus' };
 		expect(admit(ready(2), stacks([1, 2], {}, [bogus]), cfg)).toMatchObject({ code: 'stack-broken' });
 	});
+
+	test("a PR on another PR's branch but not on its latest commit is told to rebase onto it, not that its base is wrong", () => {
+		const off: StackIssue = { kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: "Not on #1's latest commit" };
+		expect(admit(ready(2, { targetsDefault: false }), stacks([1, 2], {}, [off]), cfg)).toEqual({
+			ok: false,
+			code: 'stack-broken',
+			reason: "Not on #1's latest commit"
+		});
+	});
+
+	test("a PR on a broken stack is told where it breaks, without its own number", () => {
+		const issue: StackIssue = { kind: 'parent-rebased', pr: 2, parent: 1, severity: 'blocking', message: 'r' };
+		expect(admit(ready(3), stacks([1, 2, 3], { 2: 1, 3: 2 }, [issue]), cfg)).toEqual({
+			ok: false,
+			code: 'parent-not-ready',
+			reason: 'The stack under it is broken at #2'
+		});
+	});
 });
 
 describe('planning a batch', () => {

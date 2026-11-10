@@ -50,7 +50,7 @@ describe('closedPRReason', () => {
 		github.getBranchSha.mockResolvedValue(null);
 		github.getRecentlyClosedPRs.mockResolvedValue([parent]);
 		const reason = await closedPRReason(repo, child('2026-01-01T12:00:00Z'));
-		expect(reason).toMatch(/closed #2 because its base branch 'a' was deleted \(it was stacked on #1\)/);
+		expect(reason).toMatch(/closed it because its base branch 'a' was deleted \(it was stacked on #1\)/);
 	});
 
 	test('a recorded delete webhook makes it certain', async () => {
@@ -58,7 +58,7 @@ describe('closedPRReason', () => {
 		github.getBranchSha.mockResolvedValue(null);
 		github.getRecentlyClosedPRs.mockResolvedValue([parent]);
 		const reason = await closedPRReason(repo, child(new Date().toISOString()));
-		expect(reason).toMatch(/^GitHub closed #2/);
+		expect(reason).toMatch(/^GitHub closed it because/);
 	});
 
 	test('base still present: a manual close', async () => {
