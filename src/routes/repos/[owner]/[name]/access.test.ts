@@ -151,7 +151,7 @@ describe('who sees the page', () => {
 		expect(d.repo).toEqual({ id: repoId, owner: 'acme', name: 'repo', default_branch: 'main' });
 		const pipe = (await d.pipeline) as Record<string, unknown>;
 		expect(pipe).toMatchObject({ paused: 'The queue is paused', tickError: null, progressErrors: {} });
-		expect(((await d.stacks) as { error: string }).error).not.toMatch(/secret/);
+		expect(((await d.board) as { error: string }).error).not.toMatch(/secret/);
 		for (const i of d.queueItems as Array<Record<string, unknown>>) expect(i).toMatchObject({ queued_by: '', head_sha: null });
 	});
 
@@ -171,7 +171,7 @@ describe('who sees the page', () => {
 		const calls = [github.getRepo, github.getOpenPRs, github.collaboratorRole].map((f) => vi.mocked(f).mock.calls.length);
 		const d = await load(null);
 		await d.pipeline;
-		await d.stacks;
+		await d.board;
 		expect([github.getRepo, github.getOpenPRs, github.collaboratorRole].map((f) => vi.mocked(f).mock.calls.length)).toEqual(calls);
 	});
 

@@ -3,7 +3,7 @@
 import * as db from './db';
 import * as github from './github';
 import { loadStackInput } from './stack-source';
-import { analyzeStacks, detectAutoClose, mergeBlocker, type StackAnalysis } from './stacks';
+import { analyzeStacks, detectAutoClose, type StackAnalysis } from './stacks';
 import { memoByGeneration } from './wake';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
@@ -44,15 +44,6 @@ export async function dashboardStackAnalysis(repo: RepoRef & { owner: string }, 
 	const value = await currentStackAnalysis(repo);
 	shown.set(repo.id, { at: Date.now(), value });
 	return value;
-}
-
-/** Why the queue must not merge this PR yet, or null. */
-export async function stackMergeBlocker(repo: RepoRef, prNumber: number): Promise<string | null> {
-	const analysis = await analyzeRepoStacks(repo);
-	for (const issue of analysis.issues) {
-		if (issue.pr === prNumber) console.log(`[stacks] ${repo.owner}/${repo.name}: ${issue.message}`);
-	}
-	return mergeBlocker(analysis, prNumber);
 }
 
 /**

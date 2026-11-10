@@ -45,7 +45,7 @@ async function admin(params: { owner: string; name: string }, login: string | un
 }
 
 export const actions: Actions = {
-	/** Switches between merging PRs one by one and in batches; leaving batches stops the ones in flight. */
+	/** Switches between merging PRs one by one and in batches; a switch stops the runs in flight. */
 	setMode: async ({ request, params, locals }) => {
 		const a = await admin(params, locals.user?.login, 'modeError');
 		if ('failure' in a) return a.failure;
@@ -57,7 +57,7 @@ export const actions: Actions = {
 			const was = getQueueSettings(repo.id).mode;
 			if (was === mode) return;
 			patchConfig(repo, me, { mode });
-			if (was === 'batch') await retireBatches(liveDeps(repo));
+			await retireBatches(liveDeps(repo));
 			markDirty(repo.id);
 			console.log(`[merge-queue] ${repo.owner}/${repo.name} switched to ${mode} mode by ${me.login}`);
 		});

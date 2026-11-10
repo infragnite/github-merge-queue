@@ -14,7 +14,7 @@
 		{
 			value: 'serial',
 			title: 'One by one',
-			body: 'Each PR is tested on top of the default branch and merged before the next starts. Simple and predictable; the queue moves at one CI run per PR.',
+			body: 'The stack at the head of the queue (a PR, with the queued PRs stacked on it) is tested on top of the default branch and lands before the next starts. A red stack lands its good part. Simple and predictable; the queue moves at one CI run per stack.',
 			order: 'You set the order by dragging PRs in the queue.'
 		},
 		{
@@ -31,7 +31,7 @@
 		const text =
 			to === 'serial'
 				? 'Switch to one by one now? The batches being tested stop, and their PRs go back in line, not marked as failed.'
-				: 'Switch to batches now? The queue then tests PRs together, urgent first, and the order can no longer be dragged.';
+				: 'Switch to batches now? The run being tested stops and its PRs go back in line; the queue then tests PRs together, urgent first, and the order can no longer be dragged.';
 		if (!confirm(text)) return cancel();
 		switching = true;
 		return async ({ update }) => {
@@ -95,7 +95,7 @@
 			{/each}
 		</div>
 		<p class="mt-2 text-xs text-gray-500">
-			A switch takes effect at once, without saving.{data.mode === 'batch' ? ' Switching to one by one stops the batches being tested; their PRs go back in line, not marked as failed.' : ''}
+			A switch takes effect at once, without saving. It stops what is being tested; those PRs go back in line, not marked as failed.
 		</p>
 		{#if form?.modeError}<p class="mt-2 text-sm text-red-600" role="alert">{form.modeError}</p>{/if}
 		{#if form?.modeSaved}<p class="mt-2 text-xs text-green-700" role="status">Switched. The queue works this way from its next step.</p>{/if}
@@ -118,7 +118,7 @@
 			<section id={group.id} class="scroll-mt-4 rounded-xl border border-border-subtle bg-surface-raised p-4 sm:p-5" aria-labelledby="{group.id}-title">
 				<h2 id="{group.id}-title" class="text-base font-semibold text-gray-900">{group.title}</h2>
 				<p class="mt-0.5 text-sm text-gray-500">
-					{group.help}{group.id !== 'ci' && data.mode !== 'batch' ? ' Used when merging in batches.' : ''}
+					{group.help}{group.id === 'batching' && data.mode !== 'batch' ? ' Used when merging in batches.' : ''}
 				</p>
 				<fieldset class="mt-3 divide-y divide-border-subtle" disabled={!data.canEdit || saving}>
 					<legend class="sr-only">{group.title}</legend>

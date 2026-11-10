@@ -6,7 +6,6 @@ import {
 	type BisectRun,
 	DEFAULT_BATCH_CONFIG,
 	descendants,
-	planNextBatch,
 	splitPoint,
 	forkSplit,
 	type BatchConfig,
@@ -14,6 +13,7 @@ import {
 	type Priority,
 	type QueueEntry
 } from './batching';
+import { planNextBatch } from './queue-model';
 import { analyzeStacks, type PRStackInfo, type StackAnalysis, type StackIssue } from './stacks';
 import { GitSandbox } from './testing/git-sandbox';
 
@@ -204,7 +204,7 @@ describe('stacks in batches', () => {
 		const p = plan([entry(2, 90), entry(4, 80)], s());
 		expect(p.batch).toEqual([4]);
 		expect(p.held).toEqual([
-			{ pr: 2, admission: expect.objectContaining({ code: 'parent-not-ready', reason: expect.stringMatching(/queue #1 first/) }) }
+			{ pr: 2, admission: expect.objectContaining({ code: 'parent-not-queued', reason: "Stacked on #1, which isn't queued; queue #1 first" }) }
 		]);
 	});
 

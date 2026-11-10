@@ -125,6 +125,17 @@ export type AdmissionCode =
 	| 'parent-not-ready'
 	| 'wrong-base';
 
+/** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
+export type HoldCode = AdmissionCode | 'conflict' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
+
+export interface Hold {
+	ok: false;
+	code: HoldCode;
+	reason: string;
+	/** True when the PR stays queued and may become ready by itself. */
+	wait: boolean;
+}
+
 export type Admission =
 	| { ok: true }
 	| {
@@ -235,7 +246,7 @@ export interface Plan {
 	/** When nothing is started only to collect a fuller batch: when to plan again. */
 	waitUntil: number | null;
 	/** Queued PRs that cannot go in a batch now, and why. */
-	held: { pr: number; admission: Exclude<Admission, { ok: true }> }[];
+	held: { pr: number; admission: Hold }[];
 	/** The priority each queued PR was planned at, after stack inheritance. */
 	effectivePriority: Map<number, Priority>;
 }
@@ -244,114 +255,6 @@ export interface Plan {
 function openParent(analysis: StackAnalysis, n: number): number | null {
 	const p = analysis.prs.get(n)?.parent ?? null;
 	return p !== null && analysis.prs.has(p) ? p : null;
-}
-
-/** Picks the next batch: urgent first, then in line order; stacks in parent-before-child order. */
-export function planNextBatch(input: PlanInput): Plan {
-	const { now, queue, states, analysis, inflight, config } = input;
-	const held: Plan['held'] = [];
-	const admitted = new Map<number, QueueEntry>();
-	for (const e of queue) {
-		const s = states.get(e.pr);
-		const a: Admission = s
-			? admit(s, analysis, config)
-			: { ok: false, code: 'ci-pending', reason: `#${e.pr} has not been fetched yet`, wait: true };
-		if (a.ok) admitted.set(e.pr, e);
-		else held.push({ pr: e.pr, admission: a });
-	}
-
-	// A PR whose open parent is neither in flight nor admitted can't be tested yet.
-	const flying = new Set(inflight.flat());
-	const queued = new Set(queue.map((e) => e.pr));
-	const reachable = new Map<number, boolean>();
-	const canReach = (n: number, seen = new Set<number>()): boolean => {
-		const cached = reachable.get(n);
-		if (cached !== undefined) return cached;
-		if (seen.has(n)) return false;
-		seen.add(n);
-		const p = openParent(analysis, n);
-		const ok = p === null || flying.has(p) || (admitted.has(p) && canReach(p, seen));
-		reachable.set(n, ok);
-		return ok;
-	};
-	for (const n of [...admitted.keys()]) {
-		if (canReach(n)) continue;
-		const p = openParent(analysis, n)!;
-		admitted.delete(n);
-		held.push({
-			pr: n,
-			admission: {
-				ok: false,
-				code: 'parent-not-ready',
-				reason: queued.has(p)
-					? `Stacked on #${p}, which can't be batched yet`
-					: `Stacked on #${p}, which isn't merged or queued; queue #${p} first`,
-				wait: true
-			}
-		});
-	}
-
-	// Priority inheritance: an urgent child lifts the unmerged stack under it.
-	const effective = new Map<number, Priority>();
-	for (const e of queue) effective.set(e.pr, e.priority);
-	for (const e of admitted.values()) {
-		let p = openParent(analysis, e.pr);
-		while (p !== null && admitted.has(p)) {
-			if (PRIORITY_RANK[e.priority] < PRIORITY_RANK[effective.get(p)!]) effective.set(p, e.priority);
-			p = openParent(analysis, p);
-		}
-	}
-
-	const result = (batch: number[] | null, express = false, waitUntil: number | null = null): Plan => ({
-		batch,
-		express,
-		waitUntil,
-		held,
-		effectivePriority: effective
-	});
-
-	if (inflight.length >= config.depth || admitted.size === 0) return result(null);
-
-	const ordered = [...admitted.values()].sort(byQueueOrder((e) => PRIORITY_RANK[effective.get(e.pr)!]));
-	// An urgent PR gets an express batch of urgent PRs only, and the next batch is built on top of
-	// it: alone, it gets a clean result in one run (in a big batch it is split with its neighbours
-	// for several rounds), and the batch on top of it loses nothing when it passes.
-	const express = effective.get(ordered[0].pr) === 'urgent';
-	const candidates = express ? ordered.filter((e) => e.priority === 'urgent') : ordered;
-	const limit = express ? config.expressMax : config.maxBatch;
-
-	const batch: number[] = [];
-	const inBatch = new Set<number>();
-	/** Unmerged ancestors not yet in flight or in the batch, bottom-up, ending with n. */
-	const chain = (n: number): number[] => {
-		const out = [n];
-		let p = openParent(analysis, n);
-		while (p !== null && !flying.has(p) && !inBatch.has(p)) {
-			out.unshift(p);
-			p = openParent(analysis, p);
-		}
-		return out;
-	};
-	for (const e of candidates) {
-		if (inBatch.has(e.pr)) continue;
-		const c = chain(e.pr);
-		// An express batch takes a whole urgent stack even past its size limit.
-		const room = express && batch.length === 0 ? Math.max(limit, c.length) : limit;
-		if (batch.length + c.length > room) continue;
-		for (const n of c) {
-			batch.push(n);
-			inBatch.add(n);
-		}
-		if (batch.length >= room) break;
-	}
-	if (batch.length === 0) return result(null);
-
-	if (!express && batch.length < config.maxBatch && config.collectWindowMs > 0) {
-		const oldest = Math.min(...batch.map((n) => admitted.get(n)!.enqueuedAt));
-		const due = oldest + config.collectWindowMs;
-		if (now < due) return result(null, false, due);
-	}
-	return result(batch, express);
 }
 
 /** Every open PR stacked (directly or not) on one of `prs`. */

@@ -22,13 +22,14 @@ import {
 	admit,
 	planBisection,
 	descendants,
-	planNextBatch,
 	planRedBatch,
+	type Hold,
 	type PRState,
 	type Priority,
 	type QueueEntry,
 	type TestGroup
 } from './batching';
+import { planNextBatch } from './queue-model';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
 import type { StackAnalysis } from './stacks';
@@ -259,7 +260,7 @@ class Tick {
 	}
 
 	settings() {
-		return store.getQueueSettings(this.repoId);
+		return planningSettings(store.getQueueSettings(this.repoId));
 	}
 
 	/** The Actions runs of a queue branch; a link that works before the run exists and after the branch is deleted. */
@@ -1611,6 +1612,8 @@ class Tick {
 				.filter((i) => carried.has(i.pr_number) || (i.status === 'queued' && !i.error_message))
 				.map((i) => i.pr_number)
 		);
+		// Deferred PRs stay in the queue model (held), so what is stacked on them waits for them.
+		const deferred = new Map<number, Hold>();
 		const waiting = this.items().filter((i) => {
 			if (i.status !== 'queued') return false;
 			const behind = store.deferredFor(i as QueueItem & { deferred_for?: string | null });
@@ -1621,6 +1624,7 @@ class Tick {
 					store.setDeferredFor(i.id, still);
 					db.updateQueueItemStatus(i.id, 'queued', deferredReason(still));
 				}
+				deferred.set(i.pr_number, { ok: false, code: 'deferred', reason: deferredReason(still), wait: true });
 				return false;
 			}
 			if (behind.length) {
@@ -1630,14 +1634,14 @@ class Tick {
 			return true;
 		});
 		if (waiting.length === 0) return 'idle';
-		const queue: QueueEntry[] = waiting.map((i) => ({
+		const queue: QueueEntry[] = [...waiting, ...this.items().filter((i) => deferred.has(i.pr_number))].map((i) => ({
 			pr: i.pr_number,
 			enqueuedAt: sqliteMs(i.created_at),
 			position: i.position,
 			priority: ((i as QueueItem & { priority?: Priority }).priority ?? 'normal') as Priority
 		}));
 		const states = new Map<number, PRState>();
-		for (const e of queue) states.set(e.pr, await this.state(e.pr));
+		for (const e of queue) if (!deferred.has(e.pr)) states.set(e.pr, await this.state(e.pr));
 		// On a red default branch, batches of PRs not yet tried there run side by side on it (not
 		// stacked) until one passes: that batch carries a fix and lands. When no untried PR can be
 		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
@@ -1651,7 +1655,7 @@ class Tick {
 			if (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha)) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
 			plan = planRedBatch({
-				queue,
+				queue: queue.filter((e) => !deferred.has(e.pr)),
 				states,
 				analysis,
 				config: settings.config,
@@ -1659,7 +1663,8 @@ class Tick {
 				live: new Set(this.items().map((i) => i.pr_number))
 			});
 		} else {
-			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config });
+			if (opts.urgentOnly && settings.mode === 'serial') return 'idle';
+			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode, held: deferred });
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
 			if (opts.urgentOnly && !plan.express) return 'idle';
@@ -1678,11 +1683,19 @@ class Tick {
 	}
 }
 
+/**
+ * The settings the runtime plans with. One by one is the batch runtime with one run in flight,
+ * started as soon as the head stack can go.
+ */
+function planningSettings(s: ReturnType<typeof store.getQueueSettings>): ReturnType<typeof store.getQueueSettings> {
+	return s.mode === 'serial' ? { ...s, config: { ...s.config, depth: 1, collectWindowMs: 0 } } : s;
+}
+
 export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	const t = new Tick(deps);
 	const settings = store.getQueueSettings(deps.repo.id);
 	await t.recoverInterrupted();
-	if (settings.pausedReason || settings.mode !== 'batch') return;
+	if (settings.pausedReason) return;
 	await t.reconcile();
 	await t.advanceTries();
 	await t.advanceMaster();
@@ -1729,7 +1742,7 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	}
 	// Don't plan new work on top of a bisection: its base is about to change.
 	if (active.some((b) => b.status === 'bisecting')) return;
-	const config = store.getQueueSettings(deps.repo.id).config;
+	const config = planningSettings(store.getQueueSettings(deps.repo.id)).config;
 	if (config.autoRebase && (await t.restack())) return;
 	if (!t.items().some((i) => i.status === 'queued')) return;
 	if (!active.length) {

@@ -109,11 +109,11 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 				const b = await body();
 				const visibility = b.publicView === true ? await api.repoVisibility(() => github.getRepo(repo.owner, repo.name)) : null;
 				// Under the repo lock, so a running tick finishes before the mode flips and none
-				// starts a batch after the retire.
+				// starts a run after the retire.
 				const r = await withRepoLock(repo.id, async () => {
 					const was = getQueueSettings(repo.id).mode;
 					const out = api.patchConfig(repo, caller, b, visibility);
-					if (was === 'batch' && getQueueSettings(repo.id).mode !== 'batch') await retireBatches(liveDeps(repo));
+					if (getQueueSettings(repo.id).mode !== was) await retireBatches(liveDeps(repo));
 					return out;
 				});
 				return json(r);

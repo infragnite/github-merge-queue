@@ -183,16 +183,6 @@ export function getAllQueueItems(repoId: number): QueueItem[] {
 		.all(repoId) as QueueItem[];
 }
 
-export function getActiveQueueItem(repoId: number): QueueItem | undefined {
-	return getDb()
-		.prepare(
-			`SELECT * FROM queue_items
-		 WHERE repo_id = ? AND status NOT IN ('merged', 'failed', 'cancelled')
-		 ORDER BY position LIMIT 1`
-		)
-		.get(repoId) as QueueItem | undefined;
-}
-
 export function addToQueue(
 	repoId: number,
 	prNumber: number,

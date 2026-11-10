@@ -862,6 +862,19 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([2]);
 	});
 
+	test('a PR stacked on a deferred PR waits for it, and says why', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		pr(3, { from: 'pr2', base: 'pr2' });
+		await tickBatchQueue(world.deps());
+		expect(world.started.map((x) => x.prs)).toEqual([[1]]);
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		expect(item(2).error_message).toBe('Conflicts with #1 ahead of it; waits for them to land');
+		// One more tick plans the rest: #2 is queued, only deferred; #3 waits for it.
+		await tickBatchQueue(world.deps());
+		expect(item(3).error_message).toBe('Waits for #2: conflicts with #1 ahead of it; waits for them to land');
+	});
+
 	test('a deferred PR says only what it still waits for, not PRs that landed since', async () => {
 		pr(1, { file: 'same.txt' });
 		pr(2);
@@ -1462,6 +1475,29 @@ describe('stopping a red run at its first failed job', () => {
 		for (const h of failing) expect(world.slowReads.has(h)).toBe(false);
 	});
 
+	for (const mode of ['batch', 'serial'] as const)
+		test(`${mode}: the run that ejects a stacked PR is read to its end`, async () => {
+			// 1 <- 2 <- 3 <- 4, with #3 the breaker, and #5 on its own.
+			store.updateQueueSettings(repo.id, { mode, config: { retryFailed: false } });
+			world.slowFailures = true;
+			pr(1);
+			pr(2, { from: 'pr1', base: 'pr1' });
+			pr(3, { from: 'pr2', base: 'pr2', file: 'x-breaks-3.txt' });
+			pr(4, { from: 'pr3', base: 'pr3' });
+			pr(5);
+			world.breakingFiles.add('x-breaks-3.txt');
+			await run(80);
+			expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 5]);
+			expect(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr).sort()).toEqual([3, 4]);
+			// The last run with #3 in it decided its eject: read to the end, never cancelled, whatever
+			// else is on its branch.
+			const decisive = world.started.filter((x) => x.prs.includes(3)).at(-1)!;
+			expect(world.cancelled).not.toContain(decisive.head);
+			expect(world.slowReads.get(decisive.head), `run of ${decisive.prs.join(' ')}`).toBe(4);
+			// Earlier failing runs with #3 and other suspects stopped at their first failure.
+			for (const x of world.started.filter((x) => x.prs.includes(3) && x !== decisive)) expect(world.cancelled, `run of ${x.prs.join(' ')}`).toContain(x.head);
+		});
+
 	test('off, a red run is read to its end', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false, stopOnFirstFailure: false } });
 		pr(1);
@@ -1531,5 +1567,107 @@ describe('batch queue runtime, randomised', () => {
 				return false;
 			};
 			expect([...ejected].filter((p) => !breakers.has(p) && !onEjected(p)).length).toBeLessThanOrEqual(pair.length ? 1 : 0);
+		});
+});
+
+describe('one by one, on the batch runtime', () => {
+	beforeEach(() => store.updateQueueSettings(repo.id, { mode: 'serial', config: { retryFailed: false, collectWindowMs: 60 * 60 * 1000, depth: 2 } }));
+
+	/** Ticks until the queue is empty, checking that at most one run is ever in flight. */
+	async function runSerial(ticks = 60) {
+		for (let i = 0; i < ticks && queued().length; i++) {
+			await tickBatchQueue(world.deps());
+			expect(store.getActiveBatches(repo.id).length, `runs in flight after tick ${i}`).toBeLessThanOrEqual(1);
+		}
+	}
+	const ejected = () => world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr);
+
+	test('tests the head stack whole, one run at a time, without waiting to collect more', async () => {
+		pr(1);
+		pr(2);
+		pr(3, { from: 'pr2', base: 'pr2' });
+		pr(4);
+		await runSerial();
+		expect(world.started.map((s) => s.prs)).toEqual([[1], [2, 3], [4]]);
+		expect(world.merged).toEqual([1, 2, 3, 4]);
+		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'pr3.txt', 'pr4.txt']);
+	});
+
+	test('a lone PR that fails is ejected, and the next one goes', async () => {
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		pr(3);
+		world.breakingFiles.add('x-breaks-master.txt');
+		await runSerial();
+		expect(world.started.map((s) => s.prs)).toEqual([[1], [2], [3]]);
+		expect(world.merged).toEqual([1, 3]);
+		expect(ejected()).toEqual([2]);
+	});
+
+	test('a red stack lands its good part and ejects the PR that breaks it, with what sits on it', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		pr(3, { from: 'pr2', base: 'pr2', file: 'x-breaks-3.txt' });
+		pr(4, { from: 'pr3', base: 'pr3' });
+		pr(5);
+		world.breakingFiles.add('x-breaks-3.txt');
+		await runSerial();
+		expect(world.started[0].prs).toEqual([1, 2, 3, 4]);
+		expect(world.merged).toEqual([1, 2, 5]);
+		expect(ejected().sort()).toEqual([3, 4]);
+		// Every run tests a stack's prefix: never a child without its parent.
+		for (const s of world.started.slice(1)) {
+			if (s.prs.includes(5)) expect(s.prs).toEqual([5]);
+			else expect(s.prs).toEqual([1, 2, 3, 4].slice(s.prs[0] - 1, s.prs[0] - 1 + s.prs.length));
+		}
+	});
+
+	test('a stack that is partly held goes with its good part', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1', approve: false });
+		pr(3);
+		await runSerial(20);
+		expect(world.started.map((s) => s.prs)).toEqual([[1], [3]]);
+		expect(world.merged).toEqual([1, 3]);
+	});
+});
+
+describe('both planners, the same queue', () => {
+	// The same queue of PRs, with breakers and stacks but no PRs that interact, run one by one and
+	// in batches: the same PRs land and the same PRs leave. Only the cost differs.
+	async function outcome(seed: number, mode: 'serial' | 'batch') {
+		let s = seed * 7919;
+		const rnd = () => ((s = (s * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+		store.updateQueueSettings(repo.id, { mode, config: { retryFailed: false, bisectRuns: 2, maxBatch: 4, collectWindowMs: 0, depth: 2 } });
+		const n = 5 + Math.floor(rnd() * 6);
+		const prs = Array.from({ length: n }, (_, i) => i + 1);
+		const breakers = new Set(prs.filter(() => rnd() < 0.25));
+		for (const p of prs) {
+			const file = breakers.has(p) ? `x-breaks-${p}.txt` : undefined;
+			pr(p, p > 1 && rnd() < 0.35 ? { file, from: `pr${p - 1}`, base: `pr${p - 1}` } : { file });
+			if (file) world.breakingFiles.add(file);
+		}
+		for (let tick = 0; tick < 150 && queued().length; tick++) {
+			await tickBatchQueue(world.deps());
+			expect(world.ciFails(git.sha('main')), `${mode}: main broke after tick ${tick}`).toBe(false);
+		}
+		expect(queued(), mode).toEqual([]);
+		const ejected = world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr);
+		return { merged: [...world.merged].sort((a, b) => a - b), ejected: ejected.sort((a, b) => a - b), runs: world.started.length };
+	}
+
+	for (const seed of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+		test(`seed ${seed}`, { timeout: 120_000 }, async () => {
+			const serial = await outcome(seed, 'serial');
+			// A fresh repository for the second run of the same queue.
+			git.cleanup();
+			git = new GitSandbox();
+			world = new World();
+			const name = `repo${++repoSeq}`;
+			db.addRepo('acme', name, 'main', db.upsertUser(1, 'dev', null, null));
+			repo = { ...db.getRepoByOwnerName('acme', name)!, default_branch: 'main' };
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			const batch = await outcome(seed, 'batch');
+			expect({ merged: batch.merged, ejected: batch.ejected }).toEqual({ merged: serial.merged, ejected: serial.ejected });
 		});
 });

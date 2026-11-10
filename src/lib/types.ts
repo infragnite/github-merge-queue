@@ -42,6 +42,14 @@ export interface QueueItem {
 	priority?: 'urgent' | 'normal' | 'low' | null;
 }
 
+/** A queue row as the repository page gets it. */
+export interface ViewItem extends QueueItem {
+	/** The planner's hold on a queued PR: true when it waits by itself, false when it needs someone. */
+	holdWait: boolean | null;
+	/** It doesn't apply on top of PRs being tested, so it waits for them to land. */
+	deferred?: boolean;
+}
+
 export interface HistoryItem {
 	id: number;
 	repo_id: number;
