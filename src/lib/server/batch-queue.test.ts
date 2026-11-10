@@ -562,14 +562,15 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 3]);
 		// once #1 is on master, #2 conflicts with master itself: its author is told, and it stays queued
 		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
-		expect(world.comments).toEqual([
-			{ pr: 2, body: expect.stringMatching(/^\*\*Merge queue:\*\* [^\n]+\n\n```sh\n.*git rebase origin\/main[\s\S]*```\n\n<!-- merge-queue /) }
-		]);
+		// Git names the files when the author rebases: the reason is only what it conflicts with.
+		expect(world.comments).toEqual([{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'conflict', reason: 'Conflicts with main', files: ['same.txt'], fix: 'git fetch origin main && git rebase origin/main' }) }]);
+		expect(world.comments[0].body).toMatch(/^\*\*Merge queue:\*\* Conflicts with main\. /);
+		expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)!.error_message).toBe('Conflicts with main');
 		// One format: the conflict reads back like any other hold, with its files.
 		// Waiting for #1 had nothing for the author to do, so it said nothing.
 		expect(readNotice(world.comments[0].body)).toMatchObject({ kind: 'hold', pr: 2, head: git.sha('pr2'), code: 'conflict', files: ['same.txt'], nextActions: ['resolve-conflict'] });
 		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
-		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required', title: expect.not.stringMatching(/Needs attention/), summary: expect.stringContaining('"code":"conflict"') });
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required', title: 'Conflicts with main', summary: expect.stringContaining('"code":"conflict"') });
 
 		// the author rebases and resolves: the PR is picked up again and lands
 		git.git('checkout', '-q', 'pr2');
