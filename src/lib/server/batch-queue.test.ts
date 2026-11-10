@@ -1423,10 +1423,10 @@ describe('surviving a crash at any step', () => {
 });
 
 describe('batch queue runtime, randomised', () => {
-	// Whole queue runs with random breakers and interacting pairs, two bisection runs at once. After
+	// Whole queue runs with random breakers, interacting pairs and stacks, two bisection runs at once. After
 	// every tick: no PR shows a green merge-queue status on its head unless it merged, the default
 	// branch never holds a breaker, and in the end every PR merged or was ejected with a comment.
-	for (const seed of [1, 2, 3, 4, 5, 6])
+	for (const seed of [1, 2, 3, 4, 5, 6, 7, 8])
 		test(`seed ${seed}`, { timeout: 120_000 }, async () => {
 			let s = seed * 7919;
 			const rnd = () => ((s = (s * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
@@ -1435,9 +1435,12 @@ describe('batch queue runtime, randomised', () => {
 			const prs = Array.from({ length: n }, (_, i) => i + 1);
 			const breakers = new Set(prs.filter(() => rnd() < 0.2));
 			const pair = rnd() < 0.5 ? prs.filter((p) => !breakers.has(p)).sort(() => rnd() - 0.5).slice(0, 2) : [];
+			// Some PRs are stacked on the one before them.
+			const parents = new Map<number, number>();
 			for (const p of prs) {
 				const file = breakers.has(p) ? `x-breaks-${p}.txt` : pair.includes(p) ? `x-pair-${p}.txt` : undefined;
-				pr(p, { file });
+				if (p > 1 && rnd() < 0.25) parents.set(p, p - 1);
+				pr(p, parents.has(p) ? { file, from: `pr${p - 1}`, base: `pr${p - 1}` } : { file });
 				if (file && breakers.has(p)) world.breakingFiles.add(file);
 			}
 			if (pair.length === 2) world.conflictPairs.push(pair.map((p) => `x-pair-${p}.txt`));
@@ -1454,7 +1457,12 @@ describe('batch queue runtime, randomised', () => {
 			const ejected = new Set(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr));
 			expect([...world.merged, ...ejected].sort((a, b) => a - b)).toEqual(prs);
 			for (const b of breakers) expect(ejected).toContain(b);
-			// Of an interacting pair, at most one is ejected; every other PR merges.
-			expect([...ejected].filter((p) => !breakers.has(p)).length).toBeLessThanOrEqual(pair.length ? 1 : 0);
+			// Of an interacting pair, at most one is ejected; every other PR merges, but for what is
+			// stacked on an ejected PR, which leaves with it.
+			const onEjected = (p: number) => {
+				for (let q = parents.get(p); q !== undefined; q = parents.get(q)) if (ejected.has(q)) return true;
+				return false;
+			};
+			expect([...ejected].filter((p) => !breakers.has(p) && !onEjected(p)).length).toBeLessThanOrEqual(pair.length ? 1 : 0);
 		});
 });
