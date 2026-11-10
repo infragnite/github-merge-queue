@@ -66,37 +66,20 @@
 				: batch.status
 	);
 	const prList = (ns: number[]) => ns.map((n) => `#${n}`).join(', ');
-	const PR_STATE: Record<string, { label: string; cls: string }> = {
-		landed: { label: 'landed', cls: 'bg-green-600 text-white' },
-		failing: { label: 'failing', cls: 'bg-red-100 text-red-800' },
-		checking: { label: 'checking', cls: 'bg-amber-100 text-amber-800' },
-		passing: { label: 'passing', cls: 'bg-green-100 text-green-800' },
-		unknown: { label: 'unknown', cls: 'bg-gray-100 text-gray-600' },
-		left: { label: 'back in line', cls: 'bg-gray-100 text-gray-500' }
+	// A compact icon per state; the word is in its tooltip and in the counts above the list.
+	const PR_STATE: Record<string, { label: string; icon: string; cls: string }> = {
+		landed: { label: 'landed', icon: '✓', cls: 'bg-green-600 text-white' },
+		failing: { label: 'failing', icon: '✕', cls: 'bg-red-600 text-white' },
+		checking: { label: 'checking', icon: '●', cls: 'bg-amber-100 text-amber-600 animate-pulse' },
+		passing: { label: 'passing', icon: '✓', cls: 'bg-green-100 text-green-700 ring-1 ring-green-300' },
+		unknown: { label: 'unknown', icon: '?', cls: 'bg-gray-100 text-gray-500' },
+		left: { label: 'back in line', icon: '↩', cls: 'bg-gray-100 text-gray-400' }
 	};
 	const ORDER = ['landed', 'checking', 'passing', 'unknown', 'failing', 'left'];
 	const stateCounts = $derived(
 		ORDER.map((st) => [st, batch.prs.filter((p) => p.state === st).length] as const).filter(([, c]) => c > 0)
 	);
 	const runningRuns = $derived(batch.bisection.filter((r) => r.ci === 'pending' && !['cancelled', 'superseded'].includes(r.status)).length);
-	// Bisection's state in one line: where the failure has been narrowed to so far.
-	const verdict = $derived.by(() => {
-		if (batch.status !== 'bisecting') return null;
-		const runs = batch.bisection;
-		const failed = runs.filter((r) => r.ci === 'failure' || (r.status === 'testing' && (r.progress?.failed ?? 0) > 0));
-		const smallest = failed.sort((a, b) => a.prs.length - b.prs.length)[0];
-		const total = batch.prs.length;
-		const landed = batch.landed.length ? `Landed ${prList(batch.landed)}. ` : '';
-		if (smallest) {
-			const n = smallest.prs.length;
-			return (
-				landed +
-				(n === 1 ? `Found it: #${smallest.prs[0].pr} breaks the batch` : `Narrowed to ${n} of ${total} PRs: ${prList(smallest.prs.map((x) => x.pr))}`)
-			);
-		}
-		if (landed) return `${landed}Testing the rest on top`;
-		return `Splitting ${total} PRs in two to find which one fails; a half that passes lands at once`;
-	});
 	const pct = (n: number) => (p && p.total > 0 ? (n / p.total) * 100 : 0);
 </script>
 
@@ -121,9 +104,6 @@
 		{/if}
 	</div>
 
-	{#if verdict}
-		<p class="mt-1 text-sm font-medium text-orange-800">{verdict}</p>
-	{/if}
 
 	{#if p}
 		<div class="mt-2">
@@ -151,7 +131,12 @@
 
 	{#if stateCounts.length}
 		<p class="mt-2 flex flex-wrap gap-x-3 text-xs text-gray-600">
-			{#each stateCounts as [st, count] (st)}<span><span class="font-semibold">{count}</span> {PR_STATE[st].label}</span>{/each}
+			{#each stateCounts as [st, count] (st)}
+				<span class="inline-flex items-center gap-1"
+					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full text-[10px] leading-none {PR_STATE[st].cls}" aria-hidden="true">{PR_STATE[st].icon}</span
+					><span class="font-semibold">{count}</span> {PR_STATE[st].label}</span
+				>
+			{/each}
 		</p>
 	{/if}
 
@@ -160,7 +145,12 @@
 			<li class="flex min-w-0 items-center gap-2" style="padding-left: {pr.depth * 1.25}rem">
 				{#if pr.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
 				{#if pr.state}
-					<span class="w-20 shrink-0 rounded px-1.5 py-0.5 text-center text-xs {PR_STATE[pr.state].cls}" title={pr.evidence || 'not in any run yet'}>{PR_STATE[pr.state].label}</span>
+					<span
+						class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] leading-none {PR_STATE[pr.state].cls}"
+						title="{PR_STATE[pr.state].label}{pr.evidence ? `\n${pr.evidence}` : ': not in any run yet'}"
+						role="img"
+						aria-label={PR_STATE[pr.state].label}>{PR_STATE[pr.state].icon}</span
+					>
 				{/if}
 				<a href={pr.url || `https://github.com/${owner}/${name}/pull/${pr.pr}`} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{pr.pr}</a>
 				<span class="min-w-0 truncate text-gray-600">{pr.title}</span>

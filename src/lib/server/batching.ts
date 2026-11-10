@@ -578,7 +578,11 @@ export function planBisection(input: {
 	// it waits until that landed.
 	const split = byEvidence(clear);
 	for (const g of split ? [split.left, split.right] : [clear]) if (g.length && whole(g) && want(g)) clearRun.push(g);
-	const start = [...clearRun, ...retryAlone, ...firstHalves, ...secondHalves];
+	// A half made only of PRs that passed is expected to pass and land: it goes ahead of the halves
+	// that narrow a failure, whichever group it came from.
+	const expected = (g: number[]) => g.every((n) => passedWith.has(n));
+	const halves = [...firstHalves, ...secondHalves];
+	const start = [...clearRun, ...halves.filter(expected), ...retryAlone, ...halves.filter((g) => !expected(g))];
 	if (input.slots !== undefined) start.splice(Math.max(0, input.slots - runs.filter((r) => r.result === 'pending').length));
 
 	const pending = runs.some((r) => r.result === 'pending');
