@@ -251,6 +251,7 @@ export function changeEntry(repo: Repo, caller: Caller, n: number, body: { prior
 		const p = parsePriority(body.priority);
 		requireRole(caller, p === 'urgent' ? 'maintain' : 'write', `Setting priority ${p}`);
 		store.setQueuePriority(repo.id, n, p);
+		emitEvent(repo.id, n, 'priority', { priority: p, by: caller.login });
 	}
 	if (body.jumpTo !== undefined) {
 		if (body.jumpTo !== 'front') throw new ApiError(400, 'jumpTo must be "front"');
@@ -258,6 +259,7 @@ export function changeEntry(repo: Repo, caller: Caller, n: number, body: { prior
 		// The front of its own priority: it does not become urgent (urgent PRs still go first).
 		const order = db.getQueueItems(repo.id).map((i) => i.id);
 		db.reorderQueue(repo.id, [it.id, ...order.filter((id) => id !== it.id)]);
+		emitEvent(repo.id, n, 'priority', { jumpTo: 'front', by: caller.login });
 	}
 	return queueEntry(repo.id, n);
 }
