@@ -1656,7 +1656,12 @@ class Tick {
 				continue;
 			}
 			const { code, reason } = h;
-			if (was?.told && was.code === code && was.reason === reason) continue;
+			// Told on this head already. A status belongs to a commit: a push needs it again.
+			const head = (await this.pr(it.pr_number).catch((e) => {
+				if (e instanceof RateLimitedError) throw e;
+				return null;
+			}))?.headSha;
+			if (was?.told && was.code === code && was.reason === reason && (!head || !was.head || was.head === head)) continue;
 			const posted = await tell(it.pr_number, 'failure', `Needs attention: ${reason}`);
 			if (!posted) continue;
 			// One comment per kind of hold: it notifies the author, a status doesn't. A new reason of
