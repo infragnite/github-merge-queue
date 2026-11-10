@@ -7,19 +7,16 @@ import {
 	reorderQueue,
 	updateQueueItemStatus
 } from '$lib/server/db';
-import { getOpenPRs, rateLimitOf, getRepo, getPR } from '$lib/server/github';
+import { getOpenPRs, rateLimitOf, getPR } from '$lib/server/github';
 import { atLeast, AuthError, requireRole, type Caller, type Role } from '$lib/server/api-auth';
-import { ApiError, changeEntry, enqueue, patchConfig, repoVisibility } from '$lib/server/api-service';
+import { ApiError, changeEntry, enqueue } from '$lib/server/api-service';
 import { webCaller } from '$lib/server/web-auth';
 import { publicHistory, publicQueueItem, prUrl } from '$lib/server/public-view';
 import { savingsFor } from '$lib/server/ci-savings';
-import { DEFAULT_BATCH_CONFIG } from '$lib/server/batching';
-import { DEFAULT_CI } from '$lib/server/batch-store';
-import { parseSettingsForm } from '$lib/settings-form';
 import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
 import { currentHold, deferredFor, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
 import { withRepoLock } from '$lib/server/repo-lock';
-import { cancelBatch, retireBatches } from '$lib/server/batch-queue';
+import { cancelBatch } from '$lib/server/batch-queue';
 import { liveDeps } from '$lib/server/batch-live';
 import { emitEvent } from '$lib/server/events';
 import { markDirty } from '$lib/server/wake';
@@ -127,17 +124,8 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 			urgent: atLeast(role, 'maintain'),
 			cancel: atLeast(role, 'maintain'),
 			resume: atLeast(role, 'maintain'),
-			mode: atLeast(role, 'admin'),
 			settings: atLeast(role, 'admin')
 		},
-		settings: readonly
-			? null
-			: {
-					config: settings.config,
-					ci: settings.ci,
-					view: { publicView: settings.publicView },
-					defaults: { config: DEFAULT_BATCH_CONFIG, ci: DEFAULT_CI, view: { publicView: false } }
-				},
 		repo: { id: repo.id, owner: repo.owner, name: repo.name, default_branch: repo.default_branch },
 		savings: savingsFor(repo.id),
 		queueItems,
@@ -189,23 +177,6 @@ function intField(form: FormData, name: string): number {
 }
 
 export const actions: Actions = {
-	/** Switches between merging PRs one by one and in batches (admin, like the settings API). */
-	setMode: (event) =>
-		guarded(event, 'admin', 'Switching the merge mode', async ({ repo, me, form }) => {
-			const mode = form.get('mode');
-			if (mode !== 'serial' && mode !== 'batch') throw new ApiError(400, 'mode must be serial or batch');
-			// Under the repo lock, so a running tick finishes first and none starts a batch after the retire.
-			await withRepoLock(repo.id, async () => {
-				const was = getQueueSettings(repo.id).mode;
-				if (was === mode) return;
-				updateQueueSettings(repo.id, { mode });
-				if (was === 'batch') await retireBatches(liveDeps(repo));
-				emitEvent(repo.id, null, 'mode', { mode, by: me.login });
-				markDirty(repo.id);
-				console.log(`[merge-queue] ${repo.owner}/${repo.name} switched to ${mode} mode by ${me.login}`);
-			});
-		}),
-
 	/** Stops a batch (and its bisection); its PRs go back in line, blamed for nothing. */
 	cancelBatch: (event) =>
 		guarded(event, 'maintain', 'Cancelling a batch', async ({ repo, me, form }) => {
@@ -220,28 +191,6 @@ export const actions: Actions = {
 			}
 			markDirty(repo.id);
 		}),
-
-	/** The queue's settings, through the same validation as the settings API. */
-	saveSettings: (event) =>
-		guarded(
-			event,
-			'admin',
-			'Changing queue settings',
-			async ({ repo, me, form }) => {
-				const cur = getQueueSettings(repo.id);
-				let body;
-				try {
-					body = parseSettingsForm(form, { ...cur, view: { publicView: cur.publicView } });
-				} catch (e) {
-					throw new ApiError(400, e instanceof Error ? e.message : String(e));
-				}
-				const visibility = body.publicView === true ? await repoVisibility(() => getRepo(repo.owner, repo.name)) : null;
-				await withRepoLock(repo.id, async () => patchConfig(repo, me, body, visibility));
-				markDirty(repo.id);
-				return { settingsSaved: true };
-			},
-			'settingsError'
-		),
 
 	/** Batch mode's order: urgent PRs go first, in an express batch (urgent needs maintain). */
 	setPriority: (event) =>

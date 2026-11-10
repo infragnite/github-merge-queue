@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { parseSettingsForm, shown, BATCH_FIELDS } from './settings-form';
+import { parseSettingsForm, shown, BATCH_FIELDS, ALL_FIELDS, SETTING_GROUPS } from './settings-form';
 
 const form = (entries: Record<string, string>) => {
 	const f = new FormData();
@@ -61,4 +61,9 @@ test('the public page box is sent only when it changed', () => {
 	expect(parseSettingsForm(form({ 'view.publicView': 'on' }), current).publicView).toBe(true);
 	expect(parseSettingsForm(form({}), current)).not.toHaveProperty('publicView');
 	expect(parseSettingsForm(form({}), { ...current, view: { publicView: true } }).publicView).toBe(false);
+});
+
+test('the settings page shows every field exactly once (a boolean left off would be saved as off)', () => {
+	const shownNames = SETTING_GROUPS.flatMap((g) => g.fields.map((f) => f.name));
+	expect([...shownNames].sort()).toEqual(ALL_FIELDS.map((f) => f.name).sort());
 });
