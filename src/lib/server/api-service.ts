@@ -7,7 +7,7 @@ import * as store from './batch-store';
 import { emitEvent, waitForEvents } from './events';
 import { noteVisibility } from './public-view';
 import { requireRole, type Caller } from './api-auth';
-import { DEFAULT_BATCH_CONFIG, type BatchConfig, type Priority } from './batching';
+import { COMMENT_MODES, DEFAULT_BATCH_CONFIG, type BatchConfig, type CommentMode, type Priority } from './batching';
 import type { BatchRow } from './batch-store';
 import type { PRStackInfo, StackAnalysis, StackIssue } from './stacks';
 import type { QueueItem, Repo } from '$lib/types';
@@ -328,6 +328,7 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 	}
 	if (config.maxBatch !== undefined && config.maxBatch < 1) throw new ApiError(400, 'maxBatch must be >= 1');
 	if (config.depth !== undefined && config.depth < 1) throw new ApiError(400, 'depth must be >= 1');
+	if (config.comments !== undefined && !COMMENT_MODES.includes(config.comments as CommentMode)) throw new ApiError(400, `comments must be one of ${COMMENT_MODES.join(', ')}`);
 	if (config.bisectRuns !== undefined && (config.bisectRuns < 1 || !Number.isInteger(config.bisectRuns))) throw new ApiError(400, 'bisectRuns must be a whole number >= 1');
 	const mode = body.mode;
 	if (mode !== undefined && mode !== 'serial' && mode !== 'batch') throw new ApiError(400, 'mode must be serial or batch');

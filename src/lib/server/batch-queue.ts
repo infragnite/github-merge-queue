@@ -323,9 +323,7 @@ class Tick {
 		db.updateQueueItemStatus(it.id, 'failed', reason);
 		db.addToHistory(this.repoId, n, it.pr_title, it.pr_url, it.author_login, null, 'failed', reason, it.created_at);
 		db.removeFromQueue(it.id);
-		await this.d.github
-			.comment(n, notice)
-			.catch(this.bestEffort('github.comment'));
+		if (this.speaks('attention')) await this.d.github.comment(n, notice).catch(this.bestEffort('github.comment'));
 		this.event(n, 'ejected', { reason });
 		this.log(`ejected #${n}: ${reason}`);
 	}
@@ -415,7 +413,7 @@ class Tick {
 		const hold = { pr: n, head: p.headSha, code: 'conflict' as const, reason, files, fix };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
 		await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
-		await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
+		if (this.speaks('attention')) await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
 	}
@@ -1609,12 +1607,15 @@ class Tick {
 			store.recordRebasedHead(this.repoId, n, p.headSha, r.head, before.ciGreen);
 			db.updateQueueItemHeadSha(it.id, r.head);
 			if (merged && p.baseRef !== def) await this.d.github.retargetBase(n, def).catch(this.bestEffort('github.retargetBase'));
-			await this.d.github
-				.comment(
-					n,
-					`The merge queue restacked this PR onto ${ontoName} (${issue.message}). Its ${r.replayed} commit(s) applied without conflicts; approvals carry over.\n\nBefore pushing again, move any local commits onto it:\n\n\`\`\`sh\ngit fetch origin ${p.headRef} && git rebase --onto FETCH_HEAD ${p.headSha.slice(0, 12)}\n\`\`\``
-				)
-				.catch(this.bestEffort('github.comment'));
+			// Informational: the push already happened, and nothing is waiting on the author.
+			if (this.speaks('info')) {
+				await this.d.github
+					.comment(
+						n,
+						`The merge queue restacked this PR onto ${ontoName} (${issue.message}). Its ${r.replayed} commit(s) applied without conflicts; approvals carry over.\n\nBefore pushing again, move any local commits onto it:\n\n\`\`\`sh\ngit fetch origin ${p.headRef} && git rebase --onto FETCH_HEAD ${p.headSha.slice(0, 12)}\n\`\`\``
+					)
+					.catch(this.bestEffort('github.comment'));
+			}
 			this.event(n, 'rebased', { from: p.headSha, to: r.head, onto: ontoName, reason: issue.message });
 			this.log(`restacked #${n} onto ${ontoName}`);
 			pushed = true;
@@ -1632,8 +1633,15 @@ class Tick {
 	 * of the queue, is released. What couldn't be posted is recorded only once it is, so the next
 	 * tick tries again.
 	 */
-	/** A comment on PR `n`, best effort; a rate limit stops the tick. */
-	async say(n: number, body: string) {
+	/** Whether the repo's comment setting posts a notice of this kind. */
+	speaks(kind: 'attention' | 'info'): boolean {
+		const mode = this.settings().config.comments;
+		return mode === 'all' || (mode === 'attention' && kind === 'attention');
+	}
+
+	/** A comment on PR `n`, best effort, if the repo's comment setting posts this kind; a rate limit stops the tick. */
+	async say(n: number, body: string, kind: 'attention' | 'info') {
+		if (!this.speaks(kind)) return;
 		await this.d.github.comment(n, body).catch((e) => {
 			if (e instanceof RateLimitedError) throw e;
 			this.bestEffort('github.comment')(e);
@@ -1694,7 +1702,7 @@ class Tick {
 			// Told this kind on this head already; a deferral that comes back is told again only after a push.
 			const toldThis = !!stored?.told && stored.code === code && (!stored.released || (code === 'deferred' && stored.head === (head ?? undefined)));
 			if (advice && !toldThis)
-				await this.say(it.pr_number, holdNotice(hold(head)));
+				await this.say(it.pr_number, holdNotice(hold(head)), 'attention');
 			db.updateQueueItemStatus(it.id, 'queued', reason);
 			store.setHold(it.id, { code, reason, told: true, head: head ?? undefined });
 			this.event(it.pr_number, 'held', { code, reason });

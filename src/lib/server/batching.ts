@@ -47,6 +47,13 @@ export interface PRState {
 	fromFork?: boolean;
 }
 
+/**
+ * How much the queue comments on PRs: every notice, only the ones that ask someone to act (a hold,
+ * a conflict, an ejection), or none. Statuses and labels are set either way.
+ */
+export type CommentMode = 'all' | 'attention' | 'none';
+export const COMMENT_MODES: CommentMode[] = ['all', 'attention', 'none'];
+
 export interface BatchConfig {
 	/** Most PRs in a normal batch. */
 	maxBatch: number;
@@ -95,6 +102,8 @@ export interface BatchConfig {
 	 * run is built on what the one before it landed.
 	 */
 	bisectRuns: number;
+	/** Which notices are posted as PR comments; see `CommentMode`. */
+	comments: CommentMode;
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
@@ -111,7 +120,8 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	retryFailed: true,
 	stopOnFirstFailure: true,
 	masterRunMinGapMs: 0,
-	bisectRuns: 1
+	bisectRuns: 1,
+	comments: 'all'
 };
 
 export type AdmissionCode =

@@ -2,7 +2,7 @@
 // and turning a submitted form back into the body the settings API takes. Shared by the page
 // (to render) and its action (to parse), so both agree on names and units.
 
-export type FieldKind = 'number' | 'duration' | 'boolean' | 'text';
+export type FieldKind = 'number' | 'duration' | 'boolean' | 'text' | 'choice';
 
 export interface SettingField {
 	/** `config.<key>`, `ci.<key>` or `view.<key>`. */
@@ -14,6 +14,8 @@ export interface SettingField {
 	unitMs?: number;
 	unit?: string;
 	min?: number;
+	/** Choices: the values offered, each with its label. */
+	options?: { value: string; label: string }[];
 }
 
 const MIN = 60_000;
@@ -33,7 +35,18 @@ export const BATCH_FIELDS: SettingField[] = [
 	{ name: 'config.requirePRChecks', label: "Hold PRs whose own checks failed", help: "A PR whose required check failed on its head waits for a fix. Checks still running never hold a PR: the batch's CI tests it.", kind: 'boolean' },
 	{ name: 'config.autoRebase', label: 'Restack automatically', help: 'Rebase PRs whose parent was rebased or merged, when that needs no conflict resolution.', kind: 'boolean' },
 	{ name: 'config.masterRun', label: 'Run CI on the default branch after landing', help: 'Saves caches and runs what the repo runs there.', kind: 'boolean' },
-	{ name: 'config.masterRunMinGapMs', label: 'Least time between those runs', help: '0 runs one per landed batch.', kind: 'duration', unitMs: MIN, unit: 'min' }
+	{ name: 'config.masterRunMinGapMs', label: 'Least time between those runs', help: '0 runs one per landed batch.', kind: 'duration', unitMs: MIN, unit: 'min' },
+	{
+		name: 'config.comments',
+		label: 'PR comments',
+		help: 'Which notices the queue posts as comments on PRs. "Only when action is needed": a hold, a conflict or a removal from the queue, not being back in line or a clean restack. Statuses and labels are set either way.',
+		kind: 'choice',
+		options: [
+			{ value: 'all', label: 'All' },
+			{ value: 'attention', label: 'Only when action is needed' },
+			{ value: 'none', label: 'None' }
+		]
+	}
 ];
 
 export const CI_FIELDS: SettingField[] = [
@@ -87,6 +100,11 @@ export function parseSettingsForm(
 			if (group === 'ci') ci[key] = text;
 			continue;
 		}
+		if (f.kind === 'choice') {
+			if (!f.options!.some((o) => o.value === text)) throw new Error(`${f.label} must be one of: ${f.options!.map((o) => o.label).join(', ')}`);
+			config[key] = text;
+			continue;
+		}
 		const n = Number(text);
 		if (text === '' || !Number.isFinite(n) || n < (f.min ?? 0)) throw new Error(`${f.label} must be a number of at least ${f.min ?? 0}`);
 		if (f.kind === 'number' && !Number.isInteger(n)) throw new Error(`${f.label} must be a whole number`);
@@ -106,6 +124,7 @@ export const SETTING_GROUPS: { id: string; title: string; help: string; fields: 
 	{ id: 'failures', title: 'Urgent PRs and failures', help: 'Urgent PRs skip ahead; a failed batch is narrowed down to the PR that breaks it.', fields: pick('config.expressMax', 'config.bisectRuns', 'config.retryFailed', 'config.stopOnFirstFailure') },
 	{ id: 'rules', title: 'Who can enter a batch', help: 'What a PR needs before the queue tests it.', fields: pick('config.requireApproval', 'config.approvalOnHead', 'config.requirePRChecks', 'config.autoRebase') },
 	{ id: 'ci', title: 'CI', help: 'How the queue starts and reads CI.', fields: [...pick('config.ciTimeoutMs', 'config.masterRun', 'config.masterRunMinGapMs'), ...CI_FIELDS] },
+	{ id: 'notices', title: 'PR comments', help: 'How much the queue says on PRs.', fields: pick('config.comments') },
 	{ id: 'visibility', title: 'Visibility', help: 'Who can see the queue page.', fields: VIEW_FIELDS }
 ];
 

@@ -8,7 +8,7 @@
 	let switching = $state(false);
 	const base = $derived(`/repos/${data.repo.owner}/${data.repo.name}`);
 	const isDefault = (f: SettingField) => shown(f, data.settings) === shown(f, data.settings.defaults);
-	const fmt = (f: SettingField, v: string | number | boolean) => (f.kind === 'boolean' ? (v ? 'on' : 'off') : f.kind === 'duration' ? `${v} ${f.unit}` : v === '' ? 'empty' : String(v));
+	const fmt = (f: SettingField, v: string | number | boolean) => (f.kind === 'boolean' ? (v ? 'on' : 'off') : f.kind === 'choice' ? (f.options?.find((o) => o.value === v)?.label ?? String(v)) : f.kind === 'duration' ? `${v} ${f.unit}` : v === '' ? 'empty' : String(v));
 
 	const STRATEGIES = [
 		{
@@ -140,6 +140,10 @@
 									<input {id} type="number" name={f.name} value={v} min={f.min ?? 0} step={f.kind === 'duration' ? 'any' : 1} required aria-describedby="{id}-help" class="w-24 rounded border border-border-subtle bg-transparent px-2 py-1 text-right text-sm tabular-nums" />
 									<span class="w-7 text-xs text-gray-500">{f.unit ?? ''}</span>
 								</span>
+							{:else if f.kind === 'choice'}
+								<select {id} name={f.name} value={v} aria-describedby="{id}-help" class="w-full rounded border border-border-subtle bg-transparent px-2 py-1 text-sm sm:w-60">
+									{#each f.options ?? [] as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+								</select>
 							{:else if f.kind === 'text'}
 								<input {id} type="text" name={f.name} value={v} required={f.name !== 'ci.dispatchRef'} aria-describedby="{id}-help" class="w-full rounded border border-border-subtle bg-transparent px-2 py-1 font-mono text-xs sm:w-60" />
 							{/if}
