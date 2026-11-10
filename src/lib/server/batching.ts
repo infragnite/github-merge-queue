@@ -82,6 +82,12 @@ export interface BatchConfig {
 	retryFailed: boolean;
 	/** At least this long between those runs (0: one per landed batch). */
 	masterRunMinGapMs: number;
+	/**
+	 * Bisection runs of one failed batch tested at once; the rest wait their turn. One by default:
+	 * two groups expected to pass can't both land on the branch they ran on, and one by one every
+	 * run is built on what the one before it landed.
+	 */
+	bisectRuns: number;
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
@@ -96,7 +102,8 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	requirePRChecks: false,
 	masterRun: true,
 	retryFailed: true,
-	masterRunMinGapMs: 0
+	masterRunMinGapMs: 0,
+	bisectRuns: 1
 };
 
 export type AdmissionCode =
@@ -437,6 +444,12 @@ export function planBisection(input: {
 	 * one once settled, the batch's own base, trees this bisection landed. By default only the current.
 	 */
 	trusted?: (tree: string) => boolean;
+	/**
+	 * Most runs going at once (unlimited by default). Those to start are taken in turn: first what
+	 * no failure points at (it is expected to pass and land), then one half of each failing group,
+	 * smallest group first, then the other halves.
+	 */
+	slots?: number;
 }): BisectPlan {
 	const { runs, masterTree, parentOf } = input;
 	const trusted = input.trusted ?? ((t: string) => t === masterTree);
@@ -468,9 +481,14 @@ export function planBisection(input: {
 
 	// 2. Failing groups: what's left of each failed run; a group that contains a smaller failing
 	// group is explained by it, so only disjoint, smallest ones are narrowed.
+	// A PR that failed alone on a trusted branch and is gone (ejected) explains every failed run it
+	// was in: the rest of such a run is no longer pointed at, and runs with everything else.
+	const proven = new Set(
+		runs.filter((r) => r.result === 'failure' && r.members.length === 1 && !left.has(r.members[0]) && trusted(r.baseTree)).map((r) => r.members[0])
+	);
 	const failing: { set: Set<number>; run: number }[] = [];
 	runs
-		.map((r, i) => ({ set: new Set(r.members.filter((n) => left.has(n))), run: i, ok: r.result !== 'failure' }))
+		.map((r, i) => ({ set: new Set(r.members.filter((n) => left.has(n))), run: i, ok: r.result !== 'failure' || r.members.some((n) => proven.has(n)) }))
 		.filter((f) => !f.ok && f.set.size > 0)
 		// A later run with all of them that passed outweighs it: the failure was a flake, or came from
 		// PRs that have landed or left since (if they still fail on top of what landed, a run says so).
@@ -482,13 +500,18 @@ export function planBisection(input: {
 		});
 
 	const eject: { pr: number; reason: string; run: number }[] = [];
-	const start: number[][] = [];
+	// Groups to run, in the order they take free slots: what is expected to pass, PRs to retry
+	// alone, then each failing group's first half, then the second halves.
+	const clearRun: number[][] = [];
+	const retryAlone: number[][] = [];
+	const firstHalves: number[][] = [];
+	const secondHalves: number[][] = [];
 	const busy = new Set(runs.filter((r) => r.result === 'pending').flatMap((r) => r.members));
+	/** Whether `g` should run now. */
 	const want = (g: number[]) => {
 		// Wait for a run still going with any of these PRs: its failure narrows them down.
-		if (g.some((n) => busy.has(n))) return;
-		if (current(g) >= 0) return;
-		start.push(g);
+		if (g.some((n) => busy.has(n))) return false;
+		return current(g) < 0;
 	};
 	const suspects = new Set<number>();
 	for (const f of failing) {
@@ -507,13 +530,15 @@ export function planBisection(input: {
 						: `#${g[0]} fails on its own on top of the default branch`,
 					run: alone
 				});
-			} else if (whole(g)) want(g);
+			} else if (whole(g) && want(g)) retryAlone.push(g);
 			continue;
 		}
 		const { left: a, right: b, independent } = splitPoint(g, parentOf);
-		want(a);
+		const halves = [a, ...(independent ? [b] : [])].filter(want);
 		// A right half stacked on the left can only run once the left landed (it is then whole).
-		if (independent) want(b);
+		// The second half waits for a slot behind every group's first one.
+		if (halves[0]) firstHalves.push(halves[0]);
+		if (halves[1]) secondHalves.push(halves[1]);
 	}
 
 	// 3. Everything no failure points at runs together on the current branch, so it can land.
@@ -527,7 +552,9 @@ export function planBisection(input: {
 		for (let p = parentOf(n); p !== null; p = parentOf(p)) if (suspects.has(p)) return false;
 		return true;
 	});
-	if (clear.length) want(clear);
+	if (clear.length && want(clear)) clearRun.push(clear);
+	const start = [...clearRun, ...retryAlone, ...firstHalves, ...secondHalves];
+	if (input.slots !== undefined) start.splice(Math.max(0, input.slots - runs.filter((r) => r.result === 'pending').length));
 
 	const pending = runs.some((r) => r.result === 'pending');
 	const stuck = !start.length && !eject.length && !pending;
