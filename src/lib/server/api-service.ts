@@ -30,13 +30,18 @@ export type NextAction =
 
 type Q = QueueItem & { priority?: Priority };
 
+/** A batch's PRs still in it: not landed from a bisection, nor back in line or ejected. */
+function inBatchNow(b: BatchRow): number[] {
+	return b.members.filter((n) => !b.landed.includes(n) && !b.left_prs.includes(n));
+}
+
 function queueEntry(repoId: number, n: number) {
 	const items = db.getQueueItems(repoId) as Q[];
 	const waiting = items.filter((i) => ['queued', 'checking', 'updating', 'merging', 'conflict'].includes(i.status));
 	const idx = waiting.findIndex((i) => i.pr_number === n);
 	if (idx < 0) return null;
 	const it = waiting[idx];
-	const batch = store.getActiveBatches(repoId).find((b) => b.members.includes(n));
+	const batch = store.getActiveBatches(repoId).find((b) => inBatchNow(b).includes(n));
 	return {
 		status: batch ? 'testing' : it.status,
 		position: idx + 1,
@@ -164,7 +169,7 @@ export function batchSummary(b: BatchRow) {
 
 export function queueState(repo: Repo) {
 	const s = store.getQueueSettings(repo.id);
-	const inBatch = new Set(store.getActiveBatches(repo.id).flatMap((b) => b.members));
+	const inBatch = new Set(store.getActiveBatches(repo.id).flatMap(inBatchNow));
 	const waiting = (db.getQueueItems(repo.id) as Q[])
 		.filter((i) => !['merged', 'failed', 'cancelled'].includes(i.status))
 		.map((i, idx) => ({
