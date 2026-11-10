@@ -1421,3 +1421,40 @@ describe('surviving a crash at any step', () => {
 		});
 	}
 });
+
+describe('batch queue runtime, randomised', () => {
+	// Whole queue runs with random breakers and interacting pairs, two bisection runs at once. After
+	// every tick: no PR shows a green merge-queue status on its head unless it merged, the default
+	// branch never holds a breaker, and in the end every PR merged or was ejected with a comment.
+	for (const seed of [1, 2, 3, 4, 5, 6])
+		test(`seed ${seed}`, { timeout: 120_000 }, async () => {
+			let s = seed * 7919;
+			const rnd = () => ((s = (s * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+			store.updateQueueSettings(repo.id, { config: { retryFailed: false, bisectRuns: 2 } });
+			const n = 5 + Math.floor(rnd() * 5);
+			const prs = Array.from({ length: n }, (_, i) => i + 1);
+			const breakers = new Set(prs.filter(() => rnd() < 0.2));
+			const pair = rnd() < 0.5 ? prs.filter((p) => !breakers.has(p)).sort(() => rnd() - 0.5).slice(0, 2) : [];
+			for (const p of prs) {
+				const file = breakers.has(p) ? `x-breaks-${p}.txt` : pair.includes(p) ? `x-pair-${p}.txt` : undefined;
+				pr(p, { file });
+				if (file && breakers.has(p)) world.breakingFiles.add(file);
+			}
+			if (pair.length === 2) world.conflictPairs.push(pair.map((p) => `x-pair-${p}.txt`));
+			const head = (p: number) => git.sha(`pr${p}`);
+			for (let tick = 0; tick < 120 && queued().length; tick++) {
+				await tickBatchQueue(world.deps());
+				for (const p of prs) {
+					const last = world.prStatuses.filter((x) => x.sha === head(p) && x.context === 'merge-queue').at(-1);
+					if (last?.state === 'success') expect(world.merged, `#${p} green but not merged after tick ${tick}`).toContain(p);
+				}
+				expect(world.ciFails(git.sha('main')), `main broke after tick ${tick}`).toBe(false);
+			}
+			expect(queued()).toEqual([]);
+			const ejected = new Set(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr));
+			expect([...world.merged, ...ejected].sort((a, b) => a - b)).toEqual(prs);
+			for (const b of breakers) expect(ejected).toContain(b);
+			// Of an interacting pair, at most one is ejected; every other PR merges.
+			expect([...ejected].filter((p) => !breakers.has(p)).length).toBeLessThanOrEqual(pair.length ? 1 : 0);
+		});
+});
