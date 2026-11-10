@@ -66,37 +66,22 @@
 				: batch.status
 	);
 	const prList = (ns: number[]) => ns.map((n) => `#${n}`).join(', ');
-	const PR_STATE: Record<string, { label: string; cls: string }> = {
-		landed: { label: 'landed', cls: 'bg-green-600 text-white' },
-		failing: { label: 'failing', cls: 'bg-red-100 text-red-800' },
-		checking: { label: 'checking', cls: 'bg-amber-100 text-amber-800' },
-		passing: { label: 'passing', cls: 'bg-green-100 text-green-800' },
-		unknown: { label: 'unknown', cls: 'bg-gray-100 text-gray-600' },
-		left: { label: 'back in line', cls: 'bg-gray-100 text-gray-500' }
+	// What the runs showed about a PR, as an icon; what is happening to it, as a mark on that icon.
+	const VERDICT: Record<string, { label: string; icon: string; cls: string }> = {
+		passing: { label: 'passing', icon: '✓', cls: 'bg-green-100 text-green-700' },
+		unknown: { label: 'unknown', icon: '?', cls: 'bg-gray-100 text-gray-500' },
+		failing: { label: 'failing', icon: '✕', cls: 'bg-red-100 text-red-700' }
 	};
-	const ORDER = ['landed', 'checking', 'passing', 'unknown', 'failing', 'left'];
-	const stateCounts = $derived(
-		ORDER.map((st) => [st, batch.prs.filter((p) => p.state === st).length] as const).filter(([, c]) => c > 0)
-	);
+	const ACTIVITY: Record<string, { label: string; cls: string }> = {
+		checking: { label: 'checking', cls: 'ring-2 ring-amber-400 motion-safe:animate-pulse' },
+		landed: { label: 'landed', cls: '!bg-green-600 !text-white' },
+		left: { label: 'back in line', cls: 'opacity-50' }
+	};
+	const count = <T,>(values: T[], order: string[]) =>
+		order.map((k) => [k, values.filter((v) => v === k).length] as const).filter(([, c]) => c > 0);
+	const verdictCounts = $derived(count(batch.prs.map((p) => p.verdict), ['passing', 'unknown', 'failing']));
+	const activityCounts = $derived(count(batch.prs.map((p) => p.activity), ['checking', 'landed', 'left']));
 	const runningRuns = $derived(batch.bisection.filter((r) => r.ci === 'pending' && !['cancelled', 'superseded'].includes(r.status)).length);
-	// Bisection's state in one line: where the failure has been narrowed to so far.
-	const verdict = $derived.by(() => {
-		if (batch.status !== 'bisecting') return null;
-		const runs = batch.bisection;
-		const failed = runs.filter((r) => r.ci === 'failure' || (r.status === 'testing' && (r.progress?.failed ?? 0) > 0));
-		const smallest = failed.sort((a, b) => a.prs.length - b.prs.length)[0];
-		const total = batch.prs.length;
-		const landed = batch.landed.length ? `Landed ${prList(batch.landed)}. ` : '';
-		if (smallest) {
-			const n = smallest.prs.length;
-			return (
-				landed +
-				(n === 1 ? `Found it: #${smallest.prs[0].pr} breaks the batch` : `Narrowed to ${n} of ${total} PRs: ${prList(smallest.prs.map((x) => x.pr))}`)
-			);
-		}
-		if (landed) return `${landed}Testing the rest on top`;
-		return `Splitting ${total} PRs in two to find which one fails; a half that passes lands at once`;
-	});
 	const pct = (n: number) => (p && p.total > 0 ? (n / p.total) * 100 : 0);
 </script>
 
@@ -121,9 +106,6 @@
 		{/if}
 	</div>
 
-	{#if verdict}
-		<p class="mt-1 text-sm font-medium text-orange-800">{verdict}</p>
-	{/if}
 
 	{#if p}
 		<div class="mt-2">
@@ -149,9 +131,21 @@
 		<p class="mt-2 text-xs text-gray-500">On top of {prList(batch.context)}, which passed</p>
 	{/if}
 
-	{#if stateCounts.length}
-		<p class="mt-2 flex flex-wrap gap-x-3 text-xs text-gray-600">
-			{#each stateCounts as [st, count] (st)}<span><span class="font-semibold">{count}</span> {PR_STATE[st].label}</span>{/each}
+	{#if verdictCounts.length}
+		<p class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-600">
+			{#each verdictCounts as [v, c] (v)}
+				<span class="inline-flex items-center gap-1"
+					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full text-[10px] leading-none {VERDICT[v].cls}" aria-hidden="true">{VERDICT[v].icon}</span
+					><span class="font-semibold">{c}</span> {VERDICT[v].label}</span
+				>
+			{/each}
+			{#if activityCounts.length}<span class="text-gray-300" aria-hidden="true">|</span>{/if}
+			{#each activityCounts as [a, c] (a)}
+				<span class="inline-flex items-center gap-1"
+					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-100 text-[10px] leading-none text-gray-500 {ACTIVITY[a].cls}" aria-hidden="true"></span
+					><span class="font-semibold">{c}</span> {ACTIVITY[a].label}</span
+				>
+			{/each}
 		</p>
 	{/if}
 
@@ -159,8 +153,14 @@
 		{#each batch.prs as pr (pr.pr)}
 			<li class="flex min-w-0 items-center gap-2" style="padding-left: {pr.depth * 1.25}rem">
 				{#if pr.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
-				{#if pr.state}
-					<span class="w-20 shrink-0 rounded px-1.5 py-0.5 text-center text-xs {PR_STATE[pr.state].cls}" title={pr.evidence || 'not in any run yet'}>{PR_STATE[pr.state].label}</span>
+				{#if pr.verdict}
+					{@const label = [VERDICT[pr.verdict].label, pr.activity ? ACTIVITY[pr.activity].label : null].filter(Boolean).join(', ')}
+					<span
+						class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] leading-none {VERDICT[pr.verdict].cls} {pr.activity ? ACTIVITY[pr.activity].cls : ''}"
+						title="{label}{pr.trail ? `\n${pr.trail}` : ': not in any run yet'}"
+						role="img"
+						aria-label={label}>{VERDICT[pr.verdict].icon}</span
+					>
 				{/if}
 				<a href={pr.url || `https://github.com/${owner}/${name}/pull/${pr.pr}`} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{pr.pr}</a>
 				<span class="min-w-0 truncate text-gray-600">{pr.title}</span>
