@@ -148,3 +148,17 @@ test('a failed run of one PR stops being read once all its jobs are done', () =>
 	expect(ciMayStillRun(r, now, { total: 40, done: 40 })).toBe(false);
 	expect(ciMayStillRun(r, now, { total: 40, done: 15 })).toBe(true);
 });
+
+test('a PR that failed alone on a tree not known green is tried alone again, not waiting to be ejected', () => {
+	const b8 = row({ id: 8, number: 8, status: 'bisecting', ci_result: 'failure', members: [3241, 3364], landed: [3364], base_tree: 'bt' });
+	const runs = [
+		row({ id: 71, kind: 'bisect', members: [3241, 3364], status: 'failed', ci_result: 'failure', base_tree: 'bt' }),
+		row({ id: 74, kind: 'bisect', members: [3364], status: 'landed', ci_result: 'success', base_tree: 'bt', tree_sha: 'after-3364' }),
+		// On a default branch that moved outside the queue: its failure may be that branch's.
+		row({ id: 73, kind: 'bisect', members: [3241], status: 'failed', ci_result: 'failure', base_tree: 'pushed-by-hand' })
+	];
+	expect(batchCard(b8, runs, null, new Map(), new Map()).prs.some((p) => p.awaitingEject)).toBe(false);
+	// On the tree a run of this bisection landed, it is known green.
+	runs[2] = { ...runs[2], base_tree: 'after-3364' };
+	expect(batchCard(b8, runs, null, new Map(), new Map()).prs.filter((p) => p.awaitingEject).map((p) => p.pr)).toEqual([3241]);
+});
