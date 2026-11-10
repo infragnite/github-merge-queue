@@ -67,7 +67,7 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 	const sideRuns = [...store.getRunningTries(repo.id), ...[store.getRunningBaseline(repo.id)].filter((b) => b !== null)];
 	const bisection = new Map(active.map((b) => [b.id, store.getBisectRuns(b.id)]));
 
-	const running = [...active, ...sideRuns, ...[...bisection.values()].flat()].filter((b) => ciMayStillRun(b));
+	const running = [...active, ...sideRuns, ...[...bisection.values()].flat()].filter((b) => ciMayStillRun(b, Date.now(), progressCache.get(`${repo.owner}/${repo.name}@${b.head_sha}`)?.value));
 	const budget = await github.rateLimitOf(repo.owner).catch(() => null);
 	const progress = new Map<string, CIProgress>();
 	await Promise.all(

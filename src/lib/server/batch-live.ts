@@ -117,9 +117,17 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 	};
 	const start = Object.keys(jobs).find((id) => id === gate || label(id) === gate);
 	if (!start) return null;
+	// A job allowed to fail (`continue-on-error`, or an expression that may allow it) doesn't fail the
+	// gate, nor does a job only it needs (its failure just skips the tolerant one): neither decides
+	// anything early. A gate that itself tolerates failed needs (checking `needs.*.result`) can't be
+	// read from the file; early stop doesn't suit such a gate.
+	const tolerant = (id: string) => {
+		const c = jobs[id]?.['continue-on-error'];
+		return c !== undefined && c !== false && c !== 'false';
+	};
 	const closure = new Set<string>();
 	const visit = (id: string) => {
-		if (closure.has(id) || !jobs[id]) return;
+		if (closure.has(id) || !jobs[id] || tolerant(id)) return;
 		closure.add(id);
 		const needs = jobs[id].needs;
 		for (const n of typeof needs === 'string' ? [needs] : Array.isArray(needs) ? needs : []) if (typeof n === 'string') visit(n);
@@ -128,14 +136,7 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 	// A check run is named by its job's name with each expression replaced by its value (a matrix
 	// job without a name adds its values in parentheses); a reusable workflow's jobs add ` / callee`.
 	const escape = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	// A job allowed to fail (`continue-on-error`, or an expression that may allow it) doesn't fail the
-	// gate: its failure decides nothing early. A gate that itself tolerates failed needs (checking
-	// `needs.*.result`) can't be read from the file; early stop doesn't suit such a gate.
-	const tolerant = (id: string) => {
-		const c = jobs[id]?.['continue-on-error'];
-		return c !== undefined && c !== false && c !== 'false';
-	};
-	const matchers = [...closure].filter((id) => !tolerant(id)).map((id) => {
+	const matchers = [...closure].map((id) => {
 		const n = jobs[id]?.name;
 		const template = typeof n === 'string' && n.trim() ? n.trim() : id;
 		const pattern = template

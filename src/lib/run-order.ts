@@ -17,9 +17,9 @@ export interface RunSlot {
 	urgent: boolean;
 }
 
-/** Unresolved PRs of a bisecting batch: neither landed, ejected nor back in line. */
+/** Unresolved PRs of a bisecting batch: neither landed, ejected (or about to be) nor back in line. */
 function unresolved(b: BatchCard) {
-	return b.prs.filter((p) => p.verdict !== 'failing' && p.activity !== 'landed' && p.activity !== 'left');
+	return b.prs.filter((p) => p.verdict !== 'failing' && !p.awaitingEject && p.activity !== 'landed' && p.activity !== 'left');
 }
 
 /** The default branch's health, as the queue records it. `since` is in ms. */
@@ -87,7 +87,7 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 		});
 	}
 	for (const b of bisecting) {
-		const failing = b.prs.filter((p) => p.verdict === 'failing' && !p.settled && p.activity !== 'left');
+		const failing = b.prs.filter((p) => p.awaitingEject);
 		if (checking && failing.length)
 			next.push({
 				key: `e${b.id}`,
