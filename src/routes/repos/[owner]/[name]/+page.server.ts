@@ -13,7 +13,8 @@ import { ApiError, changeEntry, enqueue } from '$lib/server/api-service';
 import { webCaller } from '$lib/server/web-auth';
 import { knownPublic, noteReadOnlyView, publicHistory, publicQueueItem, prUrl } from '$lib/server/public-view';
 import { savingsFor } from '$lib/server/ci-savings';
-import { pipelineView, publicPipeline, type PipelineView } from '$lib/server/pipeline-view';
+import { pipelineView, publicActivity, publicPipeline, type PipelineView } from '$lib/server/pipeline-view';
+import { activityOf, withActivity } from '$lib/server/activity';
 import { currentHold, deferredFor, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
 import { withRepoLock } from '$lib/server/repo-lock';
 import { cancelBatch } from '$lib/server/batch-queue';
@@ -120,7 +121,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		.catch((e) => {
 		const why = e instanceof Error ? e.message : String(e);
 		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);
-		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {} };
+		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {}, activity: readonly ? publicActivity(activityOf(repo.id)) : activityOf(repo.id), serverTime: Date.now() };
 	});
 
 	// Built by the planners' own queue model; PRs being tested are in the batches, not in line.
@@ -227,7 +228,7 @@ export const actions: Actions = {
 			const limit = (await rateLimitOf(repo.owner).catch(() => null))?.blockedUntil;
 			if (limit) throw new ApiError(409, `GitHub's rate limit is used up; cancel again after ${new Date(limit).toLocaleTimeString()}`);
 			try {
-				await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), id, me.login));
+				await withRepoLock(repo.id, () => withActivity(liveDeps(repo), (d) => cancelBatch(d, id, me.login)));
 			} catch (e) {
 				throw new ApiError(409, e instanceof Error ? e.message : String(e));
 			}
