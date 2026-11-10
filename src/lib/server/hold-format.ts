@@ -1,11 +1,11 @@
 // What the queue tells a PR, in one format: the comment that notifies its author (an agent, often)
-// and the check run's summary. Each carries a stable code and a hidden machine-readable block,
-// `<!-- merge-queue {json} -->`, so an agent reads why the PR is held and what to do without
+// and the check run's summary. People read one line: the reason and what to do. Agents read the
+// hidden block, `<!-- merge-queue {json} -->`, with its stable code and next actions, without
 // parsing prose.
 
 import { holdAdvice, type HoldCode } from './batching';
 
-/** Stable ids of what to do about each hold, for agents to switch on. */
+/** Stable ids of what to do about each hold, for agents to switch on. None: the PR waits on others. */
 export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	draft: ['mark-ready'],
 	'not-fetched': [],
@@ -15,10 +15,10 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	'changes-requested': ['address-review'],
 	'stack-broken': ['retarget'],
 	'wrong-base': ['retarget'],
-	'parent-not-ready': ['fix-parent'],
-	'parent-held': ['fix-parent'],
+	'parent-not-ready': [],
+	'parent-held': [],
 	'parent-not-queued': ['queue-parent'],
-	deferred: ['rebase-or-wait'],
+	deferred: [],
 	conflict: ['resolve-conflict'],
 	failed: ['fix-failure']
 };
@@ -49,8 +49,7 @@ export interface HoldInfo {
 	fix?: string;
 }
 
-const HEADING = '### Needs attention in the merge queue';
-const MAX_FILES = 20;
+const LEAD = '**Merge queue:**';
 const MAX_TITLE = 200;
 
 /** The block, escaped so nothing in it can end the HTML comment early. */
@@ -67,17 +66,18 @@ function command(h: HoldInfo): string | null {
 	return null;
 }
 
-function holdBody(h: HoldInfo): string {
-	const parts = [`**${h.reason}** · \`${h.code}\``];
-	if (h.files?.length) {
-		const shown = h.files.slice(0, MAX_FILES).map((f) => `- \`${f}\``);
-		if (h.files.length > MAX_FILES) shown.push(`- and ${h.files.length - MAX_FILES} more`);
-		parts.push(`Conflicting files:\n${shown.join('\n')}`);
-	}
+const sentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`);
+
+/**
+ * The comment telling a PR what holds it in the queue: the reason and the one thing to do, a
+ * command where there is one, then the hidden block. No heading: a comment from the queue needs
+ * attention by being there. A conflict's files are only in the block: the rebase shows them.
+ */
+export function holdNotice(h: HoldInfo): string {
 	const advice = holdAdvice(h.code);
-	if (advice) parts.push(`**What to do:** ${advice}`);
+	const parts = [`${LEAD} ${sentence(h.reason)}${advice ? ` ${advice}` : ''}`];
 	const cmd = command(h);
-	if (cmd) parts.push(`**To fix:**\n\n\`\`\`sh\n${cmd}\n\`\`\``);
+	if (cmd) parts.push(`\`\`\`sh\n${cmd}\n\`\`\``);
 	parts.push(
 		marker({
 			v: 1,
@@ -93,19 +93,13 @@ function holdBody(h: HoldInfo): string {
 	return parts.join('\n\n');
 }
 
-/** The comment telling a PR what holds it in the queue and what to do. */
-export function holdNotice(h: HoldInfo): string {
-	return `${HEADING}\n\n${holdBody(h)}`;
-}
-
-/** The check run for a hold: the reason in its title (one line, as lists show it), the comment as its summary. */
+/** The check run for a hold: the reason as its title (action required says the rest), the comment as its summary. */
 export function holdCheck(h: HoldInfo): { title: string; summary: string } {
-	const title = `Needs attention: ${h.reason}`;
-	return { title: title.length > MAX_TITLE ? `${title.slice(0, MAX_TITLE - 3)}...` : title, summary: holdBody(h) };
+	return { title: h.reason.length > MAX_TITLE ? `${h.reason.slice(0, MAX_TITLE - 3)}...` : h.reason, summary: holdNotice(h) };
 }
 
 export function releasedNotice(n: { pr: number; head: string | null }): string {
-	return `Back in line in the merge queue.\n\n${marker({ v: 1, kind: 'released', pr: n.pr, head: n.head, nextActions: [] })}`;
+	return `${LEAD} back in line.\n\n${marker({ v: 1, kind: 'released', pr: n.pr, head: n.head, nextActions: [] })}`;
 }
 
 export function ejectedNotice(n: { pr: number; head: string | null; reason: string; link?: string }): string {

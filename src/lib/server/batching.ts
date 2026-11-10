@@ -148,33 +148,33 @@ const EVERY_HOLD: Record<HoldCode, true> = {
 /** Every hold code: stable ids, shown on the PR and in its hidden block, so agents can switch on them. */
 export const HOLD_CODES = Object.keys(EVERY_HOLD) as HoldCode[];
 
-/** What a held PR's author does about its hold, for the comment that tells them. Empty: nothing to say. */
+/** The one thing a held PR's author does about its hold, as a sentence. Empty: there is nothing to do, so nothing is said. */
 export function holdAdvice(code: HoldCode): string {
 	switch (code) {
 		case 'draft':
-			return 'mark it ready for review.';
+			return 'Mark it ready for review.';
 		case 'ci-failed':
-			return 'fix its failing checks and push.';
+			return 'Fix the failing checks and push.';
 		case 'not-approved':
-			return 'get an approving review.';
+			return 'Get an approving review.';
 		case 'stale-approval':
-			return 'get it approved again on its current head.';
+			return 'Get it approved again on its current head.';
 		case 'changes-requested':
-			return 'address the requested changes, and get the review approved or dismissed.';
+			return 'Address them, then get the review approved or dismissed.';
 		case 'stack-broken':
+			return 'Rebase it onto the current head of the PR it builds on.';
 		case 'wrong-base':
-			return "retarget it onto its parent's branch, or the default branch when it has none, and rebase it there.";
-		case 'parent-not-ready':
-		case 'parent-held':
-			return 'fix what holds the PR it is stacked on; it then goes with it.';
+			return 'Point its base at the default branch, or at the branch of the queued PR it builds on.';
 		case 'parent-not-queued':
-			return 'queue the PR it is stacked on; a stacked PR goes only with the PRs under it.';
-		case 'deferred':
-			return 'rebase it onto the PRs it conflicts with (it then goes with them), or wait for them to land and rebase it onto the default branch.';
+			return 'Queue the PR it builds on; a stacked PR goes only with the PRs under it.';
 		case 'conflict':
-			return 'resolve the conflict and push. The PR stays queued and is picked up again after the push.';
+			return 'Rebase it and push:';
 		case 'failed':
-			return 'fix the failure and push.';
+			return 'Fix the failure and push.';
+		// Nothing the author can do: it waits for other PRs, or for the queue itself.
+		case 'deferred':
+		case 'parent-held':
+		case 'parent-not-ready':
 		case 'not-fetched':
 			return '';
 	}
