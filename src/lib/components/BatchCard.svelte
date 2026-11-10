@@ -147,7 +147,7 @@
 			<p class="mt-2 text-xs text-gray-500">Between steps: the next one starts when runners are free.</p>
 		{/each}
 		<p class="mt-1.5 text-xs text-gray-500">
-			The batch's own run failed{p && p.failed > 0 ? `: ${p.failedJobs.join(', ')}` : ''}{#if p?.url}<span> · </span><a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
+			The batch's own run failed{p && p.failed > 0 ? `: ${p.failedJobs.join(', ')}` : ''}{#if p?.url}&nbsp;·&nbsp;<a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
 		</p>
 	{:else if p}
 		<div class="mt-2">{@render bar(p)}</div>
