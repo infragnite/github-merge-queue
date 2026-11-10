@@ -514,6 +514,26 @@ export function planBisection(input: {
 		return current(g) < 0;
 	};
 	const suspects = new Set<number>();
+	// PRs some run passed with (on any branch), and whose ancestors here did too: those are
+	// pooled and split apart from PRs that never passed, which only an explained failure cleared.
+	const passedWith = new Set(runs.filter((r) => r.result === 'success').flatMap((r) => [...r.context, ...r.members]));
+	const passed = (n: number, among: Set<number>) => {
+		for (let p: number | null = n; p !== null; p = parentOf(p)) if (among.has(p) && !passedWith.has(p)) return false;
+		return true;
+	};
+	/** `g` split into what passed before and what never did, when it holds both. */
+	const byEvidence = (g: number[]) => {
+		const set = new Set(g);
+		const a = g.filter((n) => passed(n, set));
+		const b = g.filter((n) => !a.includes(n));
+		if (!a.length || !b.length) return null;
+		const inA = new Set(a);
+		const independent = b.every((n) => {
+			for (let p = parentOf(n); p !== null; p = parentOf(p)) if (inA.has(p)) return false;
+			return true;
+		});
+		return { left: a, right: b, independent };
+	};
 	for (const f of failing) {
 		const g = inOrder(f.set);
 		for (const n of g) suspects.add(n);
@@ -533,7 +553,8 @@ export function planBisection(input: {
 			} else if (whole(g) && want(g)) retryAlone.push(g);
 			continue;
 		}
-		const { left: a, right: b, independent } = splitPoint(g, parentOf);
+		// What passed before goes in one half, so it can land without what never did.
+		const { left: a, right: b, independent } = byEvidence(g) ?? splitPoint(g, parentOf);
 		const halves = [a, ...(independent ? [b] : [])].filter(want);
 		// A right half stacked on the left can only run once the left landed (it is then whole).
 		// The second half waits for a slot behind every group's first one.
@@ -552,7 +573,11 @@ export function planBisection(input: {
 		for (let p = parentOf(n); p !== null; p = parentOf(p)) if (suspects.has(p)) return false;
 		return true;
 	});
-	if (clear.length && want(clear)) clearRun.push(clear);
+	// What passed before runs first, together; what never passed (its failures explained by an
+	// ejected PR) runs after it, apart, so it can't hold the others back. Stacked on what passed,
+	// it waits until that landed.
+	const split = byEvidence(clear);
+	for (const g of split ? [split.left, split.right] : [clear]) if (g.length && whole(g) && want(g)) clearRun.push(g);
 	const start = [...clearRun, ...retryAlone, ...firstHalves, ...secondHalves];
 	if (input.slots !== undefined) start.splice(Math.max(0, input.slots - runs.filter((r) => r.result === 'pending').length));
 
