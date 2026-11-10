@@ -17,6 +17,8 @@ export interface BatchPR {
 	verdict?: BisectVerdict;
 	/** What is happening to it now, alongside the verdict. */
 	activity?: BisectActivity | null;
+	/** Landed, ejected or back in line: nothing more to find out about it in this bisection. */
+	settled?: boolean;
 	/** The runs behind the verdict, for a tooltip. */
 	trail?: string;
 }
@@ -145,6 +147,13 @@ export function batchCard(
 	};
 	for (const n of b.members) if (under(n) === null) place(n);
 	for (const n of b.members) place(n);
+	// In a bisection, what is still to settle comes first; what has (landed, ejected, back in line)
+	// follows, on its own rows.
+	const settled = (n: number) => {
+		const st = states?.get(n);
+		return !!st && (st.verdict === 'failing' || st.activity === 'landed' || st.activity === 'left');
+	};
+	const rows = [...order.filter((n) => !settled(n)), ...order.filter(settled)];
 	return {
 		id: b.id,
 		kind: b.kind,
@@ -157,11 +166,12 @@ export function batchCard(
 		finishedAt: b.finished_at,
 		context: b.context,
 		landed: b.landed,
-		prs: order.map((n) => ({
+		prs: rows.map((n) => ({
 			pr: n,
 			title: prs.get(n)?.title ?? '',
 			url: prs.get(n)?.url ?? '',
-			depth: depth(n),
+			depth: settled(n) ? 0 : depth(n),
+			...(states ? { settled: settled(n) } : {}),
 			parent: parentOf(n),
 			link: analysis?.prs.get(n)?.link ?? null,
 			...(states ? states.get(n) : {})
