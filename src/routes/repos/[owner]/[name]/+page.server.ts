@@ -124,7 +124,12 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 
 	// Built by the planners' own queue model; PRs being tested are in the batches, not in line.
 	const board: Promise<QueueBoard & { warnings: Record<number, string[]>; error: string | null }> = Promise.all([analysis, pipeline]).then(([a, p]) => {
-		const inflight = new Set(p.active.flatMap((b) => b.prs.filter((x) => x.activity !== 'landed' && x.activity !== 'left').map((x) => x.pr)));
+		// Without the batches (they failed to load), a PR a batch carries is known by its status.
+		const inflight = new Set(
+			'error' in p && p.error
+				? rawItems.filter((i) => i.status === 'checking' || i.status === 'updating' || i.status === 'merging').map((i) => i.pr_number)
+				: p.active.flatMap((b) => b.prs.filter((x) => x.activity !== 'landed' && x.activity !== 'left').map((x) => x.pr))
+		);
 		const warnings: Record<number, string[]> = {};
 		for (const i of boardItems) {
 			const w = a.analysis.prs.get(i.pr)?.issues.filter((x) => x.severity === 'warning').map((x) => x.message) ?? [];

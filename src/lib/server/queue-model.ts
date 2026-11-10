@@ -195,10 +195,12 @@ export function serialPick(model: QueueModel, opts: { inflight: number }): numbe
  * What the queue tests next: in batches, a new batch filled from the queue model; one by one, the
  * head stack whole.
  */
-export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial' }): Plan {
+export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial'; held?: Map<number, Hold> }): Plan {
 	const inflight = new Set(input.inflight.flat());
 	const conflicts = [...(input.conflicts ?? [])].map(([pr, reason]) => [pr, { code: 'conflict' as const, reason }] as const);
-	const model = queueModel({ queue: input.queue, admission: plannedAdmission(input), analysis: input.analysis, inflight, problems: new Map(conflicts) });
+	const admitted = plannedAdmission(input);
+	const admission = (n: number) => input.held?.get(n) ?? admitted(n);
+	const model = queueModel({ queue: input.queue, admission, analysis: input.analysis, inflight, problems: new Map(conflicts) });
 	const fill: FillResult =
 		input.strategy === 'serial'
 			? { batch: serialPick(model, { inflight: input.inflight.length }), express: false, waitUntil: null }

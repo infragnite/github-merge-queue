@@ -23,6 +23,7 @@ import {
 	planBisection,
 	descendants,
 	planRedBatch,
+	type Hold,
 	type PRState,
 	type Priority,
 	type QueueEntry,
@@ -1611,6 +1612,8 @@ class Tick {
 				.filter((i) => carried.has(i.pr_number) || (i.status === 'queued' && !i.error_message))
 				.map((i) => i.pr_number)
 		);
+		// Deferred PRs stay in the queue model (held), so what is stacked on them waits for them.
+		const deferred = new Map<number, Hold>();
 		const waiting = this.items().filter((i) => {
 			if (i.status !== 'queued') return false;
 			const behind = store.deferredFor(i as QueueItem & { deferred_for?: string | null });
@@ -1621,6 +1624,7 @@ class Tick {
 					store.setDeferredFor(i.id, still);
 					db.updateQueueItemStatus(i.id, 'queued', deferredReason(still));
 				}
+				deferred.set(i.pr_number, { ok: false, code: 'deferred', reason: deferredReason(still), wait: true });
 				return false;
 			}
 			if (behind.length) {
@@ -1630,14 +1634,14 @@ class Tick {
 			return true;
 		});
 		if (waiting.length === 0) return 'idle';
-		const queue: QueueEntry[] = waiting.map((i) => ({
+		const queue: QueueEntry[] = [...waiting, ...this.items().filter((i) => deferred.has(i.pr_number))].map((i) => ({
 			pr: i.pr_number,
 			enqueuedAt: sqliteMs(i.created_at),
 			position: i.position,
 			priority: ((i as QueueItem & { priority?: Priority }).priority ?? 'normal') as Priority
 		}));
 		const states = new Map<number, PRState>();
-		for (const e of queue) states.set(e.pr, await this.state(e.pr));
+		for (const e of queue) if (!deferred.has(e.pr)) states.set(e.pr, await this.state(e.pr));
 		// On a red default branch, batches of PRs not yet tried there run side by side on it (not
 		// stacked) until one passes: that batch carries a fix and lands. When no untried PR can be
 		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
@@ -1651,7 +1655,7 @@ class Tick {
 			if (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha)) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
 			plan = planRedBatch({
-				queue,
+				queue: queue.filter((e) => !deferred.has(e.pr)),
 				states,
 				analysis,
 				config: settings.config,
@@ -1660,7 +1664,7 @@ class Tick {
 			});
 		} else {
 			if (opts.urgentOnly && settings.mode === 'serial') return 'idle';
-			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode });
+			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode, held: deferred });
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
 			if (opts.urgentOnly && !plan.express) return 'idle';
