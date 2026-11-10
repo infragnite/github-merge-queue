@@ -10,6 +10,8 @@ export interface RunSlot {
 	/** The batch the run belongs to, for a link to its card. */
 	batch: number | null;
 	label: string;
+	/** The branch its CI runs on, while it runs; null for what comes next. */
+	branch: string | null;
 	detail: string;
 	prs: number[];
 	urgent: boolean;
@@ -30,14 +32,14 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 		const name = `${b.express ? 'Urgent batch' : 'Batch'} #${b.number}`;
 		if (b.status === 'testing' || b.status === 'retrying') {
 			const prs = b.prs.map((p) => p.pr);
-			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, detail: b.status === 'retrying' ? 're-running failed jobs' : `${prs.length} PR${prs.length === 1 ? '' : 's'}`, prs, urgent: b.express });
+			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, branch: b.branch, detail: b.status === 'retrying' ? 're-running failed jobs' : `${prs.length} PR${prs.length === 1 ? '' : 's'}`, prs, urgent: b.express });
 		} else if (b.status === 'passed') {
-			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, detail: 'passed, landing', prs: b.prs.map((p) => p.pr), urgent: b.express });
+			running.push({ key: `b${b.id}`, state: 'running', batch: b.id, label: name, branch: b.branch, detail: 'passed, landing', prs: b.prs.map((p) => p.pr), urgent: b.express });
 		} else if (b.status === 'bisecting') {
 			b.bisection.forEach((r, i) => {
 				if (r.ci !== 'pending' || r.status === 'cancelled' || r.status === 'superseded') return;
 				const prs = r.prs.map((p) => p.pr);
-				running.push({ key: `r${r.id}`, state: 'running', batch: b.id, label: `${name}, bisection step ${i + 1}`, detail: prs.length === 1 ? `#${prs[0]} alone` : `${prs.length} PRs`, prs, urgent: b.express });
+				running.push({ key: `r${r.id}`, state: 'running', batch: b.id, label: `${name}, bisection step ${i + 1}`, branch: r.branch, detail: prs.length === 1 ? `#${prs[0]} alone` : `${prs.length} PRs`, prs, urgent: b.express });
 			});
 		}
 	}
@@ -47,6 +49,7 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 			state: 'next',
 			batch: null,
 			label: 'Urgent batch',
+			branch: null,
 			detail: bisecting.length ? 'before the next bisection step' : 'ahead of the rest of the queue',
 			prs: input.upNext,
 			urgent: true
@@ -60,6 +63,7 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 			state: 'next',
 			batch: b.id,
 			label: `${b.express ? 'Urgent batch' : 'Batch'} #${b.number}, next bisection step`,
+			branch: null,
 			detail: `${open.length} PR${open.length === 1 ? '' : 's'} still to settle`,
 			prs: open.map((p) => p.pr),
 			urgent: b.express
@@ -71,6 +75,7 @@ export function runOrder(input: { active: BatchCard[]; upNext: number[]; express
 			state: 'next',
 			batch: null,
 			label: 'Next batch',
+			branch: null,
 			detail: bisecting.length ? 'once the bisection is done' : `${input.upNext.length} PR${input.upNext.length === 1 ? '' : 's'}`,
 			prs: input.upNext,
 			urgent: false
