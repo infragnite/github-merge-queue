@@ -1359,6 +1359,29 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }]);
 	});
 
+	test('an ejection waiting for the default branch to be verified holds only itself: the other groups go on bisecting', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false, bisectRuns: 2 } });
+		pr(1);
+		pr(2, { file: 'x-breaks-2.txt' });
+		pr(3);
+		pr(4, { file: 'x-breaks-4.txt' });
+		world.breakingFiles.add('x-breaks-2.txt');
+		world.breakingFiles.add('x-breaks-4.txt');
+		world.holdMasterRuns = true; // the default-branch run after a landing takes a while
+		await run(40);
+		// #1 passed alone and landed, so the default branch is being verified; #2 failed alone and
+		// waits for that to be ejected. #3 and #4 were still tested meanwhile.
+		expect(store.getMasterHealth(repo.id)?.state).toBe('verifying');
+		const alone = (n: number) => world.started.some((x) => x.prs.length === 1 && x.prs[0] === n);
+		expect([1, 2, 3, 4].filter(alone)).toEqual([1, 2, 3, 4]);
+		expect(world.merged).toEqual([1, 3]);
+		expect(world.comments).toEqual([]);
+		world.holdMasterRuns = false;
+		await run(30);
+		expect(world.merged).toEqual([1, 3]);
+		expect(world.comments.map((c) => c.pr).sort()).toEqual([2, 4]);
+	});
+
 	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {
 		pr(1);
 		world.refuseMerge.add(1);
