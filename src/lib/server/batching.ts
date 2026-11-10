@@ -617,8 +617,8 @@ export function planBisection(input: {
 				eject.push({
 					pr: g[0],
 					reason: ctx.length
-						? `#${g[0]} fails when combined with ${ctx.map((c) => `#${c}`).join(', ')}`
-						: `#${g[0]} fails on its own on top of the default branch`,
+						? `Fails when combined with ${ctx.map((c) => `#${c}`).join(', ')}`
+						: `Fails on its own on top of the default branch`,
 					run: alone
 				});
 			} else if (whole(g) && want(g)) retryAlone.push(g);
