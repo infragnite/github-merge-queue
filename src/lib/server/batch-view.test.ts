@@ -43,3 +43,27 @@ test('counts jobs, treating skipped and neutral as passing', () => {
 		])
 	).toEqual({ total: 5, done: 3, failed: 1, running: 1, url: 'c', failedJobs: ['test'] });
 });
+
+test("a bisecting batch shows each PR's state: landed, failing, checking, passing, unknown, back in line", () => {
+	const batch = row({ id: 1, status: 'bisecting', members: [1, 2, 3, 4, 5, 6, 7], landed: [1], left_prs: [2, 7] });
+	const runs = [
+		row({ id: 2, kind: 'bisect', members: [1, 3], ci_result: 'success', status: 'landed', base_sha: 'aaaaaaa1' }),
+		row({ id: 3, kind: 'bisect', members: [2], ci_result: 'failure', status: 'failed', base_sha: 'bbbbbbb2' }),
+		row({ id: 4, kind: 'bisect', members: [4, 5, 6, 7], ci_result: 'failure', status: 'failed', base_sha: 'bbbbbbb2' }),
+		row({ id: 5, kind: 'bisect', members: [4], ci_result: 'success', status: 'passed', base_sha: 'bbbbbbb2' }),
+		row({ id: 6, kind: 'bisect', members: [5], ci_result: 'pending', status: 'testing', base_sha: 'ccccccc3' })
+	];
+	const card = batchCard(batch, runs, null, new Map(), new Map());
+	expect(card.prs.map((p) => [p.pr, p.state])).toEqual([
+		[1, 'landed'],
+		[2, 'failing'],
+		[3, 'passing'],
+		[4, 'passing'],
+		[5, 'checking'],
+		[6, 'unknown'],
+		[7, 'left']
+	]);
+	expect(card.prs[3].evidence).toBe('run 3: failed with 3 others on bbbbbbb\nrun 4: passed alone on bbbbbbb');
+	// Runs themselves carry no states.
+	expect(card.bisection[0].prs[0].state).toBeUndefined();
+});

@@ -13,6 +13,49 @@ export interface BatchPR {
 	/** The open PR it is stacked on, in this batch or not. */
 	parent: number | null;
 	link: LinkStatus | null;
+	/** Where a bisecting batch stands with this PR (bisecting batches only). */
+	state?: BisectPRState;
+	/** The runs behind that state, for a tooltip. */
+	evidence?: string;
+}
+
+/**
+ * A PR of a bisecting batch: what the runs so far showed about it (`unknown`, `passing` once it
+ * was in any run that passed, `failing` once it failed alone), and what follows from that:
+ * `landed`, `checking` while it is in a run still going, `left` when it went back in line.
+ */
+export type BisectPRState = 'landed' | 'failing' | 'checking' | 'passing' | 'unknown' | 'left';
+
+export function bisectStates(b: Pick<BatchRow, 'members' | 'landed' | 'left_prs'>, runs: Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'>[]) {
+	const out = new Map<number, { state: BisectPRState; evidence: string }>();
+	const tested = runs.map((r, i) => ({ r, step: i + 1 })).filter(({ r }) => r.status !== 'cancelled');
+	for (const n of b.members) {
+		const inRun = tested.filter(({ r }) => r.members.includes(n) || r.context.includes(n));
+		const green = inRun.filter(({ r }) => r.ci_result === 'success');
+		// Its last finished run alone decides: a failure on a branch not known green is run again.
+		const lastAlone = inRun.filter(({ r }) => r.ci_result !== 'pending' && r.members.length === 1 && r.members[0] === n).at(-1);
+		const going = inRun.some(({ r }) => r.ci_result === 'pending');
+		const state: BisectPRState = b.landed.includes(n)
+			? 'landed'
+			: lastAlone?.r.ci_result === 'failure'
+				? 'failing'
+				: b.left_prs.includes(n)
+					? 'left'
+					: going
+						? 'checking'
+						: green.length
+							? 'passing'
+							: 'unknown';
+		const evidence = inRun
+			.map(({ r, step }) => {
+				const result = r.ci_result === 'success' ? 'passed' : r.ci_result === 'failure' ? 'failed' : 'running';
+				const how = r.members.length === 1 && r.members[0] === n ? 'alone' : `with ${r.members.length - 1} other${r.members.length === 2 ? '' : 's'}`;
+				return `run ${step}: ${result} ${how} on ${r.base_sha.slice(0, 7)}`;
+			})
+			.join('\n');
+		out.set(n, { state, evidence });
+	}
+	return out;
 }
 
 export interface CIProgress {
@@ -74,6 +117,7 @@ export function batchCard(
 ): BatchCard {
 	const members = new Set(b.members);
 	const parentOf = (n: number) => analysis?.prs.get(n)?.parent ?? null;
+	const states = b.kind === 'batch' && bisection.length ? bisectStates(b, bisection) : null;
 	const depth = (n: number): number => {
 		const p = parentOf(n);
 		return p !== null && members.has(p) ? depth(p) + 1 : 0;
@@ -96,7 +140,8 @@ export function batchCard(
 			url: prs.get(n)?.url ?? '',
 			depth: depth(n),
 			parent: parentOf(n),
-			link: analysis?.prs.get(n)?.link ?? null
+			link: analysis?.prs.get(n)?.link ?? null,
+			...(states ? states.get(n) : {})
 		})),
 		bisection: bisection.map((r) => batchCard(r, [], analysis, prs, progress)),
 		progress: progress.get(b.head_sha) ?? null
