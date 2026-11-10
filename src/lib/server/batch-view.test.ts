@@ -25,6 +25,23 @@ test('nests a PR under its parent only when the parent is in the same batch', ()
 	]);
 });
 
+test('draws a PR under its own parent, not under the row before it, and not under a parent that landed', () => {
+	// Like batch 13: #3296 is stacked on #3280, listed apart; #3039's parent #3000 already landed.
+	const analysis: StackAnalysis = {
+		prs: new Map([[2600, info(2600, null)], [3039, info(3039, 3000)], [3000, info(3000, null)], [3280, info(3280, null)], [3296, info(3296, 3280)]]),
+		stacks: [],
+		issues: []
+	};
+	const card = batchCard(row({ status: 'bisecting', members: [3000, 2600, 3039, 3280, 3296].reverse(), landed: [3000] }), [], analysis, new Map(), new Map());
+	expect(card.prs.map((p) => [p.pr, p.depth])).toEqual([
+		[3280, 0],
+		[3296, 1],
+		[3039, 0],
+		[2600, 0],
+		[3000, 0]
+	]);
+});
+
 test('attaches each run its own progress, bisection runs included', () => {
 	const progress = new Map([['h2', { total: 2, done: 1, failed: 0, running: 1, url: 'j', failedJobs: [] }]]);
 	const card = batchCard(row({ status: 'bisecting', members: [1, 2] }), [row({ id: 2, kind: 'bisect', head_sha: 'h2', members: [1] })], null, new Map(), progress);

@@ -14,6 +14,7 @@ export type QueueEventKind =
 	| 'deferred'
 	| 'ejected'
 	| 'requeued'
+	| 'changed'
 	| 'master-broken'
 	| 'master-green'
 	| 'merged'

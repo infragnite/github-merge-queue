@@ -125,11 +125,26 @@ export function batchCard(
 	const members = new Set(b.members);
 	const parentOf = (n: number) => analysis?.prs.get(n)?.parent ?? null;
 	const states = b.kind === 'batch' && bisection.length ? bisectStates(b, bisection) : null;
-	// Bounded by the batch's size, so a cycle in the stack analysis can't take the view down.
-	const depth = (n: number, seen = 0): number => {
+	// A PR is drawn under its parent only while that parent is still to land with it: once the
+	// parent merged (or left), the PR stands on its own.
+	const gone = new Set([...b.landed, ...b.left_prs]);
+	const under = (n: number) => {
 		const p = parentOf(n);
-		return p !== null && members.has(p) && seen < members.size ? depth(p, seen + 1) + 1 : 0;
+		return p !== null && p !== n && members.has(p) && !gone.has(p) && !gone.has(n) ? p : null;
 	};
+	const depth = (n: number, seen = 0): number => {
+		const p = under(n);
+		return p !== null && seen < members.size ? depth(p, seen + 1) + 1 : 0;
+	};
+	// Each PR right after its parent (and its parent's other children), so the connector points at it.
+	const order: number[] = [];
+	const place = (n: number) => {
+		if (order.includes(n)) return;
+		order.push(n);
+		for (const m of b.members) if (under(m) === n) place(m);
+	};
+	for (const n of b.members) if (under(n) === null) place(n);
+	for (const n of b.members) place(n);
 	return {
 		id: b.id,
 		kind: b.kind,
@@ -142,7 +157,7 @@ export function batchCard(
 		finishedAt: b.finished_at,
 		context: b.context,
 		landed: b.landed,
-		prs: b.members.map((n) => ({
+		prs: order.map((n) => ({
 			pr: n,
 			title: prs.get(n)?.title ?? '',
 			url: prs.get(n)?.url ?? '',

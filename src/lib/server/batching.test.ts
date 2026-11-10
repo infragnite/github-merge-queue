@@ -8,6 +8,7 @@ import {
 	descendants,
 	planNextBatch,
 	splitPoint,
+	forkSplit,
 	type BatchConfig,
 	type PRState,
 	type Priority,
@@ -354,6 +355,32 @@ describe('bisection', () => {
 		expect(r.eject).toEqual([]);
 		expect([...r.land].sort()).toEqual(batch);
 		expect(r.rounds).toBe(2);
+	});
+
+	test('a failing stack that forks is split along its paths, the shared PR in both', () => {
+		// #1 with two branches on it, #2 and #3: one of the three breaks.
+		const parent = (n: number) => (n === 1 ? null : 1);
+		const runsOf = (r: ReturnType<typeof bisect>) => r.tested.map((t) => t.members);
+		// A broken branch: the other path lands, the broken one runs alone and is ejected.
+		const b3 = bisect([1, 2, 3], (t) => t.includes(3), parent, 1);
+		expect(runsOf(b3)).toEqual([[1, 2], [3]]);
+		expect([b3.land, b3.eject.map((e) => e.pr)]).toEqual([[1, 2], [3]]);
+		// The path tested first is broken: the other one is tried before the shared PR alone.
+		const b2 = bisect([1, 2, 3], (t) => t.includes(2), parent, 1);
+		expect(runsOf(b2)).toEqual([[1, 2], [1, 3], [2]]);
+		expect([b2.land, b2.eject.map((e) => e.pr)]).toEqual([[1, 3], [2]]);
+		// Both paths fail: the shared PR runs alone, and takes both branches with it.
+		const b1 = bisect([1, 2, 3], (t) => t.includes(1), parent, 1);
+		expect(runsOf(b1)).toEqual([[1, 2], [1, 3], [1]]);
+		expect([b1.land, b1.eject.map((e) => e.pr).sort()]).toEqual([[], [1, 2, 3]]);
+	});
+
+	test('forkSplit shares out the branches above the first fork, with the PRs under it in both halves', () => {
+		const parent = (n: number) => ({ 2: 1, 3: 2, 4: 2, 5: 4 })[n] ?? null;
+		expect(forkSplit([1, 2, 3, 4, 5], parent)).toEqual({ left: [1, 2, 3], right: [1, 2, 4, 5] });
+		expect(forkSplit([1, 2, 3], (n) => (n === 1 ? null : n - 1))).toBeNull();
+		// Something beside the fork: not a single tree, split as usual.
+		expect(forkSplit([1, 2, 3, 9], (n) => (n === 2 || n === 3 ? 1 : null))).toBeNull();
 	});
 
 	test('a failing parent takes its stack children with it', () => {

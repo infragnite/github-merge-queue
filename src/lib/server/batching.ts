@@ -425,6 +425,40 @@ export function splitPoint(
 	return { left: members.slice(0, mid), right: members.slice(mid), independent: false };
 }
 
+/**
+ * A failing stack that forks splits along its paths: the PRs under the first fork go in both
+ * halves, the branches above it are shared out between them. Each half is a tree that can be
+ * built, and a half that passes lands with the shared part, leaving the other branch as the
+ * suspect. Null when `members` has no fork.
+ */
+export function forkSplit(members: number[], parentOf: (n: number) => number | null): { left: number[]; right: number[] } | null {
+	const set = new Set(members);
+	const kids = (n: number) => members.filter((m) => parentOf(m) === n);
+	const under = (n: number): number[] => [n, ...kids(n).flatMap(under)];
+	for (const f of members) {
+		const branches = kids(f);
+		if (branches.length < 2) continue;
+		// Only a fork with nothing else beside it: the shared part is `f` and the PRs under it.
+		const shared: number[] = [];
+		for (let p: number | null = f; p !== null && set.has(p); p = parentOf(p)) shared.push(p);
+		const subtrees = branches.map(under);
+		if (shared.length + subtrees.flat().length !== members.length) continue;
+		// Branches are shared out by size, in queue order, so both halves test about as much.
+		const total = subtrees.flat().length;
+		const a = new Set(shared);
+		let size = 0;
+		for (const t of subtrees) {
+			if (size > 0 && size + t.length > total / 2) break;
+			for (const n of t) a.add(n);
+			size += t.length;
+		}
+		const left = members.filter((n) => a.has(n));
+		const right = members.filter((n) => !a.has(n) || shared.includes(n));
+		return { left, right };
+	}
+	return null;
+}
+
 /** A test run of a bisection: `members` on top of `context`, on the default branch at `baseTree`. */
 export interface BisectRun {
 	context: number[];
@@ -513,6 +547,11 @@ export function planBisection(input: {
 	const proven = new Set(
 		runs.filter((r) => r.result === 'failure' && r.members.length === 1 && !left.has(r.members[0]) && trusted(r.baseTree)).map((r) => r.members[0])
 	);
+	/** `n` or a PR it is stacked on was ejected: it leaves with it. */
+	const provenUnder = (n: number) => {
+		for (let p: number | null = n; p !== null; p = parentOf(p)) if (proven.has(p)) return true;
+		return false;
+	};
 	const failing: { set: Set<number>; run: number }[] = [];
 	runs
 		.map((r, i) => ({ set: new Set(r.members.filter((n) => left.has(n))), run: i, ok: r.result !== 'failure' || r.members.some((n) => proven.has(n)) }))
@@ -593,8 +632,24 @@ export function planBisection(input: {
 			} else if (whole(g) && want(g)) retryAlone.push(g);
 			continue;
 		}
-		// What passed before goes in one half, so it can land without what never did.
-		const { left: a, right: b, independent } = byEvidence(g) ?? splitPoint(g, parentOf);
+		// What passed before goes in one half, so it can land without what never did. A fork splits
+		// along its paths (both halves can run); otherwise at a prefix.
+		const fork = byEvidence(g) ? null : forkSplit(g, parentOf);
+		let { left: a, right: b, independent } = byEvidence(g) ?? (fork ? { ...fork, independent: true } : splitPoint(g, parentOf));
+		if (!fork && !independent) {
+			// The prefix would run alone. Where another branch of it waits outside the group, untested
+			// with it, the prefix runs with that branch instead: a pass lands both and leaves the
+			// rest of the group as the suspect; a failure points at the prefix, which then runs alone.
+			const inA = new Set(a);
+			const above = (n: number) => {
+				for (let p = parentOf(n); p !== null; p = parentOf(p)) if (inA.has(p)) return true;
+				return false;
+			};
+			const branch = order.filter((n) => left.has(n) && !set.has(n) && !failing.some((o) => o.set.has(n)) && !provenUnder(n) && above(n));
+			const path = inOrder(new Set([...a, ...branch]));
+			const failedWith = runs.some((r) => r.result === 'failure' && r.members.every((n) => !left.has(n) || path.includes(n)) && r.members.some((n) => branch.includes(n)));
+			if (branch.length && branch.length >= a.length && !failedWith && whole(path)) a = path;
+		}
 		const halves = [a, ...(independent ? [b] : [])].filter(want);
 		// A right half stacked on the left can only run once the left landed (it is then whole).
 		// The second half waits for a slot behind every group's first one.
