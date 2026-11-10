@@ -88,7 +88,7 @@ describe('stopping at the first failed job', () => {
 		expect(earlyFailure(required, [job('nightly', 'completed', 'failure', 9)])).toBe(false);
 	});
 
-	test('without the required check yet, nothing is known to feed it', () => {
+	test('without the required check yet and without its workflow, nothing is known to feed it', () => {
 		expect(earlyFailure([], [job('tests', 'completed', 'failure', 7)])).toBe(false);
 	});
 
@@ -163,5 +163,14 @@ jobs:
 		const required = [{ check_suite: { id: 7 } }];
 		expect(earlyFailure(required, [job('route', 'failure')], null, feeds)).toBe(false);
 		expect(earlyFailure(required, [job('Test mac', 'failure')], null, feeds)).toBe(true);
+	});
+
+	test('before the gate has a check run (GitHub makes it once its needs end), a failed job it needs fails it early', () => {
+		// krusty's batch 8: eight conformance jobs red for 15 minutes, the gate not created yet.
+		const feeds = gateFeeds(workflow, 'ci-and-conformance')!;
+		const job = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion, completed_at: null, check_suite: { id: 7 } });
+		expect(earlyFailure([], [job('Build', 'completed', 'success'), job('conformance / suite', 'completed', 'failure'), job('Test mac', 'in_progress', null)], null, feeds)).toBe(true);
+		expect(earlyFailure([], [job('route', 'completed', 'failure'), job('Test mac', 'in_progress', null)], null, feeds)).toBe(false);
+		expect(earlyFailure([], [job('Build', 'completed', 'success')], null, feeds)).toBe(false);
 	});
 });
