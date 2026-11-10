@@ -1024,7 +1024,7 @@ describe('batch queue runtime', () => {
 		world.changesRequested.add(2);
 		await run(3);
 		expect(world.comments).toEqual([
-			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'changes-requested', reason: '#2 has changes requested' }) }
+			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'changes-requested', reason: 'Changes requested' }) }
 		]);
 		world.changesRequested.delete(2);
 		await run();
@@ -1048,7 +1048,7 @@ describe('batch queue runtime', () => {
 		store.updateQueueSettings(repo.id, { config: { comments: 'attention' } });
 		await run(3);
 		expect(world.comments).toEqual([
-			{ pr: 1, body: holdNotice({ pr: 1, head: git.sha('pr1'), code: 'changes-requested', reason: '#1 has changes requested' }) }
+			{ pr: 1, body: holdNotice({ pr: 1, head: git.sha('pr1'), code: 'changes-requested', reason: 'Changes requested' }) }
 		]);
 	});
 
@@ -1069,7 +1069,7 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([]);
 		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
 		expect(world.prChecks.filter((x) => x.sha === git.sha('pr3')).at(-1)).toMatchObject({ state: 'failure', title: expect.stringMatching(/^Left the queue/) });
-		expect(world.prChecks.filter((x) => x.sha === git.sha('pr4')).at(-1)).toMatchObject({ state: 'action_required', title: '#4 has changes requested' });
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr4')).at(-1)).toMatchObject({ state: 'action_required', title: 'Changes requested' });
 		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required' });
 	});
 
