@@ -687,6 +687,18 @@ describe('batch queue runtime', () => {
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
 	});
 
+	test('comments only when action is needed: a clean restack is not told', async () => {
+		store.updateQueueSettings(repo.id, { config: { comments: 'attention' } });
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		git.commit('main', 'm1', 'x-main.txt');
+		git.rebase('pr1', 'main');
+		await run();
+		expect(world.pushedHeads[0]).toMatchObject({ branch: 'pr2' });
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.comments).toEqual([]);
+	});
+
 	test('a failing stack parent takes its child out of the queue too', async () => {
 		pr(1, { file: 'x-breaks-master.txt' });
 		pr(2, { from: 'pr1', base: 'pr1' });
@@ -1002,6 +1014,53 @@ describe('batch queue runtime', () => {
 		expect(world.comments.slice(1)).toEqual([]);
 		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).map((x) => x.state)).toContain('queued');
 		expect(events.listEvents(repo.id, { pr: 2 }).map((e) => e.kind)).toContain('released');
+	});
+
+	test('comments only when action is needed: the hold is told, being back in line is not', async () => {
+		store.updateQueueSettings(repo.id, { config: { comments: 'attention' } });
+		pr(1);
+		pr(2);
+		world.changesRequested.add(2);
+		await run(3);
+		expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/^Needs attention in the merge queue: #2 has changes requested/) }]);
+		world.changesRequested.delete(2);
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.comments).toHaveLength(1);
+		// The status still says it is back in line.
+		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr2') && x.context === 'merge-queue').map((x) => x.description)).toContain('In line in the merge queue');
+	});
+
+	test('with comments off, a hold, a conflict and an ejection post nothing; statuses and labels still tell', async () => {
+		store.updateQueueSettings(repo.id, { config: { comments: 'none', retryFailed: false } });
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		pr(3, { file: 'x-breaks-master.txt' });
+		pr(4);
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.changesRequested.add(4);
+		await run(60);
+		expect(world.merged).toEqual([1]);
+		expect(queued().sort((a, b) => a.pr - b.pr)).toEqual([
+			{ pr: 2, status: 'conflict' },
+			{ pr: 4, status: 'queued' }
+		]);
+		expect(world.comments).toEqual([]);
+		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
+		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr3')).at(-1)).toMatchObject({ state: 'failure', description: expect.stringMatching(/^Left the queue/) });
+		expect(world.prStatuses.filter((x) => x.sha === git.sha('pr4')).at(-1)).toMatchObject({ state: 'failure', description: 'Needs attention: #4 has changes requested' });
+	});
+
+	test('comments only when action is needed: an ejection and a conflict are told', async () => {
+		store.updateQueueSettings(repo.id, { config: { comments: 'attention', retryFailed: false } });
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		pr(3, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(60);
+		expect(world.merged).toEqual([1]);
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([{ pr: 3, body: expect.stringMatching(/^Removed from the merge queue/) }]);
+		expect(world.comments.filter((c) => c.pr === 2).map((c) => c.body)).toContainEqual(expect.stringMatching(/can't apply this PR/));
 	});
 
 	test('a PR whose parent is not queued is told to queue it', async () => {

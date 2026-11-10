@@ -283,6 +283,8 @@ describe('queue control', () => {
 		expect(() => api.patchConfig(repo, admin, { config: { bogus: 1 } })).toThrow(/Unknown setting/);
 		expect(() => api.patchConfig(repo, admin, { config: { depth: '2' } })).toThrow(/must be a number/);
 		expect(() => api.patchConfig(repo, admin, { mode: 'fast' })).toThrow(/mode must be/);
+		expect(api.patchConfig(repo, admin, { config: { comments: 'attention' } }).config.comments).toBe('attention');
+		expect(() => api.patchConfig(repo, admin, { config: { comments: 'some' } })).toThrow(/comments must be one of all, attention, none/);
 	});
 
 	test('the PR report is a check run, a status, or both; both by default', () => {
