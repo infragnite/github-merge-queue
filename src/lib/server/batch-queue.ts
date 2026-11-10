@@ -540,7 +540,7 @@ class Tick {
 			const it = this.item(n);
 			if (!it || it.status !== 'checking') {
 				this.log(`#${n} left the queue while batch ${batch.id} was testing; the rest lands without it`);
-				this.skip(out, prs, src, n);
+				this.skip(out, prs, n);
 				continue;
 			}
 			const s = await this.state(n, true);
@@ -548,7 +548,7 @@ class Tick {
 			if (p.state !== 'open' || p.headSha !== batch.heads[n]) {
 				// The author pushed or closed it after the batch was built: what we tested is stale.
 				this.log(`#${n} changed after batch ${batch.id} was built; the rest lands without it`);
-				this.skip(out, prs, src, n);
+				this.skip(out, prs, n);
 				continue;
 			}
 			// Reviews and drafts may have changed while the batch was testing; the batch's own CI stands in for the PR's.
@@ -556,17 +556,20 @@ class Tick {
 			if (!adm.ok) {
 				db.updateQueueItemStatus(it.id, 'checking', adm.reason);
 				this.log(`#${n} can no longer land: ${adm.reason}; the rest lands without it`);
-				this.skip(out, prs, src, n);
+				this.skip(out, prs, n);
 			}
 		}
 		return out;
 	}
 
+	/** The parent of each PR of the landing under way, inside or outside the group. */
+	parentAt: (n: number) => number | null = () => null;
+
 	/** Adds `n` to `out`, with every PR of `prs` stacked on it (directly or not). */
-	skip(out: Set<number>, prs: number[], src: BatchRow, n: number) {
+	skip(out: Set<number>, prs: number[], n: number) {
 		out.add(n);
 		for (const m of prs) {
-			for (let p = src.steps[m]?.parent ?? null; p !== null && p !== undefined; p = src.steps[p]?.parent ?? null) {
+			for (let p = this.parentAt(m), seen = 0; p !== null && seen < prs.length; p = this.parentAt(p), seen++) {
 				if (out.has(p)) {
 					out.add(m);
 					break;
@@ -591,11 +594,14 @@ class Tick {
 		// A PR that can no longer land as tested goes back in line, with what is stacked on it; the
 		// rest of the group was tested as one tree with it, so no subset is safer than another: all
 		// of the rest lands, and master is then checked alone.
+		const known = await this.parentOf();
+		// Older batches recorded no parents; their stacks come from what the queue knows now.
+		this.parentAt = (m) => (src.steps[m] && src.steps[m].parent !== undefined ? src.steps[m].parent! : known(m));
 		this.skipped = await this.notLandable(batch, prs, src);
 		const part = prs.filter((n) => !this.skipped.has(n));
 		if (!part.length) return false;
 		// Recorded before the first merge: a crash before it is cleared is finished by `recoverLanding`.
-		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs: part });
+		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs: part, group: prs });
 		const merged: number[] = [];
 		const ok = (await this.landNow(batch, part, src, merged)) && this.skipped.size === 0;
 		// What landed is recorded together with clearing the intent, so a crash can't split them.
@@ -662,7 +668,8 @@ class Tick {
 			await this.d.git.fetch([master]);
 			const tree = await this.d.git.tree(master);
 			const last = intent.prs.filter((n) => merged.includes(n)).at(-1)!;
-			const all = merged.length === intent.prs.length;
+			// The whole group, not just the PRs this landing set out to merge (some may have been left out).
+			const all = intent.group.every((n) => merged.includes(n) || batch.landed.includes(n));
 			if (src.steps[last]?.tree === tree) {
 				// Master holds the queue's landing. Only all of it is a tree a run tested; part of it is
 				// checked alone next tick (master's health is left as it was, for an older tree).
@@ -687,7 +694,7 @@ class Tick {
 	 * checked alone (it holds a tree no run tested).
 	 */
 	changedWhileLanding(batch: BatchRow, n: number, now: LivePR, prs: number[], src: BatchRow) {
-		this.skip(this.skipped, prs, src, n);
+		this.skip(this.skipped, prs, n);
 		this.log(`#${n} ${now.state !== 'open' ? 'was closed' : 'was pushed to'} while batch ${batch.id} was landing; the rest lands without it`);
 		this.event(n, 'changed', { batch: batch.id, from: batch.heads[n], to: now.headSha });
 	}
@@ -705,11 +712,12 @@ class Tick {
 			if (!this.item(n)) {
 				// Dequeued while the PRs before it were landing: the rest lands without it.
 				this.log(`#${n} left the queue while batch ${batch.id} was landing; the rest lands without it`);
-				this.skip(this.skipped, prs, src, n);
+				this.skip(this.skipped, prs, n);
 				continue;
 			}
-			// Each merge lands exactly the tree tested for its step, unless a PR was left out.
-			if (!this.skipped.size && (await this.d.git.tree(master)) !== expected) {
+			// Each merge lands exactly the tree tested for its step; once a PR is left out, only the
+			// first merge still has one (the group's base): something merged around the queue is a pause.
+			if ((!this.skipped.size || !merged.length) && (await this.d.git.tree(master)) !== expected) {
 				this.pause(`Master changed while batch ${batch.id} was landing (before #${n}); was something merged outside the queue?`);
 				return false;
 			}
@@ -729,7 +737,7 @@ class Tick {
 				if (this.skipped.size && !r.ok) {
 					// It only applied on top of a PR left out: back in line with it.
 					this.log(`#${n} does not apply without the PRs left out of batch ${batch.id}; back in line`);
-					this.skip(this.skipped, prs, src, n);
+					this.skip(this.skipped, prs, n);
 					continue;
 				}
 				if (!r.ok || (!this.skipped.size && r.tree !== step.tree)) {
@@ -787,7 +795,7 @@ class Tick {
 					// With a PR left out it may no longer apply (it was tested on top of that one): back in line.
 					await this.d.github.setPRStatus(head, 'pending', short(`Did not merge without the PRs left out of batch ${batch.id}; back in line`)).catch(this.bestEffort('github.setPRStatus'));
 					this.log(`#${n} did not merge without the PRs left out of batch ${batch.id} (${m.message ?? 'merge refused'}); back in line`);
-					this.skip(this.skipped, prs, src, n);
+					this.skip(this.skipped, prs, n);
 					continue;
 				}
 				await this.d.github.setPRStatus(head, 'pending', short(`Waiting for the merge queue (landing stopped)`)).catch(this.bestEffort('github.setPRStatus'));

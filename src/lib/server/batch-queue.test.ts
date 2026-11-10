@@ -1124,17 +1124,50 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1]);
 		// As if the app stopped after merging #1 of [1, 2], before it recorded anything.
 		store.setMasterHealth(repo.id, { sha: 'old', tree: 'old-tree', state: 'green', since: 0 });
-		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1, 2] });
+		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1, 2], group: [1, 2] });
 		await recoverInterrupted(world.deps());
 		expect(store.getLandingIntent(repo.id)).toBeNull();
 		expect(store.getMasterHealth(repo.id)).toMatchObject({ sha: 'old', tree: 'old-tree' });
+	});
+
+	test('an interrupted landing that left PRs out does not mark master green, even when all it set out to merge merged', async () => {
+		pr(1);
+		pr(2);
+		pr(3);
+		await tickBatchQueue(world.deps());
+		git.commit('pr3', 'late change');
+		// #3 is left out; later its own merge is refused, so only #1 #2 ever land.
+		world.refuseMerge.add(3);
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		// As if the app stopped right after merging #1 #2 of the group [1, 2, 3], before recording it.
+		store.setMasterHealth(repo.id, { sha: 'old', tree: 'old-tree', state: 'green', since: 0 });
+		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1, 2], group: [1, 2, 3] });
+		await recoverInterrupted(world.deps());
+		expect(store.getMasterHealth(repo.id)).toMatchObject({ sha: 'old', tree: 'old-tree' });
+	});
+
+	test('with a PR left out, a PR that GitHub then refuses goes back in line too, no pause', async () => {
+		pr(1);
+		pr(2);
+		pr(3);
+		await tickBatchQueue(world.deps());
+		git.commit('pr1', 'late change');
+		world.refuseMerge.add(3);
+		await run(2);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([2]);
+		world.refuseMerge.delete(3);
+		await run();
+		expect(world.merged.slice(1).sort()).toEqual([1, 3]);
 	});
 
 	test('an interrupted landing of a PR that was deleted meanwhile is settled, not retried forever', async () => {
 		pr(1);
 		await tickBatchQueue(world.deps());
 		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
-		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1] });
+		store.setLandingIntent(repo.id, { batchId: b.id, srcId: b.id, prs: [1], group: [1] });
 		world.deleted.add(1);
 		await recoverInterrupted(world.deps());
 		expect(store.getLandingIntent(repo.id)).toBeNull();
