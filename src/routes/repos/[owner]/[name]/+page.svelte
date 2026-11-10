@@ -38,7 +38,7 @@
 		queueView({
 			items: data.queueItems,
 			mode: batchMode ? 'batch' : 'serial',
-			batches: (pipe?.active ?? []).filter((b) => b.kind === 'batch').map((b) => ({ id: b.id, status: b.status, prs: b.prs.filter((p) => p.activity !== 'landed' && p.activity !== 'left' && p.verdict !== 'failing').map((p) => p.pr) })),
+			batches: (pipe?.active ?? []).filter((b) => b.kind === 'batch').map((b) => ({ id: b.id, number: b.number, status: b.status, prs: b.prs.filter((p) => p.activity !== 'landed' && p.activity !== 'left' && p.verdict !== 'failing').map((p) => p.pr) })),
 			stacks: stacks?.stacks ?? null,
 			limits: data.limits
 		})
@@ -307,7 +307,7 @@
 					<div class="space-y-1">
 						{#each view.inFlight as g (g.batch)}
 							<a href="#batch-{g.batch}" class="flex items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50/50 px-3 py-1.5 text-sm hover:bg-indigo-50">
-								<span class="shrink-0 whitespace-nowrap font-medium text-indigo-900">Batch #{g.batch}</span>
+								<span class="shrink-0 whitespace-nowrap font-medium text-indigo-900">Batch #{g.number}</span>
 								<span class="shrink-0 whitespace-nowrap text-indigo-800">{g.prs.length} PRs · {g.status}</span>
 								<span class="min-w-0 truncate text-xs text-indigo-700/70">{g.prs.map((n) => `#${n}`).join(' ')}</span>
 							</a>
