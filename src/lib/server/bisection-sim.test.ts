@@ -66,7 +66,10 @@ function simulate(w: World): Outcome {
 	const rnd = rng(w.seed ?? 1);
 	const inBatch = new Set(w.batch);
 	const violations: string[] = [];
-	const fail = (why: string) => violations.push(why);
+	const fail = (why: string) =>
+		violations.push(
+			why + (process.env.SIMDEBUG ? `\n${runs.map((r) => `${r.result} [${r.baseTree}] ${r.members.join(',')}`).join('\n')}\nparents ${w.batch.map((n) => `${n}<-${parentOf(n)}`).join(' ')}\nremaining ${remaining}` : '')
+		);
 	const runs: BisectRun[] = [{ context: [], members: [...w.batch], baseTree: '', result: 'failure' }];
 	/** What had landed under each run, and when it ends. */
 	const meta: { base: number[]; end: number }[] = [{ base: [], end: 0 }];
@@ -84,6 +87,10 @@ function simulate(w: World): Outcome {
 		const tree = landed.join(',');
 		const step = planBisection({ runs, remaining, masterTree: tree, parentOf, trusted: () => true, slots: w.slots });
 		if (step.kind === 'land') {
+			// Only what a green run tested, exactly as it lands: those PRs on this very tree.
+			const proof = runs[step.run];
+			if (!proof || proof.result !== 'success' || proof.baseTree !== tree || proof.context.length || key(proof.members) !== key(step.prs))
+				fail(`landed ${step.prs.join(' ')} without a green run of exactly them on ${tree || 'base'}`);
 			if (w.fails([...landed, ...step.prs])) fail(`landed a failing set: ${step.prs.join(' ')} on ${tree || 'base'}`);
 			for (const n of step.prs) {
 				const p = parentOf(n);
@@ -123,6 +130,27 @@ function simulate(w: World): Outcome {
 			return { landed, ejected, requeued: step.requeue, runs: runs.length - 1, time, landedAt, settledAt, violations };
 		}
 		if (w.slots !== undefined && pending.length + step.start.length > w.slots) fail(`${pending.length + step.start.length} runs at once on ${w.slots} slots`);
+		// No slot idles while there is work: with a slot to spare, one more slot starts nothing more
+		// (unless it lets a group run PR by PR, a choice the slot count makes).
+		if (w.slots !== undefined && pending.length + step.start.length < w.slots) {
+			const more = planBisection({ runs, remaining, masterTree: tree, parentOf, trusted: () => true, slots: w.slots + 1 });
+			if (more.kind === 'step' && more.start.length > step.start.length && !more.start.every((g) => g.length === 1))
+				fail(`a slot idles: started ${JSON.stringify(step.start)}, one more slot starts ${JSON.stringify(more.start)}`);
+		}
+		// What passed before never runs with unrelated PRs that never passed: a pass then lands the
+		// first, and a failure points at the second. A PR may run on a parent that passed, which it needs.
+		const passedBefore = new Set(runs.filter((r) => r.result === 'success').flatMap((r) => r.members));
+		for (const g of step.start) {
+			const sure = (n: number) => {
+				for (let p: number | null = n; p !== null; p = parentOf(p)) if (g.includes(p) && !passedBefore.has(p)) return false;
+				return true;
+			};
+			const rooted = (n: number) => {
+				for (let p = parentOf(n); p !== null; p = parentOf(p)) if (g.includes(p)) return true;
+				return false;
+			};
+			if (g.some(sure) && g.some((n) => !sure(n) && !rooted(n))) fail(`${key(g)} mixes PRs that passed with PRs that never did`);
+		}
 		const startKeys = step.start.map(key);
 		if (new Set(startKeys).size !== startKeys.length) fail(`the same group started twice at once`);
 		for (const g of step.start) {
@@ -172,7 +200,7 @@ function goodOnes(batch: number[], bad: Set<number>, parentOf: ParentOf) {
 	});
 }
 
-describe('bisection simulation: invariants on every decision', () => {
+describe('bisection simulation: invariants on every decision', { timeout: 60_000 }, () => {
 	// Random batches: stacks and forks, independent breakers, interacting pairs, flakes, uneven run
 	// times, and 1, 2, 4 or unlimited slots. Each decision is checked as it is made (see simulate).
 	const cases: { name: string; flake?: number; pairs: boolean; uneven: boolean }[] = [
@@ -237,7 +265,7 @@ function averages(n: number, k: number, slots: number | undefined, trials = 600)
 	return { rounds: rounds / trials, runs: runs / trials, landing: landing / trials, worst };
 }
 
-describe('bisection simulation: efficiency', () => {
+describe('bisection simulation: efficiency', { timeout: 60_000 }, () => {
 	// The planner's own numbers (independent breakers, no flakes), kept from regressing by more
 	// than 5%. Beside them, the reference model's (`slots.py`): it ejects a single PR whose sibling
 	// half passed without running it alone; the queue runs it alone first, so a flake or an
@@ -342,29 +370,35 @@ describe('bisection replays from krusty', () => {
 	});
 
 	// Batch 13's 23 PRs that ran, with what its runs showed: #3075, #3251 and #2600 fail alone, and
-	// #3342 and #3309 fail together though each passes alone. #3296 sits on #3280.
+	// #3342 and #3309 fail together though each passes alone. #3296 (on #3280) only ran in a run the
+	// pair explains, so it is tried both ways.
 	const batch13 = [3247, 3230, 3217, 3075, 3351, 3347, 3330, 3324, 3312, 2975, 3341, 3339, 3283, 3280, 3251, 3345, 3342, 3288, 2600, 3296, 3309, 3292, 3257];
-	const bad13 = new Set([3075, 3251, 2600]);
-	const fails13 = (t: number[]) => t.some((n) => bad13.has(n)) || (t.includes(3342) && t.includes(3309));
 	const parent13 = (n: number) => (n === 3296 ? 3280 : null);
+	const truth13 = (bad: number[]) => (t: number[]) => t.some((n) => bad.includes(n)) || (t.includes(3342) && t.includes(3309));
 
-	for (const slots of [1, 2, 4])
-		test(`batch 13 with ${slots} slot${slots > 1 ? 's' : ''}: settles every PR, ejects only what fails`, () => {
-			const r = simulate({ batch: batch13, parentOf: parent13, fails: fails13, slots });
-			expect(r.violations).toEqual([]);
-			const out = r.ejected.map((e) => e.pr);
-			for (const b of bad13) expect(out).toContain(b);
-			// Of the pair, the one that runs last fails on top of the other, which landed.
-			expect(out.filter((n) => n === 3342 || n === 3309)).toHaveLength(1);
-			expect(out).toHaveLength(4);
-			expect(r.landed).toHaveLength(19);
-			expect(r.requeued).toEqual([]);
-			// On krusty: 34 runs in ten and a half hours (runs take about an hour), and not finished.
-			expect({ runs: r.runs, rounds: r.time }).toEqual({ 1: { runs: 17, rounds: 17 }, 2: { runs: 22, rounds: 11 }, 4: { runs: 31, rounds: 11 } }[slots]);
-		});
+	for (const bad of [
+		[3075, 3251, 2600],
+		[3075, 3251, 2600, 3296]
+	])
+		for (const slots of [1, 2, 4])
+			test(`batch 13 with ${slots} slot${slots > 1 ? 's' : ''}, #3296 ${bad.includes(3296) ? 'bad' : 'good'}: settles every PR, ejects only what fails`, () => {
+				const r = simulate({ batch: batch13, parentOf: parent13, fails: truth13(bad), slots });
+				expect(r.violations).toEqual([]);
+				const out = r.ejected.map((e) => e.pr);
+				for (const b of bad) expect(out).toContain(b);
+				// Of the pair, the one that runs last fails on top of the other, which landed.
+				expect(out.filter((n) => n === 3342 || n === 3309)).toHaveLength(1);
+				expect(out).toHaveLength(bad.length + 1);
+				expect(r.landed).toHaveLength(batch13.length - bad.length - 1);
+				expect(r.requeued).toEqual([]);
+				// Counts pinned for the documented truth (#3296 good). On krusty: 34 runs in ten and a
+				// half hours (runs take about an hour), and not finished.
+				if (!bad.includes(3296))
+					expect({ runs: r.runs, rounds: r.time }).toEqual({ 1: { runs: 17, rounds: 17 }, 2: { runs: 22, rounds: 11 }, 4: { runs: 31, rounds: 11 } }[slots]);
+			});
 });
 
-describe('split balance', () => {
+describe('split balance', { timeout: 60_000 }, () => {
 	test('random groups split within one PR, or within the stack that cannot be cut', () => {
 		const rnd = rng(3);
 		for (let t = 0; t < 2000; t++) {
