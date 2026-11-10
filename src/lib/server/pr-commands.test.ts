@@ -6,6 +6,7 @@ const db = await import('./db');
 const store = await import('./batch-store');
 const api = await import('./api-service');
 const { emitEvent } = await import('./events');
+const { readNotice } = await import('./hold-format');
 const cmd = await import('./pr-commands');
 import type { CommandDeps, CommandResult, PRComment } from './pr-commands';
 import type { Role, Caller } from './api-auth';
@@ -506,11 +507,13 @@ describe('/mq try', () => {
 });
 
 describe('/mq status', () => {
-	/** The JSON in the reply's hidden block, for agents. */
+	/** The reply's hidden block, read as agents read every queue comment. */
 	const hidden = (body: string) => {
-		const m = body.match(/<!-- merge-queue:status (\{.*\}) -->/);
-		expect(m, body).not.toBeNull();
-		return JSON.parse(m![1]);
+		expect(body).not.toContain('merge-queue:status');
+		const n = readNotice(body);
+		expect(n, body).not.toBeNull();
+		expect(n!.kind).toBe('status');
+		return n!;
 	};
 
 	test('a PR not in the queue says so, and how to queue it', async () => {
@@ -518,7 +521,8 @@ describe('/mq status', () => {
 		const body = deps.replies[0][1];
 		expect(body).toMatch(/^Not in the merge queue/m);
 		expect(body).toMatch(/`\/mq queue`/);
-		expect(hidden(body)).toMatchObject({ pr: 3, queue: null, nextActions: [] });
+		expect(hidden(body)).toMatchObject({ v: 1, kind: 'status', pr: 3, queue: null, nextActions: [], steps: [] });
+		expect(hidden(body).code).toBeUndefined();
 	});
 
 	test('a queued PR gives its position, priority and state, and links the queue page', async () => {
@@ -549,7 +553,8 @@ describe('/mq status', () => {
 		const body = deps.replies[0][1];
 		expect(body).toMatch(/Held \(`draft`\): This PR is a draft/);
 		expect(body).toMatch(/mark-ready/);
-		expect(hidden(body)).toMatchObject({ hold: { code: 'draft', reason: 'This PR is a draft' }, nextActions: [{ do: 'mark-ready' }] });
+		expect(hidden(body)).toMatchObject({ code: 'draft', reason: 'This PR is a draft', nextActions: ['mark-ready'], steps: [{ do: 'mark-ready', why: 'This PR is a draft' }] });
+		expect(hidden(body).queue).toMatchObject({ position: 1, status: 'queued' });
 	});
 
 	test('a child waiting for a parent nobody queued is told to queue it', async () => {
@@ -558,7 +563,31 @@ describe('/mq status', () => {
 		await run('/mq status', 'rae', 2);
 		const body = deps.replies[0][1];
 		expect(body).toMatch(/queue #1/i);
-		expect(hidden(body).nextActions).toEqual([{ do: 'queue', pr: 1, why: expect.any(String) }]);
+		expect(hidden(body).steps).toEqual([{ do: 'queue', pr: 1, why: expect.any(String) }]);
+		// The same id a hold notice gives for this hold.
+		expect(hidden(body).nextActions).toEqual(['queue-parent']);
+	});
+
+	test('the head the status was about is in the block, when the queue knows it', async () => {
+		api.enqueue(repo, writer, pull(1), {});
+		db.updateQueueItemHeadSha(item(1)!.id, 'abc123');
+		await run('/mq status', 'rae', 1);
+		expect(hidden(deps.replies[0][1]).head).toBe('abc123');
+		await run('/mq status', 'rae', 2);
+		expect(hidden(deps.replies[1][1]).head).toBeNull();
+	});
+
+	test('restack steps carry their command, and the restack id', async () => {
+		deps.open.add(8);
+		deps.analysis = async () => {
+			const a = analysis([1, 8], { 8: 1 });
+			a.prs.get(8)!.issues = [{ kind: 'parent-merged', pr: 8, parent: 1, severity: 'blocking', message: '#1 was merged' }];
+			return a;
+		};
+		await run('/mq status', 'rae', 8);
+		const n = hidden(deps.replies[0][1]);
+		expect(n.steps).toContainEqual({ do: 'restack', onto: 'main', cmd: 'git fetch origin main && git rebase origin/main', why: '#1 was merged' });
+		expect(n.nextActions).toContain('restack');
 	});
 
 	test('restack commands are shown as code', async () => {

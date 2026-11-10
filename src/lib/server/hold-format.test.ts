@@ -4,7 +4,7 @@ import { HOLD_CODES, holdAdvice, type HoldCode } from './batching';
 /** Waiting on other PRs or on the queue: nothing for the author to do. */
 const SILENT: HoldCode[] = ['deferred', 'parent-held', 'parent-not-ready', 'not-fetched'];
 import * as format from './hold-format';
-import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice } from './hold-format';
+import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice, statusBlock } from './hold-format';
 
 describe('the hold comment', () => {
 	test('says what holds the PR and the one thing to do, in one line; the code is in the hidden block', () => {
@@ -123,6 +123,26 @@ describe('the hidden block', () => {
 		expect(readNotice('<!-- merge-queue {"v":1,"kind":"other","pr":1} -->')).toBeNull();
 		const quoted = `> ${holdNotice({ pr: 1, head: 'a', code: 'draft', reason: 'Draft' })}\n\n${ejectedNotice({ pr: 1, head: 'b', reason: 'Failed' })}`;
 		expect(readNotice(quoted)).toMatchObject({ kind: 'ejected', head: 'b' });
+	});
+
+	test('a /mq status reply has a status block in the same format', () => {
+		const queue = { status: 'queued', position: 2, priority: 'normal', enqueuedAt: 't', lastMessage: 'x --> y', batch: null };
+		const steps = [{ do: 'queue', pr: 1, why: 'Stacked on #1, which isn\'t queued' }];
+		const block = statusBlock({ pr: 2, head: 'abc', queue, code: 'parent-not-queued', reason: 'Parent #1 is not queued', steps });
+		expect(block.indexOf('-->')).toBe(block.length - 3);
+		expect(readNotice(`Some prose\n\n${block}`)).toEqual({
+			v: 1,
+			kind: 'status',
+			pr: 2,
+			head: 'abc',
+			code: 'parent-not-queued',
+			reason: 'Parent #1 is not queued',
+			queue,
+			steps,
+			nextActions: ['queue-parent']
+		});
+		// Not queued and nothing to do: no code, no reason.
+		expect(readNotice(statusBlock({ pr: 3, head: null, queue: null, steps: [] }))).toEqual({ v: 1, kind: 'status', pr: 3, head: null, queue: null, steps: [], nextActions: [] });
 	});
 });
 
