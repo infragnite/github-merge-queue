@@ -231,7 +231,7 @@ function openParent(analysis: StackAnalysis, n: number): number | null {
 	return p !== null && analysis.prs.has(p) ? p : null;
 }
 
-/** Picks the next batch: urgent first, then oldest; stacks in parent-before-child order. */
+/** Picks the next batch: urgent first, then in line order; stacks in parent-before-child order. */
 export function planNextBatch(input: PlanInput): Plan {
 	const { now, queue, states, analysis, inflight, config } = input;
 	const held: Plan['held'] = [];

@@ -1,5 +1,5 @@
-// GitHub's rate limits, per installation. Every response says how much of the hour's budget is
-// left; once GitHub refuses for the rate limit, calls for that installation fail at once, with no
+// GitHub's rate limits, per installation and resource (REST `core` and `graphql` are separate
+// budgets). Every response says how much of the hour's budget is left; once GitHub refuses for the rate limit, calls for that installation fail at once, with no
 // request, until GitHub's reset time, instead of spending the next hour's budget on retries.
 
 import { GitHubError } from './github-retry';
@@ -41,13 +41,18 @@ export function checkBudget(key: string, now = Date.now()) {
  * Records what a response says about the budget. Returns the error to throw when the response
  * is a rate-limit refusal (a 403 or 429 with no budget left, or a secondary limit).
  */
-export function noteResponse(key: string, status: number, headers: Headers, message: string, now = Date.now()): RateLimitedError | null {
+export function noteResponse(key: string, status: number, headers: Headers, message: string, now = Date.now(), graphqlRateLimited = false): RateLimitedError | null {
 	const b = budget(key);
 	const num = (h: string) => (headers.get(h) === null ? null : Number(headers.get(h)));
 	b.remaining = num('x-ratelimit-remaining') ?? b.remaining;
 	b.limit = num('x-ratelimit-limit') ?? b.limit;
 	const reset = num('x-ratelimit-reset');
 	if (reset !== null) b.reset = reset * 1000;
+	if (graphqlRateLimited) {
+		// GraphQL answers a rate limit with 200 and an error of type RATE_LIMITED.
+		b.blockedUntil = b.reset && b.reset > now ? b.reset : now + 60_000;
+		return new RateLimitedError(b.blockedUntil, `${message || 'GraphQL rate limit exceeded'} (calls resume at ${until(b.blockedUntil)})`);
+	}
 	if (status !== 403 && status !== 429) return null;
 	const retryAfter = num('retry-after');
 	const primary = num('x-ratelimit-remaining') === 0;

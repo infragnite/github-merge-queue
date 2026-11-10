@@ -124,7 +124,7 @@
 		const text =
 			to === 'serial'
 				? 'Switch to one by one? Batches being tested now are stopped and their PRs go back in line; PRs then merge one at a time in the order shown.'
-				: 'Switch to batches? PRs are then tested together, urgent first and then oldest, and the order can no longer be dragged.';
+				: 'Switch to batches? PRs are then tested together, urgent first and then in line order, and the order can no longer be dragged.';
 		if (!confirm(text)) cancel();
 	};
 </script>
@@ -260,7 +260,7 @@
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
 					<h2 class="text-base font-semibold text-gray-900">Queue · {inLine}</h2>
 					<span class="text-xs text-gray-500">
-						{batchMode ? 'urgent first, then oldest' : 'drag to reorder'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
+						{batchMode ? 'urgent first, then in line order' : 'drag to reorder'}{inFlightCount ? ` · ${inFlightCount} being tested` : ''}{view.attention.length ? ` · ${view.attention.length} need attention` : ''}
 					</span>
 					<input
 						type="search"

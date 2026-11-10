@@ -46,3 +46,12 @@ test('durations are shown in their unit', () => {
 	const f = BATCH_FIELDS.find((x) => x.name === 'config.ciTimeoutMs')!;
 	expect(shown(f, { config: { ciTimeoutMs: 12 * 3_600_000 }, ci: {} })).toBe(12);
 });
+
+test('with the current settings, only changed fields are sent, so a rounded duration is not written back', () => {
+	const current = { config: { maxBatch: 8, collectWindowMs: 61_234, retryFailed: true }, ci: { workflow: 'ci.yml' } };
+	const body = parseSettingsForm(form({ 'config.maxBatch': '32', 'config.collectWindowMs': '1.02', 'config.retryFailed': 'on', 'ci.workflow': 'ci.yml' }), current);
+	expect(body.config.maxBatch).toBe(32);
+	expect(body.config).not.toHaveProperty('collectWindowMs');
+	expect(body.config).not.toHaveProperty('retryFailed');
+	expect(body.ci).toEqual({});
+});
