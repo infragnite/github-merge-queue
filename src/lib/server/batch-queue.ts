@@ -323,9 +323,7 @@ class Tick {
 		db.updateQueueItemStatus(it.id, 'failed', reason);
 		db.addToHistory(this.repoId, n, it.pr_title, it.pr_url, it.author_login, null, 'failed', reason, it.created_at);
 		db.removeFromQueue(it.id);
-		await this.d.github
-			.comment(n, notice)
-			.catch(this.bestEffort('github.comment'));
+		if (this.speaks('attention')) await this.d.github.comment(n, notice).catch(this.bestEffort('github.comment'));
 		this.event(n, 'ejected', { reason });
 		this.log(`ejected #${n}: ${reason}`);
 	}
@@ -415,7 +413,7 @@ class Tick {
 		const hold = { pr: n, head: p.headSha, code: 'conflict' as const, reason, files, fix };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
 		await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
-		await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
+		if (this.speaks('attention')) await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
 	}
@@ -1609,12 +1607,15 @@ class Tick {
 			store.recordRebasedHead(this.repoId, n, p.headSha, r.head, before.ciGreen);
 			db.updateQueueItemHeadSha(it.id, r.head);
 			if (merged && p.baseRef !== def) await this.d.github.retargetBase(n, def).catch(this.bestEffort('github.retargetBase'));
-			await this.d.github
-				.comment(
-					n,
-					`The merge queue restacked this PR onto ${ontoName} (${issue.message}). Its ${r.replayed} commit(s) applied without conflicts; approvals carry over.\n\nBefore pushing again, move any local commits onto it:\n\n\`\`\`sh\ngit fetch origin ${p.headRef} && git rebase --onto FETCH_HEAD ${p.headSha.slice(0, 12)}\n\`\`\``
-				)
-				.catch(this.bestEffort('github.comment'));
+			// Informational: the push already happened, and nothing is waiting on the author.
+			if (this.speaks('info')) {
+				await this.d.github
+					.comment(
+						n,
+						`The merge queue restacked this PR onto ${ontoName} (${issue.message}). Its ${r.replayed} commit(s) applied without conflicts; approvals carry over.\n\nBefore pushing again, move any local commits onto it:\n\n\`\`\`sh\ngit fetch origin ${p.headRef} && git rebase --onto FETCH_HEAD ${p.headSha.slice(0, 12)}\n\`\`\``
+					)
+					.catch(this.bestEffort('github.comment'));
+			}
 			this.event(n, 'rebased', { from: p.headSha, to: r.head, onto: ontoName, reason: issue.message });
 			this.log(`restacked #${n} onto ${ontoName}`);
 			pushed = true;
@@ -1632,12 +1633,26 @@ class Tick {
 	 * of the queue, is released. What couldn't be posted is recorded only once it is, so the next
 	 * tick tries again.
 	 */
-	/** A comment on PR `n`, best effort; a rate limit stops the tick. */
-	async say(n: number, body: string) {
-		await this.d.github.comment(n, body).catch((e) => {
-			if (e instanceof RateLimitedError) throw e;
-			this.bestEffort('github.comment')(e);
-		});
+	/** Whether the repo's comment setting posts a notice of this kind. */
+	speaks(kind: 'attention' | 'info'): boolean {
+		const mode = this.settings().config.comments;
+		return mode === 'all' || (mode === 'attention' && kind === 'attention');
+	}
+
+	/**
+	 * A comment on PR `n`, best effort, if the repo's comment setting posts this kind; a rate limit
+	 * stops the tick. Whether it was posted.
+	 */
+	async say(n: number, body: string, kind: 'attention' | 'info'): Promise<boolean> {
+		if (!this.speaks(kind)) return false;
+		return this.d.github.comment(n, body).then(
+			() => true,
+			(e) => {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.comment')(e);
+				return false;
+			}
+		);
 	}
 
 	async recordHolds(held: { pr: number; admission: Hold }[]) {
@@ -1684,7 +1699,9 @@ class Tick {
 				if (e instanceof RateLimitedError) throw e;
 				return null;
 			}))?.headSha;
-			if (was?.told && was.code === code && was.reason === reason && (!current || !was.head || was.head === current)) continue;
+			// Kept quiet by the comment setting, and still not wanted: the check already says it.
+			const settled = !!was?.told || (!!was?.quiet && !this.speaks('attention'));
+			if (settled && was!.code === code && was!.reason === reason && (!current || !was!.head || was!.head === current)) continue;
 			const hold = (head: string | null) => ({ pr: it.pr_number, head, code: code as HoldCode, reason });
 			const head = await tell(it.pr_number, (h) => ({ state: 'action_required', ...holdCheck(hold(h)) }));
 			if (head === false) continue;
@@ -1693,10 +1710,11 @@ class Tick {
 			const advice = holdAdvice(code as HoldCode);
 			// Told this kind on this head already; a deferral that comes back is told again only after a push.
 			const toldThis = !!stored?.told && stored.code === code && (!stored.released || (code === 'deferred' && stored.head === (head ?? undefined)));
-			if (advice && !toldThis)
-				await this.say(it.pr_number, holdNotice(hold(head)));
+			// Told once the comment is posted, or when there is nothing to comment on; a hold the setting kept
+			// quiet is commented on if it is made louder.
+			const told = !advice || toldThis || (await this.say(it.pr_number, holdNotice(hold(head)), 'attention'));
 			db.updateQueueItemStatus(it.id, 'queued', reason);
-			store.setHold(it.id, { code, reason, told: true, head: head ?? undefined });
+			store.setHold(it.id, { code, reason, told, head: head ?? undefined, ...(told ? {} : { quiet: true }) });
 			this.event(it.pr_number, 'held', { code, reason });
 		}
 		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).

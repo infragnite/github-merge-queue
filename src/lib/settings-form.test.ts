@@ -68,3 +68,13 @@ test('the settings page shows every field exactly once (a boolean left off would
 	const shownNames = SETTING_GROUPS.flatMap((g) => g.fields.map((f) => f.name));
 	expect([...shownNames].sort()).toEqual(ALL_FIELDS.map((f) => f.name).sort());
 });
+
+test('how much the queue comments is a choice of all, only when action is needed, or none, all by default', () => {
+	const f = ALL_FIELDS.find((x) => x.name === 'config.comments')!;
+	expect(f.kind).toBe('choice');
+	expect(f.options?.map((o) => o.value)).toEqual(['all', 'attention', 'none']);
+	expect(shown(f, { config: { comments: 'all' }, ci: {} })).toBe('all');
+	expect(parseSettingsForm(form({ 'config.comments': 'attention' })).config.comments).toBe('attention');
+	expect(parseSettingsForm(form({ 'config.comments': 'none' }), { config: { comments: 'none' }, ci: {} }).config).not.toHaveProperty('comments');
+	expect(() => parseSettingsForm(form({ 'config.comments': 'loud' }))).toThrow('PR comments must be one of: All, Only when action is needed, None');
+});
