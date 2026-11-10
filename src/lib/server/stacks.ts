@@ -500,6 +500,21 @@ export function analyzeStacks(input: StackInput): StackAnalysis {
 }
 
 /**
+ * The command that puts a broken PR back on the head of the PR it builds on: past the stale copies
+ * of a rebased parent's commits, or a plain rebase for a PR off its parent's latest commit. Null
+ * when its stack needs no rebase onto a parent.
+ */
+export function restackCommand(info: PRStackInfo): string | null {
+	const rebased = info.issues.find((i) => i.kind === 'parent-rebased');
+	if (rebased && info.parent !== null) {
+		const upstream = rebased.staleCommits?.at(-1) ?? `<last commit of #${info.parent} in your branch>`;
+		return `git fetch origin pull/${info.parent}/head && git rebase --onto FETCH_HEAD ${upstream}`;
+	}
+	const off = info.parent === null ? info.issues.find((i) => i.kind === 'base-mismatch' && i.parent !== undefined) : undefined;
+	return off ? `git fetch origin pull/${off.parent}/head && git rebase FETCH_HEAD` : null;
+}
+
+/**
  * Whether the queue may merge `prNumber` into the default branch now, and
  * why not. Stacked PRs whose parent is still open are held: merging them
  * would either land the parent's commits or merge into the parent's branch.

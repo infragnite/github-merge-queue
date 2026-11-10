@@ -9,7 +9,7 @@ import { noteVisibility } from './public-view';
 import { requireRole, type Caller } from './api-auth';
 import { COMMENT_MODES, DEFAULT_BATCH_CONFIG, type BatchConfig, type CommentMode, type Priority } from './batching';
 import type { BatchRow } from './batch-store';
-import type { PRStackInfo, StackAnalysis, StackIssue } from './stacks';
+import { restackCommand, type PRStackInfo, type StackAnalysis, type StackIssue } from './stacks';
 import type { QueueItem, Repo } from '$lib/types';
 
 export class ApiError extends Error {
@@ -63,16 +63,8 @@ function nextActions(info: PRStackInfo, analysis: StackAnalysis, defaultBranch: 
 	const issue = (k: StackIssue['kind']) => info.issues.find((i) => i.kind === k);
 	const p = info.parent;
 	const rebased = issue('parent-rebased');
-	if (rebased && p !== null) {
-		const stale = rebased.staleCommits ?? [];
-		const upstream = stale.length ? stale.at(-1)! : `<last commit of #${p} in your branch>`;
-		out.push({
-			do: 'restack',
-			onto: `#${p}`,
-			cmd: `git fetch origin pull/${p}/head && git rebase --onto FETCH_HEAD ${upstream}`,
-			why: rebased.message
-		});
-	}
+	const restack = restackCommand(info);
+	if (rebased && p !== null && restack) out.push({ do: 'restack', onto: `#${p}`, cmd: restack, why: rebased.message });
 	const merged = issue('parent-merged');
 	if (merged) {
 		out.push({
@@ -86,9 +78,8 @@ function nextActions(info: PRStackInfo, analysis: StackAnalysis, defaultBranch: 
 	if (issue('base-branch-missing')) out.push({ do: 'retarget-base', base: info.expectedBase, why: issue('base-branch-missing')!.message });
 	const mismatch = issue('base-mismatch');
 	// No ancestry link to the PR whose branch it targets: it is off that PR's latest commit.
-	if (mismatch && p === null && mismatch.parent !== undefined) {
-		const on = mismatch.parent;
-		out.push({ do: 'restack', onto: `#${on}`, cmd: `git fetch origin pull/${on}/head && git rebase FETCH_HEAD`, why: mismatch.message });
+	if (mismatch && p === null && mismatch.parent !== undefined && restack) {
+		out.push({ do: 'restack', onto: `#${mismatch.parent}`, cmd: restack, why: mismatch.message });
 	}
 	if (p !== null && analysis.prs.has(p) && !rebased) {
 		out.push(

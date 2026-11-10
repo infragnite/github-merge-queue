@@ -65,7 +65,7 @@ export interface HoldInfo {
 	reason: string;
 	/** A conflict's files. */
 	files?: string[];
-	/** A conflict's commands, run before resolving it. */
+	/** A conflict's commands, run before resolving it; a broken stack's restack command. */
 	fix?: string;
 }
 
@@ -81,6 +81,7 @@ function marker(n: QueueNotice): string {
 /** A command that fixes the hold, when there is one we can be sure of. */
 function command(h: HoldInfo): string | null {
 	if (h.code === 'conflict' && h.fix) return `${h.fix}\n# resolve the conflicts, then\ngit push --force-with-lease`;
+	if (h.code === 'stack-broken' && h.fix) return `${h.fix}\n# resolve any conflicts, then\ngit push --force-with-lease`;
 	if (h.code === 'draft') return `gh pr ready ${h.pr}`;
 	if (h.code === 'ci-failed') return `gh pr checks ${h.pr}`;
 	return null;

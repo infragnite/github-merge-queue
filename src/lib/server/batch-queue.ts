@@ -35,7 +35,7 @@ import { planNextBatch } from './queue-model';
 import { ejectedNotice, holdCheck, holdNotice } from './hold-format';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
-import type { StackAnalysis } from './stacks';
+import { restackCommand, type StackAnalysis } from './stacks';
 import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
 import { emitEvent, heldPRs, type QueueEventKind } from './events';
@@ -1658,6 +1658,12 @@ class Tick {
 		);
 	}
 
+	/** The command that restacks a PR held for its broken stack, when a rebase onto its parent fixes it. */
+	private async restackFix(n: number): Promise<string | null> {
+		const info = (await this.analysis()).prs.get(n);
+		return info ? restackCommand(info) : null;
+	}
+
 	async recordHolds(held: { pr: number; admission: Hold }[]) {
 		const now = new Map(held.map((h) => [h.pr, h.admission]));
 		// Posts the check on the PR's head: the head it was posted on, null when the PR is closed or
@@ -1717,7 +1723,8 @@ class Tick {
 			// Kept quiet by the comment setting, and still not wanted: the check already says it.
 			const settled = !!was?.told || (!!was?.quiet && !this.speaks('attention'));
 			if (settled && was!.code === code && was!.reason === reason && (!current || !was!.head || was!.head === current)) continue;
-			const hold = (head: string | null) => ({ pr: it.pr_number, head, code: code as HoldCode, reason });
+			const restack = code === 'stack-broken' ? await this.restackFix(it.pr_number) : null;
+			const hold = (head: string | null) => ({ pr: it.pr_number, head, code: code as HoldCode, reason, ...(restack ? { fix: restack } : {}) });
 			const head = await tell(it.pr_number, (h) => ({ state: 'action_required', ...holdCheck(hold(h)) }));
 			if (head === false) continue;
 			// One comment per kind of hold: it notifies the author, a status doesn't. A new reason of
