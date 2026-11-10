@@ -335,17 +335,17 @@ class Tick {
 	 * to the queue; after a few such failures it leaves, so an unexplained
 	 * (flaky) failure can't loop forever.
 	 */
-	async requeueAfterFailure(prs: number[], batchId: number) {
+	async requeueAfterFailure(prs: number[], batch: BatchRow) {
 		for (const n of prs) {
 			const it = this.item(n);
 			if (!it) continue;
 			if (store.bumpBatchFailures(it.id) >= MAX_BATCH_FAILURES) {
 				await this.ejectWithStack([
-					{ pr: n, reason: `failed in ${MAX_BATCH_FAILURES} batches without a clear culprit (flaky tests?), last batch ${batchId}` }
+					{ pr: n, reason: `failed in ${MAX_BATCH_FAILURES} batches without a clear culprit (flaky tests?), last batch ${batch.number}` }
 				]);
 			} else {
 				db.updateQueueItemStatus(it.id, 'queued');
-				this.event(n, 'requeued', { batch: batchId });
+				this.event(n, 'requeued', { batch: batch.id, number: batch.number });
 			}
 		}
 	}
@@ -1271,7 +1271,7 @@ class Tick {
 		}
 		if (plan.requeue.length) {
 			store.leaveBatch(batch.id, plan.requeue);
-			await this.requeueAfterFailure(plan.requeue, batch.id);
+			await this.requeueAfterFailure(plan.requeue, batch);
 			await this.leaveBisection(batch, plan.requeue);
 		}
 		if (plan.done) {
@@ -1760,16 +1760,16 @@ export async function cancelBatch(deps: QueueDeps, id: number, by: string): Prom
 	const b = store.getBatch(id);
 	if (!b || b.repo_id !== deps.repo.id || b.kind !== 'batch') throw new Error(`Batch ${id} not found`);
 	const active = store.getActiveBatches(deps.repo.id);
-	if (!active.some((x) => x.id === id)) throw new Error(`Batch ${id} is ${b.status}; only a batch being tested or bisected can be cancelled`);
+	if (!active.some((x) => x.id === id)) throw new Error(`Batch ${b.number} is ${b.status}; only a batch being tested or bisected can be cancelled`);
 	const waiting = (x: BatchRow) => x.members.filter((n) => t.item(n)?.status === 'checking');
 	const requeued = waiting(b);
 	const above = active.filter((x) => x.id > id);
-	await t.supersede([b], `batch ${id} was cancelled by ${by}`);
+	await t.supersede([b], `batch ${b.number} was cancelled by ${by}`);
 	store.setBatchStatus(id, 'cancelled');
 	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled');
-	await t.supersede(above, `batch ${id} below it was cancelled`);
-	t.event(null, 'cancelled', { batch: id, by, requeued, rebuilt: above.map((x) => x.id) });
-	t.log(`batch ${id} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
+	await t.supersede(above, `batch ${b.number} below it was cancelled`);
+	t.event(null, 'cancelled', { batch: id, number: b.number, by, requeued, rebuilt: above.map((x) => x.id) });
+	t.log(`batch ${b.number} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
 	return { requeued, rebuilt: above.map((x) => x.id) };
 }
 
