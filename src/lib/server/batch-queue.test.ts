@@ -311,6 +311,58 @@ describe('batch queue runtime', () => {
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')).toMatchObject({ landed: [1, 2, 3], ejected: [4] });
 	});
 
+	test('an urgent PR runs between two bisection steps, and the bisection then goes on from where it was', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		pr(5);
+		store.setQueuePriority(repo.id, 5, 'urgent');
+		await run(60);
+		// #5 lands after the step that was running, before the next one; nothing is tested twice.
+		expect(world.merged).toEqual([1, 2, 5, 3]);
+		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
+			'batch 1,2,3,4',
+			'step 1,2',
+			'batch 5',
+			'step 3',
+			'step 4'
+		]);
+		const batches = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch');
+		expect(batches.find((b) => b.members.join() === '5')).toMatchObject({ status: 'landed', express: true });
+		expect(batches.find((b) => b.members.length === 4)).toMatchObject({ status: 'landed', landed: [1, 2, 3], ejected: [4] });
+	});
+
+	test('an urgent batch that fails between two bisection steps is bisected first, and the first bisection then goes on', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		pr(5);
+		pr(6, { file: 'y-breaks-master.txt' });
+		world.breakingFiles.add('y-breaks-master.txt');
+		store.setQueuePriority(repo.id, 5, 'urgent');
+		store.setQueuePriority(repo.id, 6, 'urgent');
+		await run(80);
+		expect(world.merged).toEqual([1, 2, 5, 3]);
+		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
+			'batch 1,2,3,4',
+			'step 1,2',
+			'batch 5,6',
+			'step 5',
+			'step 6',
+			'step 3',
+			'step 4'
+		]);
+		expect(world.comments.map((c) => c.pr).sort()).toEqual([4, 6]);
+	});
+
 	test('a bisection lands the half that passes at once, while the other half is still running', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false, bisectRuns: 2 } });
 		pr(1);
