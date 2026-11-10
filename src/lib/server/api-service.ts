@@ -85,7 +85,11 @@ function nextActions(info: PRStackInfo, analysis: StackAnalysis, defaultBranch: 
 	if (issue('parent-closed')) out.push({ do: 'fix', why: issue('parent-closed')!.message });
 	if (issue('base-branch-missing')) out.push({ do: 'retarget-base', base: info.expectedBase, why: issue('base-branch-missing')!.message });
 	const mismatch = issue('base-mismatch');
-	if (mismatch && p === null) out.push({ do: 'retarget-base', base: info.expectedBase, why: mismatch.message });
+	// No ancestry link to the PR whose branch it targets: it is off that PR's latest commit.
+	if (mismatch && p === null && mismatch.parent !== undefined) {
+		const on = mismatch.parent;
+		out.push({ do: 'restack', onto: `#${on}`, cmd: `git fetch origin pull/${on}/head && git rebase FETCH_HEAD`, why: mismatch.message });
+	}
 	if (p !== null && analysis.prs.has(p) && !rebased) {
 		out.push(
 			queued.has(p)
