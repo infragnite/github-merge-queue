@@ -135,6 +135,8 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 			.split(/\$\{\{[\s\S]*?\}\}/)
 			.map(escape)
 			.join('.+?');
+		// A name that is only expressions says nothing about the check run's name: it matches none.
+		if (!template.replace(/\$\{\{[\s\S]*?\}\}/g, '').trim()) return /(?!)/;
 		const values = template.includes('${{') ? '' : '(?: \\(.+\\))?';
 		return new RegExp(`^${pattern}${values}(?: / .+)?$`);
 	});

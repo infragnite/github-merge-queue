@@ -1638,12 +1638,15 @@ class Tick {
 			// A PR in conflict keeps its status and message: it is held for that, and was told.
 			if (it.status !== 'queued') continue;
 			const was = store.currentHold(it);
+			// What it was last told, even if its message changed since (fewer PRs ahead of a deferral).
+			const stored = store.storedHold(it as QueueItem & { hold?: string | null });
 			const h = now.get(it.pr_number);
 			if (!h) {
 				if (!was) continue;
 				if (!(await tell(it.pr_number, 'pending', 'In line in the merge queue'))) continue;
-				if (was.told) await this.say(it.pr_number, 'Back in line in the merge queue.');
-				store.setHold(it.id, null);
+				// A lifted deferral is the planner trying again, not news for the author.
+				if (was.told && was.code !== 'deferred') await this.say(it.pr_number, 'Back in line in the merge queue.');
+				store.setHold(it.id, was.told ? { ...was, released: true } : null);
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 				this.event(it.pr_number, 'released', { code: was.code });
 				continue;
@@ -1654,7 +1657,8 @@ class Tick {
 			// One comment per kind of hold: it notifies the author, a status doesn't. A new reason of
 			// the same kind (fewer PRs ahead) only updates the status.
 			const advice = holdAdvice(code as HoldCode);
-			if (advice && !(was?.told && was.code === code))
+			const toldThis = !!stored?.told && stored.code === code && (!stored.released || code === 'deferred');
+			if (advice && !toldThis)
 				await this.say(it.pr_number, `Needs attention in the merge queue: ${reason}\n\nWhat to do: ${advice}`);
 			db.updateQueueItemStatus(it.id, 'queued', reason);
 			store.setHold(it.id, { code, reason, told: true });

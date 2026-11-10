@@ -535,12 +535,24 @@ export interface Hold {
 	reason: string;
 	/** Its agent was told on GitHub. A hold saved before agents were told is told again. */
 	told?: boolean;
+	/** The PR was free again after it; kept so a deferral that comes back isn't commented on again. */
+	released?: boolean;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {
 	getDb()
 		.prepare('UPDATE queue_items SET hold = ? WHERE id = ?')
 		.run(hold ? JSON.stringify(hold) : null, itemId);
+}
+
+/** The last hold saved for the item, current or not. */
+export function storedHold(item: { hold?: string | null }): Hold | null {
+	if (!item.hold) return null;
+	try {
+		return JSON.parse(item.hold) as Hold;
+	} catch {
+		return null;
+	}
 }
 
 /** The item's hold, when it still describes the item's current message. */
