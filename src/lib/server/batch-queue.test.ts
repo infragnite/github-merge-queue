@@ -627,7 +627,7 @@ describe('batch queue runtime', () => {
 		await run();
 		expect(world.started).toEqual([]);
 		expect(git.pr(1).baseRef).toBe('release');
-		expect(db.getQueueItems(repo.id)[0].error_message).toMatch(/does not target the default branch/);
+		expect(db.getQueueItems(repo.id)[0].error_message).toBe('Does not target the default branch');
 	});
 
 	test('a PR dequeued while its batch is being built does not land', async () => {
@@ -1282,7 +1282,7 @@ describe('batch queue runtime', () => {
 		world.forks.add(2);
 		await run();
 		expect(world.merged).toEqual([1]);
-		expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.error_message).toMatch(/stacked on another PR from a fork/);
+		expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.error_message).toBe('Stacked on another PR from a fork; retarget it to the default branch once its parent lands');
 	});
 
 	test('a PR left updating by serial mode goes back in line in batch mode', async () => {
@@ -1724,7 +1724,7 @@ describe('batch queue runtime', () => {
 		world.forks.add(1);
 		await run(3);
 		expect(world.started).toEqual([]);
-		expect(db.getQueueItems(repo.id)[0].error_message).toMatch(/comes from a fork/);
+		expect(db.getQueueItems(repo.id)[0].error_message).toBe('From a fork; a writer must approve its head first');
 		await expect(startTry(world.deps(), 1)).rejects.toThrow(/comes from a fork/);
 		world.approved.add(1);
 		await run();
