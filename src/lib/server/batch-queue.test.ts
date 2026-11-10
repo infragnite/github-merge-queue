@@ -7,6 +7,7 @@ const { tickBatchQueue, startTry, retireBatches, recoverInterrupted, cancelBatch
 const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
+const { enqueue } = await import('./api-service');
 const events = await import('./events');
 import { GitSandbox } from './testing/git-sandbox';
 import { writeFileSync } from 'node:fs';
@@ -774,6 +775,23 @@ describe('batch queue runtime', () => {
 		expect(world.prChecks.filter((c) => c.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required', title: reason });
 		// Not a conflict to rebase: no needs-rebase label.
 		expect(world.labels.get(2)?.has('needs-rebase') ?? false).toBe(false);
+	});
+
+	test('a PR held for its workflow change stays queued, so queueing it again is refused; a push retries it', async () => {
+		world.workflowsDenied = true;
+		pr(1);
+		pr(2, { file: '.github/workflows/ci.yml' });
+		await run();
+		expect(world.merged).toEqual([1]);
+		const live = { number: 2, title: 'PR 2', html_url: 'https://example.test/pull/2', state: 'open', user: { login: 'dev', avatar_url: '' } };
+		expect(() => enqueue(repo as Parameters<typeof enqueue>[0], { login: 'agent', role: 'write', app: false }, live, {})).toThrow('#2 is already queued');
+		// An admin grants the permission; nothing retries until a push.
+		world.workflowsDenied = false;
+		await run(3);
+		expect(world.merged).toEqual([1]);
+		git.commit('pr2', 'pr2 again', 'pr2.txt');
+		await run();
+		expect(world.merged).toEqual([1, 2]);
 	});
 
 	test('pipelines a second batch on top of the first', async () => {

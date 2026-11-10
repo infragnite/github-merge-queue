@@ -61,7 +61,7 @@ describe('the hold comment', () => {
 		const body = holdNotice({ pr: 2, head: 'h2', code: 'workflow-permission', reason: 'Changes .github/workflows/ci.yml, which the merge queue app may not push', files: ['.github/workflows/ci.yml'] });
 		expect(body).toBe(
 			[
-				"**Merge queue:** Changes .github/workflows/ci.yml, which the merge queue app may not push. A repository admin grants the app the Workflows: Read and write permission; push again, or queue it again, to retry.",
+				"**Merge queue:** Changes .github/workflows/ci.yml, which the merge queue app may not push. A repository admin grants the app the Workflows: Read and write permission; then push to retry.",
 				'',
 				'<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"h2","code":"workflow-permission","reason":"Changes .github/workflows/ci.yml, which the merge queue app may not push","files":[".github/workflows/ci.yml"],"nextActions":["grant-workflows-permission"]} -->'
 			].join('\n')
