@@ -893,6 +893,46 @@ describe('batch queue runtime', () => {
 		expect(kinds().filter((k) => k === 'held' || k === 'released' || k === 'batched')).toEqual(['held', 'released', 'batched']);
 	});
 
+	test('a hold recorded before PRs were told about holds is told on the next tick', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!;
+		// What the previous version left: the hold and its message, and nothing posted.
+		db.updateQueueItemStatus(item.id, 'queued', '#1 has changes requested');
+		store.setHold(item.id, { code: 'changes-requested', reason: '#1 has changes requested' });
+		await run(2);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+		expect(world.comments).toEqual([
+			{ pr: 1, body: 'Needs attention in the merge queue: #1 has changes requested\n\nWhat to do: address the requested changes, and get the review approved or dismissed.' }
+		]);
+	});
+
+	test('a held PR gets one comment saying what to do, and one when it is back in line', async () => {
+		pr(1);
+		pr(2);
+		world.changesRequested.add(2);
+		await run(3);
+		expect(world.merged).toEqual([1]);
+		expect(world.comments).toEqual([
+			{ pr: 2, body: 'Needs attention in the merge queue: #2 has changes requested\n\nWhat to do: address the requested changes, and get the review approved or dismissed.' }
+		]);
+		world.changesRequested.delete(2);
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.comments.slice(1)).toEqual([{ pr: 2, body: 'Back in line in the merge queue.' }]);
+	});
+
+	test('a PR whose parent is not queued is told to queue it', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		await run(2);
+		expect(world.comments).toEqual([
+			{ pr: 2, body: "Needs attention in the merge queue: Stacked on #1, which isn't queued; queue #1 first\n\nWhat to do: queue the PR it is stacked on; a stacked PR goes only with the PRs under it." }
+		]);
+	});
+
 	test('a PR held while a batch bisects is told then, not once the bisection ends', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
