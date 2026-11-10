@@ -6,6 +6,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
+import { RateLimitedError } from './rate-limit';
 import { baselineCommit, buildBatch, GitRunner } from './batch-builder';
 import { replay } from './rebase';
 import { getQueueSettings, type CISettings } from './batch-store';
@@ -294,6 +295,29 @@ export function prReportCalls(report: PRReport | undefined): ('check-run' | 'sta
 	return ['check-run', 'status'];
 }
 
+/**
+ * Posts what the PR report setting says. Posting both, the status is what a ruleset still requires:
+ * only its failure fails the post (so it is retried). A refused check run, before the app has the
+ * Checks permission on the installation, is only warned about; a retry would post the status again
+ * every tick. A rate limit stops at once.
+ */
+export async function postPRReport(
+	report: PRReport | undefined,
+	postCheck: () => Promise<unknown>,
+	postStatus: () => Promise<unknown>,
+	warn: (e: unknown) => void
+): Promise<void> {
+	const kinds = prReportCalls(report);
+	for (const kind of kinds) {
+		try {
+			await (kind === 'check-run' ? postCheck() : postStatus());
+		} catch (e) {
+			if (e instanceof RateLimitedError || kind === 'status' || kinds.length === 1) throw e;
+			warn(e);
+		}
+	}
+}
+
 export function liveDeps(repo: RepoRef): QueueDeps {
 	const { owner, name } = repo;
 	const mirror = new Mirror(repo);
@@ -450,17 +474,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			setPRCheck: async (sha, check) => {
 				const { prStatus, prReport } = ci();
 				const page = queuePage(env.APP_URL, owner, name, sha);
-				// Both are posted even when one fails, and the first failure is raised after.
-				let failed: unknown = null;
-				for (const kind of prReportCalls(prReport)) {
-					try {
-						if (kind === 'check-run') await github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page }));
-						else await github.createCommitStatus(owner, name, sha, statusFromCheck(check, prStatus, page));
-					} catch (e) {
-						failed ??= e;
-					}
-				}
-				if (failed) throw failed;
+				await postPRReport(
+					prReport,
+					() => github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page })),
+					() => github.createCommitStatus(owner, name, sha, statusFromCheck(check, prStatus, page)),
+					(e) => console.warn(`[merge-queue] ${owner}/${name}: check run not posted (does the app have the Checks write permission?): ${e instanceof Error ? e.message : e}`)
+				);
 			},
 			label: async (n, label, on) => {
 				if (on) await github.addLabel(owner, name, n, label);
