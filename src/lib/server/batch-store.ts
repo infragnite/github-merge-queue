@@ -52,6 +52,8 @@ export interface BatchRow {
 	landed: number[];
 	/** PRs that left a bisecting batch without landing. */
 	left_prs: number[];
+	/** Those of them ejected: shown to fail (or stacked on one that was). */
+	ejected: number[];
 	status: BatchStatus;
 	express: boolean;
 	ci_result: 'pending' | 'success' | 'failure';
@@ -189,7 +191,8 @@ export function migrateBatches(database: Database.Database) {
 		// Bisection lands passing groups as it goes: the PRs of this batch that landed so far.
 		['landed', `TEXT NOT NULL DEFAULT '[]'`],
 		// PRs that left a bisecting batch without landing (ejected, or back in the queue).
-		['left_prs', `TEXT NOT NULL DEFAULT '[]'`]
+		['left_prs', `TEXT NOT NULL DEFAULT '[]'`],
+		['ejected', `TEXT NOT NULL DEFAULT '[]'`]
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
@@ -256,10 +259,11 @@ export function setQueuePriority(repoId: number, prNumber: number, priority: Pri
 
 // --- batches ---
 
-type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs'> & {
+type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs' | 'ejected'> & {
 	members: string;
 	landed: string | null;
 	left_prs: string | null;
+	ejected: string | null;
 	heads: string;
 	steps: string;
 	context: string;
@@ -273,6 +277,7 @@ function parse(r: RawBatch): BatchRow {
 		context: JSON.parse(r.context),
 		landed: JSON.parse(r.landed ?? '[]'),
 		left_prs: JSON.parse(r.left_prs ?? '[]'),
+		ejected: JSON.parse(r.ejected ?? '[]'),
 		heads: JSON.parse(r.heads),
 		steps: JSON.parse(r.steps),
 		express: !!r.express
@@ -326,11 +331,12 @@ export function recordBisectLanding(id: number, prs: number[], sha: string, tree
 }
 
 /** PRs leave a bisecting batch without landing: it no longer carries them. */
-export function leaveBatch(id: number, prs: number[]) {
+export function leaveBatch(id: number, prs: number[], opts: { ejected?: boolean } = {}) {
 	const b = getBatch(id);
 	if (!b || !prs.length) return;
 	const left = [...new Set([...b.left_prs, ...prs])];
-	getDb().prepare('UPDATE batches SET left_prs = ? WHERE id = ?').run(JSON.stringify(left), id);
+	const ejected = opts.ejected ? [...new Set([...b.ejected, ...prs])] : b.ejected;
+	getDb().prepare('UPDATE batches SET left_prs = ?, ejected = ? WHERE id = ?').run(JSON.stringify(left), JSON.stringify(ejected), id);
 }
 
 /** The default branch moved under a bisecting batch: it follows it. */
