@@ -346,7 +346,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
 			build: async (base, members) => buildBatch(mirror.git, base, members),
 			restack: async (head, upstream, onto) => replay(mirror.git, { head, upstream, onto }),
-			baseline: async (base) => baselineCommit(mirror.git, base)
+			baseline: async (base) => baselineCommit(mirror.git, base),
+			changed: async (from, to) => mirror.git.run(['diff', '--name-only', from, to]).out.split('\n').filter(Boolean)
 		},
 		ci: {
 			// Pushing the mq/* branch triggers the workflow; the base is in the batch commit's trailer.

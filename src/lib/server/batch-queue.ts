@@ -140,6 +140,8 @@ export interface QueueGit {
 	restack(head: string, upstream: string, onto: string): Promise<ReplayResult>;
 	/** A commit with `base`'s own tree on top of it, to test the default branch alone. */
 	baseline(base: string): Promise<string>;
+	/** The paths that differ between two commits. */
+	changed(from: string, to: string): Promise<string[]>;
 }
 
 export interface QueueDeps {
@@ -403,19 +405,33 @@ class Tick {
 	 * current head, and the author (an agent watching its checks, usually) is
 	 * told on the PR. A push clears it and the PR is picked up again.
 	 */
-	async conflict(n: number, reason: string, files: string[], fix: string) {
+	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict') {
 		const it = this.item(n);
 		const p = await this.pr(n);
 		if (it) {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
 		}
-		const hold = { pr: n, head: p.headSha, code: 'conflict' as const, reason, files, fix };
+		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
-		await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
+		if (code === 'conflict') await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
 		if (this.speaks('attention')) await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
+	}
+
+	/** Holds the PRs of a batch that change a workflow; returns how many it held. */
+	async holdWorkflowChanges(baseSha: string, commits: { pr: number; sha: string }[]): Promise<number> {
+		let tip = baseSha;
+		let held = 0;
+		for (const c of commits) {
+			const files = (await this.d.git.changed(tip, c.sha)).filter((f) => f.startsWith('.github/workflows/'));
+			tip = c.sha;
+			if (!files.length) continue;
+			await this.conflict(c.pr, `Changes ${files.join(', ')}, which the merge queue app may not push`, files, '', 'workflow-permission');
+			held++;
+		}
+		return held;
 	}
 
 	async rebaseCommand(n: number): Promise<string> {
@@ -515,6 +531,12 @@ class Tick {
 			if (e instanceof RateLimitedError) throw e;
 			// A push or dispatch failure is a setup problem (permissions, workflow trigger): stop and say so.
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
+			// GitHub refuses a workflow change from an app without the Workflows permission: hold the PRs
+			// that make one, and replan without them, rather than stop the queue.
+			if (/without `workflows` permission/.test(e instanceof Error ? e.message : String(e))) {
+				const held = await this.holdWorkflowChanges(baseSha, result.commits);
+				if (held) return 'conflict';
+			}
 			this.pause(`Could not start a batch of ${prs.map((n) => `#${n}`).join(' ')}: ${e instanceof Error ? e.message : e}`);
 			return 'error';
 		}

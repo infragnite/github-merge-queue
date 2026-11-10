@@ -136,7 +136,7 @@ export type AdmissionCode =
 	| 'wrong-base';
 
 /** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
-export type HoldCode = AdmissionCode | 'conflict' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
+export type HoldCode = AdmissionCode | 'conflict' | 'workflow-permission' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
 
 const EVERY_HOLD: Record<HoldCode, true> = {
 	draft: true,
@@ -149,6 +149,7 @@ const EVERY_HOLD: Record<HoldCode, true> = {
 	'parent-not-ready': true,
 	'wrong-base': true,
 	conflict: true,
+	'workflow-permission': true,
 	failed: true,
 	deferred: true,
 	'parent-not-queued': true,
@@ -179,6 +180,8 @@ export function holdAdvice(code: HoldCode): string {
 			return 'Queue the PR it builds on; a stacked PR goes only with the PRs under it.';
 		case 'conflict':
 			return 'Rebase it and push:';
+		case 'workflow-permission':
+			return 'A repository admin grants the app the Workflows: Read and write permission; push again, or queue it again, to retry.';
 		case 'failed':
 			return 'Fix the failure and push.';
 		// Nothing the author can do: it waits for other PRs, or for the queue itself.

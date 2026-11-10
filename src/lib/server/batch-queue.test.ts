@@ -119,7 +119,8 @@ class World {
 				tree: async (sha) => git.git('rev-parse', `${sha}^{tree}`),
 				build: async (base, members) => buildBatch(runner, base, members),
 				restack: async (head, upstream, onto) => replay(runner, { head, upstream, onto }),
-				baseline: async (base) => baselineCommit(runner, base)
+				baseline: async (base) => baselineCommit(runner, base),
+				changed: async (from, to) => git.git('diff', '--name-only', from, to).split('\n').filter(Boolean)
 			},
 			ci: {
 				start: async (branch, _base, head, prs) => {

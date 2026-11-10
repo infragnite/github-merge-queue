@@ -20,6 +20,7 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	'parent-not-queued': ['queue-parent'],
 	deferred: [],
 	conflict: ['resolve-conflict'],
+	'workflow-permission': ['grant-workflows-permission'],
 	failed: ['fix-failure']
 };
 
