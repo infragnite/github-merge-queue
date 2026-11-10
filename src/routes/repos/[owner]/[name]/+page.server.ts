@@ -173,6 +173,8 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		pipeline,
 		mode: settings.mode,
 		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },
+		// Whether runs of several PRs stop at their first failure, for why a run goes on.
+		stopsEarly: settings.config.stopOnFirstFailure,
 		history: getRepoHistory(repo.id).map((h) => {
 			const item = { ...h, pr_url: prUrl(repo, h.pr_number) };
 			return readonly ? publicHistory(item) : item;

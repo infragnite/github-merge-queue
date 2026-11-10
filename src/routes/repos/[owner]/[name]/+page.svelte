@@ -254,7 +254,7 @@
 						</p>
 					{/if}
 					{#each pipe.active as batch (batch.id)}
-						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} />
+						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} stopsEarly={data.stopsEarly} />
 					{/each}
 				</section>
 			{/if}

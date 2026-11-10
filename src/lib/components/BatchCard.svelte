@@ -12,7 +12,8 @@
 		nested = false,
 		step = null,
 		canCancel = false,
-		progressErrors = {}
+		progressErrors = {},
+		stopsEarly = true
 	}: {
 		batch: Card;
 		owner: string;
@@ -22,6 +23,8 @@
 		canCancel?: boolean;
 		/** Why CI progress could not be read, by head commit. */
 		progressErrors?: Record<string, string>;
+		/** The repo's stop-on-first-failure setting, for why a run goes on. */
+		stopsEarly?: boolean;
 	} = $props();
 	const progressError = $derived(progressErrors[batch.headSha] ?? null);
 	const cancellable = $derived(canCancel && batch.kind === 'batch' && ['testing', 'retrying', 'bisecting', 'passed'].includes(batch.status));
@@ -60,7 +63,7 @@
 	// A bisection or try run that passed is stored as landed; it landed nothing itself.
 	const p = $derived(batch.progress);
 	// Why a run of one PR goes on after a failure.
-	const note = $derived(runNote(batch));
+	const note = $derived(runNote(batch, stopsEarly));
 	// A run with a failed job will fail: say so before the remaining jobs finish.
 	const status = $derived(
 		(batch.kind === 'try' || batch.kind === 'baseline') && batch.status === 'landed'
@@ -190,7 +193,7 @@
 			</summary>
 			<div class="mt-2 space-y-2 border-l-2 border-orange-200 pl-3">
 				{#each batch.bisection as run, i (run.id)}
-					<BatchCard batch={run} {owner} {name} nested step={i + 1} {progressErrors} />
+					<BatchCard batch={run} {owner} {name} nested step={i + 1} {progressErrors} {stopsEarly} />
 				{/each}
 			</div>
 		</details>
