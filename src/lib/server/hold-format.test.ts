@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'vitest';
-import { HOLD_CODES, type HoldCode } from './batching';
+import { HOLD_CODES, holdAdvice, type HoldCode } from './batching';
+
+/** Waiting on other PRs or on the queue: nothing for the author to do. */
+const SILENT: HoldCode[] = ['deferred', 'parent-held', 'parent-not-ready', 'not-fetched'];
 import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice, releasedNotice } from './hold-format';
 
 describe('the hold comment', () => {
@@ -43,23 +46,30 @@ describe('the hold comment', () => {
 			files: ['a.ts', 'b.ts'],
 			fix: 'git fetch origin main && git rebase FETCH_HEAD'
 		});
-		expect(body).toMatch(/^\*\*Merge queue:\*\* conflicts with main\. Resolve the conflict and push; it stays queued\.\n\nConflicting files: `a\.ts`, `b\.ts`\.\n\n/);
-		expect(body).toContain('```sh\ngit fetch origin main && git rebase FETCH_HEAD\n# resolve the conflicts, then\ngit push --force-with-lease\n```');
+		// Trying the rebase shows the files: the comment is the reason and the commands, nothing else.
+		expect(body).toBe(
+			[
+				'**Merge queue:** conflicts with main. Rebase it and push:',
+				'',
+				'```sh\ngit fetch origin main && git rebase FETCH_HEAD\n# resolve the conflicts, then\ngit push --force-with-lease\n```',
+				'',
+				'<!-- merge-queue {"v":1,"kind":"hold","pr":3,"head":"h3","code":"conflict","reason":"conflicts with main","files":["a.ts","b.ts"],"nextActions":["resolve-conflict"]} -->'
+			].join('\n')
+		);
 		expect(readNotice(body)).toMatchObject({ kind: 'hold', code: 'conflict', files: ['a.ts', 'b.ts'], nextActions: ['resolve-conflict'] });
 	});
 
-	test('lists at most 20 conflicting files, and says how many more there are', () => {
+	test('the conflicting files are only in the hidden block, all of them', () => {
 		const files = Array.from({ length: 25 }, (_, i) => `f${i}.ts`);
-		const body = holdNotice({ pr: 3, head: 'h', code: 'conflict', reason: 'r', files, fix: 'x' });
-		expect(body).toContain('`f18.ts`, `f19.ts` and 5 more.');
-		expect(body).not.toContain('`f20.ts`');
+		const body = holdNotice({ pr: 3, head: 'h', code: 'conflict', reason: 'Conflicts with main', files, fix: 'x' });
+		expect(body.slice(0, body.indexOf('<!--'))).not.toContain('f0.ts');
 		expect(readNotice(body)?.files).toEqual(files);
 	});
 
 	test('every hold code has advice, a next action, and reads back from its comment', () => {
-		for (const code of HOLD_CODES.filter((c) => c !== 'not-fetched')) {
+		for (const code of HOLD_CODES.filter((c) => !SILENT.includes(c) && c !== 'conflict')) {
 			const body = holdNotice({ pr: 5, head: 'h5', code, reason: `held for ${code}` });
-			// The reason, then one action as a sentence.
+			// The reason, then one action as a sentence (a conflict's action is its command).
 			expect(body, code).toMatch(new RegExp(`^\\*\\*Merge queue:\\*\\* held for ${code}\\. [A-Z][^\\n]+\\.(\\n|$)`));
 			expect(NEXT_ACTIONS[code].length, code).toBeGreaterThan(0);
 			expect(readNotice(body), code).toEqual({
@@ -72,6 +82,15 @@ describe('the hold comment', () => {
 				nextActions: NEXT_ACTIONS[code]
 			});
 		}
+	});
+
+	test('a hold the author can do nothing about has no action, so nothing is said about it', () => {
+		for (const code of SILENT) {
+			expect(holdAdvice(code), code).toBe('');
+			expect(NEXT_ACTIONS[code], code).toEqual([]);
+		}
+		// Every other code names one.
+		for (const code of HOLD_CODES.filter((c) => !SILENT.includes(c))) expect(holdAdvice(code), code).not.toBe('');
 	});
 
 	test('next actions are stable ids an agent can switch on', () => {

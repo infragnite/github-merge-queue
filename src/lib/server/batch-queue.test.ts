@@ -563,11 +563,11 @@ describe('batch queue runtime', () => {
 		// once #1 is on master, #2 conflicts with master itself: its author is told, and it stays queued
 		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
 		expect(world.comments).toEqual([
-			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'deferred', reason: 'Conflicts with #1 ahead of it; waits for them to land' }) },
-			{ pr: 2, body: expect.stringMatching(/^\*\*Merge queue:\*\* .+\. Resolve the conflict and push; it stays queued\.\n\nConflicting files: `same.txt`\.\n\n```sh\n.*git rebase origin\/main/) }
+			{ pr: 2, body: expect.stringMatching(/^\*\*Merge queue:\*\* [^\n]+\n\n```sh\n.*git rebase origin\/main[\s\S]*```\n\n<!-- merge-queue /) }
 		]);
 		// One format: the conflict reads back like any other hold, with its files.
-		expect(readNotice(world.comments[1].body)).toMatchObject({ kind: 'hold', pr: 2, head: git.sha('pr2'), code: 'conflict', files: ['same.txt'], nextActions: ['resolve-conflict'] });
+		// Waiting for #1 had nothing for the author to do, so it said nothing.
+		expect(readNotice(world.comments[0].body)).toMatchObject({ kind: 'hold', pr: 2, head: git.sha('pr2'), code: 'conflict', files: ['same.txt'], nextActions: ['resolve-conflict'] });
 		expect(world.labels.get(2)).toEqual(new Set(['needs-rebase']));
 		expect(world.prChecks.filter((x) => x.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required', title: expect.not.stringMatching(/Needs attention/), summary: expect.stringContaining('"code":"conflict"') });
 
@@ -959,14 +959,15 @@ describe('batch queue runtime', () => {
 		expect(last.summary).toBe(c.body.replace(/^Removed from the merge queue: /, 'Left the queue: '));
 	});
 
-	test('a conflict is told on the check run in the hold format: action required, its files and the commands', async () => {
+	test('a conflict is told on the check run in the hold format: action required and the commands, its files only in the block', async () => {
 		pr(1, { file: 'same.txt' });
 		pr(2, { file: 'same.txt' });
 		await run();
 		expect(world.merged).toEqual([1]);
 		const last = world.prChecks.filter((x) => x.sha === git.sha('pr2') && x.name === 'merge-queue').at(-1)!;
 		expect(last.state).toBe('action_required');
-		expect(last.summary).toMatch(/Conflicting files:\n- `same.txt`[\s\S]*\*\*To fix:\*\*\n\n```sh\n[\s\S]*git push --force-with-lease\n```/);
+		expect(last.summary).toMatch(/```sh\n[\s\S]*git push --force-with-lease\n```/);
+		expect(last.summary).not.toContain('Conflicting files');
 		expect(readNotice(last.summary!)).toMatchObject({ kind: 'hold', code: 'conflict', head: git.sha('pr2'), files: ['same.txt'] });
 	});
 
@@ -1085,7 +1086,7 @@ describe('batch queue runtime', () => {
 		expect(item(3).error_message).toBe('Conflicts with #1 ahead of it; waits for them to land');
 	});
 
-	test('a deferred PR is commented on once; fewer PRs ahead only update its status, and a lifted deferral says nothing', async () => {
+	test('a deferred PR has nothing to do, so it is never commented on; fewer PRs ahead only update its check', async () => {
 		pr(1);
 		pr(2);
 		world.hold = () => true;
@@ -1104,11 +1105,7 @@ describe('batch queue runtime', () => {
 			['action_required', 'Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
 			['action_required', 'Conflicts with #1 #2 ahead of it; waits for them to land']
 		]);
-		const deferredComment = {
-			pr: 3,
-			body: holdNotice({ pr: 3, head: git.sha('pr3'), code: 'deferred', reason: 'Conflicts with #1 #2 #4 ahead of it; waits for them to land' })
-		};
-		expect(world.comments.filter((c) => c.pr === 3)).toEqual([deferredComment]);
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
 		// The deferral lifts (only #4, held, is left ahead), then comes back: no comment either time.
 		store.setDeferredFor(item(3).id, [4]);
 		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #4 ahead of it; waits for them to land');
@@ -1116,7 +1113,7 @@ describe('batch queue runtime', () => {
 		store.setDeferredFor(item(3).id, [1]);
 		db.updateQueueItemStatus(item(3).id, 'queued', 'Conflicts with #1 ahead of it; waits for them to land');
 		await tickBatchQueue(world.deps());
-		expect(world.comments.filter((c) => c.pr === 3)).toEqual([deferredComment]);
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
 		// Lifted, it is no longer told it needs attention.
 		expect(told()).toEqual([
 			['action_required', 'Conflicts with #1 #2 #4 ahead of it; waits for them to land'],
@@ -1139,7 +1136,7 @@ describe('batch queue runtime', () => {
 		expect(world.comments.map((c) => c.pr)).toEqual([1]);
 	});
 
-	test('a deferral that comes back after the author pushed is commented on again', async () => {
+	test('a deferral is not commented on, even when it comes back after the author pushed', async () => {
 		pr(1);
 		world.hold = () => true;
 		pr(4);
@@ -1154,14 +1151,9 @@ describe('batch queue runtime', () => {
 		await defer([1]);
 		await tickBatchQueue(world.deps()); // #4 is held now
 		await defer([4]); // lifted: only #4, held, is ahead
-		const before = git.sha('pr3');
 		git.commit('pr3', 'a new attempt');
 		await defer([1]);
-		const reason = 'Conflicts with #1 ahead of it; waits for them to land';
-		expect(world.comments.filter((c) => c.pr === 3).map((c) => c.body)).toEqual([
-			holdNotice({ pr: 3, head: before, code: 'deferred', reason }),
-			holdNotice({ pr: 3, head: git.sha('pr3'), code: 'deferred', reason })
-		]);
+		expect(world.comments.filter((c) => c.pr === 3)).toEqual([]);
 	});
 
 	test('a PR whose changes are already on the default branch leaves the queue instead of an empty batch', async () => {
