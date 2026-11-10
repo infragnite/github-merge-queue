@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { approvalsFrom, checkResult, checkRunRequest, earlyFailure, gateFeeds, prReportCalls, queuePage, statusFromCheck } from './batch-live';
+import { approvalsFrom, checkResult, checkRunRequest, earlyFailure, gateFeeds, postPRReport, prReportCalls, queuePage, statusFromCheck } from './batch-live';
+import { RateLimitedError } from './rate-limit';
 import type { GhReview } from './github';
 
 const review = (login: string, state: string, sha: string, at: string, assoc = 'COLLABORATOR'): GhReview => ({
@@ -377,5 +378,41 @@ describe('what the PR report setting posts', () => {
 		// A setting from before it existed, or a typo: the status the ruleset requires keeps being posted.
 		expect(prReportCalls(undefined)).toEqual(['check-run', 'status']);
 		expect(prReportCalls('checks' as never)).toEqual(['check-run', 'status']);
+	});
+});
+
+describe('posting both, while a ruleset still requires the status', () => {
+	const calls: string[] = [];
+	const ok = (kind: string) => async () => void calls.push(kind);
+	const fail = (kind: string, e: Error = new Error(`${kind} refused`)) => async () => {
+		calls.push(kind);
+		throw e;
+	};
+
+	test('a refused check run (no Checks permission yet) does not fail the post: the status went out, and retrying every tick would only post it again', async () => {
+		calls.length = 0;
+		const warned: unknown[] = [];
+		await postPRReport('both', fail('check-run'), ok('status'), (e) => warned.push(e));
+		expect(calls).toEqual(['check-run', 'status']);
+		expect(warned).toHaveLength(1);
+	});
+
+	test('a refused status fails it, whatever the check run did', async () => {
+		calls.length = 0;
+		await expect(postPRReport('both', ok('check-run'), fail('status'), () => {})).rejects.toThrow('status refused');
+		expect(calls).toEqual(['check-run', 'status']);
+	});
+
+	test('a rate limit stops it at once', async () => {
+		calls.length = 0;
+		const limited = new RateLimitedError(Date.now() + 1000, 'rate limited');
+		await expect(postPRReport('both', fail('check-run', limited), ok('status'), () => {})).rejects.toBe(limited);
+		expect(calls).toEqual(['check-run']);
+	});
+
+	test('posting only the check run, its refusal fails the post, so it is tried again', async () => {
+		calls.length = 0;
+		await expect(postPRReport('check-run', fail('check-run'), ok('status'), () => {})).rejects.toThrow('check-run refused');
+		expect(calls).toEqual(['check-run']);
 	});
 });
