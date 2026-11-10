@@ -109,7 +109,7 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 	} catch {
 		return null;
 	}
-	const jobs = (doc as { jobs?: Record<string, { name?: unknown; needs?: unknown }> } | null)?.jobs;
+	const jobs = (doc as { jobs?: Record<string, { name?: unknown; needs?: unknown; 'continue-on-error'?: unknown }> } | null)?.jobs;
 	if (!jobs || typeof jobs !== 'object') return null;
 	const label = (id: string) => {
 		const n = jobs[id]?.name;
@@ -128,7 +128,14 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 	// A check run is named by its job's name with each expression replaced by its value (a matrix
 	// job without a name adds its values in parentheses); a reusable workflow's jobs add ` / callee`.
 	const escape = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	const matchers = [...closure].map((id) => {
+	// A job allowed to fail (`continue-on-error`, or an expression that may allow it) doesn't fail the
+	// gate: its failure decides nothing early. A gate that itself tolerates failed needs (checking
+	// `needs.*.result`) can't be read from the file; early stop doesn't suit such a gate.
+	const tolerant = (id: string) => {
+		const c = jobs[id]?.['continue-on-error'];
+		return c !== undefined && c !== false && c !== 'false';
+	};
+	const matchers = [...closure].filter((id) => !tolerant(id)).map((id) => {
 		const n = jobs[id]?.name;
 		const template = typeof n === 'string' && n.trim() ? n.trim() : id;
 		const pattern = template
