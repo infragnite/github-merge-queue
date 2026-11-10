@@ -227,6 +227,23 @@ describe('queue control', () => {
 		expect(() => api.dequeue(repo, writer, 1)).toThrow(/being tested/);
 	});
 
+	test('batches are addressed by the number the app shows, not their id', () => {
+		const row = (kind: 'batch' | 'bisect', branch: string) =>
+			store.insertBatch({ repoId: repo.id, kind, branch, baseSha: 'b', headSha: 'h', treeSha: 't', baseTree: 'bt', members: [1], heads: {} });
+		const first = row('batch', 'mq/batch-a');
+		row('bisect', 'mq/bisect-a');
+		row('bisect', 'mq/bisect-b');
+		const second = row('batch', 'mq/batch-b');
+		expect([first.number, second.number]).toEqual([1, 2]);
+		expect(second.id).not.toBe(2);
+		expect(api.batchDetail(repo, 2)).toMatchObject({ id: second.id, number: 2, branch: 'mq/batch-b' });
+		// The id of the second batch names no batch to an API caller: it is not a number shown.
+		expect(() => api.batchDetail(repo, second.id)).toThrow(`No batch #${second.id}`);
+		expect(() => api.canCancelBatch(repo, writer, 2)).toThrow(/needs maintain/);
+		expect(api.canCancelBatch(repo, maintainer, 2).id).toBe(second.id);
+		expect(() => api.canCancelBatch(repo, maintainer, second.id)).toThrow(`No batch #${second.id}`);
+	});
+
 	test('maintainers move a PR to the front', () => {
 		api.enqueue(repo, writer, pull(1), {});
 		api.enqueue(repo, writer, pull(2), {});

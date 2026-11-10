@@ -221,6 +221,8 @@ export function migrateBatches(database: Database.Database) {
 			database.exec(`UPDATE batches SET number = (SELECT COUNT(*) FROM batches b2 WHERE b2.repo_id = batches.repo_id AND b2.kind = 'batch' AND b2.id <= batches.id) WHERE kind = 'batch'`);
 			database.exec(`INSERT INTO done_migrations (name) VALUES ('batch-numbers')`);
 		})();
+	// Bisection runs have no number, and NULLs never collide.
+	database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS batches_repo_number ON batches(repo_id, number)`);
 	const backfill = 'backfill-ejected';
 	const pending = !database.prepare(`SELECT 1 FROM done_migrations WHERE name = ?`).get(backfill);
 	const before = !pending ? [] : database
@@ -446,6 +448,12 @@ export function getBatchByBranch(repoId: number, branch: string): BatchRow | und
 
 export function getBatch(id: number): BatchRow | undefined {
 	const r = getDb().prepare('SELECT * FROM batches WHERE id = ?').get(id) as RawBatch | undefined;
+	return r ? parse(r) : undefined;
+}
+
+/** A top-level batch by the number the app shows for it, which counts only this repository's batches. */
+export function getBatchByNumber(repoId: number, number: number): BatchRow | undefined {
+	const r = getDb().prepare(`SELECT * FROM batches WHERE repo_id = ? AND number = ? AND kind = 'batch'`).get(repoId, number) as RawBatch | undefined;
 	return r ? parse(r) : undefined;
 }
 
