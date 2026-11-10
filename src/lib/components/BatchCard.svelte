@@ -66,19 +66,21 @@
 				: batch.status
 	);
 	const prList = (ns: number[]) => ns.map((n) => `#${n}`).join(', ');
-	// A compact icon per state; the word is in its tooltip and in the counts above the list.
-	const PR_STATE: Record<string, { label: string; icon: string; cls: string }> = {
-		landed: { label: 'landed', icon: '✓', cls: 'bg-green-600 text-white' },
-		failing: { label: 'failing', icon: '✕', cls: 'bg-red-600 text-white' },
-		checking: { label: 'checking', icon: '●', cls: 'bg-amber-100 text-amber-600 animate-pulse' },
-		passing: { label: 'passing', icon: '✓', cls: 'bg-green-100 text-green-700 ring-1 ring-green-300' },
+	// What the runs showed about a PR, as an icon; what is happening to it, as a mark on that icon.
+	const VERDICT: Record<string, { label: string; icon: string; cls: string }> = {
+		passing: { label: 'passing', icon: '✓', cls: 'bg-green-100 text-green-700' },
 		unknown: { label: 'unknown', icon: '?', cls: 'bg-gray-100 text-gray-500' },
-		left: { label: 'back in line', icon: '↩', cls: 'bg-gray-100 text-gray-400' }
+		failing: { label: 'failing', icon: '✕', cls: 'bg-red-100 text-red-700' }
 	};
-	const ORDER = ['landed', 'checking', 'passing', 'unknown', 'failing', 'left'];
-	const stateCounts = $derived(
-		ORDER.map((st) => [st, batch.prs.filter((p) => p.state === st).length] as const).filter(([, c]) => c > 0)
-	);
+	const ACTIVITY: Record<string, { label: string; cls: string }> = {
+		checking: { label: 'checking', cls: 'ring-2 ring-amber-400 motion-safe:animate-pulse' },
+		landed: { label: 'landed', cls: '!bg-green-600 !text-white' },
+		left: { label: 'back in line', cls: 'opacity-50' }
+	};
+	const count = <T,>(values: T[], order: string[]) =>
+		order.map((k) => [k, values.filter((v) => v === k).length] as const).filter(([, c]) => c > 0);
+	const verdictCounts = $derived(count(batch.prs.map((p) => p.verdict), ['passing', 'unknown', 'failing']));
+	const activityCounts = $derived(count(batch.prs.map((p) => p.activity), ['checking', 'landed', 'left']));
 	const runningRuns = $derived(batch.bisection.filter((r) => r.ci === 'pending' && !['cancelled', 'superseded'].includes(r.status)).length);
 	const pct = (n: number) => (p && p.total > 0 ? (n / p.total) * 100 : 0);
 </script>
@@ -129,12 +131,19 @@
 		<p class="mt-2 text-xs text-gray-500">On top of {prList(batch.context)}, which passed</p>
 	{/if}
 
-	{#if stateCounts.length}
-		<p class="mt-2 flex flex-wrap gap-x-3 text-xs text-gray-600">
-			{#each stateCounts as [st, count] (st)}
+	{#if verdictCounts.length}
+		<p class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-600">
+			{#each verdictCounts as [v, c] (v)}
 				<span class="inline-flex items-center gap-1"
-					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full text-[10px] leading-none {PR_STATE[st].cls}" aria-hidden="true">{PR_STATE[st].icon}</span
-					><span class="font-semibold">{count}</span> {PR_STATE[st].label}</span
+					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full text-[10px] leading-none {VERDICT[v].cls}" aria-hidden="true">{VERDICT[v].icon}</span
+					><span class="font-semibold">{c}</span> {VERDICT[v].label}</span
+				>
+			{/each}
+			{#if activityCounts.length}<span class="text-gray-300" aria-hidden="true">|</span>{/if}
+			{#each activityCounts as [a, c] (a)}
+				<span class="inline-flex items-center gap-1"
+					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-100 text-[10px] leading-none text-gray-500 {ACTIVITY[a].cls}" aria-hidden="true"></span
+					><span class="font-semibold">{c}</span> {ACTIVITY[a].label}</span
 				>
 			{/each}
 		</p>
@@ -144,12 +153,13 @@
 		{#each batch.prs as pr (pr.pr)}
 			<li class="flex min-w-0 items-center gap-2" style="padding-left: {pr.depth * 1.25}rem">
 				{#if pr.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
-				{#if pr.state}
+				{#if pr.verdict}
+					{@const label = [VERDICT[pr.verdict].label, pr.activity ? ACTIVITY[pr.activity].label : null].filter(Boolean).join(', ')}
 					<span
-						class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] leading-none {PR_STATE[pr.state].cls}"
-						title="{PR_STATE[pr.state].label}{pr.evidence ? `\n${pr.evidence}` : ': not in any run yet'}"
+						class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] leading-none {VERDICT[pr.verdict].cls} {pr.activity ? ACTIVITY[pr.activity].cls : ''}"
+						title="{label}{pr.trail ? `\n${pr.trail}` : ': not in any run yet'}"
 						role="img"
-						aria-label={PR_STATE[pr.state].label}>{PR_STATE[pr.state].icon}</span
+						aria-label={label}>{VERDICT[pr.verdict].icon}</span
 					>
 				{/if}
 				<a href={pr.url || `https://github.com/${owner}/${name}/pull/${pr.pr}`} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{pr.pr}</a>
