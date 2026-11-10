@@ -150,8 +150,11 @@
 	{/if}
 
 	<ul class="mt-2 space-y-1 text-sm">
-		{#each batch.prs as pr (pr.pr)}
-			<li class="flex min-w-0 items-center gap-2" style="padding-left: {pr.depth * 1.25}rem">
+		{#each batch.prs as pr, i (pr.pr)}
+			{#if pr.settled && !batch.prs[i - 1]?.settled && i > 0}
+				<li class="pt-1 text-xs font-medium text-gray-400" aria-hidden="true">Settled: landed, ejected or back in line</li>
+			{/if}
+			<li class="flex min-w-0 items-center gap-2 {pr.settled ? 'opacity-60' : ''}" style="padding-left: {pr.depth * 1.25}rem">
 				{#if pr.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
 				{#if pr.verdict}
 					{@const label = [VERDICT[pr.verdict].label, pr.activity ? ACTIVITY[pr.activity].label : null].filter(Boolean).join(', ')}
