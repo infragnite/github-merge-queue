@@ -893,6 +893,57 @@ describe('batch queue runtime', () => {
 		expect(kinds().filter((k) => k === 'held' || k === 'released' || k === 'batched')).toEqual(['held', 'released', 'batched']);
 	});
 
+	test('a PR held while a batch bisects is told then, not once the bisection ends', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		// The bisection's runs (one PR each) take long.
+		world.hold = (prs) => prs.length === 1;
+		await run(5);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('bisecting');
+		pr(5);
+		world.changesRequested.add(5);
+		await run(2);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr5') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([['failure', 'Needs attention: #5 has changes requested']]);
+	});
+
+	test('a status that could not be posted is posted on the next tick', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		const deps = world.deps();
+		const post = deps.github.setPRStatus;
+		let down = true;
+		deps.github.setPRStatus = async (...a) => {
+			if (down) {
+				down = false;
+				throw new Error('GitHub is down');
+			}
+			return post(...a);
+		};
+		await tickBatchQueue(deps);
+		await tickBatchQueue(deps);
+		await tickBatchQueue(deps);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([['failure', 'Needs attention: #1 has changes requested']]);
+	});
+
+	test('a held PR taken out of the queue is no longer told it needs attention', async () => {
+		pr(1);
+		world.changesRequested.add(1);
+		await run(2);
+		const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!;
+		db.removeFromQueue(item.id);
+		await run(2);
+		const told = world.prStatuses.filter((x) => x.sha === git.sha('pr1') && x.context === 'merge-queue').map((x) => [x.state, x.description]);
+		expect(told).toEqual([
+			['failure', 'Needs attention: #1 has changes requested'],
+			['pending', 'Not in the merge queue']
+		]);
+		expect(events.listEvents(repo.id, { pr: 1 }).map((e) => e.kind).filter((k) => k === 'held' || k === 'released')).toEqual(['held', 'released']);
+	});
+
 	test('a PR stacked on a queued PR in conflict says that its parent conflicts, not that it is unqueued', async () => {
 		pr(1);
 		pr(2, { from: 'pr1', base: 'pr1' });
