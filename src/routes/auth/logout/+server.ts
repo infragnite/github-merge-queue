@@ -1,7 +1,8 @@
 import { redirect } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 
-export const GET: RequestHandler = ({ cookies }) => {
+// POST only: a GET could be triggered by any page linking here. SvelteKit refuses cross-site form posts.
+export const POST: RequestHandler = ({ cookies }) => {
 	cookies.delete('session', { path: '/' });
-	redirect(302, '/login');
+	redirect(303, '/login');
 };

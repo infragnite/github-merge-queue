@@ -2,6 +2,8 @@
 	import { page } from '$app/state';
 
 	const error = $derived(page.url.searchParams.get('error'));
+	// Where to come back to after signing in (a page a link pointed at).
+	const next = $derived(page.url.searchParams.get('next'));
 
 	const errorMessages: Record<string, string> = {
 		not_member: 'You must be a member of the infragnite organization.',
@@ -39,7 +41,7 @@
 			{/if}
 
 			<a
-				href="/auth/github"
+				href={next ? `/auth/github?next=${encodeURIComponent(next)}` : '/auth/github'}
 				class="flex w-full items-center justify-center gap-3 rounded-lg bg-gray-900 px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-gray-800"
 			>
 				<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">

@@ -96,6 +96,7 @@
 								</p>
 							</div>
 						</div>
+						{#if repo.canRemove}
 						<form method="POST" action="?/remove" use:enhance>
 							<input type="hidden" name="repo_id" value={repo.id} />
 							<button
@@ -110,6 +111,7 @@
 								Remove
 							</button>
 						</form>
+						{/if}
 					</div>
 				{/each}
 			</div>
