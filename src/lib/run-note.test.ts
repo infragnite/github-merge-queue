@@ -15,6 +15,12 @@ describe('why a run goes on', () => {
 		expect(runNote(run([3364, 3365]), false)).toBe('Runs to the end: stop on first failure is off in the settings.');
 	});
 
+	test('a run of one PR decided at its first failed job says its other jobs run only for the log', () => {
+		expect(runNote(run([3241], { ci: 'failure', finishedAt: '2026-11-10 16:36:00', progress: progress(15, 1) }))).toBe(
+			"Failed at its first failed job. Its other 25 jobs go on only for #3241's full log; nothing waits for them."
+		);
+	});
+
 	test('a run of several PRs, or one that has ended, needs no note', () => {
 		expect(runNote(run([3364, 3365], { progress: progress(15, 1) }))).toBeNull();
 		expect(runNote(run([3241], { ci: 'failure', finishedAt: '2026-11-10 17:00:00', progress: progress(40, 3) }))).toBeNull();

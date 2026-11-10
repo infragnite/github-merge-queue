@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { batchCard, summarizeJobs } from './batch-view';
+import { batchCard, ciMayStillRun, summarizeJobs } from './batch-view';
 import type { BatchRow } from './batch-store';
 import type { StackAnalysis, PRStackInfo } from './stacks';
 
@@ -107,4 +107,14 @@ test("a bisecting batch shows each PR's verdict and, apart from it, what is happ
 	expect(card.prs.find((p) => p.pr === 4)!.trail).toBe('run 3: failed with 4 others on bbbbbbb\nrun 4: passed alone on bbbbbbb\nrun 6: running with 1 other on ccccccc');
 	// Runs themselves carry none.
 	expect(card.bisection[0].prs[0].verdict).toBeUndefined();
+});
+
+test("a failed run of one PR is decided at its first failed job, so its CI may still run for the log; it is worth reading for two hours", () => {
+	const now = Date.parse('2026-11-10T17:30:00Z');
+	const row = (over: Partial<BatchRow>) => ({ status: 'failed', ci_result: 'failure', members: [3241], finished_at: '2026-11-10 16:36:00', ...over }) as BatchRow;
+	expect(ciMayStillRun(row({}), now)).toBe(true);
+	expect(ciMayStillRun(row({ status: 'testing', ci_result: 'pending', finished_at: null }), now)).toBe(true);
+	expect(ciMayStillRun(row({ members: [3364, 3365] }), now)).toBe(false); // cancelled at its first failure
+	expect(ciMayStillRun(row({ finished_at: '2026-11-10 15:29:00' }), now)).toBe(false);
+	expect(ciMayStillRun(row({ status: 'landed', ci_result: 'success' }), now)).toBe(false);
 });
