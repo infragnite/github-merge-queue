@@ -126,6 +126,24 @@ describe('admission', () => {
 		const bogus: StackIssue = { kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: 'bogus' };
 		expect(admit(ready(2), stacks([1, 2], {}, [bogus]), cfg)).toMatchObject({ code: 'stack-broken' });
 	});
+
+	test("a PR on another PR's branch but not on its latest commit is told to rebase onto it, not that its base is wrong", () => {
+		const off: StackIssue = { kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: "Not on #1's latest commit" };
+		expect(admit(ready(2, { targetsDefault: false }), stacks([1, 2], {}, [off]), cfg)).toEqual({
+			ok: false,
+			code: 'stack-broken',
+			reason: "Not on #1's latest commit"
+		});
+	});
+
+	test("a PR on a broken stack is told where it breaks, without its own number", () => {
+		const issue: StackIssue = { kind: 'parent-rebased', pr: 2, parent: 1, severity: 'blocking', message: 'r' };
+		expect(admit(ready(3), stacks([1, 2, 3], { 2: 1, 3: 2 }, [issue]), cfg)).toEqual({
+			ok: false,
+			code: 'parent-not-ready',
+			reason: 'The stack under it is broken at #2'
+		});
+	});
 });
 
 describe('planning a batch', () => {
@@ -362,7 +380,7 @@ describe('bisection', () => {
 
 	test('finds one breaker in a batch of 8, landing each passing half as soon as it passes', () => {
 		const r = bisect(batch, (t) => t.includes(6));
-		expect(r.eject).toEqual([{ pr: 6, reason: '#6 fails on its own on top of the default branch' }]);
+		expect(r.eject).toEqual([{ pr: 6, reason: 'Fails on its own on top of the default branch' }]);
 		expect([...r.land].sort()).toEqual([1, 2, 3, 4, 5, 7, 8]);
 		expect(r.requeue).toEqual([]);
 		// 1-4 pass in the first round and land then; 5-8 narrow down on top of them.
@@ -387,7 +405,7 @@ describe('bisection', () => {
 	test('finds a semantic conflict between two PRs that pass alone', () => {
 		// #3 adds a field, #6 adds an initializer without it: only the pair fails
 		const r = bisect(batch, (t) => t.includes(3) && t.includes(6));
-		expect(r.eject).toEqual([{ pr: 6, reason: '#6 fails on its own on top of the default branch' }]);
+		expect(r.eject).toEqual([{ pr: 6, reason: 'Fails on its own on top of the default branch' }]);
 		expect([...r.land].sort()).toEqual([1, 2, 3, 4, 5, 7, 8]);
 	});
 
@@ -446,7 +464,7 @@ describe('bisection', () => {
 		const parentOf = (n: number) => (n === 5 ? 4 : n === 6 ? 5 : null);
 		const r = bisect(batch, (t) => t.includes(4), parentOf);
 		expect(r.eject).toEqual([
-			{ pr: 4, reason: '#4 fails on its own on top of the default branch' },
+			{ pr: 4, reason: 'Fails on its own on top of the default branch' },
 			{ pr: 5, reason: 'Stacked on #4, which failed in the queue' },
 			{ pr: 6, reason: 'Stacked on #5, which failed in the queue' }
 		]);
@@ -469,7 +487,7 @@ describe('bisection', () => {
 		const fails = (t: number[]) => t.includes(1) && t.includes(2);
 		const r = bisect([1, 2], fails);
 		expect(r.land).toEqual([1]);
-		expect(r.eject).toEqual([{ pr: 2, reason: '#2 fails on its own on top of the default branch' }]);
+		expect(r.eject).toEqual([{ pr: 2, reason: 'Fails on its own on top of the default branch' }]);
 		expect(r.tested).toEqual([
 			{ base: [], members: [1] },
 			{ base: [], members: [2] },

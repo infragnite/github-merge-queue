@@ -150,6 +150,14 @@ describe('stack state for agents', () => {
 		]);
 	});
 
+	test("a PR on its parent's branch but not on its latest commit is told to rebase onto it", () => {
+		const issue: StackIssue = { kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: "Not on #1's latest commit" };
+		const s = api.stackState(repo, 2, analysis([1, 2], {}, [issue]));
+		expect(s.nextActions).toEqual([
+			{ do: 'restack', onto: '#1', cmd: 'git fetch origin pull/1/head && git rebase FETCH_HEAD', why: "Not on #1's latest commit" }
+		]);
+	});
+
 	test('a held PR lists what to do about its hold', () => {
 		const hold = (n: number, code: string, reason: string) => {
 			api.enqueue(repo, writer, pull(n), {});
@@ -158,13 +166,13 @@ describe('stack state for agents', () => {
 			store.setHold(it.id, { code, reason });
 			return it;
 		};
-		hold(1, 'draft', '#1 is a draft');
-		hold(2, 'changes-requested', '#2 has changes requested');
+		hold(1, 'draft', 'Draft');
+		hold(2, 'changes-requested', 'Changes requested');
 		const deferred = hold(3, 'deferred', 'Conflicts with #7 ahead of it; waits for them to land');
 		store.setDeferredFor(deferred.id, [7]);
 		const a = analysis([1, 2, 3, 7]);
-		expect(api.stackState(repo, 1, a).nextActions).toEqual([{ do: 'mark-ready', why: '#1 is a draft' }]);
-		expect(api.stackState(repo, 2, a).nextActions).toEqual([{ do: 'fix', why: '#2 has changes requested' }]);
+		expect(api.stackState(repo, 1, a).nextActions).toEqual([{ do: 'mark-ready', why: 'Draft' }]);
+		expect(api.stackState(repo, 2, a).nextActions).toEqual([{ do: 'fix', why: 'Changes requested' }]);
 		expect(api.stackState(repo, 3, a).nextActions).toEqual([
 			{ do: 'wait-for', pr: 7, why: 'Conflicts with #7 ahead of it; waits for them to land' }
 		]);

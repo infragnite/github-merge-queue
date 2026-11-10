@@ -38,6 +38,36 @@ describe('the hold comment', () => {
 		expect(holdNotice({ pr: 7, head: 'h', code: 'not-approved', reason: 'Not approved' })).not.toContain('```');
 	});
 
+	test('a broken stack carries the restack command', () => {
+		const body = holdNotice({
+			pr: 2,
+			head: 'h2',
+			code: 'stack-broken',
+			reason: '#1 was rebased or force-pushed; this PR still carries 1 old commit from it',
+			fix: 'git fetch origin pull/1/head && git rebase --onto FETCH_HEAD abc123'
+		});
+		expect(body).toBe(
+			[
+				'**Merge queue:** #1 was rebased or force-pushed; this PR still carries 1 old commit from it. Rebase it onto the current head of the PR it builds on.',
+				'',
+				'```sh\ngit fetch origin pull/1/head && git rebase --onto FETCH_HEAD abc123\n# resolve any conflicts, then\ngit push --force-with-lease\n```',
+				'',
+				'<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"h2","code":"stack-broken","reason":"#1 was rebased or force-pushed; this PR still carries 1 old commit from it","nextActions":["restack"]} -->'
+			].join('\n')
+		);
+	});
+
+	test('a workflow change the app may not push says who fixes it', () => {
+		const body = holdNotice({ pr: 2, head: 'h2', code: 'workflow-permission', reason: 'Changes .github/workflows/ci.yml, which the merge queue app may not push', files: ['.github/workflows/ci.yml'] });
+		expect(body).toBe(
+			[
+				"**Merge queue:** Changes .github/workflows/ci.yml, which the merge queue app may not push. A repository admin grants the app the Workflows: Read and write permission; then push to retry.",
+				'',
+				'<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"h2","code":"workflow-permission","reason":"Changes .github/workflows/ci.yml, which the merge queue app may not push","files":[".github/workflows/ci.yml"],"nextActions":["grant-workflows-permission"]} -->'
+			].join('\n')
+		);
+	});
+
 	test('a conflict lists its files and the commands that fix it, in the same format', () => {
 		const body = holdNotice({
 			pr: 3,

@@ -3,9 +3,9 @@
 // squash merges, amends) rather than hand-written commit lists.
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { PRSnapshot, StackCommit, StackInput } from '../stacks';
 import type { GhCompare, GhPull, StackGitHub } from '../stack-source';
 
@@ -72,6 +72,7 @@ export class GitSandbox {
 	commit(branch: string, message: string, file = `${message.replace(/\W+/g, '-')}.txt`): string {
 		this.tick();
 		this.git('checkout', '-q', branch);
+		mkdirSync(dirname(join(this.dir, file)), { recursive: true });
 		writeFileSync(join(this.dir, file), `${message}\n${this.clock}\n`);
 		this.git('add', '-A');
 		this.git('commit', '-q', '-m', message);

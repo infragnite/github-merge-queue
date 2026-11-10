@@ -3,6 +3,7 @@ import {
 	analyzeStacks,
 	detectAutoClose,
 	mergeBlocker,
+	restackCommand,
 	AUTO_CLOSE_WINDOW_MS,
 	type PRSnapshot,
 	type StackAnalysis,
@@ -100,8 +101,8 @@ describe('stack inference from ancestry', () => {
 		expect(info(a, 2).parent).toBeNull();
 		const issue = info(a, 2).issues[0];
 		expect(issue).toMatchObject({ kind: 'base-mismatch', parent: 1, severity: 'blocking' });
-		expect(issue.message).toMatch(/doesn't contain #1/);
-		expect(mergeBlocker(a, 2)).toMatch(/targets 'a'/);
+		expect(issue.message).toBe("Not on #1's latest commit");
+		expect(mergeBlocker(a, 2)).toBe("Not on #1's latest commit");
 		expect(a.stacks).toEqual([]);
 	});
 
@@ -406,7 +407,9 @@ describe('PRs GitHub auto-closes when their base branch is deleted', () => {
 		const a = analyzeStacks(git.input());
 		const issue = a.issues.find((i) => i.kind === 'auto-closed');
 		expect(issue).toMatchObject({ pr: 2, parent: 1, evidence: 'webhook' });
-		expect(issue!.message).toMatch(/GitHub closed #2 because its base branch 'a' was deleted/);
+		expect(issue!.message).toBe(
+			"GitHub closed it because its base branch 'a' was deleted (it was stacked on #1); reopen it against main to queue it again"
+		);
 	});
 
 	test('inferred from timing when the webhook was missed', () => {
@@ -679,4 +682,133 @@ describe('rebase matrix: every level of a 4-PR stack, every rewrite kind', () =>
 			expect(a.stacks).toEqual([[2, 3, 4]]);
 		});
 	}
+});
+
+describe("a stack issue's message doesn't name the PR it is on", () => {
+	function twoStack() {
+		git.branch('a', 'main');
+		git.commit('a', 'a1');
+		git.branch('b', 'a');
+		git.commit('b', 'b1');
+		git.openPR(1, 'a', 'main');
+		git.openPR(2, 'b', 'a');
+	}
+	const c = (sha: string): StackCommit => ({ sha, message: sha, authorEmail: 'dev@example.com', authoredAt: '2026-01-01T00:00:00Z' });
+	const open = (number: number, headRef: string, baseRef: string, commits: StackCommit[]): PRSnapshot => ({
+		number,
+		state: 'open',
+		merged: false,
+		headRef,
+		baseRef,
+		headSha: commits.at(-1)!.sha,
+		commits
+	});
+	const message = (a: StackAnalysis, n: number, kind: string) =>
+		info(a, n).issues.find((i) => i.kind === kind)?.message;
+
+	test("#3322's shape: on its parent's branch, sharing an older commit, without the parent's head", () => {
+		// #3321 = c1 + c2 (head); #3322 targets #3321's branch with c1 + d1, and the queue never saw c1 as a head.
+		git.branch('a', 'main');
+		git.commit('a', 'c1');
+		git.branch('b', 'a');
+		git.commit('b', 'd1');
+		git.commit('a', 'c2');
+		git.openPR(1, 'a', 'main');
+		git.openPR(2, 'b', 'a');
+		const a = analyzeStacks({ ...git.input(), knownHeads: new Map() });
+		expect(info(a, 2).issues).toEqual([
+			{ kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: "Not on #1's latest commit" }
+		]);
+		expect(mergeBlocker(a, 2)).toBe("Not on #1's latest commit");
+	});
+
+	test('behind its parent', () => {
+		twoStack();
+		const known = new Map([[1, [git.sha('a')]]]);
+		git.commit('a', 'a2');
+		const a = analyzeStacks({ ...git.input(), knownHeads: known });
+		expect(message(a, 2, 'parent-behind')).toBe("#1 has new commits this PR doesn't include yet");
+	});
+
+	test('its parent was rebased', () => {
+		twoStack();
+		git.commit('main', 'm2');
+		git.rebase('a', 'main');
+		const a = analyzeStacks(git.input());
+		expect(message(a, 2, 'parent-rebased')).toBe('#1 was rebased or force-pushed; this PR still carries 1 old commit from it');
+	});
+
+	test('its parent was merged', () => {
+		twoStack();
+		git.merge(1, 'squash');
+		git.deleteBranch('a', { retarget: true });
+		const a = analyzeStacks(git.input());
+		expect(message(a, 2, 'parent-merged')).toBe('#1 was merged, and this PR still carries its original commits; rebase it onto the default branch');
+	});
+
+	test('its parent was closed', () => {
+		twoStack();
+		git.close(1);
+		const a = analyzeStacks(git.input());
+		expect(message(a, 2, 'parent-closed')).toBe('#1 was closed without merging, and this PR still contains its commits');
+	});
+
+	test('stacked but pointed at the default branch', () => {
+		git.branch('a', 'main');
+		git.commit('a', 'a1');
+		git.branch('b', 'a');
+		git.commit('b', 'b1');
+		git.openPR(1, 'a', 'main');
+		git.openPR(2, 'b', 'main');
+		const a = analyzeStacks(git.input());
+		expect(message(a, 2, 'base-mismatch')).toBe("Targets 'main' but its commits sit on #1; point it at 'a'");
+	});
+
+	test('its base branch is gone', () => {
+		const a = analyzeStacks({
+			defaultBranch: 'main',
+			prs: [open(1, 'a', 'gone', [c('a1')])],
+			existingBranches: new Set(['main', 'a'])
+		});
+		expect(message(a, 1, 'base-branch-missing')).toBe("Its base branch 'gone' no longer exists");
+	});
+
+	test('too many commits to fetch', () => {
+		const pr = { ...open(1, 'a', 'main', [c('a1')]), commitsTruncated: true };
+		const a = analyzeStacks({ defaultBranch: 'main', prs: [pr] });
+		expect(message(a, 1, 'commits-truncated')).toBe('More commits than could be fetched; stack detection may be incomplete');
+	});
+});
+
+describe('the command that restacks a broken PR', () => {
+	test('onto a rebased parent: replays only its own commits, past the stale copies', () => {
+		git.branch('a', 'main');
+		git.commit('a', 'a1');
+		git.branch('b', 'a');
+		git.commit('b', 'b1');
+		git.openPR(1, 'a', 'main');
+		git.openPR(2, 'b', 'a');
+		const stale = git.sha('a');
+		git.commit('main', 'm2');
+		git.rebase('a', 'main');
+		const a = analyzeStacks(git.input());
+		expect(restackCommand(info(a, 2))).toBe(`git fetch origin pull/1/head && git rebase --onto FETCH_HEAD ${stale}`);
+	});
+
+	test("#3322's shape: a plain rebase onto the parent's head", () => {
+		git.branch('a', 'main');
+		git.commit('a', 'c1');
+		git.branch('b', 'a');
+		git.commit('b', 'd1');
+		git.commit('a', 'c2');
+		git.openPR(1, 'a', 'main');
+		git.openPR(2, 'b', 'a');
+		const a = analyzeStacks({ ...git.input(), knownHeads: new Map() });
+		expect(restackCommand(info(a, 2))).toBe('git fetch origin pull/1/head && git rebase FETCH_HEAD');
+	});
+
+	test('a healthy stack has none', () => {
+		linearStack();
+		expect(restackCommand(info(analyzeStacks(git.input()), 2))).toBeNull();
+	});
 });

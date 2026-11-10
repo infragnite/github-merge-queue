@@ -212,7 +212,7 @@ export function planNextBatch(input: PlanInput & { conflicts?: Map<number, strin
 export function plannedAdmission(input: Pick<PlanInput, 'states' | 'analysis' | 'config'>): (pr: number) => Admission {
 	return (n) => {
 		const s = input.states.get(n);
-		return s ? admit(s, input.analysis, input.config) : { ok: false, code: 'not-fetched', reason: `#${n} has not been fetched yet` };
+		return s ? admit(s, input.analysis, input.config) : { ok: false, code: 'not-fetched', reason: 'Not fetched yet' };
 	};
 }
 

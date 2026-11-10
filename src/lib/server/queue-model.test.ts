@@ -89,7 +89,7 @@ describe('the queue model: entries are stacks of queued PRs', () => {
 		});
 		expect(shape(m)).toEqual({
 			stacks: [{ members: [1, 2, 5], on: null, priority: 'normal' }],
-			attention: ["#3 #3's own checks failed on its head", "#4 Waits for #3: #3's own checks failed on its head"]
+			attention: ["#3 Its own checks failed on its head", "#4 Waits for #3: its own checks failed on its head"]
 		});
 	});
 
@@ -105,7 +105,7 @@ describe('the queue model: entries are stacks of queued PRs', () => {
 		const m = model([entry(1, 50), entry(2, 40), entry(3, 30), entry(4, 20)], stacks([1, 2, 3, 4], { 2: 1, 3: 1 }), { states: [ready(1, { draft: true })] });
 		expect(shape(m)).toEqual({
 			stacks: [{ members: [4], on: null, priority: 'normal' }],
-			attention: ['#1 #1 is a draft', '#2 Waits for #1: #1 is a draft', '#3 Waits for #1: #1 is a draft']
+			attention: ['#1 Draft', '#2 Waits for #1: draft', '#3 Waits for #1: draft']
 		});
 	});
 
@@ -387,15 +387,15 @@ describe('the queue page: the model from what the planner recorded', () => {
 
 	test("a PR the planner holds is held for the planner's reason, and its branch with it", () => {
 		const b = queueBoard(
-			[item(1, 50), item(2, 40, { hold: { code: 'draft', reason: '#2 is a draft' }, message: '#2 is a draft' }), item(3, 30), item(4, 20, { hold: { code: 'not-approved', reason: '#4 is not approved' }, message: '#4 is not approved' })],
+			[item(1, 50), item(2, 40, { hold: { code: 'draft', reason: 'Draft' }, message: 'Draft' }), item(3, 30), item(4, 20, { hold: { code: 'not-approved', reason: 'Not approved' }, message: 'Not approved' })],
 			stacks([1, 2, 3, 4], { 2: 1, 3: 2 }),
 			new Set()
 		);
 		expect(b.stacks.map((s) => s.rows.map((r) => r.pr))).toEqual([[1]]);
 		expect(b.attention).toEqual([
-			{ pr: 2, code: 'draft', reason: '#2 is a draft', cause: null },
-			{ pr: 3, code: 'parent-held', reason: 'Waits for #2: #2 is a draft', cause: 2 },
-			{ pr: 4, code: 'not-approved', reason: '#4 is not approved', cause: null }
+			{ pr: 2, code: 'draft', reason: 'Draft', cause: null },
+			{ pr: 3, code: 'parent-held', reason: 'Waits for #2: draft', cause: 2 },
+			{ pr: 4, code: 'not-approved', reason: 'Not approved', cause: null }
 		]);
 	});
 
