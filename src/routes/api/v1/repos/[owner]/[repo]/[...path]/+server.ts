@@ -15,6 +15,7 @@
 //                                 red, vouches for the branch (it is treated as green)
 //   GET    batches             recent batches
 //   GET    batches/{id}        one batch with its bisection runs
+//   POST   batches/{id}/cancel stops a batch (and its bisection); its PRs go back in line   (maintain)
 //   GET    history?limit=      merged and bounced PRs
 //   GET    events?after=&pr=&wait=   queue events after a cursor; waits up to `wait` s (max 60)
 //                                    for the first one (long poll). No `after`: recent events + cursor.
@@ -24,7 +25,7 @@ import { json, type RequestHandler } from '@sveltejs/kit';
 import * as github from '$lib/server/github';
 import { getRepoByOwnerName } from '$lib/server/db';
 import { getQueueSettings, getRecentBatches } from '$lib/server/batch-store';
-import { retireBatches, startTry } from '$lib/server/batch-queue';
+import { cancelBatch, retireBatches, startTry } from '$lib/server/batch-queue';
 import { withRepoLock } from '$lib/server/repo-lock';
 import { liveDeps } from '$lib/server/batch-live';
 import { requireRole } from '$lib/server/api-auth';
@@ -93,6 +94,15 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 				return json({ batches: getRecentBatches(repo.id).map(api.batchSummary) });
 			case 'GET batches/:n':
 				return json(api.batchDetail(repo, n));
+			case 'POST batches/:n/cancel': {
+				api.canCancelBatch(repo, caller, n);
+				try {
+					return json(await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), n, caller.login)));
+				} catch (e) {
+					if (e instanceof Error && /only a batch being tested/.test(e.message)) throw new api.ApiError(409, e.message);
+					throw e;
+				}
+			}
 			case 'GET history':
 				return json(api.history(repo, api.intParam(url.searchParams.get('limit'), 'limit', 50)!));
 			case 'GET events':

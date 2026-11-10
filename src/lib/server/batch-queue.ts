@@ -321,7 +321,7 @@ class Tick {
 	}
 
 	/** Every active batch from `from` on is rebuilt later; their PRs go back to the queue. */
-	async supersede(batches: BatchRow[]) {
+	async supersede(batches: BatchRow[], why = 'a batch below it failed or master moved') {
 		for (const b of batches) {
 			store.setBatchStatus(b.id, 'superseded');
 			this.requeue(b.members);
@@ -329,7 +329,7 @@ class Tick {
 			for (const n of b.members) {
 				if (this.item(n)?.status !== 'queued') continue;
 				await this.d.github
-					.setPRStatus(b.heads[n], 'pending', short(`Back in line: ${b.branch} was dropped (a batch below it failed or master moved); it is rebuilt`))
+					.setPRStatus(b.heads[n], 'pending', short(`Back in line: ${b.branch} was dropped (${why}); it is rebuilt`))
 					.catch(this.bestEffort('github.setPRStatus'));
 			}
 		}
@@ -1459,6 +1459,7 @@ class Tick {
 		const queue: QueueEntry[] = waiting.map((i) => ({
 			pr: i.pr_number,
 			enqueuedAt: sqliteMs(i.created_at),
+			position: i.position,
 			priority: ((i as QueueItem & { priority?: Priority }).priority ?? 'normal') as Priority
 		}));
 		const states = new Map<number, PRState>();
@@ -1578,6 +1579,30 @@ export async function retireBatches(deps: QueueDeps): Promise<void> {
 		store.setBatchStatus(base.id, 'superseded');
 		store.clearMasterHealth(deps.repo.id);
 	}
+}
+
+/**
+ * Cancels a batch in the pipeline, or one being bisected: its CI and its bisection runs' CI stop,
+ * and its PRs that are still in the queue go back in line at their places, blamed for nothing.
+ * The batches built on top of it are rebuilt too. Call it under the repo lock.
+ */
+export async function cancelBatch(deps: QueueDeps, id: number, by: string): Promise<{ requeued: number[]; rebuilt: number[] }> {
+	const b = store.getBatch(id);
+	if (!b || b.repo_id !== deps.repo.id || b.kind !== 'batch') throw new Error(`Batch ${id} not found`);
+	const active = store.getActiveBatches(deps.repo.id);
+	if (!active.some((x) => x.id === id)) throw new Error(`Batch ${id} is ${b.status}; only a batch being tested or bisected can be cancelled`);
+	const t = new Tick(deps);
+	await t.recoverInterrupted();
+	const waiting = (x: BatchRow) => x.members.filter((n) => t.item(n)?.status === 'checking');
+	const requeued = waiting(b);
+	const above = active.filter((x) => x.id > id);
+	await t.supersede([b], `batch ${id} was cancelled by ${by}`);
+	store.setBatchStatus(id, 'cancelled');
+	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled');
+	await t.supersede(above, `batch ${id} below it was cancelled`);
+	t.event(null, 'cancelled', { batch: id, by, requeued, rebuilt: above.map((x) => x.id) });
+	t.log(`batch ${id} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
+	return { requeued, rebuilt: above.map((x) => x.id) };
 }
 
 /** Starts a one-off CI run of a PR on top of the default branch (the `try` API). */

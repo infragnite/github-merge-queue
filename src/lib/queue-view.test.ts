@@ -59,6 +59,13 @@ test('an urgent PR makes the next batch an express batch of urgent PRs only', ()
 	expect(nums(v.rows)).toEqual([32, 1, 2]);
 });
 
+test('batch mode follows the queue order within a priority (a PR moved to the front)', () => {
+	const items = [item(1, { position: 2 }), item(2, { position: 3 }), item(3, { position: 1 })];
+	const v = queueView({ items, mode: 'batch', batches: [], stacks: null, limits });
+	expect(nums(v.upNext)).toEqual([3, 1, 2]);
+	expect(v.express).toBe(false);
+});
+
 test('PRs that need someone move to attention with the reason; PRs that wait by themselves stay in line but out of the preview', () => {
 	const items = [
 		item(1, { status: 'conflict' }),
@@ -107,4 +114,12 @@ test('one by one keeps the queue order, the active PR in line, and has no batch 
 	expect(nums(v.rows)).toEqual([1, 2, 3]);
 	expect(v.inFlight).toEqual([]);
 	expect(v.upNext).toEqual([]);
+});
+
+test('a PR that waits for PRs being tested is not shown as the next batch', () => {
+	const items = [item(1, { deferred: true, error_message: 'Conflicts with #9 ahead of it; waits for them to land' }), item(2)];
+	const v = queueView({ items, mode: 'batch', batches: [], stacks: null, limits });
+	expect(nums(v.upNext)).toEqual([2]);
+	expect(nums(v.rows)).toEqual([1]);
+	expect(v.attention).toEqual([]);
 });

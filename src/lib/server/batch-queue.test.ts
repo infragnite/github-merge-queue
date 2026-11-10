@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
-const { tickBatchQueue, startTry, retireBatches, recoverInterrupted } = await import('./batch-queue');
+const { tickBatchQueue, startTry, retireBatches, recoverInterrupted, cancelBatch } = await import('./batch-queue');
 const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
 const { replay } = await import('./rebase');
 const { analyzeStacks } = await import('./stacks');
@@ -955,6 +955,46 @@ describe('batch queue runtime', () => {
 		world.deleted.add(1);
 		await recoverInterrupted(world.deps());
 		expect(store.getLandingIntent(repo.id)).toBeNull();
+	});
+
+	test('cancelling a bisecting batch stops its runs and puts its PRs back in line, blaming nobody', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		expect(b.status).toBe('bisecting');
+		const runs = world.started.filter((x) => x.branch.includes('-bisect-'));
+		const r = await cancelBatch(world.deps(), b.id, 'anton');
+		expect(r).toEqual({ requeued: [1, 2], rebuilt: [] });
+		expect(store.getBatch(b.id)!.status).toBe('cancelled');
+		expect(store.getBisectRuns(b.id).map((x) => x.status)).toEqual(runs.map(() => 'cancelled'));
+		for (const x of runs) expect(world.cancelled).toContain(x.head);
+		expect(queued()).toEqual([
+			{ pr: 1, status: 'queued' },
+			{ pr: 2, status: 'queued' }
+		]);
+		expect(world.comments).toEqual([]);
+		await expect(cancelBatch(world.deps(), b.id, 'anton')).rejects.toThrow(/only a batch being tested or bisected/);
+	});
+
+	test('cancelling a batch in the pipeline rebuilds the one built on it', async () => {
+		store.updateQueueSettings(repo.id, { config: { maxBatch: 1, depth: 2, collectWindowMs: 0 } });
+		pr(1);
+		pr(2);
+		world.hold = () => true;
+		await run(3);
+		const [first, second] = store.getActiveBatches(repo.id);
+		expect([first.members, second.members]).toEqual([[1], [2]]);
+		const r = await cancelBatch(world.deps(), first.id, 'anton');
+		expect(r).toEqual({ requeued: [1], rebuilt: [second.id] });
+		expect(store.getBatch(second.id)!.status).toBe('superseded');
+		expect(store.getActiveBatches(repo.id)).toEqual([]);
+		world.hold = () => false;
+		await run();
+		expect(world.merged).toEqual([1, 2]);
 	});
 
 	test('a superseded batch has its CI cancelled', async () => {

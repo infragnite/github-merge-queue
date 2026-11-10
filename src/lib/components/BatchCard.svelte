@@ -1,8 +1,28 @@
 <script lang="ts">
+	import { enhance } from '$app/forms';
 	import BatchCard from './BatchCard.svelte';
 	import type { BatchCard as Card } from '$lib/server/batch-view';
 
-	let { batch, owner, name, nested = false, step = null }: { batch: Card; owner: string; name: string; nested?: boolean; step?: number | null } = $props();
+	let {
+		batch,
+		owner,
+		name,
+		nested = false,
+		step = null,
+		canCancel = false,
+		progressErrors = {}
+	}: {
+		batch: Card;
+		owner: string;
+		name: string;
+		nested?: boolean;
+		step?: number | null;
+		canCancel?: boolean;
+		/** Why CI progress could not be read, by head commit. */
+		progressErrors?: Record<string, string>;
+	} = $props();
+	const progressError = $derived(progressErrors[batch.headSha] ?? null);
+	const cancellable = $derived(canCancel && batch.kind === 'batch' && ['testing', 'retrying', 'bisecting', 'passed'].includes(batch.status));
 
 	const KIND: Record<Card['kind'], string> = { batch: 'Batch', bisect: 'Bisection run', try: 'Tried alone', baseline: 'Master check' };
 	const STATUS: Record<string, string> = {
@@ -74,6 +94,18 @@
 		{#if batch.express}<span class="rounded bg-indigo-100 px-1.5 py-0.5 text-xs text-indigo-700" title="A small batch of urgent PRs, ahead of the rest">urgent</span>{/if}
 		<a href="https://github.com/{owner}/{name}/commit/{batch.headSha}" target="_blank" rel="noopener" class="hidden max-w-[12rem] truncate font-mono text-[11px] text-gray-400 hover:text-indigo-600 sm:inline" title={batch.branch}>{batch.branch}</a>
 		<span class="ml-auto text-xs text-gray-400">{batch.finishedAt ? `took ${since(batch.createdAt, batch.finishedAt)}` : `running ${since(batch.createdAt, null)}`}</span>
+		{#if cancellable}
+			<form
+				method="POST"
+				action="/repos/{owner}/{name}?/cancelBatch"
+				use:enhance={({ cancel }) => {
+					if (!confirm(`Cancel batch ${batch.id}? Its CI stops and its PRs go back in line, blamed for nothing. Batches built on it are rebuilt.`)) cancel();
+				}}
+			>
+				<input type="hidden" name="batch_id" value={batch.id} />
+				<button type="submit" class="rounded px-1.5 py-0.5 text-xs text-gray-500 hover:bg-red-50 hover:text-red-700" aria-label="Cancel batch {batch.id}">Cancel</button>
+			</form>
+		{/if}
 	</div>
 
 	{#if verdict}
@@ -95,8 +127,9 @@
 				{#if p.url}<a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
 			</div>
 		</div>
+		{#if progressError}<p class="mt-1 text-xs text-red-600">Last known progress; reading it now failed: {progressError}</p>{/if}
 	{:else if batch.status === 'testing' && !batch.finishedAt}
-		<p class="mt-2 text-xs text-gray-500">CI has not started yet.</p>
+		<p class="mt-2 text-xs {progressError ? 'text-red-600' : 'text-gray-500'}">{progressError ? `Could not read CI progress: ${progressError}` : 'No CI run found for it yet.'}</p>
 	{/if}
 
 	{#if batch.context.length > 0}
@@ -122,7 +155,7 @@
 	{#if batch.bisection.length > 0}
 		<div class="mt-3 space-y-2 border-l-2 border-orange-200 pl-3">
 			{#each batch.bisection as run, i (run.id)}
-				<BatchCard batch={run} {owner} {name} nested step={i + 1} />
+				<BatchCard batch={run} {owner} {name} nested step={i + 1} {progressErrors} />
 			{/each}
 		</div>
 	{/if}
