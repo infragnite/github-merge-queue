@@ -1,7 +1,8 @@
 import { expect, test } from 'vitest';
-import { batchCard, summarizeJobs } from './batch-view';
+import { batchCard, ciMayStillRun, summarizeJobs } from './batch-view';
 import type { BatchRow } from './batch-store';
 import type { StackAnalysis, PRStackInfo } from './stacks';
+import { runOrder } from '$lib/run-order';
 
 const row = (o: Partial<BatchRow>): BatchRow => ({
 	id: 1, repo_id: 1, kind: 'batch', parent_batch_id: null, branch: 'mq/1', base_sha: 'b', head_sha: 'h1', tree_sha: 't',
@@ -107,4 +108,57 @@ test("a bisecting batch shows each PR's verdict and, apart from it, what is happ
 	expect(card.prs.find((p) => p.pr === 4)!.trail).toBe('run 3: failed with 4 others on bbbbbbb\nrun 4: passed alone on bbbbbbb\nrun 6: running with 1 other on ccccccc');
 	// Runs themselves carry none.
 	expect(card.bisection[0].prs[0].verdict).toBeUndefined();
+});
+
+test("a failed run of one PR is decided at its first failed job, so its CI may still run for the log; it is worth reading for two hours", () => {
+	const now = Date.parse('2026-11-10T17:30:00Z');
+	const row = (over: Partial<BatchRow>) => ({ status: 'failed', ci_result: 'failure', members: [3241], finished_at: '2026-11-10 16:36:00', ...over }) as BatchRow;
+	expect(ciMayStillRun(row({}), now)).toBe(true);
+	expect(ciMayStillRun(row({ status: 'testing', ci_result: 'pending', finished_at: null }), now)).toBe(true);
+	expect(ciMayStillRun(row({ members: [3364, 3365] }), now)).toBe(false); // cancelled at its first failure
+	expect(ciMayStillRun(row({ finished_at: '2026-11-10 15:29:00' }), now)).toBe(false);
+	expect(ciMayStillRun(row({ status: 'landed', ci_result: 'success' }), now)).toBe(false);
+});
+
+test('a PR that failed alone and is not ejected yet waits to be: Run order says it waits for the check of the default branch', () => {
+	// Batch 8 at 17:24Z: run 73 ([3241]) failed alone, run 74 landed, master is being verified.
+	const b8 = row({ id: 8, number: 8, status: 'bisecting', ci_result: 'failure', members: [3241, 3309, 3364], landed: [3364] });
+	const runs = [
+		row({ id: 71, kind: 'bisect', members: [3241, 3309], status: 'failed', ci_result: 'failure' }),
+		row({ id: 73, kind: 'bisect', members: [3241], status: 'failed', ci_result: 'failure' }),
+		row({ id: 74, kind: 'bisect', members: [3364], status: 'landed', ci_result: 'success' })
+	];
+	const card = batchCard(b8, runs, null, new Map(), new Map());
+	expect(card.prs.filter((p) => p.awaitingEject).map((p) => p.pr)).toEqual([3241]);
+	const since = Date.parse('2026-11-10T17:03:00Z');
+	const order = runOrder({ active: [card], upNext: [], express: false, master: { sha: '9db284a0c0ffee', state: 'verifying', since, branch: 'master' }, now: since + 21 * 60_000 });
+	expect(order.map((r) => [r.label, r.detail])).toEqual([
+		['Check of master', '9db284a, running 21 min; ejections wait for it'],
+		['Batch #8: eject #3241', 'waits for the check of master 9db284a'],
+		['Batch #8, next bisection step', '1 PR still to settle']
+	]);
+	// Once ejected, it no longer waits.
+	const after = batchCard({ ...b8, ejected: [3241], left_prs: [3241] }, runs, null, new Map(), new Map());
+	expect(after.prs.some((p) => p.awaitingEject)).toBe(false);
+});
+
+test('a failed run of one PR stops being read once all its jobs are done', () => {
+	const now = Date.parse('2026-11-10T17:30:00Z');
+	const r = row({ status: 'failed', ci_result: 'failure', members: [3241], finished_at: '2026-11-10 16:36:00' });
+	expect(ciMayStillRun(r, now, { total: 40, done: 40 })).toBe(false);
+	expect(ciMayStillRun(r, now, { total: 40, done: 15 })).toBe(true);
+});
+
+test('a PR that failed alone on a tree not known green is tried alone again, not waiting to be ejected', () => {
+	const b8 = row({ id: 8, number: 8, status: 'bisecting', ci_result: 'failure', members: [3241, 3364], landed: [3364], base_tree: 'bt' });
+	const runs = [
+		row({ id: 71, kind: 'bisect', members: [3241, 3364], status: 'failed', ci_result: 'failure', base_tree: 'bt' }),
+		row({ id: 74, kind: 'bisect', members: [3364], status: 'landed', ci_result: 'success', base_tree: 'bt', tree_sha: 'after-3364' }),
+		// On a default branch that moved outside the queue: its failure may be that branch's.
+		row({ id: 73, kind: 'bisect', members: [3241], status: 'failed', ci_result: 'failure', base_tree: 'pushed-by-hand' })
+	];
+	expect(batchCard(b8, runs, null, new Map(), new Map()).prs.some((p) => p.awaitingEject)).toBe(false);
+	// On the tree a run of this bisection landed, it is known green.
+	runs[2] = { ...runs[2], base_tree: 'after-3364' };
+	expect(batchCard(b8, runs, null, new Map(), new Map()).prs.filter((p) => p.awaitingEject).map((p) => p.pr)).toEqual([3241]);
 });

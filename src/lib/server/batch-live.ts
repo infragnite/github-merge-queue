@@ -109,7 +109,7 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 	} catch {
 		return null;
 	}
-	const jobs = (doc as { jobs?: Record<string, { name?: unknown; needs?: unknown }> } | null)?.jobs;
+	const jobs = (doc as { jobs?: Record<string, { name?: unknown; needs?: unknown; 'continue-on-error'?: unknown }> } | null)?.jobs;
 	if (!jobs || typeof jobs !== 'object') return null;
 	const label = (id: string) => {
 		const n = jobs[id]?.name;
@@ -117,9 +117,17 @@ export function gateFeeds(workflow: string, gate: string): ((name: string) => bo
 	};
 	const start = Object.keys(jobs).find((id) => id === gate || label(id) === gate);
 	if (!start) return null;
+	// A job allowed to fail (`continue-on-error`, or an expression that may allow it) doesn't fail the
+	// gate, nor does a job only it needs (its failure just skips the tolerant one): neither decides
+	// anything early. A gate that itself tolerates failed needs (checking `needs.*.result`) can't be
+	// read from the file; early stop doesn't suit such a gate.
+	const tolerant = (id: string) => {
+		const c = jobs[id]?.['continue-on-error'];
+		return c !== undefined && c !== false && c !== 'false';
+	};
 	const closure = new Set<string>();
 	const visit = (id: string) => {
-		if (closure.has(id) || !jobs[id]) return;
+		if (closure.has(id) || !jobs[id] || tolerant(id)) return;
 		closure.add(id);
 		const needs = jobs[id].needs;
 		for (const n of typeof needs === 'string' ? [needs] : Array.isArray(needs) ? needs : []) if (typeof n === 'string') visit(n);

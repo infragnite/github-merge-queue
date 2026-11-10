@@ -1359,6 +1359,29 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/Removed from the merge queue: #3 fails on its own/) }]);
 	});
 
+	test('an ejection waiting for the default branch to be verified holds only itself: the other groups go on bisecting', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false, bisectRuns: 2 } });
+		pr(1);
+		pr(2, { file: 'x-breaks-2.txt' });
+		pr(3);
+		pr(4, { file: 'x-breaks-4.txt' });
+		world.breakingFiles.add('x-breaks-2.txt');
+		world.breakingFiles.add('x-breaks-4.txt');
+		world.holdMasterRuns = true; // the default-branch run after a landing takes a while
+		await run(40);
+		// #1 passed alone and landed, so the default branch is being verified; #2 failed alone and
+		// waits for that to be ejected. #3 and #4 were still tested meanwhile.
+		expect(store.getMasterHealth(repo.id)?.state).toBe('verifying');
+		const alone = (n: number) => world.started.some((x) => x.prs.length === 1 && x.prs[0] === n);
+		expect([1, 2, 3, 4].filter(alone)).toEqual([1, 2, 3, 4]);
+		expect(world.merged).toEqual([1, 3]);
+		expect(world.comments).toEqual([]);
+		world.holdMasterRuns = false;
+		await run(30);
+		expect(world.merged).toEqual([1, 3]);
+		expect(world.comments.map((c) => c.pr).sort()).toEqual([2, 4]);
+	});
+
 	test('a refused merge takes the tested status back, so nobody can merge around the queue', async () => {
 		pr(1);
 		world.refuseMerge.add(1);
@@ -1671,7 +1694,7 @@ describe('surviving a crash at any step', () => {
 describe('stopping a red run at its first failed job', () => {
 	const prsOf = (head: string) => world.started.find((x) => x.head === head)?.prs ?? [];
 
-	test('a batch and a bisection step of several PRs fail fast and are cancelled; a PR alone runs to the end', async () => {
+	test('a batch and a bisection step of several PRs fail fast and are cancelled; a PR alone is decided then, and its CI goes on for the log', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		world.slowFailures = true;
 		for (let n = 1; n <= 8; n++) pr(n, n === 4 ? { file: 'x-breaks-master.txt' } : {});
@@ -1679,21 +1702,22 @@ describe('stopping a red run at its first failed job', () => {
 		await run(80);
 		expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 3, 5, 6, 7, 8]);
 		expect(world.comments).toEqual([{ pr: 4, body: expect.stringMatching(/#4 fails on its own/) }]);
-		// Every run of several PRs read fail-fast, every run of one PR did not.
-		for (const r of world.resultReads) expect(r.failFast, `run of ${prsOf(r.head).join(' ')}`).toBe(prsOf(r.head).length > 1);
+		// Every run is read fail-fast: its first failed job decides it.
+		for (const r of world.resultReads.filter((r) => prsOf(r.head).length > 0)) expect(r.failFast, `run of ${prsOf(r.head).join(' ')}`).toBe(true);
 		// The failing batch and the failing step were cancelled when they failed; the lone run was not.
 		const failing = world.started.filter((x) => x.prs.length > 1 && x.prs.includes(4)).map((x) => x.head);
 		expect(failing.length).toBeGreaterThanOrEqual(2);
 		for (const h of failing) expect(world.cancelled).toContain(h);
-		// The lone run of #4 was read to its end (it took its extra reads) and never cancelled.
+		// The lone run of #4 was decided at its first failure, without waiting for the rest of its
+		// jobs, and never cancelled: they go on so its author gets every error.
 		const lone = world.started.find((x) => x.prs.length === 1 && x.prs[0] === 4)!.head;
 		expect(world.cancelled).not.toContain(lone);
-		expect(world.slowReads.get(lone)).toBe(4);
+		expect(world.slowReads.has(lone)).toBe(false);
 		for (const h of failing) expect(world.slowReads.has(h)).toBe(false);
 	});
 
 	for (const mode of ['batch', 'serial'] as const)
-		test(`${mode}: the run that ejects a stacked PR is read to its end`, async () => {
+		test(`${mode}: the run that ejects a stacked PR is decided at its first failure and not cancelled`, async () => {
 			// 1 <- 2 <- 3 <- 4, with #3 the breaker, and #5 on its own.
 			store.updateQueueSettings(repo.id, { mode, config: { retryFailed: false } });
 			world.slowFailures = true;
@@ -1706,11 +1730,11 @@ describe('stopping a red run at its first failed job', () => {
 			await run(80);
 			expect(world.merged.sort((a, b) => a - b)).toEqual([1, 2, 5]);
 			expect(world.comments.filter((c) => /Removed from the merge queue/.test(c.body)).map((c) => c.pr).sort()).toEqual([3, 4]);
-			// The last run with #3 in it decided its eject: read to the end, never cancelled, whatever
-			// else is on its branch.
+			// The last run with #3 in it decided its eject at its first failure, whatever else is on its
+			// branch, and was never cancelled: its jobs go on for the author's log.
 			const decisive = world.started.filter((x) => x.prs.includes(3)).at(-1)!;
 			expect(world.cancelled).not.toContain(decisive.head);
-			expect(world.slowReads.get(decisive.head), `run of ${decisive.prs.join(' ')}`).toBe(4);
+			expect(world.slowReads.has(decisive.head), `run of ${decisive.prs.join(' ')}`).toBe(false);
 			// Earlier failing runs with #3 and other suspects stopped at their first failure.
 			for (const x of world.started.filter((x) => x.prs.includes(3) && x !== decisive)) expect(world.cancelled, `run of ${x.prs.join(' ')}`).toContain(x.head);
 		});
@@ -1724,6 +1748,36 @@ describe('stopping a red run at its first failed job', () => {
 		expect(world.merged).toEqual([1]);
 		expect(world.resultReads.every((r) => !r.failFast)).toBe(true);
 		expect(world.cancelled).toEqual([]);
+	});
+
+	test('a failed run of one PR that is still running blocks no bisection step: the next starts at once', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false, bisectRuns: 1 } });
+		world.slowFailures = true;
+		pr(1, { file: 'x-breaks-master.txt' });
+		pr(2);
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(40);
+		expect(world.merged).toEqual([2]);
+		const lone1 = world.started.find((x) => x.prs.length === 1 && x.prs[0] === 1)!.head;
+		const lone2 = world.started.find((x) => x.prs.length === 1 && x.prs[0] === 2)!.head;
+		// #2's run started while #1's lone run was still going, and nothing waited for #1's to end.
+		expect(world.started.findIndex((x) => x.head === lone2)).toBeGreaterThan(world.started.findIndex((x) => x.head === lone1));
+		expect(world.slowReads.has(lone1)).toBe(false);
+		expect(world.cancelled).not.toContain(lone1);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/#1 fails on its own[\s\S]*CI run: https:\/\/ci\.example\//) }]);
+	});
+
+	test('a failed run of one PR waits for its flake re-run while retries are on', async () => {
+		world.slowFailures = true;
+		world.rerunWaits = 2;
+		pr(1, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(40);
+		expect(world.merged).toEqual([]);
+		const head = world.started[0].head;
+		// It failed early, but a re-run of its failed jobs could still pass: it waited for it.
+		expect(world.reruns.get(head)).toBe(1);
+		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/^Removed from the merge queue: CI failed[\s\S]*CI run: https:\/\/ci\.example\//) }]);
 	});
 
 	test('a fail-fast failure is still re-run once when flake retries are on', async () => {

@@ -852,16 +852,19 @@ class Tick {
 		return true;
 	}
 
-	/** Whether `b`'s run counts as failed at its first failed job: a run of several PRs, if the repo stops early. */
+	/** Whether `b`'s run is cancelled at its first failed job: a run of several PRs, if the repo stops early. */
 	failFast(b: BatchRow): boolean {
 		return this.settings().config.stopOnFirstFailure && b.members.length > 1;
 	}
 
-	/** The required check's result on `b`; a failure found early stops the rest of its run. */
+	/**
+	 * The required check's result on `b`. If the repo stops early, its first failed job decides it.
+	 * A run of several PRs is then cancelled; a run of one PR goes on, only so its author gets every
+	 * error, and holds nothing back: the queue has its verdict.
+	 */
 	async ciResult(b: BatchRow): Promise<'pending' | 'success' | 'failure'> {
-		const failFast = this.failFast(b);
-		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast });
-		if (r === 'failure' && failFast)
+		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast: this.settings().config.stopOnFirstFailure });
+		if (r === 'failure' && this.failFast(b))
 			await this.d.ci.cancel(b.head_sha).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				this.bestEffort('ci.cancel')(e);
@@ -1272,9 +1275,10 @@ class Tick {
 			return;
 		}
 
-		if (plan.eject.length) {
-			// The default branch may be what fails: blame nobody until it is known.
-			if (!this.masterSettled(masterTree)) return;
+		// The default branch may be what fails: blame nobody until it is known. That holds only the
+		// ejection: the other groups' runs don't depend on it.
+		const ejectWaits = plan.eject.length > 0 && !this.masterSettled(masterTree);
+		if (plan.eject.length && !ejectWaits) {
 			if (this.masterState(masterTree) === 'red') {
 				for (const r of runs) await this.retire(r);
 				await this.failedOnRed({ ...batch, members: remaining });
@@ -1296,7 +1300,7 @@ class Tick {
 			await this.leaveBisection(batch, plan.requeue);
 		}
 		if (plan.done) {
-			await this.finishBisection(batch, runs, batch.landed.length > 0);
+			if (!ejectWaits) await this.finishBisection(batch, runs, batch.landed.length > 0);
 			return;
 		}
 		// Between two steps, urgent PRs go first: each step is planned again on whatever master is

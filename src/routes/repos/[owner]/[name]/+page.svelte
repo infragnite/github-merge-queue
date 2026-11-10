@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
+	import { actionsUrl } from '$lib/actions-link';
 	import { invalidateAll } from '$app/navigation';
 	import QueueItem from '$lib/components/QueueItem.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
@@ -48,7 +49,8 @@
 	const inLine = $derived((board?.stacks ?? []).reduce((n: number, s: BoardStack) => n + s.rows.length, 0));
 	const attention = $derived((board?.attention ?? []).filter((h: BoardHeld) => items.has(h.pr)));
 	// What runs CI now: the batches and their bisection steps. What comes next is not guessed.
-	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false }) : []);
+	// The check of the default branch is a run too: ejections wait for it.
+	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false, master: pipe.master ? { ...pipe.master, branch: data.repo.default_branch } : null }) : []);
 
 	const MASTER: Record<string, { label: string; tone: string; hint: string }> = {
 		green: { label: 'green', tone: 'bg-green-100 text-green-800', hint: 'Batches build on it' },
@@ -236,6 +238,7 @@
 								{/if}
 								<span class="shrink-0 text-xs text-gray-500">{r.detail}</span>
 								<span class="min-w-0 truncate text-xs text-gray-400" title={r.prs.map((n) => `#${n}`).join(' ')}>{r.prs.map((n) => `#${n}`).join(' ')}</span>
+								{#if r.branch}<a href={actionsUrl(data.repo.owner, data.repo.name, r.branch)} target="_blank" rel="noopener" class="ml-auto shrink-0 text-xs text-gray-500 hover:text-indigo-600" title="GitHub Actions runs of {r.branch}">Actions</a>{/if}
 							</li>
 						{/each}
 					</ol>
@@ -252,7 +255,7 @@
 						</p>
 					{/if}
 					{#each pipe.active as batch (batch.id)}
-						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} />
+						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} stopsEarly={data.stopsEarly} />
 					{/each}
 				</section>
 			{/if}

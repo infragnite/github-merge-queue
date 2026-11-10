@@ -19,6 +19,8 @@ export interface BatchPR {
 	activity?: BisectActivity | null;
 	/** Landed, ejected or back in line: nothing more to find out about it in this bisection. */
 	settled?: boolean;
+	/** It failed alone and is to be ejected, once the default branch it failed on is known green. */
+	awaitingEject?: boolean;
 	/** The runs behind the verdict, for a tooltip. */
 	trail?: string;
 }
@@ -33,10 +35,13 @@ export type BisectVerdict = 'unknown' | 'passing' | 'failing';
 export type BisectActivity = 'checking' | 'landed' | 'left';
 
 export function bisectStates(
-	b: Pick<BatchRow, 'members' | 'landed' | 'left_prs' | 'ejected'>,
-	runs: Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'>[]
+	b: Pick<BatchRow, 'members' | 'landed' | 'left_prs' | 'ejected'> & Partial<Pick<BatchRow, 'base_tree'>>,
+	runs: (Pick<BatchRow, 'members' | 'context' | 'ci_result' | 'status' | 'base_sha'> & Partial<Pick<BatchRow, 'base_tree' | 'tree_sha'>>)[]
 ) {
-	const out = new Map<number, { verdict: BisectVerdict; activity: BisectActivity | null; trail: string }>();
+	// Trees known green, as the planner trusts them: the one the batch failed on and those this
+	// bisection landed. Only a failure alone on one of them ejects.
+	const trusted = new Set([runs[0]?.base_tree ?? b.base_tree, ...runs.filter((r) => r.status === 'landed').map((r) => r.tree_sha)].filter(Boolean));
+	const out = new Map<number, { verdict: BisectVerdict; activity: BisectActivity | null; trail: string; awaitingEject?: boolean }>();
 	const tested = runs.map((r, i) => ({ r, step: i + 1 })).filter(({ r }) => r.status !== 'cancelled');
 	for (const n of b.members) {
 		const inRun = tested.filter(({ r }) => r.members.includes(n) || r.context.includes(n));
@@ -62,7 +67,10 @@ export function bisectStates(
 				return `run ${step}: ${result} ${how} on ${r.base_sha.slice(0, 7)}`;
 			})
 			.join('\n');
-		out.set(n, { verdict, activity, trail });
+		// Failed alone and not ejected yet: the ejection waits for the default branch to be known.
+		const alone = inRun.filter(({ r }) => r.members.length === 1 && r.members[0] === n).at(-1);
+		const awaitingEject = !landed && !b.ejected.includes(n) && !b.left_prs.includes(n) && alone?.r.ci_result === 'failure' && trusted.has(alone.r.base_tree);
+		out.set(n, { verdict, activity, trail, ...(awaitingEject ? { awaitingEject } : {}) });
 	}
 	return out;
 }
@@ -117,6 +125,24 @@ export function summarizeJobs(jobs: Array<{ name: string; status: string; conclu
 /** True while a batch's CI may still be moving, so its progress is worth fetching. */
 export function isRunning(b: Pick<BatchRow, 'status'>): boolean {
 	return b.status === 'testing' || b.status === 'retrying' || b.status === 'bisecting';
+}
+
+const LOG_RUN_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * True while a run's CI may still be moving: it is running, or it is a run of one PR that failed
+ * lately. That run was decided at its first failed job, and its other jobs go on for the log.
+ */
+export function ciMayStillRun(
+	b: Pick<BatchRow, 'status' | 'ci_result' | 'members' | 'finished_at'>,
+	now = Date.now(),
+	/** Its last known progress: once every job is done, there is nothing more to read. */
+	last?: { total: number; done: number } | null
+): boolean {
+	if (isRunning(b)) return true;
+	if (b.status !== 'failed' || b.ci_result !== 'failure' || b.members.length !== 1 || !b.finished_at) return false;
+	if (last && last.total > 0 && last.done >= last.total) return false;
+	return now - Date.parse(b.finished_at.replace(' ', 'T') + 'Z') < LOG_RUN_MS;
 }
 
 export function batchCard(
