@@ -8,7 +8,7 @@
 //   PATCH  pulls/{n}/queue     {priority?, jumpTo?: "front"}
 //   DELETE pulls/{n}/queue     dequeue
 //   GET    queue/config        settings
-//   PATCH  queue/config        {mode?, config?, ci?}            (admin)
+//   PATCH  queue/config        {mode?, config?, ci?, publicView?}  (admin; publicView only on a public repo)
 //   POST   queue/pause         {reason?}                         (maintain)
 //   POST   queue/resume                                          (maintain)
 //                                 lifts a pause; on an unpaused queue whose default branch is
@@ -32,6 +32,18 @@ import { requireRole } from '$lib/server/api-auth';
 import { analyzeRepoStacks } from '$lib/server/stack-runtime';
 import { AuthError, bearer, resolveCaller, type AuthGitHub } from '$lib/server/api-auth';
 import * as api from '$lib/server/api-service';
+import { RequestLimiter, addressKey } from '$lib/server/request-limit';
+import { GitHubError } from '$lib/server/github-retry';
+
+// Per address before the token is checked, per user after: agents poll, but not this much.
+const byAddress = new RequestLimiter(240, 240);
+const byCaller = new RequestLimiter(120, 120);
+/** The same answer for a repo that isn't managed, one the token can't see, and a token GitHub refuses. */
+const NOT_FOUND = 'Not found, or this token cannot see the repository';
+
+function tooMany(wait: number) {
+	return json({ error: 'Too many requests; slow down' }, { status: 429, headers: { 'retry-after': String(wait) } });
+}
 
 const authGitHub: AuthGitHub = {
 	user: (token) => github.userForToken(token),
@@ -39,14 +51,33 @@ const authGitHub: AuthGitHub = {
 	repoAsCaller: (token, owner, repo) => github.repoForToken(token, owner, repo)
 };
 
-const handle: RequestHandler = async ({ params, request, url }) => {
+const handle: RequestHandler = async ({ params, request, url, getClientAddress }) => {
+	let address = 'unknown';
+	try {
+		address = addressKey(getClientAddress());
+	} catch {
+		// no address (tests)
+	}
+	const wait = byAddress.take(address);
+	if (wait) return tooMany(wait);
 	try {
 		// Unmanaged repos are refused before any GitHub call, so arbitrary owner/repo paths can't
-		// spend the app's rate limit. That a repo is managed is not a secret; its queue is.
+		// spend the app's rate limit; they answer like a repo the token can't see, so which private
+		// repositories the queue manages can't be probed with a made-up token.
 		if (!bearer(request.headers.get('authorization'))) throw new AuthError(401, 'Send your GitHub token: Authorization: Bearer $(gh auth token)');
 		const repo = getRepoByOwnerName(params.owner!, params.repo!);
-		if (!repo) return json({ error: `${params.owner}/${params.repo} is not managed by this queue` }, { status: 404 });
-		const caller = await resolveCaller(authGitHub, request.headers.get('authorization'), params.owner!, params.repo!);
+		if (!repo) return json({ error: NOT_FOUND }, { status: 404 });
+		let caller;
+		try {
+			caller = await resolveCaller(authGitHub, request.headers.get('authorization'), params.owner!, params.repo!);
+		} catch (e) {
+			if (e instanceof AuthError && e.cantSee) return json({ error: NOT_FOUND }, { status: 404 });
+			// GitHub couldn't say who this is: nobody is let in on a guess.
+			if (!(e instanceof AuthError) && (e instanceof GitHubError || e instanceof TypeError)) return json({ error: 'GitHub is unreachable; try again shortly' }, { status: 503, headers: { 'retry-after': '30' } });
+			throw e;
+		}
+		const callerWait = byCaller.take(caller.login);
+		if (callerWait) return tooMany(callerWait);
 		const parts = (params.path ?? '').split('/').filter(Boolean);
 		const m = request.method;
 		const body = async (): Promise<Record<string, unknown>> => {
@@ -76,11 +107,12 @@ const handle: RequestHandler = async ({ params, request, url }) => {
 				return json(api.getConfig(repo));
 			case 'PATCH queue/config': {
 				const b = await body();
+				const visibility = b.publicView === true ? await api.repoVisibility(() => github.getRepo(repo.owner, repo.name)) : null;
 				// Under the repo lock, so a running tick finishes before the mode flips and none
 				// starts a batch after the retire.
 				const r = await withRepoLock(repo.id, async () => {
 					const was = getQueueSettings(repo.id).mode;
-					const out = api.patchConfig(repo, caller, b);
+					const out = api.patchConfig(repo, caller, b, visibility);
 					if (was === 'batch' && getQueueSettings(repo.id).mode !== 'batch') await retireBatches(liveDeps(repo));
 					return out;
 				});

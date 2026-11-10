@@ -56,6 +56,13 @@ test('with the current settings, only changed fields are sent, so a rounded dura
 	expect(body.ci).toEqual({});
 });
 
+test('the public page box is sent only when it changed', () => {
+	const current = { config: {}, ci: {}, view: { publicView: false } };
+	expect(parseSettingsForm(form({ 'view.publicView': 'on' }), current).publicView).toBe(true);
+	expect(parseSettingsForm(form({}), current)).not.toHaveProperty('publicView');
+	expect(parseSettingsForm(form({}), { ...current, view: { publicView: true } }).publicView).toBe(false);
+});
+
 test('the settings page shows every field exactly once (a boolean left off would be saved as off)', () => {
 	const shownNames = SETTING_GROUPS.flatMap((g) => g.fields.map((f) => f.name));
 	expect([...shownNames].sort()).toEqual(ALL_FIELDS.map((f) => f.name).sort());

@@ -3,6 +3,7 @@ import { env } from '$env/dynamic/private';
 import { createSessionToken } from '$lib/server/auth';
 import { upsertUser } from '$lib/server/db';
 import { getUser, checkOrgMembership } from '$lib/server/github';
+import { safeNext } from '$lib/server/next-path';
 import type { RequestHandler } from './$types';
 
 const ALLOWED_ORG = 'infragnite';
@@ -12,6 +13,8 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 	const state = url.searchParams.get('state');
 	const savedState = cookies.get('oauth_state');
 	cookies.delete('oauth_state', { path: '/' });
+	const next = cookies.get('oauth_next');
+	cookies.delete('oauth_next', { path: '/' });
 
 	if (!code) redirect(302, '/login?error=no_code');
 	if (!state || !savedState || state !== savedState) {
@@ -59,5 +62,5 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		maxAge: 60 * 60 * 24 * 30
 	});
 
-	redirect(302, '/');
+	redirect(302, safeNext(next, env.APP_URL) ?? '/');
 };

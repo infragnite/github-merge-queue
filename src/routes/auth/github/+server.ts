@@ -1,9 +1,10 @@
 import { redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import { randomBytes } from 'crypto';
+import { safeNext } from '$lib/server/next-path';
 import type { RequestHandler } from './$types';
 
-export const GET: RequestHandler = ({ cookies }) => {
+export const GET: RequestHandler = ({ cookies, url }) => {
 	const clientId = env.GITHUB_CLIENT_ID;
 	const appUrl = env.APP_URL || 'http://localhost:3000';
 	const redirectUri = `${appUrl}/auth/callback`;
@@ -17,6 +18,11 @@ export const GET: RequestHandler = ({ cookies }) => {
 		secure: isSecure,
 		maxAge: 600
 	});
+
+	// A path on this site only: `//host` or a scheme would send the user elsewhere after sign-in.
+	const next = safeNext(url.searchParams.get('next'), appUrl);
+	if (next) cookies.set('oauth_next', next, { path: '/', httpOnly: true, sameSite: 'lax', secure: isSecure, maxAge: 600 });
+	else cookies.delete('oauth_next', { path: '/' });
 
 	const params = new URLSearchParams({
 		client_id: clientId!,

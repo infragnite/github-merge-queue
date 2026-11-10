@@ -1,18 +1,20 @@
-import { redirect, error, fail } from '@sveltejs/kit';
+import { redirect, error, fail, type RequestEvent } from '@sveltejs/kit';
 import {
 	getRepoByOwnerName,
 	getQueueItems,
 	getRepoHistory,
-	addToQueue,
 	removeFromQueue,
 	reorderQueue,
 	updateQueueItemStatus
 } from '$lib/server/db';
-import { getOpenPRs, rateLimitOf } from '$lib/server/github';
-import { atLeast, type Role } from '$lib/server/api-auth';
-import { pageCaller } from '$lib/server/page-caller';
-import { pipelineView, type PipelineView } from '$lib/server/pipeline-view';
-import { currentHold, deferredFor, getQueueSettings, setQueuePriority, updateQueueSettings } from '$lib/server/batch-store';
+import { getOpenPRs, rateLimitOf, getPR } from '$lib/server/github';
+import { atLeast, AuthError, requireRole, type Caller, type Role } from '$lib/server/api-auth';
+import { ApiError, changeEntry, enqueue } from '$lib/server/api-service';
+import { webCaller } from '$lib/server/web-auth';
+import { knownPublic, noteReadOnlyView, publicHistory, publicQueueItem, prUrl } from '$lib/server/public-view';
+import { savingsFor } from '$lib/server/ci-savings';
+import { pipelineView, publicPipeline, type PipelineView } from '$lib/server/pipeline-view';
+import { currentHold, deferredFor, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
 import { withRepoLock } from '$lib/server/repo-lock';
 import { cancelBatch } from '$lib/server/batch-queue';
 import { liveDeps } from '$lib/server/batch-live';
@@ -20,10 +22,11 @@ import { emitEvent } from '$lib/server/events';
 import { markDirty } from '$lib/server/wake';
 import { dashboardStackAnalysis } from '$lib/server/stack-runtime';
 import { stackView, type StackView } from '$lib/server/stack-view';
+import type { Repo } from '$lib/types';
 import type { PageServerLoad, Actions } from './$types';
 
-// The page refreshes every few seconds per viewer: the open PRs it reads from GitHub are shared and
-// reused for a while, so open dashboards don't spend the App's rate limit (the queue needs it).
+// The page refreshes every few seconds per viewer: what it reads from GitHub is shared and reused
+// for a while, so open dashboards don't spend the App's rate limit (the queue needs it).
 const OPEN_PRS_TTL_MS = 60_000;
 const openPrsCache = new Map<number, { at: number; value: Awaited<ReturnType<typeof getOpenPRs>> }>();
 
@@ -40,13 +43,27 @@ async function openPRsOf(owner: string, name: string, repoId: number) {
 	}
 }
 
-export const load: PageServerLoad = async ({ params, locals }) => {
-	if (!locals.user) redirect(302, '/login');
-
+export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) => {
 	const repo = getRepoByOwnerName(params.owner, params.name);
+	const anonymous = !locals.user;
+	// Signed in: the user's own role on the repository, as GitHub says; read access or more sees it all.
+	const me: Caller | null = repo && locals.user ? await webCaller(repo.owner, repo.name, locals.user.login) : null;
+	const member = !!me && atLeast(me.role, 'read');
+	// Anyone else sees the read-only page of a repository that made it public, or nothing: an unknown
+	// repository and one they can't see answer the same.
+	const readonly = !member;
+	// Public only while the stored setting is on and GitHub last said the repository is public.
+	if (readonly && !(repo && getQueueSettings(repo.id).publicView && knownPublic(repo.id))) {
+		if (anonymous) redirect(302, `/login?next=${encodeURIComponent(url.pathname)}`);
+		error(404, 'Repository not found');
+	}
 	if (!repo) error(404, 'Repository not found');
 
-	const queueItems = getQueueItems(repo.id).map((i) => ({ ...i, holdWait: currentHold(i)?.wait ?? null, deferred: deferredFor(i as typeof i & { deferred_for?: string | null }).length > 0 }));
+	// Links are built here, never taken from what was stored: a stored URL came from a form once.
+	const queueItems = getQueueItems(repo.id).map((i) => {
+		const item = { ...i, pr_url: prUrl(repo, i.pr_number), holdWait: currentHold(i)?.wait ?? null, deferred: deferredFor(i as typeof i & { deferred_for?: string | null }).length > 0 };
+		return readonly ? publicQueueItem(item) : item;
+	});
 
 	let openPrs: Array<{
 		number: number;
@@ -56,7 +73,8 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		draft: boolean;
 	}> = [];
 	try {
-		openPrs = await openPRsOf(repo.owner, repo.name, repo.id);
+		// Signed-out visitors only see what signed-in ones fetched (titles of PRs in stacks).
+		openPrs = readonly ? (openPrsCache.get(repo.id)?.value ?? []) : await openPRsOf(repo.owner, repo.name, repo.id);
 	} catch {
 		// GitHub API error — user sees empty PR list
 	}
@@ -64,19 +82,28 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	// Streamed: the page renders while the analysis (a call per changed PR) finishes.
 	// Queue items keep a title even when GitHub can't be reached; open PRs have the current one.
 	const prMeta = new Map(queueItems.map((i) => [i.pr_number, { title: i.pr_title, url: i.pr_url }]));
-	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: pr.html_url });
+	for (const pr of openPrs) prMeta.set(pr.number, { title: pr.title, url: prUrl(repo, pr.number) });
 	const queueStatus = new Map(queueItems.map((i) => [i.pr_number, i.status as string]));
-	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = dashboardStackAnalysis(repo)
+	// A read-only viewer only gets what is cached: none of their loads calls GitHub.
+	if (readonly) {
+		noteReadOnlyView(repo.id);
+		// Only the viewer's own browser may keep it, briefly; a shared cache never (it varies by sign-in).
+		setHeaders({ 'cache-control': 'private, max-age=5', vary: 'Cookie' });
+	}
+	const stacks: Promise<{ stacks: StackView[]; error: string | null }> = dashboardStackAnalysis(repo, { cachedOnly: readonly })
 		.then((a) => ({ stacks: stackView(a, prMeta, queueStatus), error: null }))
 		.catch((e) => {
-			console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
-			return { stacks: [], error: `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
+			if (!readonly) console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
+			return { stacks: [], error: readonly ? 'Stacks could not be loaded' : `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
 		});
 
-	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta).catch((e) => {
+	const pipeline: Promise<PipelineView> = pipelineView(repo, prMeta, { cachedOnly: readonly })
+		// Why the queue stopped can name internals (App permissions, GitHub errors): only signed-in users see it.
+		.then((p) => (readonly ? publicPipeline(p) : p))
+		.catch((e) => {
 		const why = e instanceof Error ? e.message : String(e);
 		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);
-		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {} };
+		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {} };
 	});
 
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));
@@ -85,203 +112,164 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		.map((pr) => ({
 			number: pr.number,
 			title: pr.title,
-			url: pr.html_url,
+			url: prUrl(repo, pr.number),
 			author: pr.user.login,
 			authorAvatar: pr.user.avatar_url,
 			draft: pr.draft
 		}));
 
 	const settings = getQueueSettings(repo.id);
-	const me = await pageCaller(repo.owner, repo.name, locals.user.login);
+	const role: Role = member ? me!.role : 'none';
 	return {
-		role: me.role,
-		can: { cancel: atLeast(me.role, 'maintain') },
-		repo,
+		anonymous,
+		readonly,
+		role,
+		// What the page offers; every action checks the role again on the server.
+		can: {
+			queue: atLeast(role, 'write'),
+			reorder: atLeast(role, 'maintain'),
+			urgent: atLeast(role, 'maintain'),
+			cancel: atLeast(role, 'maintain'),
+			resume: atLeast(role, 'maintain'),
+			settings: atLeast(role, 'admin')
+		},
+		repo: { id: repo.id, owner: repo.owner, name: repo.name, default_branch: repo.default_branch },
+		savings: savingsFor(repo.id),
 		queueItems,
-		openPrs: availablePrs,
+		openPrs: atLeast(role, 'write') ? availablePrs : [],
 		stacks,
 		pipeline,
 		mode: settings.mode,
 		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },
-		history: getRepoHistory(repo.id)
+		history: getRepoHistory(repo.id).map((h) => {
+			const item = { ...h, pr_url: prUrl(repo, h.pr_number) };
+			return readonly ? publicHistory(item) : item;
+		})
 	};
 };
 
-/** A form action's role check, as the API's: a failure to return, or null when allowed. */
-async function requireRole(repo: { owner: string; name: string }, login: string, role: Role, what: string) {
-	const me = await pageCaller(repo.owner, repo.name, login);
-	return atLeast(me.role, role) ? null : fail(403, { error: `${what} needs ${role} access; you have ${me.role}` });
+type Guarded = { repo: Repo; me: Caller; form: FormData };
+
+/**
+ * Runs a page action for a signed-in user with at least `need` on the repository (the role the
+ * agent API requires for the same change). The role is GitHub's, looked up on the server: what
+ * the page shows or hides is only a convenience. Errors become a failed action under `key`.
+ */
+async function guarded(
+	event: RequestEvent,
+	need: Role,
+	what: string,
+	run: (c: Guarded) => Promise<Record<string, unknown> | void> | Record<string, unknown> | void,
+	key = 'error'
+) {
+	const { locals, params, request } = event;
+	if (!locals.user) return fail(401, { [key]: 'Sign in first' });
+	const repo = getRepoByOwnerName(params.owner!, params.name!);
+	if (!repo) return fail(404, { [key]: 'Repository not found' });
+	const me = await webCaller(repo.owner, repo.name, locals.user.login);
+	try {
+		requireRole(me, need, what);
+		return (await run({ repo, me, form: await request.formData() })) ?? { success: true };
+	} catch (e) {
+		if (e instanceof AuthError || e instanceof ApiError) return fail(e.status, { [key]: e.message });
+		throw e;
+	}
+}
+
+/** A positive whole number from a form field, or a 400. */
+function intField(form: FormData, name: string): number {
+	const v = String(form.get(name) ?? '');
+	if (!/^[1-9]\d{0,9}$/.test(v)) throw new ApiError(400, `${name} must be a positive whole number`);
+	return Number(v);
 }
 
 export const actions: Actions = {
 	/** Stops a batch (and its bisection); its PRs go back in line, blamed for nothing. */
-	cancelBatch: async ({ request, params, locals }) => {
-		if (!locals.user) return fail(401);
-		const repo = getRepoByOwnerName(params.owner, params.name);
-		if (!repo) return fail(404);
-		const me = await pageCaller(repo.owner, repo.name, locals.user.login);
-		if (!atLeast(me.role, 'maintain')) return fail(403, { error: `Cancelling a batch needs maintain access; you have ${me.role}` });
-		const id = parseInt((await request.formData()).get('batch_id') as string, 10);
-		if (!id) return fail(400, { error: 'batch_id is required' });
-		// Its CI could not be stopped nor its branches deleted until the reset.
-		const limit = (await rateLimitOf(repo.owner).catch(() => null))?.blockedUntil;
-		if (limit) return fail(409, { error: `GitHub's rate limit is used up; cancel again after ${new Date(limit).toLocaleTimeString()}` });
-		try {
-			await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), id, me.login));
-		} catch (e) {
-			return fail(409, { error: e instanceof Error ? e.message : String(e) });
-		}
-		markDirty(repo.id);
-		return { success: true };
-	},
+	cancelBatch: (event) =>
+		guarded(event, 'maintain', 'Cancelling a batch', async ({ repo, me, form }) => {
+			const id = intField(form, 'batch_id');
+			// Its CI could not be stopped nor its branches deleted until the reset.
+			const limit = (await rateLimitOf(repo.owner).catch(() => null))?.blockedUntil;
+			if (limit) throw new ApiError(409, `GitHub's rate limit is used up; cancel again after ${new Date(limit).toLocaleTimeString()}`);
+			try {
+				await withRepoLock(repo.id, () => cancelBatch(liveDeps(repo), id, me.login));
+			} catch (e) {
+				throw new ApiError(409, e instanceof Error ? e.message : String(e));
+			}
+			markDirty(repo.id);
+		}),
 
-	/** Batch mode's order: urgent PRs go first, in an express batch. */
-	setPriority: async ({ request, params, locals }) => {
-		if (!locals.user) return fail(401);
-		const repo = getRepoByOwnerName(params.owner, params.name);
-		if (!repo) return fail(404);
-		const form = await request.formData();
-		const n = parseInt(form.get('pr_number') as string, 10);
-		const priority = form.get('priority');
-		if (!n || (priority !== 'urgent' && priority !== 'normal' && priority !== 'low')) return fail(400);
-		const denied = await requireRole(repo, locals.user.login, priority === 'urgent' ? 'maintain' : 'write', `Setting priority ${priority}`);
-		if (denied) return denied;
-		if (!getQueueItems(repo.id).some((i) => i.pr_number === n)) return fail(404);
-		setQueuePriority(repo.id, n, priority);
-		emitEvent(repo.id, n, 'priority', { priority, by: locals.user.login });
-		markDirty(repo.id);
-		return { success: true };
-	},
+	/** Batch mode's order: urgent PRs go first, in an express batch (urgent needs maintain). */
+	setPriority: (event) =>
+		guarded(event, 'write', 'Changing a priority', async ({ repo, me, form }) => {
+			const n = intField(form, 'pr_number');
+			const priority = form.get('priority');
+			if (priority !== 'urgent' && priority !== 'normal' && priority !== 'low') throw new ApiError(400, 'priority must be urgent, normal or low');
+			changeEntry(repo, me, n, { priority });
+			markDirty(repo.id);
+		}),
 
 	/** Lifts a pause of the batch queue; it acts on the next processor cycle. */
-	resume: async ({ params, locals }) => {
-		if (!locals.user) return fail(401);
-		const repo = getRepoByOwnerName(params.owner, params.name);
-		if (!repo) return fail(404);
-		const denied = await requireRole(repo, locals.user.login, 'maintain', 'Resuming the queue');
-		if (denied) return denied;
-		const was = getQueueSettings(repo.id).pausedReason;
-		if (was === null) return { success: true };
-		updateQueueSettings(repo.id, { pausedReason: null });
-		emitEvent(repo.id, null, 'resumed', { by: locals.user.login });
-		markDirty(repo.id);
-		console.log(`[merge-queue] ${repo.owner}/${repo.name} resumed by ${locals.user.login} (was paused: ${was})`);
-		return { success: true };
-	},
+	resume: (event) =>
+		guarded(event, 'maintain', 'Resuming the queue', ({ repo, me }) => {
+			const was = getQueueSettings(repo.id).pausedReason;
+			if (was === null) return;
+			updateQueueSettings(repo.id, { pausedReason: null });
+			emitEvent(repo.id, null, 'resumed', { by: me.login });
+			markDirty(repo.id);
+			console.log(`[merge-queue] ${repo.owner}/${repo.name} resumed by ${me.login} (was paused: ${was})`);
+		}),
 
-	addToQueue: async ({ request, params, locals }) => {
-		if (!locals.user) return fail(401);
-
-		const repo = getRepoByOwnerName(params.owner, params.name);
-		if (!repo) return fail(404);
-		const denied = await requireRole(repo, locals.user.login, 'write', 'Queueing a PR');
-		if (denied) return denied;
-
-		const formData = await request.formData();
-		const prNumber = parseInt(formData.get('pr_number') as string, 10);
-		const prTitle = formData.get('pr_title') as string;
-		const prUrl = formData.get('pr_url') as string;
-		const authorLogin = formData.get('author_login') as string;
-		const authorAvatar = formData.get('author_avatar') as string;
-
-		if (!prNumber || !prTitle || !prUrl || !authorLogin) {
-			return fail(400, { error: 'Missing required fields' });
-		}
-		if (prTitle.length > 500 || prUrl.length > 2000 || authorLogin.length > 100) {
-			return fail(400, { error: 'Invalid field values' });
-		}
-
-		try {
-			addToQueue(
-				repo.id,
-				prNumber,
-				prTitle,
-				prUrl,
-				authorLogin,
-				authorAvatar,
-				locals.user.login
-			);
-		} catch (e: unknown) {
-			const msg = e instanceof Error ? e.message : String(e);
-			if (msg.includes('UNIQUE')) {
-				return fail(409, { error: 'PR is already in the queue' });
+	/** Queues an open PR. What is stored about it comes from GitHub, not from the form. */
+	addToQueue: (event) =>
+		guarded(event, 'write', 'Queueing a PR', async ({ repo, me, form }) => {
+			const n = intField(form, 'pr_number');
+			let pr;
+			try {
+				pr = await getPR(repo.owner, repo.name, n);
+			} catch {
+				throw new ApiError(404, `#${n} was not found on GitHub`);
 			}
-			return fail(500, { error: 'Failed to add PR to queue' });
-		}
+			enqueue(repo, me, pr, {});
+			markDirty(repo.id);
+		}),
 
-		return { success: true };
-	},
+	removeFromQueue: (event) =>
+		guarded(event, 'write', 'Removing a PR from the queue', ({ repo, me, form }) => {
+			const itemId = intField(form, 'item_id');
+			const item = getQueueItems(repo.id).find((i) => i.id === itemId);
+			if (!item) throw new ApiError(404, 'Not in this queue');
+			removeFromQueue(itemId);
+			emitEvent(repo.id, item.pr_number, 'dequeued', { by: me.login });
+			markDirty(repo.id);
+		}),
 
-	removeFromQueue: async ({ request, params, locals }) => {
-		if (!locals.user) return fail(401);
+	/** The whole line's order (one by one mode); like moving a PR to the front, it needs maintain. */
+	reorder: (event) =>
+		guarded(event, 'maintain', 'Reordering the queue', ({ repo, form }) => {
+			let orderedIds: unknown;
+			try {
+				orderedIds = JSON.parse(String(form.get('order') ?? ''));
+			} catch {
+				throw new ApiError(400, 'order must be a JSON list of item ids');
+			}
+			if (!Array.isArray(orderedIds) || orderedIds.some((id) => !Number.isSafeInteger(id))) throw new ApiError(400, 'order must be a JSON list of item ids');
+			const validIds = new Set(getQueueItems(repo.id).map((i) => i.id));
+			if (orderedIds.length !== validIds.size || new Set(orderedIds).size !== validIds.size || !orderedIds.every((id) => validIds.has(id))) {
+				throw new ApiError(400, 'Invalid item order');
+			}
+			reorderQueue(repo.id, orderedIds as number[]);
+			markDirty(repo.id);
+		}),
 
-		const repo = getRepoByOwnerName(params.owner, params.name);
-		if (!repo) return fail(404);
-		const denied = await requireRole(repo, locals.user.login, 'write', 'Removing a PR from the queue');
-		if (denied) return denied;
-
-		const formData = await request.formData();
-		const itemId = parseInt(formData.get('item_id') as string, 10);
-		if (!itemId) return fail(400);
-
-		const items = getQueueItems(repo.id);
-		if (!items.some((i) => i.id === itemId)) return fail(403);
-
-		removeFromQueue(itemId);
-		return { success: true };
-	},
-
-	reorder: async ({ request, params, locals }) => {
-		if (!locals.user) return fail(401);
-
-		const repo = getRepoByOwnerName(params.owner, params.name);
-		if (!repo) return fail(404);
-		const denied = await requireRole(repo, locals.user.login, 'maintain', 'Reordering the queue');
-		if (denied) return denied;
-
-		const formData = await request.formData();
-		const orderJson = formData.get('order') as string;
-		if (!orderJson) return fail(400);
-
-		let orderedIds: number[];
-		try {
-			orderedIds = JSON.parse(orderJson);
-		} catch {
-			return fail(400);
-		}
-
-		if (!Array.isArray(orderedIds) || orderedIds.some((id) => typeof id !== 'number')) {
-			return fail(400);
-		}
-
-		const items = getQueueItems(repo.id);
-		const validIds = new Set(items.map((i) => i.id));
-		if (orderedIds.length !== validIds.size || !orderedIds.every((id) => validIds.has(id))) {
-			return fail(400, { error: 'Invalid item order' });
-		}
-
-		reorderQueue(repo.id, orderedIds);
-		return { success: true };
-	},
-
-	retry: async ({ request, params, locals }) => {
-		if (!locals.user) return fail(401);
-
-		const repo = getRepoByOwnerName(params.owner, params.name);
-		if (!repo) return fail(404);
-		const denied = await requireRole(repo, locals.user.login, 'write', 'Retrying a PR');
-		if (denied) return denied;
-
-		const formData = await request.formData();
-		const itemId = parseInt(formData.get('item_id') as string, 10);
-		if (!itemId) return fail(400);
-
-		const items = getQueueItems(repo.id);
-		const item = items.find((i) => i.id === itemId);
-		if (!item) return fail(403);
-		if (item.status !== 'failed') return fail(400, { error: 'Only failed items can be retried' });
-
-		updateQueueItemStatus(itemId, 'queued');
-		return { success: true };
-	}
+	retry: (event) =>
+		guarded(event, 'write', 'Putting a PR back in the queue', ({ repo, me, form }) => {
+			const itemId = intField(form, 'item_id');
+			const item = getQueueItems(repo.id).find((i) => i.id === itemId);
+			if (!item) throw new ApiError(404, 'Not in this queue');
+			if (item.status !== 'failed') throw new ApiError(400, 'Only failed items can be retried');
+			updateQueueItemStatus(itemId, 'queued');
+			emitEvent(repo.id, item.pr_number, 'requeued', { by: me.login });
+			markDirty(repo.id);
+		})
 };

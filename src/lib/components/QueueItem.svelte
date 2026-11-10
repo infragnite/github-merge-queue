@@ -11,7 +11,9 @@
 		reorderable = false,
 		batchMode,
 		stack = null,
-		why = null
+		why = null,
+		readonly = false,
+		canUrgent = false
 	}: {
 		item: ViewItem;
 		position?: number | null;
@@ -22,6 +24,10 @@
 		stack?: StackPlace | null;
 		/** Set when the row is listed under "Needs attention": what is wrong. */
 		why?: string | null;
+		/** A signed-out visitor's view: no controls. */
+		readonly?: boolean;
+		/** Making a PR urgent needs maintain. */
+		canUrgent?: boolean;
 	} = $props();
 
 	const isActive = $derived(['updating', 'checking', 'merging'].includes(item.status));
@@ -82,7 +88,7 @@
 		<span class="shrink-0 rounded px-1.5 py-0.5 text-xs font-medium {priority === 'urgent' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'}">{priority}</span>
 	{/if}
 	{#if showStatus}<StatusBadge status={item.status} />{/if}
-	{#if batchMode && (item.status === 'queued' || item.status === 'conflict')}
+	{#if !readonly && batchMode && (item.status === 'queued' || item.status === 'conflict')}
 		<form method="POST" action={action('setPriority')} use:enhance class="hidden shrink-0 sm:block sm:opacity-0 sm:transition-opacity sm:focus-within:opacity-100 sm:group-hover:opacity-100">
 			<input type="hidden" name="pr_number" value={item.pr_number} />
 			<select
@@ -93,14 +99,16 @@
 				aria-label="Priority of #{item.pr_number}"
 				title="Urgent PRs go first, in a small express batch"
 			>
-				<option value="urgent">urgent</option>
+				<option value="urgent" disabled={!canUrgent && priority !== 'urgent'}>urgent</option>
 				<option value="normal">normal</option>
 				<option value="low">low</option>
 			</select>
 		</form>
 	{/if}
 	<div class="flex shrink-0 items-center">
-		{#if item.status === 'failed'}
+		{#if readonly}
+			<!-- nothing to change -->
+		{:else if item.status === 'failed'}
 			<form method="POST" action={action('retry')} use:enhance>
 				<input type="hidden" name="item_id" value={item.id} />
 				<button type="submit" class="rounded p-1 text-gray-400 hover:bg-indigo-50 hover:text-indigo-600" title="Put back in the queue" aria-label="Retry #{item.pr_number}">
@@ -110,7 +118,7 @@
 				</button>
 			</form>
 		{/if}
-		{#if canRemove}
+		{#if canRemove && !readonly}
 			<form
 				method="POST"
 				action={action('removeFromQueue')}
