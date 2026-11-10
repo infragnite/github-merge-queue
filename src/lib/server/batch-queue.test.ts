@@ -24,6 +24,8 @@ class World {
 	ciRed = new Set<number>();
 	/** CI fails when the tested tree has this file (a PR that breaks master). */
 	breakingFiles = new Set<string>();
+	/** GitHub refuses a push that changes a workflow: the app has no Workflows permission. */
+	workflowsDenied = false;
 	/** CI fails when the tree has all of these files (a semantic conflict between PRs). */
 	conflictPairs: string[][] = [];
 	/** Head SHAs whose first CI run fails and whose re-run passes. */
@@ -178,6 +180,14 @@ class World {
 					changesRequested: this.changesRequested.has(n)
 				}),
 				pushBranch: async (branch, sha) => {
+					if (this.workflowsDenied) {
+						const changed = git.git('diff', '--name-only', git.sha('main'), sha, '--', '.github/workflows').trim();
+						if (changed) {
+							throw new Error(
+								`git push failed: ! [remote rejected] ${sha} -> ${branch} (refusing to allow a GitHub App to create or update workflow \`${changed.split('\n')[0]}\` without \`workflows\` permission)`
+							);
+						}
+					}
 					git.git('branch', '-f', branch, sha);
 				},
 				pushHead: async (branch, sha, expected) => {
@@ -744,6 +754,25 @@ describe('batch queue runtime', () => {
 		expect(world.comments.find((c) => c.pr === 2)?.body).toMatch(/Stacked on #1, which failed/);
 		// The batch records both as ejected, the child too, not as back in line.
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')).toMatchObject({ ejected: expect.arrayContaining([1, 2]) });
+	});
+
+	test('a PR that changes a workflow the app may not push is held with what to do; the queue goes on', async () => {
+		world.workflowsDenied = true;
+		pr(1);
+		pr(2, { file: '.github/workflows/ci.yml' });
+		pr(3);
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([1, 3]);
+		const reason = 'Changes .github/workflows/ci.yml, which the merge queue app may not push';
+		expect(db.getQueueItems(repo.id).map((i) => ({ pr: i.pr_number, status: i.status, message: i.error_message }))).toEqual([
+			{ pr: 2, status: 'conflict', message: reason }
+		]);
+		const notice = holdNotice({ pr: 2, head: git.sha('pr2'), code: 'workflow-permission', reason, files: ['.github/workflows/ci.yml'] });
+		expect(world.comments).toEqual([{ pr: 2, body: notice }]);
+		expect(world.prChecks.filter((c) => c.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required', title: reason });
+		// Not a conflict to rebase: no needs-rebase label.
+		expect(world.labels.get(2)?.has('needs-rebase') ?? false).toBe(false);
 	});
 
 	test('pipelines a second batch on top of the first', async () => {
