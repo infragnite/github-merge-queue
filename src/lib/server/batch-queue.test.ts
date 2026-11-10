@@ -642,7 +642,7 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1]);
 		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, '#2 has changes requested']]);
 		// The dashboard shows it as needing someone, not as waiting for its turn.
-		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: '#2 has changes requested', told: true });
+		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: '#2 has changes requested', told: true, head: git.sha('pr2') });
 	});
 
 	test('marks the PR head as tested right before merging it', async () => {

@@ -537,6 +537,8 @@ export interface Hold {
 	told?: boolean;
 	/** The PR was free again after it; kept so a deferral that comes back isn't commented on again. */
 	released?: boolean;
+	/** The PR's head when it was told: after a new push, a hold of the same kind is news again. */
+	head?: string;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {
@@ -560,7 +562,7 @@ export function currentHold(item: { hold?: string | null; status: string; error_
 	if (item.status !== 'queued' || !item.hold || !item.error_message) return null;
 	try {
 		const h = JSON.parse(item.hold) as Hold;
-		return h.reason === item.error_message ? h : null;
+		return h.reason === item.error_message && !h.released ? h : null;
 	} catch {
 		return null;
 	}

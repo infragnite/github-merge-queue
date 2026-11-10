@@ -1619,15 +1619,16 @@ class Tick {
 
 	async recordHolds(held: { pr: number; admission: Hold }[]) {
 		const now = new Map(held.map((h) => [h.pr, h.admission]));
-		const tell = async (n: number, state: 'failure' | 'pending', description: string): Promise<boolean> => {
+		/** Posts the status; false if it couldn't, else the head it was posted on (none: the PR is gone). */
+		const tell = async (n: number, state: 'failure' | 'pending', description: string): Promise<false | { head?: string }> => {
 			const p = await this.pr(n).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				return null;
 			});
-			if (!p) return true; // closed or gone: there is no head to tell
+			if (!p) return {}; // closed or gone: there is no head to tell
 			try {
 				await this.d.github.setPRStatus(p.headSha, state, short(description));
-				return true;
+				return { head: p.headSha };
 			} catch (e) {
 				if (e instanceof RateLimitedError) throw e;
 				this.bestEffort('github.setPRStatus')(e);
@@ -1642,26 +1643,31 @@ class Tick {
 			const stored = store.storedHold(it as QueueItem & { hold?: string | null });
 			const h = now.get(it.pr_number);
 			if (!h) {
-				if (!was) continue;
+				// Free again. Its message may be gone already (plan() clears a lifted deferral's), so
+				// what it was told comes from the stored hold.
+				const told = was ?? (stored?.told && !stored.released ? stored : null);
+				if (!told) continue;
 				if (!(await tell(it.pr_number, 'pending', 'In line in the merge queue'))) continue;
 				// A lifted deferral is the planner trying again, not news for the author.
-				if (was.told && was.code !== 'deferred') await this.say(it.pr_number, 'Back in line in the merge queue.');
-				store.setHold(it.id, was.told ? { ...was, released: true } : null);
+				if (told.told && told.code !== 'deferred') await this.say(it.pr_number, 'Back in line in the merge queue.');
+				store.setHold(it.id, told.told ? { ...told, released: true } : null);
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
-				this.event(it.pr_number, 'released', { code: was.code });
+				this.event(it.pr_number, 'released', { code: told.code });
 				continue;
 			}
 			const { code, reason } = h;
 			if (was?.told && was.code === code && was.reason === reason) continue;
-			if (!(await tell(it.pr_number, 'failure', `Needs attention: ${reason}`))) continue;
+			const posted = await tell(it.pr_number, 'failure', `Needs attention: ${reason}`);
+			if (!posted) continue;
 			// One comment per kind of hold: it notifies the author, a status doesn't. A new reason of
 			// the same kind (fewer PRs ahead) only updates the status.
 			const advice = holdAdvice(code as HoldCode);
-			const toldThis = !!stored?.told && stored.code === code && (!stored.released || code === 'deferred');
+			// Told this kind on this head already; a deferral that comes back is told again only after a push.
+			const toldThis = !!stored?.told && stored.code === code && (!stored.released || (code === 'deferred' && stored.head === posted.head));
 			if (advice && !toldThis)
 				await this.say(it.pr_number, `Needs attention in the merge queue: ${reason}\n\nWhat to do: ${advice}`);
 			db.updateQueueItemStatus(it.id, 'queued', reason);
-			store.setHold(it.id, { code, reason, told: true });
+			store.setHold(it.id, { code, reason, told: true, head: posted.head });
 			this.event(it.pr_number, 'held', { code, reason });
 		}
 		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).
