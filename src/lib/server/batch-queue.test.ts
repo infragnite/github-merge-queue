@@ -651,9 +651,9 @@ describe('batch queue runtime', () => {
 		world.changesRequested.add(2);
 		await run();
 		expect(world.merged).toEqual([1]);
-		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, '#2 has changes requested']]);
+		expect(db.getQueueItems(repo.id).map((i) => [i.pr_number, i.error_message])).toEqual([[2, 'Changes requested']]);
 		// The dashboard shows it as needing someone, not as waiting for its turn.
-		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: '#2 has changes requested', told: true, head: git.sha('pr2') });
+		expect(store.currentHold(db.getQueueItems(repo.id)[0])).toEqual({ code: 'changes-requested', reason: 'Changes requested', told: true, head: git.sha('pr2') });
 	});
 
 	test('marks the PR head as tested right before merging it', async () => {
@@ -913,9 +913,9 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1]);
 		const told = () => world.prChecks.filter((x) => x.sha === git.sha('pr2') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
 		// Told once, however many ticks hold it.
-		expect(told()).toEqual([['action_required', '#2 has changes requested']]);
+		expect(told()).toEqual([['action_required', 'Changes requested']]);
 		const kinds = () => events.listEvents(repo.id, { pr: 2 }).map((e) => e.kind);
-		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'held').map((e) => e.data)).toEqual([{ code: 'changes-requested', reason: '#2 has changes requested' }]);
+		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'held').map((e) => e.data)).toEqual([{ code: 'changes-requested', reason: 'Changes requested' }]);
 		world.changesRequested.delete(2);
 		await run();
 		expect(world.merged).toEqual([1, 2]);
@@ -926,7 +926,7 @@ describe('batch queue runtime', () => {
 		pr(1);
 		world.drafts.add(1);
 		await run(2);
-		const h = { pr: 1, head: git.sha('pr1'), code: 'draft' as const, reason: '#1 is a draft' };
+		const h = { pr: 1, head: git.sha('pr1'), code: 'draft' as const, reason: 'Draft' };
 		const checks = world.prChecks.filter((x) => x.sha === git.sha('pr1'));
 		expect(checks).toEqual([{ sha: git.sha('pr1'), name: 'merge-queue', state: 'action_required', ...holdCheck(h) }]);
 		expect(checks[0].summary).toContain('```sh\ngh pr ready 1\n```');
@@ -989,13 +989,13 @@ describe('batch queue runtime', () => {
 		world.changesRequested.add(1);
 		const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!;
 		// What the previous version left: the hold and its message, and nothing posted.
-		db.updateQueueItemStatus(item.id, 'queued', '#1 has changes requested');
-		store.setHold(item.id, { code: 'changes-requested', reason: '#1 has changes requested' });
+		db.updateQueueItemStatus(item.id, 'queued', 'Changes requested');
+		store.setHold(item.id, { code: 'changes-requested', reason: 'Changes requested' });
 		await run(2);
 		const told = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
-		expect(told).toEqual([['action_required', '#1 has changes requested']]);
+		expect(told).toEqual([['action_required', 'Changes requested']]);
 		expect(world.comments).toEqual([
-			{ pr: 1, body: holdNotice({ pr: 1, head: git.sha('pr1'), code: 'changes-requested', reason: '#1 has changes requested' }) }
+			{ pr: 1, body: holdNotice({ pr: 1, head: git.sha('pr1'), code: 'changes-requested', reason: 'Changes requested' }) }
 		]);
 	});
 
@@ -1006,7 +1006,7 @@ describe('batch queue runtime', () => {
 		await run(3);
 		expect(world.merged).toEqual([1]);
 		expect(world.comments).toEqual([
-			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'changes-requested', reason: '#2 has changes requested' }) }
+			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'changes-requested', reason: 'Changes requested' }) }
 		]);
 		world.changesRequested.delete(2);
 		await run();
@@ -1108,7 +1108,7 @@ describe('batch queue runtime', () => {
 		world.changesRequested.add(5);
 		await run(2);
 		const told = world.prChecks.filter((x) => x.sha === git.sha('pr5') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
-		expect(told).toEqual([['action_required', '#5 has changes requested']]);
+		expect(told).toEqual([['action_required', 'Changes requested']]);
 	});
 
 	test('a status that could not be posted is posted on the next tick', async () => {
@@ -1128,7 +1128,7 @@ describe('batch queue runtime', () => {
 		await tickBatchQueue(deps);
 		await tickBatchQueue(deps);
 		const told = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
-		expect(told).toEqual([['action_required', '#1 has changes requested']]);
+		expect(told).toEqual([['action_required', 'Changes requested']]);
 	});
 
 	test('a held PR taken out of the queue is no longer told it needs attention', async () => {
@@ -1140,7 +1140,7 @@ describe('batch queue runtime', () => {
 		await run(2);
 		const told = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
 		expect(told).toEqual([
-			['action_required', '#1 has changes requested'],
+			['action_required', 'Changes requested'],
 			['queued', 'Not in the merge queue']
 		]);
 		expect(events.listEvents(repo.id, { pr: 1 }).map((e) => e.kind).filter((k) => k === 'held' || k === 'released')).toEqual(['held', 'released']);
@@ -1234,8 +1234,8 @@ describe('batch queue runtime', () => {
 		git.commit('pr1', 'still working on it');
 		await run(2);
 		const on = (sha: string) => world.prChecks.filter((x) => x.sha === sha && x.name === 'merge-queue').map((x) => [x.state, x.title]);
-		expect(on(first)).toEqual([['action_required', '#1 has changes requested']]);
-		expect(on(git.sha('pr1'))).toEqual([['action_required', '#1 has changes requested']]);
+		expect(on(first)).toEqual([['action_required', 'Changes requested']]);
+		expect(on(git.sha('pr1'))).toEqual([['action_required', 'Changes requested']]);
 		expect(world.comments.map((c) => c.pr)).toEqual([1]);
 	});
 
@@ -1407,7 +1407,7 @@ describe('batch queue runtime', () => {
 		world.changesRequested.add(5);
 		await run(2);
 		const told = world.prChecks.filter((x) => x.sha === git.sha('pr5') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
-		expect(told).toEqual([['action_required', '#5 has changes requested']]);
+		expect(told).toEqual([['action_required', 'Changes requested']]);
 	});
 
 	test('a PR held back on a red default branch does not stop the others from being tried alone', async () => {

@@ -158,13 +158,13 @@ describe('stack state for agents', () => {
 			store.setHold(it.id, { code, reason });
 			return it;
 		};
-		hold(1, 'draft', '#1 is a draft');
-		hold(2, 'changes-requested', '#2 has changes requested');
+		hold(1, 'draft', 'Draft');
+		hold(2, 'changes-requested', 'Changes requested');
 		const deferred = hold(3, 'deferred', 'Conflicts with #7 ahead of it; waits for them to land');
 		store.setDeferredFor(deferred.id, [7]);
 		const a = analysis([1, 2, 3, 7]);
-		expect(api.stackState(repo, 1, a).nextActions).toEqual([{ do: 'mark-ready', why: '#1 is a draft' }]);
-		expect(api.stackState(repo, 2, a).nextActions).toEqual([{ do: 'fix', why: '#2 has changes requested' }]);
+		expect(api.stackState(repo, 1, a).nextActions).toEqual([{ do: 'mark-ready', why: 'Draft' }]);
+		expect(api.stackState(repo, 2, a).nextActions).toEqual([{ do: 'fix', why: 'Changes requested' }]);
 		expect(api.stackState(repo, 3, a).nextActions).toEqual([
 			{ do: 'wait-for', pr: 7, why: 'Conflicts with #7 ahead of it; waits for them to land' }
 		]);
