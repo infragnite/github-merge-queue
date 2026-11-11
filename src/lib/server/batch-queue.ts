@@ -145,8 +145,8 @@ export interface QueueGit {
 	tree(sha: string): Promise<string>;
 	/**
 	 * Builds `members` on `baseSha`. `attrs` is the default branch's head: its `.gitattributes` pick
-	 * the queue's merge drivers, never a PR's or a batch ahead's. With `drivers` false the merges run
-	 * without the queue's drivers, as GitHub merges (the repository's other attributes still apply).
+	 * the queue's merge drivers, never a PR's or a batch ahead's. With `drivers` false the merges read
+	 * no attributes at all, as GitHub's merge reads none.
 	 */
 	build(baseSha: string, members: BatchMember[], opts: { attrs: string; drivers?: boolean }): Promise<BuildResult>;
 	/**
@@ -294,11 +294,11 @@ class Tick {
 	 * with its merge drivers). Read once a tick: it changes only with the repository's rules.
 	 */
 	canPushHeads(): Promise<boolean> {
-		// Rules GitHub won't give now are no reason to stop planning: this tick pushes nothing.
+		// Rules GitHub won't give now are no answer: building without the drivers would hold PRs that
+		// merge with them, and landing would blame the rules. The tick stops; the next one asks again.
 		this.pushable ??= this.d.github.pushKeepsApproval().catch((e) => {
-			if (e instanceof RateLimitedError) throw e;
-			this.log(`could not read the branch rules (${e instanceof Error ? e.message : e}); not pushing to PRs this tick`);
-			return false;
+			if (!(e instanceof RateLimitedError)) this.log(`could not read the branch rules (${e instanceof Error ? e.message : e}); trying again next tick`);
+			throw e;
 		});
 		return this.pushable;
 	}
@@ -1792,7 +1792,7 @@ class Tick {
 			const ontoName = rebased ? `#${info.parent}` : def;
 			if (!p.sameRepo || !(await this.canPushHeads())) {
 				const why = !p.sameRepo ? "the queue can't push to a fork" : `a push from the queue would dismiss its approval under ${def}'s rules`;
-				await this.conflict(n, `its parent #${info.parent} was ${rebased ? 'rewritten' : 'merged'} and ${why}`, [], `git fetch origin ${rebased ? `pull/${info.parent}/head` : def} && git rebase --onto FETCH_HEAD ${upstream}`);
+				await this.conflict(n, `its parent #${info.parent} was ${rebased ? 'rewritten' : 'merged'} and ${why}`, [], `git fetch ${this.upstream(p)} ${rebased ? `pull/${info.parent}/head` : def} && git rebase --onto FETCH_HEAD ${upstream}`);
 				continue;
 			}
 			await this.d.git.fetch([p.headSha, upstream, onto, master]);

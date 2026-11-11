@@ -15,9 +15,9 @@
 // markers.
 //
 // Git reads drivers only from config, so the queue passes them in the environment of its own git
-// runs (`mergeDriverEnv`); a merge it does not run (GitHub's own) never sees them. Without them, a
-// path routed to `sorted-set` falls back to git's line merge, while the repository's other
-// attributes (`merge=union`, `binary`, ...) still apply, as they do in GitHub's merge.
+// runs (`mergeDriverEnv`); a merge it does not run (GitHub's own) never sees them. GitHub's merge
+// reads no merge attributes at all, `merge=union` included, so where the queue merges as GitHub
+// does it reads none either (`--attr-source` set to the empty tree).
 //
 // The driver handles a file as bytes (latin1 maps each byte to one character), so entries in any
 // encoding keep their bytes, and byte order is the order of those characters.

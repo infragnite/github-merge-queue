@@ -372,16 +372,25 @@ export async function pushRules(owner: string, repo: string, branch: string): Pr
 	let classic: ClassicReviews = null;
 	// `protected` is also true for a branch only rulesets cover; `protection.enabled` is classic protection.
 	if (b?.protected && b?.protection?.enabled !== false) {
-		try {
-			classic = await ghFetchAsApp(`${path}/branches/${refPath(branch)}/protection/required_pull_request_reviews`);
-		} catch (e) {
-			if (!(e instanceof GitHubError && e.status === 404)) {
-				classic = 'unreadable';
-				console.warn(`[merge-queue] ${owner}/${repo}: can't read ${branch}'s review protection (${e instanceof Error ? e.message : e}); going by its rulesets`);
-			}
-		}
+		classic = await readClassicReviews(() => ghFetchAsApp(`${path}/branches/${refPath(branch)}/protection/required_pull_request_reviews`));
+		if (classic === 'unreadable') console.warn(`[merge-queue] ${owner}/${repo}: can't read ${branch}'s review protection (it needs the Administration permission); going by its rulesets`);
 	}
 	return { rules, classic };
+}
+
+/**
+ * Classic review protection, read with `read`. A 404 is none, and a 403 (the App lacks the
+ * Administration permission) is 'unreadable', which leaves the rulesets to decide. Any other error
+ * throws: a 5xx is no answer, and taking it for no protection could dismiss approvals.
+ */
+export async function readClassicReviews(read: () => Promise<Record<string, unknown>>): Promise<ClassicReviews> {
+	try {
+		return await read();
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return null;
+		if (e instanceof GitHubError && e.status === 403) return 'unreadable';
+		throw e;
+	}
 }
 
 export async function deleteBranch(owner: string, repo: string, branch: string) {
