@@ -7,8 +7,10 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
 import { RateLimitedError } from './rate-limit';
-import { baselineCommit, buildBatch, GitRunner } from './batch-builder';
+import { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } from './batch-builder';
 import { replay } from './rebase';
+import { gitConfigEnv, mergeDriverEnv, requireGitVersion } from './merge-drivers';
+import { pushRulesCached } from './push-policy';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { currentStackAnalysis } from './stack-runtime';
 import { bumpGeneration, memoByGeneration } from './wake';
@@ -158,7 +160,10 @@ const NETWORK_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** A bare mirror per repository, fetched by SHA with the installation token. */
 export class Mirror {
+	/** Git with the queue's merge drivers: every merge the queue makes runs here. */
 	readonly git: GitRunner;
+	/** Git without them, for fetches and pushes. */
+	readonly plain: GitRunner;
 
 	constructor(private readonly repo: RepoRef) {
 		const dir = join(env.MIRROR_DIR || './data/mirrors', repo.owner, `${repo.name}.git`);
@@ -166,7 +171,8 @@ export class Mirror {
 			mkdirSync(dir, { recursive: true });
 			new GitRunner(dir).run(['init', '-q', '--bare']);
 		}
-		this.git = new GitRunner(dir);
+		this.git = new GitRunner(dir, mergeDriverEnv(dir));
+		this.plain = new GitRunner(dir);
 	}
 
 	private get url() {
@@ -178,9 +184,8 @@ export class Mirror {
 		const token = await github.getInstallationTokenForGit(this.repo.owner);
 		const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
 		return {
-			GIT_CONFIG_COUNT: '1',
-			GIT_CONFIG_KEY_0: 'http.extraheader',
-			GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
+			// After the server's own config entries (a fetch or push runs without the merge drivers).
+			...gitConfigEnv([['http.extraheader', `Authorization: Basic ${basic}`]]),
 			GIT_TERMINAL_PROMPT: '0',
 			// A stalled transfer (under 1 KB/s for a minute) fails instead of hanging.
 			GIT_HTTP_LOW_SPEED_LIMIT: '1000',
@@ -218,7 +223,7 @@ export class Mirror {
 		const name = `${this.repo.owner}/${this.repo.name}`;
 		const started = Date.now();
 		try {
-			await this.git.runAsync(args, { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
+			await this.plain.runAsync(args, { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
 			console.log(`[git] ${name}: ${what} took ${Date.now() - started} ms`);
 		} catch (err) {
 			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${err instanceof Error ? err.message : err}`);
@@ -344,9 +349,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
-			build: async (base, members) => buildBatch(mirror.git, base, members),
-			restack: async (head, upstream, onto) => replay(mirror.git, { head, upstream, onto }),
+			// Checked where `--attr-source` is used, so an old git stops planning and landing, not the rest.
+			build: async (base, members, opts) => (requireGitVersion(), buildBatch(mirror.git, base, members, opts)),
+			restack: async (head, upstream, onto, attrs) => (requireGitVersion(), replay(mirror.git, { head, upstream, onto, attrs })),
 			baseline: async (base) => baselineCommit(mirror.git, base),
+			mergeTrees: async (onto, head, attrs) => (requireGitVersion(), mergeTrees(mirror.git, onto, head, attrs)),
+			mergeCommit: async (tree, parents, message) => queueMergeCommit(mirror.git, tree, parents, message),
 			changed: async (from, to) => mirror.git.run(['diff', '--name-only', from, to]).out.split('\n').filter(Boolean)
 		},
 		ci: {
@@ -458,6 +466,10 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			pushHead: async (branch, sha, expected) => {
 				bumpGeneration(repo.id);
 				await mirror.pushLease(branch, sha, expected);
+			},
+			pushKeepsApproval: async () => {
+				const r = await pushRulesCached(repo.id, () => github.pushRules(owner, name, repo.default_branch));
+				return github.pushKeepsApprovalFrom(r.rules, r.classic, { queueRequiresApproval: getQueueSettings(repo.id).config.requireApproval });
 			},
 			deleteBranch: (branch) => github.deleteBranch(owner, name, branch),
 			retargetBase: async (n, base) => {

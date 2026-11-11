@@ -69,6 +69,8 @@ export interface BatchStep {
 	fork: string | null;
 	/** The PR this one was stacked on when it was batched (unset in rows from before it was recorded). */
 	parent?: number | null;
+	/** The default branch commit whose attributes picked the merge drivers for this step (unset in older rows). */
+	attrs?: string;
 }
 
 export const PR_REPORTS = ['check-run', 'status', 'both'] as const;

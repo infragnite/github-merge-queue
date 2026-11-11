@@ -4,13 +4,14 @@ process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
 const { tickBatchQueue, startTry, retireBatches, recoverInterrupted, cancelBatch } = await import('./batch-queue');
-const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
+const { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } = await import('./batch-builder');
 const { replay } = await import('./rebase');
+const { mergeDriverEnv } = await import('./merge-drivers');
 const { analyzeStacks } = await import('./stacks');
 const { enqueue } = await import('./api-service');
 const events = await import('./events');
 import { GitSandbox } from './testing/git-sandbox';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import type { LivePR, PRCheckState, QueueDeps } from './batch-queue';
 import { ejectedNotice, holdCheck, holdNotice, readNotice } from './hold-format';
 import { RateLimitedError } from './rate-limit';
@@ -60,6 +61,13 @@ class World {
 	deleted = new Set<number>();
 	/** PRs opened from a fork. */
 	forks = new Set<number>();
+	/** GitHub won't give the branch rules (an outage, a missing permission). */
+	pushPolicyFails = false;
+	/** The reads of the branch rules (1-based) GitHub answers with an error. */
+	pushPolicyFailOn = new Set<number>();
+	pushPolicyCalls = 0;
+	/** False: the default branch's rules dismiss an approval on a push to the PR. */
+	pushKeepsApproval = true;
 
 	files(sha: string) {
 		return new Set(git.git('ls-tree', '-r', '--name-only', sha).split('\n'));
@@ -109,7 +117,7 @@ class World {
 	}
 
 	deps(): QueueDeps {
-		const runner = new GitRunner(git.dir);
+		const runner = new GitRunner(git.dir, mergeDriverEnv(`${git.dir}/.git`));
 		return {
 			repo,
 			now: () => Date.now() + this.started.length,
@@ -119,9 +127,11 @@ class World {
 			git: {
 				fetch: async () => {},
 				tree: async (sha) => git.git('rev-parse', `${sha}^{tree}`),
-				build: async (base, members) => buildBatch(runner, base, members),
-				restack: async (head, upstream, onto) => replay(runner, { head, upstream, onto }),
+				build: async (base, members, opts) => buildBatch(runner, base, members, opts),
+				restack: async (head, upstream, onto, attrs) => replay(runner, { head, upstream, onto, attrs }),
 				baseline: async (base) => baselineCommit(runner, base),
+				mergeTrees: async (onto, head, attrs) => mergeTrees(runner, onto, head, attrs),
+				mergeCommit: async (tree, parents, message) => queueMergeCommit(runner, tree, parents, message),
 				changed: async (from, to) => git.git('diff', '--name-only', from, to).split('\n').filter(Boolean)
 			},
 			ci: {
@@ -192,6 +202,11 @@ class World {
 						}
 					}
 					git.git('branch', '-f', branch, sha);
+				},
+				pushKeepsApproval: async () => {
+					this.pushPolicyCalls++;
+					if (this.pushPolicyFails || this.pushPolicyFailOn.has(this.pushPolicyCalls)) throw new Error('GitHub API error 502');
+					return this.pushKeepsApproval;
 				},
 				pushHead: async (branch, sha, expected) => {
 					if (git.sha(branch) !== expected) throw new Error('stale info');
@@ -272,6 +287,13 @@ function pr(n: number, opts: { file?: string; from?: string; base?: string; appr
 
 async function run(ticks = 30) {
 	for (let i = 0; i < ticks; i++) await tickBatchQueue(world.deps());
+}
+
+/** Ticks as the processor does: a tick that fails stops there, and the next one starts over. */
+async function runThrough(ticks = 30) {
+	const failures: string[] = [];
+	for (let i = 0; i < ticks; i++) await tickBatchQueue(world.deps()).catch((e) => failures.push(e instanceof Error ? e.message : String(e)));
+	return failures;
 }
 
 const queued = () => db.getQueueItems(repo.id).map((i) => ({ pr: i.pr_number, status: i.status }));
@@ -831,6 +853,548 @@ describe('batch queue runtime', () => {
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 	});
 
+	describe('sorted-set lists', () => {
+		const LANE = 'lists/lane.txt';
+		const HEADER = '# expected failures\n';
+		/** Main's list, routed to the queue's sorted-set driver unless `attributes` is false. */
+		const lists = (attributes = true) => {
+			git.git('checkout', '-q', 'main');
+			if (attributes) writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+			mkdirSync(`${git.dir}/lists`, { recursive: true });
+			writeFileSync(`${git.dir}/${LANE}`, `${HEADER}a.kt\nb.kt\nc.kt\nd.kt\n`);
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'lists');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+		};
+		/** Writes the list on `branch` as `keep` and commits it. */
+		const keepOnly = (branch: string, keep: string[], message = branch) => {
+			git.git('checkout', '-q', branch);
+			writeFileSync(`${git.dir}/${LANE}`, `${HEADER}${keep.map((k) => `${k}\n`).join('')}`);
+			git.git('commit', '-qam', message);
+		};
+		/** A queued, approved PR #n off `from` whose list keeps only `keep`. */
+		const removing = (n: number, keep: string[], opts: { fork?: boolean; from?: string; base?: string } = {}) => {
+			git.branch(`pr${n}`, opts.from ?? 'main');
+			keepOnly(`pr${n}`, keep, `pr${n}`);
+			git.openPR(n, `pr${n}`, opts.base ?? 'main');
+			if (opts.fork) world.forks.add(n);
+			world.approved.add(n);
+			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+		};
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n);
+		/** A fork PR's conflict notice: its author fetches this repository by URL, since a fork's origin is the fork. */
+		const forkHold = (n: number) =>
+			holdNotice({
+				pr: n,
+				head: git.sha(`pr${n}`),
+				code: 'conflict',
+				reason: 'Conflicts with main',
+				files: [LANE],
+				fix: `git fetch https://github.com/acme/${repo.name}.git main && git rebase FETCH_HEAD`
+			});
+
+		test('two PRs that remove neighbouring lines land together; the second gets master merged in first', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			const head2 = git.sha('pr2');
+			await run();
+			expect(world.started[0].prs).toEqual([1, 2]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(git.git('show', `main:${LANE}`)).toBe('# expected failures\na.kt\nd.kt');
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+			// Only #2 needed it, and the new head is a merge on top of the reviewed one (no rewrite).
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+			const pushed = world.pushedHeads[0].sha;
+			expect(git.git('rev-list', '--parents', '-n', '1', pushed).split(' ').slice(1)).toEqual([head2, git.sha('main~1')]);
+		});
+
+		test('without the attributes on main, neighbouring removals are a conflict as before', async () => {
+			lists(false);
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			await run();
+			expect(world.merged).toEqual([1]);
+			expect(item(2)?.status).toBe('conflict');
+			expect(world.pushedHeads).toEqual([]);
+		});
+
+		test('a PR that adds the attributes itself does not get the driver for its own batch', async () => {
+			lists(false);
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			git.git('checkout', '-q', 'pr2');
+			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'pr2 opts in');
+			await run();
+			expect(world.merged).toEqual([1]);
+			expect(item(2)?.status).toBe('conflict');
+		});
+
+		test('a batch built on a batch ahead takes the attributes from main, not from the PRs ahead', async () => {
+			lists(false);
+			store.updateQueueSettings(repo.id, { config: { depth: 2, maxBatch: 1 } });
+			// #1 opts the lists in; #2 and #3 remove neighbouring lines and are built on top of #1's batch.
+			git.branch('pr1', 'main');
+			git.git('checkout', '-q', 'pr1');
+			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'pr1');
+			git.openPR(1, 'pr1', 'main');
+			world.approved.add(1);
+			db.addToQueue(repo.id, 1, 'PR 1', 'https://example.test/pull/1', 'dev', '', 'dev');
+			removing(2, ['a.kt', 'c.kt', 'd.kt']);
+			removing(3, ['a.kt', 'b.kt', 'd.kt']);
+			const d = world.deps();
+			const builds: { base: string; attrs: string }[] = [];
+			const build = d.git.build;
+			d.git.build = async (base, members, opts) => {
+				builds.push({ base, attrs: opts.attrs });
+				return build(base, members, opts);
+			};
+			const master = git.sha('main');
+			await tickBatchQueue(d);
+			expect(builds.length).toBeGreaterThan(0);
+			expect(builds.every((b) => b.attrs === master)).toBe(true);
+			expect(builds.some((b) => b.base !== master)).toBe(true);
+		});
+
+		test("a restack onto a rebased parent takes the attributes from main, not from the parent's head", async () => {
+			lists(false);
+			// #1 opts the lists in; its child #2 removes c; main removes b and #1 is rebased onto it.
+			git.branch('pr1', 'main');
+			git.git('checkout', '-q', 'pr1');
+			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'pr1');
+			git.openPR(1, 'pr1', 'main');
+			world.approved.add(1);
+			db.addToQueue(repo.id, 1, 'PR 1', 'https://example.test/pull/1', 'dev', '', 'dev');
+			removing(2, ['a.kt', 'b.kt', 'd.kt'], { from: 'pr1', base: 'pr1' });
+			keepOnly('main', ['a.kt', 'c.kt', 'd.kt'], 'main removes b');
+			git.rebase('pr1', 'main');
+			await run();
+			// The queue did not restack it with the driver #1 opted into; it told #2 to rebase.
+			expect(world.pushedHeads.filter((h) => h.branch === 'pr2')).toEqual([]);
+			expect(world.comments.find((c) => c.pr === 2)?.body).toMatch(/^\*\*Merge queue:\*\* restacking onto #1 needs conflict resolution: conflicts in 1 file\(s\): lists\/lane\.txt\./);
+		});
+
+		test('a restack onto a rebased parent uses the driver when main routes the list to it', async () => {
+			lists();
+			git.branch('pr1', 'main');
+			git.commit('pr1', 'pr1', 'pr1.txt');
+			git.openPR(1, 'pr1', 'main');
+			world.approved.add(1);
+			db.addToQueue(repo.id, 1, 'PR 1', 'https://example.test/pull/1', 'dev', '', 'dev');
+			removing(2, ['a.kt', 'b.kt', 'd.kt'], { from: 'pr1', base: 'pr1' });
+			keepOnly('main', ['a.kt', 'c.kt', 'd.kt'], 'main removes b');
+			git.rebase('pr1', 'main');
+			await run();
+			expect(world.pushedHeads[0]).toMatchObject({ branch: 'pr2' });
+			expect(world.merged).toEqual([1, 2]);
+			expect(git.git('show', `main:${LANE}`)).toBe('# expected failures\na.kt\nd.kt');
+		});
+
+		test('a failed read of the branch rules at planning holds no PR: once GitHub answers, the PRs build with the driver', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			world.pushPolicyFailOn = new Set([1, 2]);
+			await runThrough();
+			expect(world.started[0].prs).toEqual([1, 2]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.comments.filter((c) => c.pr === 2)).toEqual([]);
+			expect(git.git('show', `main:${LANE}`)).toBe('# expected failures\na.kt\nd.kt');
+		});
+
+		test('a failed read of the branch rules at landing is no reason to say a push would dismiss an approval', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			// The first read plans the batch with the driver; the next one, at landing, fails.
+			world.pushPolicyFailOn = new Set([2]);
+			await runThrough();
+			expect(world.comments.filter((c) => /dismiss/.test(c.body))).toEqual([]);
+			expect(item(2)).toBeUndefined();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+		});
+
+		test('a failed read of the branch rules at landing stops it before the first merge, so the batch lands whole on the next tick', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			world.pushPolicyFailOn = new Set([2]);
+			let mergedAtFailure: number[] | null = null;
+			for (let i = 0; i < 30; i++) {
+				await tickBatchQueue(world.deps()).catch(() => {
+					mergedAtFailure ??= [...world.merged];
+				});
+			}
+			expect(mergedAtFailure).toEqual([]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.started.map((s) => s.prs)).toEqual([[1, 2]]);
+			expect(store.getLandingIntent(repo.id)).toBeNull();
+			expect(store.getMasterHealth(repo.id)?.state).toBe('green');
+			expect(world.comments.filter((c) => /interrupted/.test(c.body))).toEqual([]);
+		});
+
+		test('a failed read of the branch rules is no reason to tell a child to restack itself: the next tick restacks it', async () => {
+			lists();
+			git.branch('pr1', 'main');
+			git.commit('pr1', 'pr1', 'pr1.txt');
+			git.openPR(1, 'pr1', 'main');
+			world.approved.add(1);
+			db.addToQueue(repo.id, 1, 'PR 1', 'https://example.test/pull/1', 'dev', '', 'dev');
+			removing(2, ['a.kt', 'b.kt', 'd.kt'], { from: 'pr1', base: 'pr1' });
+			keepOnly('main', ['a.kt', 'c.kt', 'd.kt'], 'main removes b');
+			git.rebase('pr1', 'main');
+			world.pushPolicyFailOn = new Set([1]);
+			await runThrough();
+			// The only word to #2 is that the queue restacked it.
+			expect(world.comments.filter((c) => c.pr === 2).map((c) => c.body.split(' (')[0])).toEqual(['The merge queue restacked this PR onto #1']);
+			expect(world.pushedHeads[0]).toMatchObject({ branch: 'pr2' });
+			expect(world.merged).toEqual([1, 2]);
+		});
+
+		test('a fork PR is built by lines: behind a PR whose neighbouring line it changes it waits, then is held; the queue never pauses', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt'], { fork: true });
+			await run();
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(world.started.map((s) => s.prs)).toEqual([[1]]);
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(item(2)).toMatchObject({ status: 'conflict', error_message: 'Conflicts with main' });
+			expect(world.comments).toEqual([{ pr: 2, body: forkHold(2) }]);
+			expect(world.prChecks.filter((c) => c.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required' });
+			expect(world.labels.get(2)?.has('needs-rebase')).toBe(true);
+		});
+
+		test('a fork PR whose only conflict with main is in a sorted-set list is held at once, before any run, and the rest goes on', async () => {
+			lists();
+			removing(1, ['a.kt', 'b.kt', 'd.kt'], { fork: true });
+			keepOnly('main', ['a.kt', 'c.kt', 'd.kt'], 'main removes b');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			pr(2);
+			await run();
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(world.started.map((s) => s.prs)).toEqual([[2]]);
+			expect(world.merged).toEqual([2]);
+			expect(item(1)?.status).toBe('conflict');
+			expect(world.comments).toEqual([{ pr: 1, body: forkHold(1) }]);
+		});
+
+		test('every build of a fork PR is by lines: batch, bisection and try runs', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['b.kt', 'c.kt', 'd.kt'], { fork: true });
+			world.ciRed.clear();
+			const d = world.deps();
+			const builds: { prs: number[]; drivers: (boolean | undefined)[]; all?: boolean }[] = [];
+			const spy = (deps: QueueDeps) => {
+				const build = deps.git.build;
+				deps.git.build = async (base, members, opts) => {
+					builds.push({ prs: members.map((m) => m.pr), drivers: members.map((m) => m.drivers), all: opts.drivers });
+					return build(base, members, opts);
+				};
+				return deps;
+			};
+			// The batch fails, so both PRs are tested again apart.
+			world.everythingFails = true;
+			await tickBatchQueue(spy(d));
+			for (let k = 0; k < 6; k++) await tickBatchQueue(spy(world.deps()));
+			world.everythingFails = false;
+			await startTry(spy(world.deps()), 2);
+			const of2 = builds.filter((b) => b.prs.includes(2));
+			expect(of2.length).toBeGreaterThanOrEqual(3);
+			expect(of2.every((b) => b.drivers[b.prs.indexOf(2)] === false)).toBe(true);
+			expect(builds.filter((b) => b.prs.includes(1)).every((b) => b.drivers[b.prs.indexOf(1)] === undefined)).toBe(true);
+		});
+
+		test('a PR landed before it that drops the attributes does not change how a PR after it lands: no pause', async () => {
+			lists();
+			// #1 drops the sorted-set attribute; #2 and #3 remove neighbouring lines. All three are one batch.
+			git.branch('pr1', 'main');
+			git.git('checkout', '-q', 'pr1');
+			writeFileSync(`${git.dir}/.gitattributes`, '');
+			git.git('commit', '-qam', 'pr1 drops the attributes');
+			git.openPR(1, 'pr1', 'main');
+			world.approved.add(1);
+			db.addToQueue(repo.id, 1, 'PR 1', 'https://example.test/pull/1', 'dev', '', 'dev');
+			removing(2, ['a.kt', 'c.kt', 'd.kt']);
+			removing(3, ['a.kt', 'b.kt', 'd.kt']);
+			await run();
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(world.started[0].prs).toEqual([1, 2, 3]);
+			expect(world.merged).toEqual([1, 2, 3]);
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr3']);
+		});
+
+		test('a fork PR whose list changes merge by lines too lands as usual', async () => {
+			lists();
+			removing(1, ['b.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'c.kt'], { fork: true });
+			await run();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(git.git('show', `main:${LANE}`)).toBe('# expected failures\nb.kt\nc.kt');
+		});
+	});
+
+	describe('changes a PR only when GitHub would not land it as tested', () => {
+		const LIST = 'lists/lane.txt';
+		const listOf = (keep: string[]) => `# expected failures\n${keep.map((k) => `${k}\n`).join('')}`;
+		const lists = (entries: string[]) => {
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+			mkdirSync(`${git.dir}/lists`, { recursive: true });
+			writeFileSync(`${git.dir}/${LIST}`, listOf(entries));
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'lists');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+		};
+		const listPR = (n: number, content: string) => {
+			git.branch(`pr${n}`, 'main');
+			git.git('checkout', '-q', `pr${n}`);
+			writeFileSync(`${git.dir}/${LIST}`, content);
+			git.git('commit', '-qam', `pr${n}`);
+			git.openPR(n, `pr${n}`, 'main');
+			world.approved.add(n);
+			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+		};
+		const ABC = ['a.kt', 'b.kt', 'c.kt', 'd.kt', 'e.kt', 'f.kt', 'g.kt'];
+		const without = (...gone: string[]) => listOf(ABC.filter((e) => !gone.includes(e)));
+
+		test('a stacked child that squashes to the tested tree as it is is not restacked', async () => {
+			pr(1);
+			pr(2, { from: 'pr1', base: 'pr1' });
+			const head2 = git.sha('pr2');
+			await run();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(git.sha('pr2')).toBe(head2);
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+		});
+
+		test('edits of one list that a line merge already merges leave every PR as it is', async () => {
+			lists(ABC);
+			listPR(1, without('a.kt'));
+			listPR(2, without('g.kt'));
+			await run();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(git.git('show', `main:${LIST}`)).toBe(without('a.kt', 'g.kt').trimEnd());
+		});
+
+		test('a PR that conflicts with master only in a list lands, with master merged into it on top of its reviewed head', async () => {
+			lists(ABC);
+			listPR(1, without('c.kt'));
+			// master drops the neighbouring entry after the PR branched
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/${LIST}`, without('b.kt'));
+			git.git('commit', '-qam', 'fix b on master');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			const head1 = git.sha('pr1');
+			const before = git.sha('main');
+			await run();
+			expect(world.merged).toEqual([1]);
+			expect(db.getQueueItems(repo.id)).toEqual([]);
+			expect(git.git('show', `main:${LIST}`)).toBe(without('b.kt', 'c.kt').trimEnd());
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr1']);
+			const parents = git.git('rev-list', '--parents', '-n', '1', world.pushedHeads[0].sha).split(' ').slice(1);
+			expect(parents).toEqual([head1, before]);
+		});
+
+		test('a fork PR that needs master merged in goes back to its author; the queue is not paused', async () => {
+			lists(ABC);
+			listPR(1, without('b.kt'));
+			listPR(2, without('c.kt'));
+			world.forks.add(2);
+			await run(3);
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 2);
+			expect(item?.status).toBe('conflict');
+			// A fork PR merges by lines: it waits behind #1 and is then told to rebase, before any run of its own.
+			expect(item?.error_message).toBe('Conflicts with main');
+			expect(world.started.map((s) => s.prs)).toEqual([[1]]);
+		});
+
+		test('lists whose headers both sides changed are a conflict, as git reports it: nothing is pushed', async () => {
+			lists(ABC);
+			listPR(1, `# one\n${ABC.filter((e) => e !== 'b.kt').join('\n')}\n`);
+			listPR(2, `# two\n${ABC.filter((e) => e !== 'c.kt').join('\n')}\n`);
+			await run(3);
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
+		});
+
+		test('a file outside the attributes conflicts as before, even when it looks like a list', async () => {
+			lists(ABC);
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/other.txt`, listOf(ABC));
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'other');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			for (const [n, gone] of [[1, 'b.kt'], [2, 'c.kt']] as const) {
+				git.branch(`pr${n}`, 'main');
+				git.git('checkout', '-q', `pr${n}`);
+				writeFileSync(`${git.dir}/other.txt`, without(gone));
+				git.git('commit', '-qam', `pr${n}`);
+				git.openPR(n, `pr${n}`, 'main');
+				world.approved.add(n);
+				db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+			}
+			await run(3);
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
+		});
+
+		test('attributes a PR adds itself do not make the queue merge with its drivers', async () => {
+			lists(ABC);
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/.gitattributes`, '');
+			git.git('commit', '-qam', 'no attributes on master');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			listPR(1, without('b.kt'));
+			git.git('checkout', '-q', 'main');
+			git.branch('pr2', 'main');
+			git.git('checkout', '-q', 'pr2');
+			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+			writeFileSync(`${git.dir}/${LIST}`, without('c.kt'));
+			git.git('commit', '-qam', 'pr2');
+			git.openPR(2, 'pr2', 'main');
+			world.approved.add(2);
+			db.addToQueue(repo.id, 2, 'PR 2', 'u', 'dev', '', 'dev');
+			await run(3);
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
+		});
+	});
+
+	describe('where a push to a PR dismisses its approval', () => {
+		beforeEach(() => {
+			world.pushKeepsApproval = false;
+		});
+
+		test('neighbouring removals from a sorted-set list merge line by line: no push, and the second goes back to its author', async () => {
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+			mkdirSync(`${git.dir}/lists`, { recursive: true });
+			writeFileSync(`${git.dir}/lists/lane.txt`, '# expected failures\na.kt\nb.kt\nc.kt\nd.kt\n');
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'lists');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			const removing = (n: number, keep: string[]) => {
+				git.branch(`pr${n}`, 'main');
+				git.git('checkout', '-q', `pr${n}`);
+				writeFileSync(`${git.dir}/lists/lane.txt`, `# expected failures\n${keep.map((k) => `${k}\n`).join('')}`);
+				git.git('commit', '-qam', `pr${n}`);
+				git.openPR(n, `pr${n}`, 'main');
+				world.approved.add(n);
+				db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+			};
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			await run();
+			expect(world.started[0].prs).toEqual([1]);
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
+		});
+
+		test("without the queue's drivers no merge attribute applies, union neither, as in GitHub's merge", async () => {
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\nnotes.txt merge=union\n');
+			writeFileSync(`${git.dir}/notes.txt`, 'one\n');
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'attributes');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			for (const [n, line] of [[1, 'two'], [2, 'three']] as const) {
+				git.branch(`pr${n}`, 'main');
+				git.git('checkout', '-q', `pr${n}`);
+				writeFileSync(`${git.dir}/notes.txt`, `one\n${line}\n`);
+				git.git('commit', '-qam', `pr${n}`);
+				git.openPR(n, `pr${n}`, 'main');
+				world.approved.add(n);
+				db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+			}
+			await run();
+			expect(world.started.map((s) => s.prs)).toEqual([[1]]);
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
+		});
+
+		test('branch rules GitHub will not give stop the tick, not the queue: nothing is pushed or said, and the next tick lands it all', async () => {
+			world.pushKeepsApproval = true;
+			world.pushPolicyFails = true;
+			pr(1);
+			pr(2, { from: 'pr1', base: 'pr1' });
+			pr(3);
+			expect((await runThrough(3)).length).toBe(3);
+			expect(world.started).toEqual([]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(world.comments).toEqual([]);
+			world.pushPolicyFails = false;
+			expect(await runThrough()).toEqual([]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(world.merged).toEqual([1, 2, 3]);
+		});
+
+		test('a stack lands parent-first without pushing to the child', async () => {
+			pr(1);
+			pr(2, { from: 'pr1', base: 'pr1' });
+			const head2 = git.sha('pr2');
+			await run();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(git.sha('pr2')).toBe(head2);
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+		});
+
+		test('a stacked child that only lands as tested once restacked goes back to its author; its parent lands', async () => {
+			pr(1, { file: 'shared.txt' });
+			git.branch('pr2', 'pr1');
+			git.git('checkout', '-q', 'pr2');
+			writeFileSync(`${git.dir}/shared.txt`, 'child rewrote it\n');
+			git.git('commit', '-qam', 'pr2');
+			git.openPR(2, 'pr2', 'pr1');
+			world.approved.add(2);
+			db.addToQueue(repo.id, 2, 'PR 2', 'u', 'dev', '', 'dev');
+			await run();
+			expect(world.merged).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 2);
+			expect(item?.status).toBe('conflict');
+			expect(item?.error_message).toMatch(/lands as tested only once restacked onto main, and a push from the queue would dismiss its approval/);
+		});
+
+		test('a queued child whose parent was rebased is told to restack itself instead of being pushed to', async () => {
+			pr(1);
+			pr(2, { from: 'pr1', base: 'pr1' });
+			const stale = git.sha('pr1');
+			git.commit('main', 'm1', 'x-main.txt');
+			git.rebase('pr1', 'main');
+			await run(3);
+			expect(world.pushedHeads).toEqual([]);
+			const notice = world.comments.find((c) => c.pr === 2)?.body ?? '';
+			expect(notice).toMatch(/would dismiss its approval under main's rules/);
+			expect(notice).toContain(`git fetch origin pull/1/head && git rebase --onto FETCH_HEAD ${stale}`);
+		});
+	});
+
 	test('a stacked child whose parent moved on is tested with the parent\'s new commits', async () => {
 		pr(1);
 		pr(2, { from: 'pr1', base: 'pr1' });
@@ -856,10 +1420,10 @@ describe('batch queue runtime', () => {
 		pr(1);
 		const d = world.deps();
 		const build = d.git.build;
-		d.git.build = async (b, m) => {
+		d.git.build = async (b, m, attrs) => {
 			const it = db.getQueueItems(repo.id).find((i) => i.pr_number === 1);
 			if (it) db.removeFromQueue(it.id);
-			return build(b, m);
+			return build(b, m, attrs);
 		};
 		await tickBatchQueue(d);
 		await run();

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { buildBatch, GitRunner, squashMessage, type BatchMember } from './batch-builder';
 import { GitSandbox } from './testing/git-sandbox';
+import { mergeDriverEnv } from './merge-drivers';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 let git: GitSandbox;
 let runner: GitRunner;
@@ -183,5 +186,46 @@ describe('running git without blocking', () => {
 		await runner.runAsync(['rev-parse', 'main']);
 		clearTimeout(timer);
 		expect(ticked).toBe(true);
+	});
+});
+
+describe('merge drivers in a batch', () => {
+	const LIST = 'lane.txt';
+	const write = (branch: string, path: string, text: string) => {
+		git.git('checkout', '-q', branch);
+		writeFileSync(join(git.dir, path), text);
+		git.git('add', '-A');
+		git.git('commit', '-q', '-m', `${branch}: ${path}`);
+	};
+	let queue: GitRunner;
+	beforeEach(() => {
+		queue = new GitRunner(git.dir, mergeDriverEnv(join(git.dir, '.git')));
+		write('main', LIST, 'a\nb\nc\nd\n');
+	});
+
+	/** A batch ahead whose PR routes the list to the driver, and two PRs removing neighbouring lines built on it. */
+	const onBatchAhead = () => {
+		git.branch('ahead', 'main');
+		write('ahead', 'ahead.txt', 'ahead\n');
+		if (!git.git('ls-tree', '--name-only', 'main', '.gitattributes')) write('ahead', '.gitattributes', `${LIST} merge=sorted-set\n`);
+		git.branch('one', 'main');
+		write('one', LIST, 'a\nc\nd\n');
+		git.branch('two', 'main');
+		write('two', LIST, 'a\nb\nd\n');
+		return [member(1, 'one'), member(2, 'two')];
+	};
+
+	test("attributes come from the default branch, not from the base a batch ahead's PRs made", () => {
+		const members = onBatchAhead();
+		const r = buildBatch(queue, git.sha('ahead'), members, { attrs: git.sha('main'), date: 1 });
+		expect(r).toMatchObject({ ok: false, pr: 2, conflicts: [LIST] });
+	});
+
+	test('with the attributes on the default branch, the same PRs build', () => {
+		write('main', '.gitattributes', `${LIST} merge=sorted-set\n`);
+		const members = onBatchAhead();
+		const r = buildBatch(queue, git.sha('ahead'), members, { attrs: git.sha('main'), date: 1 });
+		expect(r.ok).toBe(true);
+		if (r.ok) expect(show(r.headSha, LIST)).toBe('a\nd');
 	});
 });

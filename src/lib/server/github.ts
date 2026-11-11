@@ -323,6 +323,76 @@ export async function listReviews(owner: string, repo: string, n: number): Promi
 	return out;
 }
 
+/** A rule from `GET /repos/{owner}/{repo}/rules/branches/{branch}`. */
+export interface BranchRule {
+	type: string;
+	parameters?: Record<string, unknown>;
+}
+
+/**
+ * Classic branch protection's review settings: the body of
+ * `GET .../branches/{branch}/protection/required_pull_request_reviews`, null when the branch has
+ * none, or 'unreadable' when the App may not read them (they need the Administration permission).
+ */
+export type ClassicReviews = Record<string, unknown> | null | 'unreadable';
+
+/** A branch's rules that decide whether a push to a PR costs its approval. */
+export interface PushRules {
+	rules: BranchRule[];
+	classic: ClassicReviews;
+}
+
+/**
+ * Whether a push to a PR's head leaves the PR mergeable without a new approval under these rules:
+ * no rule that requires an approval also dismisses one on a push, asks the last push to be
+ * approved by someone else, or asks one more approval for unattributed changes; and, where the
+ * queue requires an approval itself (`queueRequiresApproval`), no rule dismisses one on a push
+ * (the queue's check counts only approvals GitHub still has). Classic protection's review
+ * settings need the Administration permission, which the App doesn't ask for: when it can't read
+ * them it goes by the rulesets alone, as the queue did before it read any rules.
+ */
+export function pushKeepsApprovalFrom(rules: BranchRule[], classic: ClassicReviews, opts: { queueRequiresApproval: boolean }): boolean {
+	if (classic === 'unreadable') classic = null;
+	const costs = (p: Record<string, unknown>, dismiss: string) => {
+		// GitHub applies the last-push and unattributed-change rules only with a non-zero count.
+		if (Number(p.required_approving_review_count ?? 0) > 0) return !!p[dismiss] || !!p.require_last_push_approval || !!p.require_extra_approval_for_unattributed_changes;
+		return opts.queueRequiresApproval && !!p[dismiss];
+	};
+	if (rules.some((r) => r.type === 'pull_request' && costs(r.parameters ?? {}, 'dismiss_stale_reviews_on_push'))) return false;
+	return !(classic && costs(classic, 'dismiss_stale_reviews'));
+}
+
+/** `branch`'s rules as GitHub has them now, for `pushKeepsApprovalFrom`: two or three API calls. */
+export async function pushRules(owner: string, repo: string, branch: string): Promise<PushRules> {
+	const path = `/repos/${owner}/${repo}`;
+	const [rules, b] = await Promise.all([
+		ghFetchAsApp(`${path}/rules/branches/${refPath(branch)}?per_page=100`) as Promise<BranchRule[]>,
+		ghFetchAsApp(`${path}/branches/${refPath(branch)}`)
+	]);
+	let classic: ClassicReviews = null;
+	// `protected` is also true for a branch only rulesets cover; `protection.enabled` is classic protection.
+	if (b?.protected && b?.protection?.enabled !== false) {
+		classic = await readClassicReviews(() => ghFetchAsApp(`${path}/branches/${refPath(branch)}/protection/required_pull_request_reviews`));
+		if (classic === 'unreadable') console.warn(`[merge-queue] ${owner}/${repo}: can't read ${branch}'s review protection (it needs the Administration permission); going by its rulesets`);
+	}
+	return { rules, classic };
+}
+
+/**
+ * Classic review protection, read with `read`. A 404 is none, and a 403 (the App lacks the
+ * Administration permission) is 'unreadable', which leaves the rulesets to decide. Any other error
+ * throws: a 5xx is no answer, and taking it for no protection could dismiss approvals.
+ */
+export async function readClassicReviews(read: () => Promise<Record<string, unknown>>): Promise<ClassicReviews> {
+	try {
+		return await read();
+	} catch (e) {
+		if (e instanceof GitHubError && e.status === 404) return null;
+		if (e instanceof GitHubError && e.status === 403) return 'unreadable';
+		throw e;
+	}
+}
+
 export async function deleteBranch(owner: string, repo: string, branch: string) {
 	try {
 		await ghFetchAsApp(`/repos/${owner}/${repo}/git/refs/heads/${refPath(branch)}`, { method: 'DELETE' });

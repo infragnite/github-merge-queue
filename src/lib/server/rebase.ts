@@ -15,6 +15,11 @@ export interface ReplayInput {
 	/** The last commit that is not the PR's own work (the parent's head as the PR contains it). */
 	upstream: string;
 	onto: string;
+	/**
+	 * The commit whose `.gitattributes` pick the merge drivers: the default branch, never a PR (a
+	 * parent's head could opt its child in). Defaults to `onto`.
+	 */
+	attrs?: string;
 	/** Fixed committer date (seconds since epoch), for tests. */
 	date?: number;
 }
@@ -23,10 +28,12 @@ export type ReplayResult =
 	| { ok: true; head: string; tree: string; replayed: number }
 	| { ok: false; reason: string; conflicts: string[] };
 
-const MERGE_TREE = ['merge-tree', '--write-tree', '--name-only', '--no-messages'];
+// Attributes come from the default branch, never from the PR being replayed or its parent.
+const mergeTree = (attrs: string) => [`--attr-source=${attrs}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
 
-export function replay(git: GitRunner, { head, upstream, onto, date }: ReplayInput): ReplayResult {
-	const whole = git.run([...MERGE_TREE, `--merge-base=${upstream}`, onto, head], { allowFail: true });
+export function replay(git: GitRunner, { head, upstream, onto, attrs, date }: ReplayInput): ReplayResult {
+	const mergeArgs = mergeTree(attrs ?? onto);
+	const whole = git.run([...mergeArgs, `--merge-base=${upstream}`, onto, head], { allowFail: true });
 	const lines = whole.out.split('\n').filter(Boolean);
 	if (whole.code !== 0) {
 		const conflicts = whole.code === 1 ? lines.slice(1) : [];
@@ -48,7 +55,7 @@ export function replay(git: GitRunner, { head, upstream, onto, date }: ReplayInp
 	let tipTree = git.run(['rev-parse', `${onto}^{tree}`]).out;
 	let replayed = 0;
 	for (const c of commits) {
-		const r = git.run([...MERGE_TREE, `--merge-base=${c}^`, tip, c], { allowFail: true });
+		const r = git.run([...mergeArgs, `--merge-base=${c}^`, tip, c], { allowFail: true });
 		const out = r.out.split('\n').filter(Boolean);
 		if (r.code !== 0) {
 			const conflicts = r.code === 1 ? out.slice(1) : [];

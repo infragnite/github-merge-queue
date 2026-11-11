@@ -166,7 +166,7 @@ export function trackActivity(deps: QueueDeps, opts: TrackOptions = {}): QueueDe
 				lastFetch = { since: now(), shas: new Set(shas) };
 				return step('fetch', `fetching ${prs.length ? prList(prs) : 'commits'} from GitHub`, prs, () => git.fetch(shas));
 			},
-			build: async (base, members) => {
+			build: async (base, members, buildOpts) => {
 				for (const m of members) bySha.set(m.headSha, m.pr);
 				const prs = members.map((m) => m.pr);
 				const probe = buildFailed && members.length === 1 && !!a.phase;
@@ -176,15 +176,15 @@ export function trackActivity(deps: QueueDeps, opts: TrackOptions = {}): QueueDe
 					const since = lastFetch && members.some((m) => lastFetch!.shas.has(m.headSha)) ? lastFetch.since : now();
 					setPhase(opts.buildKind?.() ?? 'forming', prs, since);
 				}
-				const r = await step('build', probe ? `checking ${prList(prs)} against ${def}` : `merging ${prList(prs)}`, prs, () => git.build(base, members));
+				const r = await step('build', probe ? `checking ${prList(prs)} against ${def}` : `merging ${prList(prs)}`, prs, () => git.build(base, members, buildOpts));
 				buildFailed = !probe && !r.ok;
 				return r;
 			},
-			restack: (head, upstream, onto) => {
+			restack: (head, upstream, onto, attrs) => {
 				const prs = prsOf([head]);
 				if (a.phase?.kind !== 'landing') setPhase('restack', prs);
 				else for (const n of prs) if (!a.phase.prs.includes(n)) a.phase.prs.push(n);
-				return step('restack', `rebasing ${prs.length ? prList(prs) : 'a PR'}`, prs, () => git.restack(head, upstream, onto));
+				return step('restack', `rebasing ${prs.length ? prList(prs) : 'a PR'}`, prs, () => git.restack(head, upstream, onto, attrs));
 			},
 			baseline: (base) => {
 				setPhase('master', []);
