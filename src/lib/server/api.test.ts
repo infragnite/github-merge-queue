@@ -205,6 +205,34 @@ describe('stack state for agents', () => {
 		expect(api.stackState(repo, 1, analysis([1])).queue).toMatchObject({ status: 'testing', batch: { prs: [1] } });
 	});
 
+	test('queue state lists PRs in the order the queue takes them: being tested, then by priority, then by place in line', () => {
+		api.enqueue(repo, writer, pull(1), { priority: 'low' });
+		api.enqueue(repo, writer, pull(2), {});
+		api.enqueue(repo, maintainer, pull(3), { priority: 'urgent' });
+		api.enqueue(repo, writer, pull(4), {});
+		api.enqueue(repo, writer, pull(5), { priority: 'low' });
+		store.insertBatch({
+			repoId: repo.id,
+			kind: 'batch',
+			branch: 'mq/batch-1',
+			baseSha: 'b',
+			headSha: 'h',
+			treeSha: 't',
+			baseTree: 'bt',
+			members: [5],
+			heads: { 5: 'x' }
+		});
+		expect(api.queueState(repo).waiting.map((w) => [w.pr, w.position])).toEqual([
+			[5, 1],
+			[3, 2],
+			[2, 3],
+			[4, 4],
+			[1, 5]
+		]);
+		expect(api.queueEntry(repo.id, 3)).toMatchObject({ position: 2, priority: 'urgent' });
+		expect(api.queueEntry(repo.id, 1)).toMatchObject({ position: 5, priority: 'low' });
+	});
+
 	test('a PR that left a bisecting batch is back in line, not testing', () => {
 		api.enqueue(repo, writer, pull(1), {});
 		api.enqueue(repo, writer, pull(2), {});

@@ -537,6 +537,16 @@ describe('/mq status', () => {
 		expect(hidden(body)).toMatchObject({ pr: 2, queue: { position: 2, priority: 'low', status: 'queued' } });
 	});
 
+	test('an urgent PR queued last is first in line', async () => {
+		api.enqueue(repo, writer, pull(1), {});
+		api.enqueue(repo, writer, pull(2), {});
+		api.enqueue(repo, { login: 'mia', role: 'maintain', app: false }, pull(3), { priority: 'urgent' });
+		await run('/mq status', 'rae', 3);
+		const body = deps.replies[0][1];
+		expect(body).toMatch(/^In the merge queue: position 1 of 3, urgent priority/m);
+		expect(hidden(body)).toMatchObject({ pr: 3, queue: { position: 1, priority: 'urgent' } });
+	});
+
 	test('a PR in a batch names the batch', async () => {
 		api.enqueue(repo, writer, pull(1), {});
 		const b = batchOf([1]);
