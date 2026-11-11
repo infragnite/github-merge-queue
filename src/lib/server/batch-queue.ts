@@ -1595,17 +1595,21 @@ class Tick {
 
 	/** A conflict with the default branch, its head unchanged: back in line once the branch moved and it merges cleanly. */
 	async recheckConflict(it: QueueItem, p: LivePR, master: string) {
-		let hold = store.storedHold(it as QueueItem & { hold?: string | null });
-		// Its comment failed, or the setting kept it quiet and now allows it: posted now.
-		if (hold && !hold.told && hold.head === p.headSha && (hold.code === 'conflict' || hold.code === 'workflow-permission')) {
-			const notice = { pr: it.pr_number, head: p.headSha, code: hold.code as 'conflict' | 'workflow-permission', reason: hold.reason, files: hold.files ?? [], ...(hold.fix ? { fix: hold.fix } : {}) };
-			if (await this.say(it.pr_number, holdNotice(notice), 'attention')) {
-				const { quiet: _, ...rest } = hold;
-				hold = { ...rest, told: true };
-				store.setHold(it.id, hold);
-			}
-		}
-		if (hold?.code === 'workflow-permission') return;
+		if (await this.releaseConflict(it, p, master)) return;
+		// Still held, and its comment failed or the setting kept it quiet and now allows it: posted now.
+		const now = this.item(it.pr_number);
+		const hold = now ? store.storedHold(now as QueueItem & { hold?: string | null }) : null;
+		if (!hold || hold.told || hold.head !== p.headSha || (hold.code !== 'conflict' && hold.code !== 'workflow-permission')) return;
+		const notice = { pr: it.pr_number, head: p.headSha, code: hold.code as 'conflict' | 'workflow-permission', reason: hold.reason, files: hold.files ?? [], ...(hold.fix ? { fix: hold.fix } : {}) };
+		if (!(await this.say(it.pr_number, holdNotice(notice), 'attention'))) return;
+		const { quiet: _, ...rest } = hold;
+		store.setHold(it.id, { ...rest, told: true });
+	}
+
+	/** Puts a held conflict back in line when what it conflicted with moved and it may apply now; whether it did. */
+	private async releaseConflict(it: QueueItem, p: LivePR, master: string): Promise<boolean> {
+		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
+		if (hold?.code === 'workflow-permission') return false;
 		// A restack's conflict with its rebased parent: back in line once the parent moved; the restack tries again.
 		if (hold?.code === 'conflict' && hold.parent !== undefined) {
 			const parent = await this.pr(hold.parent).catch((e) => {
@@ -1614,22 +1618,22 @@ class Tick {
 			});
 			// Gone or landed: it won't move again, so the restack is tried against what is there now.
 			const gone = !parent || parent.state !== 'open';
-			if (!gone && parent.headSha === hold.base) return;
+			if (!gone && parent.headSha === hold.base) return false;
 			// A bisection skips restacks: back in line now, it would be told its stack is broken, then this conflict again.
-			if (store.getActiveBatches(this.repoId).some((b) => b.status === 'bisecting')) return;
+			if (store.getActiveBatches(this.repoId).some((b) => b.status === 'bisecting')) return false;
 			db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 			await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
 			this.event(it.pr_number, 'requeued', { reason: gone ? `#${hold.parent} is no longer open` : `#${hold.parent} moved`, headSha: p.headSha });
-			return;
+			return true;
 		}
 		// Saved with the default branch it conflicted with: checked once that moved. Saved without one: a restack's conflict, for a push.
-		if (hold?.code === 'conflict' && (!hold.base || hold.base === master)) return;
+		if (hold?.code === 'conflict' && (!hold.base || hold.base === master)) return false;
 		// Saved before conflicts kept a base: checked once, unless it is a restack's (its parent's old commits are still in it).
 		if (hold?.code !== 'conflict') {
 			// A workflow change or a fork's restack, by its reason: those wait for a push.
-			if (/(may not push|can't push to a fork)$/.test(it.error_message ?? '')) return;
+			if (/(may not push|can't push to a fork)$/.test(it.error_message ?? '')) return false;
 			const info = (await this.analysis()).prs.get(it.pr_number);
-			if (info?.issues.some((i) => (i.kind === 'parent-rebased' || i.kind === 'parent-merged') && (i.staleCommits?.length ?? 0) > 0)) return;
+			if (info?.issues.some((i) => (i.kind === 'parent-rebased' || i.kind === 'parent-merged') && (i.staleCommits?.length ?? 0) > 0)) return false;
 		}
 		await this.d.git.fetch([master, p.headSha]);
 		const r = await this.d.git.build(master, [{ pr: it.pr_number, headSha: p.headSha, title: p.title, parentHeadSha: null }]);
@@ -1638,11 +1642,12 @@ class Tick {
 			const told = hold?.code === 'conflict' ? !!hold.told : true;
 			const keep = hold?.code === 'conflict' ? { ...(hold.files ? { files: hold.files } : {}), ...(hold.fix ? { fix: hold.fix } : {}) } : {};
 			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told, ...(hold?.quiet ? { quiet: true } : {}), base: master, ...keep });
-			return;
+			return false;
 		}
 		db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 		await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
 		this.event(it.pr_number, 'requeued', { reason: `no longer conflicts with ${this.d.repo.default_branch}`, headSha: p.headSha });
+		return true;
 	}
 
 	/**
