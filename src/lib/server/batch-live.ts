@@ -162,11 +162,10 @@ const NETWORK_TIMEOUT_MS = 10 * 60 * 1000;
 export class Mirror {
 	/** Git with the queue's merge drivers: every merge the queue makes runs here. */
 	readonly git: GitRunner;
-	/** Git without them, for the line merge GitHub makes. */
+	/** Git without them, for fetches and pushes. */
 	readonly plain: GitRunner;
 
 	constructor(private readonly repo: RepoRef) {
-		requireGitVersion();
 		const dir = join(env.MIRROR_DIR || './data/mirrors', repo.owner, `${repo.name}.git`);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
@@ -350,10 +349,11 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
-			build: async (base, members, opts) => buildBatch(opts.drivers === false ? mirror.plain : mirror.git, base, members, { attrs: opts.attrs }),
-			restack: async (head, upstream, onto, attrs) => replay(mirror.git, { head, upstream, onto, attrs }),
+			// Checked where `--attr-source` is used, so an old git stops planning and landing, not the rest.
+			build: async (base, members, opts) => (requireGitVersion(), buildBatch(mirror.git, base, members, opts)),
+			restack: async (head, upstream, onto, attrs) => (requireGitVersion(), replay(mirror.git, { head, upstream, onto, attrs })),
 			baseline: async (base) => baselineCommit(mirror.git, base),
-			mergeTrees: async (onto, head) => mergeTrees(mirror.git, mirror.plain, onto, head),
+			mergeTrees: async (onto, head, attrs) => (requireGitVersion(), mergeTrees(mirror.git, onto, head, attrs)),
 			mergeCommit: async (tree, parents, message) => queueMergeCommit(mirror.git, tree, parents, message),
 			changed: async (from, to) => mirror.git.run(['diff', '--name-only', from, to]).out.split('\n').filter(Boolean)
 		},

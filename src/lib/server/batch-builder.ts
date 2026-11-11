@@ -17,7 +17,9 @@
 // routes to one of the queue's merge drivers (merge-drivers.ts) merges with it, given the driver
 // environment on the runner.
 // With `drivers: false` (a repo where the queue can't push to a PR without dismissing its
-// approval) the merges run without the queue's drivers: every file merges as GitHub merges it.
+// approval), and for a member with `drivers: false` (a fork PR), the merge reads no attributes:
+// every file merges by lines, as GitHub merges it. GitHub's merge ignores .gitattributes merge
+// drivers, built-in ones such as `union` too (github.com/orgs/community/discussions/9288).
 //
 // Needs git >= 2.41 (`merge-tree --write-tree --merge-base`, `--attr-source`).
 
@@ -29,6 +31,11 @@ export interface BatchMember {
 	title: string;
 	/** Head SHA of the PR's open parent in the stack, when it has one in or below this batch. */
 	parentHeadSha?: string | null;
+	/**
+	 * False: this PR merges by lines, without the queue's merge drivers, as GitHub merges it (a PR
+	 * from a fork, which the queue can't push a merge of master to).
+	 */
+	drivers?: boolean;
 }
 
 export interface BuiltCommit {
@@ -53,6 +60,8 @@ export interface BuildOptions {
 	 * batch ahead (whose PRs could opt themselves in). Defaults to `baseSha`.
 	 */
 	attrs?: string;
+	/** False: every file merges by lines with no attributes, as GitHub merges it. */
+	drivers?: boolean;
 }
 
 /** Strips credentials from text that may end up in logs. */
@@ -178,7 +187,8 @@ export function buildBatch(
 	const commits: BuiltCommit[] = [];
 	for (const m of members) {
 		// Attributes come from the default branch, never from a PR: they pick the queue's merge drivers.
-		const args = [`--attr-source=${opts.attrs ?? baseSha}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
+		const attrs = opts.drivers === false || m.drivers === false ? EMPTY_TREE : (opts.attrs ?? baseSha);
+		const args = [`--attr-source=${attrs}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
 		// The parent may have moved on after the child branched: the child's work
 		// starts at the newest parent commit it contains, not at the parent's head.
 		const fork = m.parentHeadSha ? git.run(['merge-base', m.parentHeadSha, m.headSha]).out : null;
@@ -218,18 +228,20 @@ export function buildBatch(
 	return { ok: true, headSha: tip, tree: tipTree, commits };
 }
 
+/** git's empty tree: as `--attr-source` it reads no attributes, so every file merges by lines. */
+export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
 /**
- * `head` merged onto `onto` twice, with attributes from `onto`: by `queue`, a runner with the queue's
- * merge drivers (as a batch is built), and by `plain`, one without them (as GitHub merges: a path
- * routed to a queue driver gets the line merge, and the repository's other attributes still apply).
- * Each is the tree, or null on a conflict.
+ * `head` merged onto `onto` twice: with the queue's merge drivers, picked by the attributes of
+ * `attrs` (the default branch the batch was built with, which a PR landed before it may have
+ * changed), and by lines with no attributes, as GitHub merges. Each is the tree, or null on a conflict.
  */
-export function mergeTrees(queue: GitRunner, plain: GitRunner, onto: string, head: string): { queue: string | null; line: string | null } {
-	const tree = (git: GitRunner) => {
-		const r = git.run([`--attr-source=${onto}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages', onto, head], { allowFail: true });
+export function mergeTrees(git: GitRunner, onto: string, head: string, attrs: string): { queue: string | null; line: string | null } {
+	const tree = (source: string) => {
+		const r = git.run([`--attr-source=${source}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages', onto, head], { allowFail: true });
 		return r.code === 0 ? r.out.split('\n')[0] : null;
 	};
-	return { queue: tree(queue), line: tree(plain) };
+	return { queue: tree(attrs), line: tree(EMPTY_TREE) };
 }
 
 /** A merge commit of `tree` on `parents`, committed by the queue. */

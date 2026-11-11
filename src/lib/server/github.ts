@@ -347,11 +347,12 @@ export interface PushRules {
  * no rule that requires an approval also dismisses one on a push, asks the last push to be
  * approved by someone else, or asks one more approval for unattributed changes; and, where the
  * queue requires an approval itself (`queueRequiresApproval`), no rule dismisses one on a push
- * (the queue's check counts only approvals GitHub still has). Rules the App can't read count as
- * ones that would, since a push can't be taken back.
+ * (the queue's check counts only approvals GitHub still has). Classic protection's review
+ * settings need the Administration permission, which the App doesn't ask for: when it can't read
+ * them it goes by the rulesets alone, as the queue did before it read any rules.
  */
 export function pushKeepsApprovalFrom(rules: BranchRule[], classic: ClassicReviews, opts: { queueRequiresApproval: boolean }): boolean {
-	if (classic === 'unreadable') return false;
+	if (classic === 'unreadable') classic = null;
 	const costs = (p: Record<string, unknown>, dismiss: string) => {
 		// GitHub applies the last-push and unattributed-change rules only with a non-zero count.
 		if (Number(p.required_approving_review_count ?? 0) > 0) return !!p[dismiss] || !!p.require_last_push_approval || !!p.require_extra_approval_for_unattributed_changes;
@@ -374,7 +375,10 @@ export async function pushRules(owner: string, repo: string, branch: string): Pr
 		try {
 			classic = await ghFetchAsApp(`${path}/branches/${refPath(branch)}/protection/required_pull_request_reviews`);
 		} catch (e) {
-			if (!(e instanceof GitHubError && e.status === 404)) classic = 'unreadable';
+			if (!(e instanceof GitHubError && e.status === 404)) {
+				classic = 'unreadable';
+				console.warn(`[merge-queue] ${owner}/${repo}: can't read ${branch}'s review protection (${e instanceof Error ? e.message : e}); going by its rulesets`);
+			}
 		}
 	}
 	return { rules, classic };

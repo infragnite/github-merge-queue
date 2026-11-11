@@ -143,8 +143,17 @@ export function gitVersionProblem(version: string): string | null {
 
 let gitProblem: string | null | undefined;
 
-/** Throws when the server's git can't run the queue's merges. Asks git once per process. */
-export function requireGitVersion() {
+/**
+ * Throws when the server's git can't run the queue's merges. Called by each git run that uses
+ * `--attr-source`, so an old git stops building and landing (a tick error the queue page shows)
+ * and nothing else. Asks git once per process, unless given `read`.
+ */
+export function requireGitVersion(read?: () => string) {
+	if (read) {
+		const problem = gitVersionProblem(read());
+		if (problem) throw new Error(problem);
+		return;
+	}
 	if (gitProblem === undefined) gitProblem = gitVersionProblem(execFileSync('git', ['--version'], { encoding: 'utf8' }));
 	if (gitProblem) throw new Error(gitProblem);
 }
