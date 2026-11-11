@@ -39,7 +39,7 @@ export const load: PageServerLoad = async ({ locals }) => {
 	});
 
 	return {
-		repos: repos.map((r) => ({ id: r.id, owner: r.owner, name: r.name, default_branch: r.default_branch, summary: repoSummary(r.id) })),
+		repos: await Promise.all(repos.map(async (r) => ({ id: r.id, owner: r.owner, name: r.name, default_branch: r.default_branch, summary: await repoSummary(r) }))),
 		addable,
 		history: getHistory(100).filter((h) => ids.has(h.repo_id)).slice(0, 15)
 	};

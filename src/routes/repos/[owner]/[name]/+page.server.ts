@@ -222,7 +222,7 @@ export const actions: Actions = {
 			markDirty(repo.id);
 		}),
 
-	/** Batch mode's order: urgent PRs go first, in an express batch (urgent needs maintain). */
+	/** Batch mode's order: urgent PRs go first, in the urgent batch (urgent needs maintain). */
 	setPriority: (event) =>
 		guarded(event, 'write', 'Changing a priority', async ({ repo, me, form }) => {
 			const n = intField(form, 'pr_number');

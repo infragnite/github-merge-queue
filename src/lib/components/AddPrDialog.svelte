@@ -9,6 +9,8 @@
 	let showDrafts = $state(false);
 	let pending = $state<string | null>(null);
 	let error = $state<string | null>(null);
+	// Closes on a click on the backdrop only when the press began there, not a text selection released outside.
+	let pressedBackdrop = false;
 
 	// A native modal: focus moves in and stays, Escape closes it, the page behind is inert.
 	$effect(() => {
@@ -47,7 +49,8 @@
 <dialog
 	bind:this={dialog}
 	onclose={() => (open = false)}
-	onclick={(e) => e.target === dialog && (open = false)}
+	onpointerdown={(e) => (pressedBackdrop = e.target === dialog)}
+	onclick={(e) => e.target === dialog && pressedBackdrop && (open = false)}
 	aria-labelledby="add-pr-title"
 	class="m-auto w-[calc(100%-2rem)] max-w-lg rounded-xl bg-surface-raised p-0 shadow-2xl backdrop:bg-black/50"
 >
@@ -81,7 +84,7 @@
 								<span class="truncate text-xs text-gray-500">{pr.author}</span>
 							</div>
 							<p class="truncate text-sm text-gray-600">{pr.title}</p>
-							{#if pr.draft}<p class="text-xs text-gray-500">Waits in line until it is marked ready on GitHub.</p>{/if}
+							{#if pr.draft}<p class="text-xs text-gray-500">Queued drafts are listed under Needs attention until they are marked ready on GitHub.</p>{/if}
 						</div>
 						<form method="POST" action="?/addToQueue" use:enhance={submit(`${pr.number}`)} class="flex shrink-0 flex-col gap-1.5 sm:flex-row">
 							<input type="hidden" name="pr_number" value={pr.number} />

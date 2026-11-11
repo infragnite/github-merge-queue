@@ -35,10 +35,28 @@
 		)
 	);
 
+	let addHeading = $state<HTMLElement | null>(null);
+	let focusSearch = false;
+
 	function openAdd() {
 		addOpen = true;
 		search = '';
-		queueMicrotask(() => searchInput?.focus());
+		focusSearch = true;
+		// Focus moves into the panel at once (the button that had it goes away), and on to the search once it is there.
+		queueMicrotask(() => (searchInput ?? addHeading)?.focus());
+	}
+	$effect(() => {
+		if (searchInput && focusSearch) {
+			focusSearch = false;
+			searchInput.focus();
+		}
+	});
+
+	function closeAdd() {
+		addOpen = false;
+		focusSearch = false;
+		// Back to the button that opened it.
+		queueMicrotask(() => document.querySelector<HTMLElement>('[data-add-repo]')?.focus());
 	}
 </script>
 
@@ -59,7 +77,7 @@
 			</p>
 		</div>
 		{#if !addOpen}
-			<button type="button" onclick={openAdd} class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-700">
+			<button type="button" data-add-repo onclick={openAdd} class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-700">
 				Add repository
 			</button>
 		{/if}
@@ -74,8 +92,8 @@
 	{#if addOpen}
 		<section class="rounded-xl border border-border-subtle bg-surface-raised p-4 sm:p-5" aria-labelledby="add-title">
 			<div class="flex items-center justify-between gap-3">
-				<h2 id="add-title" class="text-base font-semibold text-gray-900">Add repository</h2>
-				<button type="button" onclick={() => (addOpen = false)} class="rounded-md px-2 py-1 text-sm text-gray-500 hover:bg-surface-sunken hover:text-gray-700">Close</button>
+				<h2 id="add-title" bind:this={addHeading} tabindex="-1" class="text-base font-semibold text-gray-900 focus:outline-none">Add repository</h2>
+				<button type="button" onclick={closeAdd} class="rounded-md px-2 py-1 text-sm text-gray-500 hover:bg-surface-sunken hover:text-gray-700">Close</button>
 			</div>
 			<p class="mt-0.5 text-sm text-gray-500">Repositories the app is installed on that you administer on GitHub.</p>
 
@@ -143,7 +161,7 @@
 			<div class="rounded-xl border border-dashed border-gray-300 bg-surface-raised p-12 text-center">
 				<h3 class="text-sm font-medium text-gray-900">No repositories</h3>
 				<p class="mt-1 text-sm text-gray-500">Add a repository to start using the merge queue.</p>
-				<button type="button" onclick={openAdd} class="mt-4 inline-flex items-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700">
+				<button type="button" data-add-repo onclick={openAdd} class="mt-4 inline-flex items-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700">
 					Add repository
 				</button>
 			</div>

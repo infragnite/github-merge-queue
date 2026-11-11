@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
 import { summarize } from './repo-summary';
 import type { BoardItem } from './queue-model';
+import { stacks } from './testing/stack-fixture';
 
 function item(pr: number, over: Partial<BoardItem> = {}): BoardItem {
 	return { pr, status: 'queued', priority: 'normal', position: pr, enqueuedAt: 1_000 + pr, hold: null, message: null, ...over };
@@ -49,4 +50,13 @@ test('paused wins over a red default branch, which wins over running', () => {
 	expect(summarize({ ...base, items, inflight, paused: 'CI is misconfigured', masterRed: true }).state).toBe('paused');
 	expect(summarize({ ...base, items, inflight, masterRed: true }).state).toBe('red');
 	expect(summarize({ ...base, items: [] }).state).toBe('idle');
+});
+
+test('with the last stack analysis, a PR stacked on a failed parent needs attention too, as on the queue page', () => {
+	const s = summarize({
+		...base,
+		items: [item(1, { status: 'failed', message: 'CI failed' }), item(2), item(3)],
+		analysis: stacks([1, 2, 3], { 2: 1 })
+	});
+	expect(s).toMatchObject({ waiting: 1, attention: 2 });
 });
