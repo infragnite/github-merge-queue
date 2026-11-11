@@ -161,7 +161,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		board,
 		pipeline,
 		mode: settings.mode,
-		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },
+		limits: { maxBatch: settings.config.maxBatch },
 		// Whether runs of several PRs stop at their first failure, for why a run goes on.
 		stopsEarly: settings.config.stopOnFirstFailure,
 		history: getRepoHistory(repo.id).map((h) => {
