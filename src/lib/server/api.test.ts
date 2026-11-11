@@ -233,6 +233,29 @@ describe('stack state for agents', () => {
 		expect(api.queueEntry(repo.id, 1)).toMatchObject({ position: 5, priority: 'low' });
 	});
 
+	test('queue state takes whole stacks: the most urgent member decides, children follow their parent, held PRs come last', () => {
+		api.enqueue(repo, writer, pull(1), {});
+		api.enqueue(repo, writer, pull(2), {});
+		api.enqueue(repo, writer, pull(3), {});
+		api.enqueue(repo, maintainer, pull(4), { priority: 'urgent' });
+		api.enqueue(repo, writer, pull(5), {});
+		// #1 is held (a draft); #4 is an urgent child of #2; #5 is a child of #1, held with it.
+		const it = db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!;
+		db.updateQueueItemStatus(it.id, 'queued', 'Draft');
+		store.setHold(it.id, { code: 'draft', reason: 'Draft' });
+		const a = analysis([1, 2, 3, 4, 5], { 4: 2, 5: 1 });
+		expect(api.queueState(repo, a).waiting.map((w) => [w.pr, w.position])).toEqual([
+			[2, 1],
+			[4, 2],
+			[3, 3],
+			[1, 4],
+			[5, 5]
+		]);
+		expect(api.queueEntry(repo.id, 2, a)).toMatchObject({ position: 1, priority: 'normal' });
+		expect(api.stackState(repo, 4, a).queue).toMatchObject({ position: 2, priority: 'urgent' });
+		expect(api.queueEntry(repo.id, 1, a)).toMatchObject({ position: 4 });
+	});
+
 	test('a PR that left a bisecting batch is back in line, not testing', () => {
 		api.enqueue(repo, writer, pull(1), {});
 		api.enqueue(repo, writer, pull(2), {});
