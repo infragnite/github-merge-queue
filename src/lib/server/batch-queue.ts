@@ -405,15 +405,16 @@ class Tick {
 	 * current head, and the author (an agent watching its checks, usually) is
 	 * told on the PR. A push clears it and the PR is picked up again.
 	 */
-	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict') {
+	/** `base`: the default branch head it conflicted with alone; the conflict is checked again once the branch moves. Without one, only a push retries it. */
+	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict', base?: string) {
 		const it = this.item(n);
 		const p = await this.pr(n);
 		if (it) {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
-			// What it conflicts with may change without a push (the default branch moves): checked again then.
-			// A workflow change waits for a push (after the permission is granted), whatever the branch does.
-			store.setHold(it.id, { code, reason, head: p.headSha, told: true, ...(code === 'conflict' ? { base: await this.d.github.defaultBranchSha() } : {}) });
+			// A conflict with the default branch may go away when the branch moves: it is checked again then. A
+			// restack's conflict (old parent commits) and a workflow change wait for a push.
+			store.setHold(it.id, { code, reason, head: p.headSha, told: true, ...(base ? { base } : {}) });
 		}
 		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
@@ -488,7 +489,8 @@ class Tick {
 			// It fails alone on the default branch: that is what it conflicts with. Git names the files
 			// when its author rebases; they stay in the notice's block for agents.
 			const why = alone.ok ? r.reason : /could not be merged/.test(alone.reason) ? alone.reason.replace(/^#\d+ /, '') : `Conflicts with ${this.d.repo.default_branch}`;
-			await this.conflict(r.pr, why, alone.ok ? r.conflicts : alone.conflicts, await this.rebaseCommand(r.pr));
+			// Conflicting alone on the default branch: checked again once that moves on from this head.
+			await this.conflict(r.pr, why, alone.ok ? r.conflicts : alone.conflicts, await this.rebaseCommand(r.pr), 'conflict', alone.ok ? undefined : masterSha);
 		}
 		return null;
 	}
@@ -1586,12 +1588,18 @@ class Tick {
 	/** A conflict with the default branch, its head unchanged: back in line once the branch moved and it merges cleanly. */
 	async recheckConflict(it: QueueItem, p: LivePR, master: string) {
 		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
-		// Saved before the queue kept the base (or with none): checked now, and its base kept from then on.
-		if (hold?.code === 'workflow-permission' || (hold?.code === 'conflict' && hold.base === master)) return;
+		if (hold?.code === 'workflow-permission') return;
+		// Saved with the default branch it conflicted with: checked once that moved. Saved without one: a restack's conflict, for a push.
+		if (hold?.code === 'conflict' && (!hold.base || hold.base === master)) return;
+		// Saved before conflicts kept a base: checked once, unless it is a restack's (its parent's old commits are still in it).
+		if (hold?.code !== 'conflict') {
+			const info = (await this.analysis()).prs.get(it.pr_number);
+			if (info?.issues.some((i) => (i.kind === 'parent-rebased' || i.kind === 'parent-merged') && (i.staleCommits?.length ?? 0) > 0)) return;
+		}
 		await this.d.git.fetch([master, p.headSha]);
 		const r = await this.d.git.build(master, [{ pr: it.pr_number, headSha: p.headSha, title: p.title, parentHeadSha: null }]);
 		if (!r.ok) {
-			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told: true, ...hold, base: master });
+			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told: true, ...(hold?.quiet ? { quiet: true } : {}), base: master });
 			return;
 		}
 		db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
