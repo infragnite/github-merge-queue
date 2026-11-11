@@ -2073,6 +2073,8 @@ class Tick {
 		if (red && opts.urgentOnly) return 'idle';
 		const analysis = await this.analysis();
 		let plan: Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express' | 'held'>;
+		/** Plans again without the try of `n`, when building its stack did not give the tree it tested. */
+		let without: (n: number) => Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express'> = () => plan;
 		if (red) {
 			// Siblings go only beside siblings: a stacked pipeline still in flight (built before the
 			// branch turned red) is decided first.
@@ -2089,7 +2091,28 @@ class Tick {
 			});
 		} else {
 			if (opts.urgentOnly && settings.mode === 'serial') return 'idle';
-			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode, held: deferred, conflicts: conflicted });
+			// Built on the default branch, a stack a passed try tested whole lands without a run: it goes first.
+			const masterTree = await this.d.git.tree(masterSha);
+			const landable = new Set(
+				opts.urgentOnly || !active.length
+					? [...states.values()].filter((st) => store.latestTry(this.repoId, st.pr, st.headSha, masterTree)?.ci_result === 'success').map((st) => st.pr)
+					: []
+			);
+			const planWith = (landable: Set<number>) =>
+				planNextBatch({
+					now: this.d.now(),
+					queue,
+					states,
+					analysis,
+					inflight: opts.urgentOnly ? [] : active.map((b) => b.members),
+					config: settings.config,
+					strategy: settings.mode,
+					held: deferred,
+					conflicts: conflicted,
+					landable
+				});
+			plan = planWith(landable);
+			without = (n) => planWith(new Set([...landable].filter((m) => m !== n)));
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
 			if (opts.urgentOnly && !plan.express) return 'idle';
@@ -2102,11 +2125,15 @@ class Tick {
 		// Built on the default branch, the head of the batch may be what a try already passed on it.
 		// On a red branch the queue looks for a fix with its own runs, and keeps count of them.
 		const reuse = !red && base === masterSha ? await this.reusableTry(plan.batch, masterSha) : null;
+		let next: Pick<typeof plan, 'batch' | 'express'> = plan;
 		if (reuse) {
 			const r = await this.startBatch(base, reuse.prefix, below, plan.express, masterSha, reuse.run);
 			if (r !== 'stale') return r;
+			// Not what the try tested: it goes back to its place in line, and the batch is planned without it.
+			next = without(reuse.prefix[reuse.prefix.length - 1]);
+			if (!next.batch) return 'idle';
 		}
-		const r = await this.startBatch(base, plan.batch, below, plan.express, masterSha);
+		const r = await this.startBatch(base, next.batch!, below, next.express, masterSha);
 		return r === 'stale' ? 'conflict' : r;
 	}
 

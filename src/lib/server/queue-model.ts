@@ -8,7 +8,7 @@
 //
 // Pure: the runtime gathers the queue, PR states, the stack analysis and known conflicts.
 
-import { admit, type Admission, type BatchConfig, type Hold, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
+import { admit, triedPrefix, type Admission, type BatchConfig, type Hold, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
 import type { StackAnalysis } from './stacks';
 
 const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
@@ -23,6 +23,11 @@ export interface QueueModelInput {
 	inflight: Set<number>;
 	/** PRs that need someone whatever their admission says (a known conflict, a failure), with why. */
 	problems?: Map<number, { code: HoldCode; reason: string }>;
+	/**
+	 * PRs whose latest `try` passed at their current head on the default branch as it is now. A stack
+	 * such a try tested whole lands without a run of its own, so it goes first, after urgent stacks.
+	 */
+	landable?: Set<number>;
 }
 
 export interface QueueStack {
@@ -38,6 +43,8 @@ export interface QueueStack {
 	priority: Priority;
 	/** When its earliest member was queued. */
 	enqueuedAt: number;
+	/** A passed try tested the whole stack on the default branch: it lands without a run (see `landable`). */
+	landable: boolean;
 }
 
 export interface Held {
@@ -135,11 +142,19 @@ export function queueModel(input: QueueModelInput): QueueModel {
 			parentOf: within,
 			on: parentOf(root),
 			priority: es.reduce<Priority>((best, e) => (RANK[e.priority] < RANK[best] ? e.priority : best), 'low'),
-			enqueuedAt: Math.min(...es.map((e) => e.enqueuedAt))
+			enqueuedAt: Math.min(...es.map((e) => e.enqueuedAt)),
+			// Only on the default branch itself: a stack on a PR being tested was not tried on top of it.
+			landable: parentOf(root) === null && !!input.landable && triedPrefix(members, (m) => within.get(m) ?? null, (m) => input.landable!.has(m))?.length === members.length
 		};
 	});
 	const place = (s: QueueStack) => Math.min(...s.members.map((m) => entries.get(m)!.position ?? 0));
-	stacks.sort((a, b) => RANK[a.priority] - RANK[b.priority] || place(a) - place(b) || a.enqueuedAt - b.enqueuedAt || a.root - b.root);
+	// Urgent stacks first (an urgent PR may break what a try tested), then stacks that land on a
+	// passed try without a run of their own, then the rest by priority.
+	const tier = (s: QueueStack) => (s.priority === 'urgent' ? 0 : s.landable ? 1 : 1 + RANK[s.priority]);
+	stacks.sort(
+		(a, b) =>
+			tier(a) - tier(b) || Number(b.landable) - Number(a.landable) || place(a) - place(b) || a.enqueuedAt - b.enqueuedAt || a.root - b.root
+	);
 	return { stacks, attention };
 }
 
@@ -162,6 +177,8 @@ export function fillBatch(model: QueueModel, opts: { config: BatchConfig; inflig
 	const none: FillResult = { batch: null, express: false, waitUntil: null };
 	if (opts.inflightBatches >= config.depth || model.stacks.length === 0) return none;
 	const express = model.stacks[0].priority === 'urgent';
+	// It lands on its try, without a run: at once, alone; the rest is batched after it.
+	if (!express && model.stacks[0].landable) return { batch: [...model.stacks[0].members], express: false, waitUntil: null };
 	const candidates = express ? model.stacks.filter((s) => s.priority === 'urgent') : model.stacks;
 	const batch: number[] = [];
 	let oldest = Infinity;
@@ -188,12 +205,14 @@ export function serialPick(model: QueueModel, opts: { inflight: number }): numbe
  * What the queue tests next: in batches, a new batch filled from the queue model; one by one, the
  * head stack whole.
  */
-export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial'; held?: Map<number, Hold> }): Plan {
+export function planNextBatch(
+	input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial'; held?: Map<number, Hold>; landable?: Set<number> }
+): Plan {
 	const inflight = new Set(input.inflight.flat());
 	const conflicts = [...(input.conflicts ?? [])].map(([pr, reason]) => [pr, { code: 'conflict' as const, reason }] as const);
 	const admitted = plannedAdmission(input);
 	const admission = (n: number) => input.held?.get(n) ?? admitted(n);
-	const model = queueModel({ queue: input.queue, admission, analysis: input.analysis, inflight, problems: new Map(conflicts) });
+	const model = queueModel({ queue: input.queue, admission, analysis: input.analysis, inflight, problems: new Map(conflicts), landable: input.landable });
 	const fill: FillResult =
 		input.strategy === 'serial'
 			? { batch: serialPick(model, { inflight: input.inflight.length }), express: false, waitUntil: null }
