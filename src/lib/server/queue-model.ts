@@ -154,8 +154,8 @@ export interface FillResult {
 
 /**
  * The next new batch: whole stacks in queue order until the queue runs out or the batch is full,
- * the last one cut to its longest part that fits. Urgent stacks get an express batch of their own
- * (the first one whole, even past `expressMax`).
+ * the last one cut to its longest part that fits. Urgent stacks get an express batch of their own,
+ * filled the same way from the urgent stacks alone.
  */
 export function fillBatch(model: QueueModel, opts: { config: BatchConfig; inflightBatches: number; now: number }): FillResult {
 	const { config } = opts;
@@ -163,11 +163,10 @@ export function fillBatch(model: QueueModel, opts: { config: BatchConfig; inflig
 	if (opts.inflightBatches >= config.depth || model.stacks.length === 0) return none;
 	const express = model.stacks[0].priority === 'urgent';
 	const candidates = express ? model.stacks.filter((s) => s.priority === 'urgent') : model.stacks;
-	const room = express ? Math.max(config.expressMax, candidates[0].members.length) : config.maxBatch;
 	const batch: number[] = [];
 	let oldest = Infinity;
 	for (const s of candidates) {
-		const left = room - batch.length;
+		const left = config.maxBatch - batch.length;
 		if (left <= 0) break;
 		batch.push(...s.members.slice(0, left));
 		oldest = Math.min(oldest, s.enqueuedAt);

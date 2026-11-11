@@ -15,6 +15,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import type { LivePR, PRCheckState, QueueDeps } from './batch-queue';
 import { ejectedNotice, holdCheck, holdNotice, readNotice } from './hold-format';
 import { RateLimitedError } from './rate-limit';
+import { DEFAULT_BATCH_CONFIG, type BatchConfig } from './batching';
 
 let git: GitSandbox;
 let repo: { id: number; owner: string; name: string; default_branch: string };
@@ -471,6 +472,12 @@ describe('batch queue runtime', () => {
 		expect(queued()).toEqual([]);
 		const first = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
 		expect(first).toMatchObject({ status: 'landed', landed: [2, 3], left_prs: [1, 4] });
+	});
+
+	test('a setting that no longer exists is dropped from the saved settings', () => {
+		store.updateQueueSettings(repo.id, { config: { expressMax: 2 } as Partial<BatchConfig> });
+		expect(store.getQueueSettings(repo.id).config).not.toHaveProperty('expressMax');
+		expect(Object.keys(store.getQueueSettings(repo.id).config).sort()).toEqual(Object.keys(DEFAULT_BATCH_CONFIG).sort());
 	});
 
 	test('a PR that leaves a bisection says why: the timeline and its check name the push and the batch', async () => {

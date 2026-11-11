@@ -78,3 +78,8 @@ test('how much the queue comments is a choice of all, only when action is needed
 	expect(parseSettingsForm(form({ 'config.comments': 'none' }), { config: { comments: 'none' }, ci: {} }).config).not.toHaveProperty('comments');
 	expect(() => parseSettingsForm(form({ 'config.comments': 'loud' }))).toThrow('PR comments must be one of: All, Only when action is needed, None');
 });
+
+test('urgent batches have no size setting of their own: they follow the batch size', () => {
+	expect(ALL_FIELDS.map((f) => f.name)).not.toContain('config.expressMax');
+	expect(SETTING_GROUPS.find((g) => g.id === 'failures')!.fields.map((f) => f.name)).toEqual(['config.bisectRuns', 'config.retryFailed', 'config.stopOnFirstFailure']);
+});
