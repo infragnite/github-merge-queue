@@ -11,6 +11,7 @@
 //
 // Everything here is pure; the runtime builds branches, runs CI and lands.
 
+import type { DependencyGraph } from './deps';
 import type { PRStackInfo, StackAnalysis } from './stacks';
 
 export type Priority = 'urgent' | 'normal' | 'low';
@@ -133,7 +134,18 @@ export type AdmissionCode =
 	| 'wrong-base';
 
 /** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
-export type HoldCode = AdmissionCode | 'conflict' | 'workflow-permission' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
+export type HoldCode =
+	| AdmissionCode
+	| 'conflict'
+	| 'workflow-permission'
+	| 'failed'
+	| 'deferred'
+	| 'parent-not-queued'
+	| 'parent-held'
+	| 'dependency-not-queued'
+	| 'dependency-closed'
+	| 'dependency-invalid'
+	| 'dependency-cycle';
 
 const EVERY_HOLD: Record<HoldCode, true> = {
 	draft: true,
@@ -150,7 +162,11 @@ const EVERY_HOLD: Record<HoldCode, true> = {
 	failed: true,
 	deferred: true,
 	'parent-not-queued': true,
-	'parent-held': true
+	'parent-held': true,
+	'dependency-not-queued': true,
+	'dependency-closed': true,
+	'dependency-invalid': true,
+	'dependency-cycle': true
 };
 
 /** Every hold code: stable ids, shown on the PR and in its hidden block, so agents can switch on them. */
@@ -175,6 +191,14 @@ export function holdAdvice(code: HoldCode): string {
 			return 'Point its base at the default branch, or at the branch of the queued PR it builds on.';
 		case 'parent-not-queued':
 			return 'Queue the PR it builds on; a stacked PR goes only with the PRs under it.';
+		case 'dependency-not-queued':
+			return 'Queue the PR it depends on, or remove that Depends-On line.';
+		case 'dependency-closed':
+			return 'Reopen the PR it depends on, or remove that Depends-On line.';
+		case 'dependency-invalid':
+			return 'Fix or remove that Depends-On line.';
+		case 'dependency-cycle':
+			return 'Remove one Depends-On line of the cycle.';
 		case 'conflict':
 			return 'Rebase it and push:';
 		case 'workflow-permission':
@@ -330,6 +354,42 @@ export function descendants(analysis: StackAnalysis, prs: Iterable<number>): Set
 // ---------------------------------------------------------------------------
 // Bisection
 
+/**
+ * What a PR sits on: its git parent alone (null for none), or a list of the PRs it depends on (its
+ * git parent and what it declares). Bisection reads both the same way.
+ */
+export type Below = (n: number) => number | null | readonly number[];
+
+/** `below` as a list for every PR. */
+function listOf(below: Below): (n: number) => number[] {
+	return (n) => {
+		const v = below(n);
+		return v === null ? [] : typeof v === 'number' ? [v] : [...v];
+	};
+}
+
+/** Every PR `n` depends on, directly or not, each once (never loops, whatever the graph). */
+function ancestry(below: Below): (n: number) => number[] {
+	const ups = listOf(below);
+	const memo = new Map<number, number[]>();
+	return (n) => {
+		const hit = memo.get(n);
+		if (hit) return hit;
+		const out: number[] = [];
+		const seen = new Set<number>([n]);
+		const todo = [...ups(n)];
+		while (todo.length) {
+			const p = todo.shift()!;
+			if (seen.has(p)) continue;
+			seen.add(p);
+			out.push(p);
+			todo.push(...ups(p));
+		}
+		memo.set(n, out);
+		return out;
+	};
+}
+
 /** A commit to test: `context` (known good on the base) plus `members`, in order. */
 export interface TestGroup {
 	context: number[];
@@ -373,18 +433,18 @@ export function aloneIsCheaper(k: number, p: number): boolean {
  */
 export function splitPoint(
 	members: number[],
-	parentOf: (n: number) => number | null
+	parentOf: Below
 ): { left: number[]; right: number[]; independent: boolean } {
 	const set = new Set(members);
-	// Each PR's unit is its topmost ancestor in the group (through ancestors outside it, too).
-	const rootOf = (n: number) => {
-		let r = n;
-		for (let p = parentOf(n), seen = 0; p !== null && seen <= members.length; p = parentOf(p), seen++) if (set.has(p)) r = p;
-		return r;
-	};
+	const anc = ancestry(parentOf);
+	// A PR's unit holds every PR of the group it depends on (through PRs outside it, too); a plain
+	// stack's is its topmost ancestor in the group.
+	const rep = new Map(members.map((n) => [n, n]));
+	const find = (n: number): number => (rep.get(n) === n ? n : find(rep.get(n)!));
+	for (const n of members) for (const a of anc(n)) if (set.has(a)) rep.set(find(n), find(a));
 	const units = new Map<number, number[]>();
 	for (const n of members) {
-		const r = rootOf(n);
+		const r = find(n);
 		units.set(r, [...(units.get(r) ?? []), n]);
 	}
 	if (units.size === 1) {
@@ -419,7 +479,10 @@ export function splitPoint(
  * built, and a half that passes lands with the shared part, leaving the other branch as the
  * suspect. Null when `members` has no fork.
  */
-export function forkSplit(members: number[], parentOf: (n: number) => number | null): { left: number[]; right: number[] } | null {
+export function forkSplit(members: number[], below: Below): { left: number[]; right: number[] } | null {
+	const ups = listOf(below);
+	if (members.some((n) => ups(n).length > 1)) return graphSplit(members, below);
+	const parentOf = (n: number) => ups(n)[0] ?? null;
 	const set = new Set(members);
 	const kids = (n: number) => members.filter((m) => parentOf(m) === n);
 	const under = (n: number): number[] => [n, ...kids(n).flatMap(under)];
@@ -445,6 +508,31 @@ export function forkSplit(members: number[], parentOf: (n: number) => number | n
 		return { left, right };
 	}
 	return null;
+}
+
+/**
+ * A failing unit where a PR depends on several others splits by its tops (the PRs nothing else in
+ * it needs): each half takes some of the tops and everything they need, so a PR both need goes in
+ * both, as a fork's trunk does. Tops are shared out in order, about half the group each. Null
+ * with a single top: the unit is then cut at a prefix of its order.
+ */
+function graphSplit(members: number[], below: Below): { left: number[]; right: number[] } | null {
+	const set = new Set(members);
+	const anc = ancestry(below);
+	const needed = new Set(members.flatMap((n) => anc(n)));
+	const tops = members.filter((n) => !needed.has(n));
+	if (tops.length < 2) return null;
+	const closure = (t: number) => [t, ...anc(t).filter((p) => set.has(p))];
+	const a = new Set<number>();
+	let taken = 0;
+	for (const t of tops.slice(0, -1)) {
+		const next = new Set([...a, ...closure(t)]);
+		if (a.size > 0 && next.size > members.length / 2) break;
+		for (const n of next) a.add(n);
+		taken++;
+	}
+	const b = new Set(tops.slice(taken).flatMap(closure));
+	return { left: members.filter((n) => a.has(n)), right: members.filter((n) => b.has(n)) };
 }
 
 /** A test run of a bisection: `members` on top of `context`, on the default branch at `baseTree`. */
@@ -489,7 +577,8 @@ export function planBisection(input: {
 	runs: BisectRun[];
 	remaining: number[];
 	masterTree: string;
-	parentOf: (n: number) => number | null;
+	/** What each PR sits on: its git parent, or the list of PRs it depends on (see `Below`). */
+	parentOf: Below;
 	/**
 	 * Default-branch trees known green, on which a PR failing alone is its own fault: the current
 	 * one once settled, the batch's own base, trees this bisection landed. By default only the current.
@@ -503,6 +592,8 @@ export function planBisection(input: {
 	slots?: number;
 }): BisectPlan {
 	const { runs, masterTree, parentOf } = input;
+	const ups = listOf(parentOf);
+	const anc = ancestry(parentOf);
 	const trusted = input.trusted ?? ((t: string) => t === masterTree);
 	const left = new Set(input.remaining);
 	const order = input.remaining;
@@ -510,10 +601,7 @@ export function planBisection(input: {
 	/** A group can be tested (and landed) alone: no PR in it sits on a PR still left outside it. */
 	const whole = (g: number[]) => {
 		const set = new Set(g);
-		return g.every((n) => {
-			for (let p = parentOf(n); p !== null; p = parentOf(p)) if (left.has(p) && !set.has(p)) return false;
-			return true;
-		});
+		return g.every((n) => !anc(n).some((p) => left.has(p) && !set.has(p)));
 	};
 	const same = (a: number[], b: number[]) => a.length === b.length && a.every((n, i) => n === b[i]);
 	const current = (g: number[]) => runs.findIndex((r) => r.baseTree === masterTree && r.context.length === 0 && same(r.members, g));
@@ -538,10 +626,7 @@ export function planBisection(input: {
 		runs.filter((r) => r.result === 'failure' && r.members.length === 1 && !left.has(r.members[0]) && trusted(r.baseTree)).map((r) => r.members[0])
 	);
 	/** `n` or a PR it is stacked on was ejected: it leaves with it. */
-	const provenUnder = (n: number) => {
-		for (let p: number | null = n; p !== null; p = parentOf(p)) if (proven.has(p)) return true;
-		return false;
-	};
+	const provenUnder = (n: number) => proven.has(n) || anc(n).some((p) => proven.has(p));
 	const failing: { set: Set<number>; run: number }[] = [];
 	runs
 		.map((r, i) => ({ set: new Set(r.members.filter((n) => left.has(n))), run: i, ok: r.result !== 'failure' || r.members.some((n) => proven.has(n)) }))
@@ -573,10 +658,7 @@ export function planBisection(input: {
 	// PRs some run passed with (on any branch), and whose ancestors here did too: those are
 	// pooled and split apart from PRs that never passed, which only an explained failure cleared.
 	const passedWith = new Set(runs.filter((r) => r.result === 'success').flatMap((r) => [...r.context, ...r.members]));
-	const passed = (n: number, among: Set<number>) => {
-		for (let p: number | null = n; p !== null; p = parentOf(p)) if (among.has(p) && !passedWith.has(p)) return false;
-		return true;
-	};
+	const passed = (n: number, among: Set<number>) => [n, ...anc(n)].every((p) => !among.has(p) || passedWith.has(p));
 	/** `g` split into what passed before and what never did, when it holds both. */
 	const byEvidence = (g: number[]) => {
 		const set = new Set(g);
@@ -584,10 +666,7 @@ export function planBisection(input: {
 		const b = g.filter((n) => !a.includes(n));
 		if (!a.length || !b.length) return null;
 		const inA = new Set(a);
-		const independent = b.every((n) => {
-			for (let p = parentOf(n); p !== null; p = parentOf(p)) if (inA.has(p)) return false;
-			return true;
-		});
+		const independent = b.every((n) => !anc(n).some((p) => inA.has(p)));
 		return { left: a, right: b, independent };
 	};
 	// How often a PR of this batch breaks, from what the runs showed: each failing group and each
@@ -601,7 +680,7 @@ export function planBisection(input: {
 		// is ejected and explains the group's failure), which then costs no more than one run per PR.
 		// Not where some passed before: those are split off by evidence and pooled to land.
 		const set = new Set(g);
-		const fresh = g.every((n) => !passedWith.has(n)) && g.every((n) => parentOf(n) === null || !set.has(parentOf(n)!));
+		const fresh = g.every((n) => !passedWith.has(n)) && g.every((n) => ups(n).every((p) => !set.has(p)));
 		// With a few slots, halves run side by side and narrow faster than single PRs a few at a time.
 		const slots = input.slots ?? Infinity;
 		if (g.length > 1 && fresh && (slots === 1 || slots >= g.length) && aloneIsCheaper(g.length, breakRate)) {
@@ -636,10 +715,7 @@ export function planBisection(input: {
 			// with it, the prefix runs with that branch instead: a pass lands both and leaves the
 			// rest of the group as the suspect; a failure points at the prefix, which then runs alone.
 			const inA = new Set(a);
-			const above = (n: number) => {
-				for (let p = parentOf(n); p !== null; p = parentOf(p)) if (inA.has(p)) return true;
-				return false;
-			};
+			const above = (n: number) => anc(n).some((p) => inA.has(p));
 			const branch = order.filter((n) => left.has(n) && !set.has(n) && !failing.some((o) => o.set.has(n)) && !provenUnder(n) && above(n));
 			const path = inOrder(new Set([...a, ...branch]));
 			const failedWith = runs.some((r) => r.result === 'failure' && r.members.every((n) => !left.has(n) || path.includes(n)) && r.members.some((n) => branch.includes(n)));
@@ -652,15 +728,9 @@ export function planBisection(input: {
 
 	// 3. Everything no failure points at runs together on the current branch, so it can land.
 	const ejected = new Set(eject.map((e) => e.pr));
-	const gone = (n: number) => {
-		for (let p: number | null = n; p !== null; p = parentOf(p)) if (ejected.has(p)) return true;
-		return false;
-	};
+	const gone = (n: number) => ejected.has(n) || anc(n).some((p) => ejected.has(p));
 	const rest = order.filter((n) => !suspects.has(n) && !gone(n));
-	const clear = rest.filter((n) => {
-		for (let p = parentOf(n); p !== null; p = parentOf(p)) if (suspects.has(p)) return false;
-		return true;
-	});
+	const clear = rest.filter((n) => !anc(n).some((p) => suspects.has(p)));
 	// What passed before runs first, together; what never passed (its failures explained by an
 	// ejected PR) runs after it, apart, so it can't hold the others back. Stacked on what passed,
 	// it waits until that landed.
@@ -707,34 +777,63 @@ export function planRedBatch(input: {
 	tried: (n: number, alone: boolean) => boolean;
 	/** Every PR still in the queue, also those being tested in another batch. */
 	live?: Set<number>;
+	/** Git parents and declared dependencies (see deps.ts); by default only git parents. */
+	dependencies?: Pick<DependencyGraph, 'depsOf' | 'problems'>;
 }): Pick<Plan, 'batch' | 'express' | 'held'> {
 	const { queue, states, analysis, config, tried } = input;
 	const held: Plan['held'] = [];
 	const ok = new Map<number, QueueEntry>();
 	for (const e of queue) {
-		const a = admit(states.get(e.pr)!, analysis, config);
+		const problem = input.dependencies?.problems.get(e.pr);
+		const a: Admission | Hold = problem ? { ok: false, ...problem } : admit(states.get(e.pr)!, analysis, config);
 		if (a.ok) ok.set(e.pr, e);
 		else held.push({ pr: e.pr, admission: a });
 	}
 	const queued = input.live ?? new Set(queue.map((e) => e.pr));
+	const depsOf =
+		input.dependencies?.depsOf ??
+		((n: number) => {
+			const p = openParent(analysis, n);
+			return p === null ? [] : [p];
+		});
+	/** `n` with everything it depends on, each after what it needs; null when one of them can't go. */
 	const chainOf = (n: number): number[] | null => {
-		const out = [n];
-		for (let p = openParent(analysis, n); p !== null; p = openParent(analysis, p)) {
-			if (out.includes(p)) return null; // a cycle in the analysis: never loop
-			if (!ok.has(p)) {
-				if (!held.some((h) => h.pr === n)) held.push({
-					pr: n,
-					admission: {
-						ok: false,
-						code: 'parent-not-ready',
-						reason: queued.has(p) ? `Stacked on #${p}, which can't be batched yet` : `Stacked on #${p}, which isn't merged or queued; queue #${p} first`
-					}
-				});
-				return null;
+		const out: number[] = [];
+		const seen = new Set<number>();
+		let blocked: { below: number; on: number } | null = null;
+		const visit = (m: number) => {
+			if (seen.has(m) || blocked) return; // seen: never loops, whatever the graph
+			seen.add(m);
+			for (const p of depsOf(m)) {
+				if (!ok.has(p)) {
+					blocked ??= { below: m, on: p };
+					return;
+				}
+				visit(p);
 			}
-			out.unshift(p);
-		}
-		return out;
+			out.push(m);
+		};
+		visit(n);
+		if (!blocked) return out;
+		const { below, on: p } = blocked;
+		const stacked = openParent(analysis, below) === p;
+		if (!held.some((h) => h.pr === n))
+			held.push({
+				pr: n,
+				admission:
+					!stacked && !queued.has(p)
+						? { ok: false, code: 'dependency-not-queued', reason: `Depends on #${p}, which isn't queued` }
+						: {
+								ok: false,
+								code: 'parent-not-ready',
+								reason: stacked
+									? queued.has(p)
+										? `Stacked on #${p}, which can't be batched yet`
+										: `Stacked on #${p}, which isn't merged or queued; queue #${p} first`
+									: `Depends on #${p}, which can't be batched yet`
+							}
+			});
+		return null;
 	};
 	const ordered = [...ok.values()].sort(byQueueOrder((e) => PRIORITY_RANK[e.priority]));
 	const chains = (alone: boolean) =>

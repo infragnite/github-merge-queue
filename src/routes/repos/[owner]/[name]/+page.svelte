@@ -487,6 +487,7 @@
 										depth={r.depth}
 										parent={k === 0 ? st.on : null}
 										after={r.after ?? []}
+										also={r.also ?? []}
 										warnings={board?.warnings[r.pr] ?? []}
 									/>
 								{/each}

@@ -288,7 +288,10 @@ function actionLine(a: api.NextAction): string {
 		case 'wait-for':
 			return head(`Wait for #${a.pr}. ${a.why}`);
 		case 'queue':
+		case 'queue-dependency':
 			return head(`Queue #${a.pr} (comment \`/mq queue\` on it). ${a.why}`);
+		case 'edit-dependencies':
+			return head(`Fix or remove that \`Depends-On:\` line in the description. ${a.why}`);
 		case 'mark-ready':
 			return head(`Mark it ready for review. ${a.why}`);
 		case 'fix':

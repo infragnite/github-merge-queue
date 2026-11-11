@@ -420,7 +420,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					authorLogin: p.user?.login ?? '',
 					baseRef: p.base.ref,
 					state: 'open' as const,
-					merged: false
+					merged: false,
+					body: p.body ?? null
 				})),
 			pr: async (n): Promise<LivePR> => {
 				const p = await github.getPR(owner, name, n);
@@ -435,7 +436,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					authorLogin: p.user?.login ?? '',
 					baseRef: p.base.ref,
 					state: p.state,
-					merged: !!p.merged
+					merged: !!p.merged,
+					body: p.body ?? null
 				};
 			},
 			readiness: async (n, headSha, author, opts): Promise<Readiness> => {

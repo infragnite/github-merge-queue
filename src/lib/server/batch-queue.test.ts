@@ -69,6 +69,8 @@ class World {
 	pushPolicyCalls = 0;
 	/** False: the default branch's rules dismiss an approval on a push to the PR. */
 	pushKeepsApproval = true;
+	/** PR descriptions (`Depends-On:` lines), by PR. */
+	bodies = new Map<number, string>();
 
 	files(sha: string) {
 		return new Set(git.git('ls-tree', '-r', '--name-only', sha).split('\n'));
@@ -113,7 +115,8 @@ class World {
 			authorLogin: 'dev',
 			baseRef: p.baseRef,
 			state: p.state,
-			merged: p.merged
+			merged: p.merged,
+			body: this.bodies.get(n) ?? null
 		};
 	}
 
@@ -3106,4 +3109,147 @@ describe('both planners, the same queue', () => {
 			const batch = await outcome(seed, 'batch');
 			expect({ merged: batch.merged, ejected: batch.ejected }).toEqual({ merged: serial.merged, ejected: serial.ejected });
 		});
+});
+
+describe('declared dependencies (Depends-On) at runtime', () => {
+	test('a PR lands after the PR it depends on, though it was queued first', async () => {
+		pr(2);
+		world.bodies.set(2, 'Uses the reader.\n\nDepends-On: #1');
+		pr(1);
+		pr(3);
+		await run();
+		expect(world.started[0].prs).toEqual([1, 2, 3]);
+		expect(world.merged).toEqual([1, 2, 3]);
+		expect(queued()).toEqual([]);
+	});
+
+	test("a PR whose dependency isn't queued is told to queue it, and the rest goes", async () => {
+		pr(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		await run();
+		expect(world.merged).toEqual([3]);
+		expect(world.comments).toEqual([
+			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'dependency-not-queued', reason: "Depends on #1, which isn't queued" }) }
+		]);
+		expect(world.comments[0].body).toMatch(/^\*\*Merge queue:\*\* Depends on #1, which isn't queued\. Queue the PR it depends on, or remove that Depends-On line\./);
+		expect(queued()).toEqual([{ pr: 2, status: 'queued' }]);
+	});
+
+	test('a merged dependency is done: the PR goes as it is', async () => {
+		pr(1);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.merge(1, 'squash');
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		await run();
+		expect(world.merged).toEqual([2]);
+	});
+
+	test('a dependency closed without merging holds the PR until it is reopened or the line removed', async () => {
+		pr(1);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.close(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		await run(3);
+		expect(world.merged).toEqual([]);
+		expect(world.comments.map((c) => readNotice(c.body))).toEqual([expect.objectContaining({ pr: 2, code: 'dependency-closed', reason: 'Depends on #1, which was closed without merging' })]);
+		// The author removes the line: it goes.
+		world.bodies.set(2, 'No dependencies after all.');
+		await run();
+		expect(world.merged).toEqual([2]);
+	});
+
+	test('a cycle of declarations holds every PR in it', async () => {
+		pr(1);
+		pr(2);
+		world.bodies.set(1, 'Depends-On: #2');
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		await run();
+		expect(world.merged).toEqual([3]);
+		expect(world.comments.map((c) => [c.pr, readNotice(c.body)?.code, readNotice(c.body)?.reason])).toEqual([
+			[1, 'dependency-cycle', 'Depends on itself through #2'],
+			[2, 'dependency-cycle', 'Depends on itself through #1']
+		]);
+	});
+
+	test('bisection: a breaker is ejected, and the PR that depends on it goes back in line, not ejected', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'x-breaks-master.txt' });
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(60);
+		expect(world.merged).toEqual([3]);
+		expect(db.getRepoHistory(repo.id).find((h) => h.pr_number === 1)?.status).toBe('failed');
+		expect(db.getRepoHistory(repo.id).find((h) => h.pr_number === 2)).toBeUndefined();
+		expect(queued()).toEqual([{ pr: 2, status: 'queued' }]);
+		// No run ever held #2 without #1.
+		for (const r of world.started) if (r.prs.includes(2)) expect(r.prs).toContain(1);
+		expect(world.comments.filter((c) => c.pr === 2).map((c) => readNotice(c.body)?.code)).toContain('dependency-not-queued');
+	});
+
+	test('a closed dependency is asked about once, not on every tick', async () => {
+		pr(1);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.close(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1, #77');
+		world.deleted.add(77);
+		await run(1);
+		const calls = world.prCalls;
+		await run(5);
+		expect(world.prCalls).toBe(calls);
+	});
+
+	test('declaring the git parent again records nothing extra', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		world.bodies.set(2, 'Depends-On: #1');
+		world.hold = () => true;
+		await run(1);
+		const it = db.getQueueItems(repo.id).find((i) => i.pr_number === 2)! as { depends_on?: string | null };
+		expect(store.dependsOn(it)).toEqual([]);
+	});
+
+	test('bisection keeps the dependencies a PR was batched with, even if its description changes meanwhile', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'x-breaks-master.txt' });
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		world.breakingFiles.add('x-breaks-master.txt');
+		// The bisection runs take long; meanwhile #2's author drops the line.
+		world.hold = (prs) => prs.length < 3;
+		await run(4);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('bisecting');
+		world.bodies.set(2, 'No dependencies.');
+		world.hold = () => false;
+		await run(40);
+		const batch = store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!;
+		const runs = world.started.filter((r) => r.branch.startsWith(`${batch.branch}-bisect-`));
+		for (const r of runs) if (r.prs.includes(2)) expect(r.prs, JSON.stringify(runs)).toContain(1);
+		expect(batch.landed).not.toContain(2);
+	});
+
+	test('landing: a dependency pushed to after the batch was built stays out, and its dependent with it', async () => {
+		pr(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		// While the batch is tested, #1's author pushes.
+		world.hold = () => true;
+		await run(2);
+		expect(world.started.map((r) => r.prs)).toEqual([[1, 2, 3]]);
+		git.commit('pr1', 'pr1 again', 'pr1-more.txt');
+		world.hold = () => false;
+		await run(1);
+		expect(world.merged).toEqual([3]);
+		expect(queued().map((q) => q.pr).sort()).toEqual([1, 2]);
+	});
 });

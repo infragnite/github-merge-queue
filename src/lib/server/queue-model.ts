@@ -9,9 +9,11 @@
 // Pure: the runtime gathers the queue, PR states, the stack analysis and known conflicts.
 
 import { admit, type Admission, type BatchConfig, type Hold, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
+import type { DependencyGraph } from './deps';
 import type { StackAnalysis } from './stacks';
 
 const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
+const PRIORITIES: Priority[] = ['urgent', 'normal', 'low'];
 
 export interface QueueModelInput {
 	/** The queued PRs (not those being tested). */
@@ -23,18 +25,37 @@ export interface QueueModelInput {
 	inflight: Set<number>;
 	/** PRs that need someone whatever their admission says (a known conflict, a failure), with why. */
 	problems?: Map<number, { code: HoldCode; reason: string }>;
+	/**
+	 * Each PR's git parent and the dependencies it declares (`Depends-On:`, see deps.ts), cycles
+	 * already cut. By default only the git parent.
+	 */
+	deps?: Pick<DependencyGraph, 'depsOf' | 'declaredOf'>;
 }
 
 export interface QueueStack {
 	/** The PR at the bottom of the stack: members[0]. */
 	root: number;
-	/** The PRs that can go, parents first, each branch whole (preorder), branches in queue order. */
+	/**
+	 * The PRs that can go, in landing order: each after everything it depends on, each branch whole
+	 * (preorder) where it can be, branches in queue order. A prefix of it is always buildable.
+	 */
 	members: number[];
-	/** Each member's parent within the stack; null for the root. */
+	/**
+	 * Each member's place in the stack drawn as a tree: the member it comes after, the one of its
+	 * dependencies here placed last (its git parent in a plain stack); null for a member that
+	 * depends on nothing here.
+	 */
 	parentOf: Map<number, number | null>;
-	/** The PR being tested that the root sits on, or null when it sits on the default branch. */
+	/** Each member's dependencies within the stack (its git parent first, then what it declares). */
+	needs: Map<number, number[]>;
+	/** The PR being tested that a member depends on, or null when the stack sits on the default branch. */
 	on: number | null;
-	/** Its most urgent member's priority. */
+	/**
+	 * Queued PRs of earlier stacks that members depend on: a less urgent PR that declares a
+	 * dependency on a more urgent one follows it in a stack of its own.
+	 */
+	after: number[];
+	/** Its most urgent member's priority, or that of a PR depending on it. */
 	priority: Priority;
 	/** When its earliest member was queued. */
 	enqueuedAt: number;
@@ -60,10 +81,17 @@ const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? s[0].toLowerCase() + 
 export function queueModel(input: QueueModelInput): QueueModel {
 	const { queue, analysis, inflight } = input;
 	const entries = new Map(queue.filter((e) => !inflight.has(e.pr)).map((e) => [e.pr, e]));
-	const parentOf = (n: number) => {
+	const gitParent = (n: number) => {
 		const p = analysis.prs.get(n)?.parent ?? null;
 		return p !== null && analysis.prs.has(p) ? p : null;
 	};
+	const depsOf = input.deps
+		? (n: number) => input.deps!.depsOf(n)
+		: (n: number) => {
+				const p = gitParent(n);
+				return p === null ? [] : [p];
+			};
+	const declared = (n: number) => (input.deps ? input.deps.declaredOf(n).filter((d) => d !== gitParent(n)) : []);
 	const byOrder = (a: number, b: number) => {
 		const x = entries.get(a)!;
 		const y = entries.get(b)!;
@@ -78,17 +106,25 @@ export function queueModel(input: QueueModelInput): QueueModel {
 		if (problem) own.set(n, problem);
 		else if (a && !a.ok) own.set(n, { code: a.code, reason: a.reason });
 		else {
-			const p = parentOf(n);
-			if (p !== null && !entries.has(p) && !inflight.has(p)) own.set(n, { code: 'parent-not-queued', reason: `Stacked on #${p}, which isn't queued; queue #${p} first` });
+			const missing = (d: number) => !entries.has(d) && !inflight.has(d);
+			const p = gitParent(n);
+			const d = declared(n).find(missing);
+			if (p !== null && missing(p)) own.set(n, { code: 'parent-not-queued', reason: `Stacked on #${p}, which isn't queued; queue #${p} first` });
+			else if (d !== undefined) own.set(n, { code: 'dependency-not-queued', reason: `Depends on #${d}, which isn't queued` });
 		}
 	}
 
-	// A held PR holds its branch: the nearest held PR below decides.
+	// A held PR holds what depends on it: the first held PR found below decides.
 	const holder = new Map<number, number | null>();
 	const heldBy = (n: number): number | null => {
 		if (holder.has(n)) return holder.get(n)!;
-		const p = parentOf(n);
-		const below = p !== null && entries.has(p) ? (own.has(p) ? p : heldBy(p)) : null;
+		holder.set(n, null); // never loops, whatever the graph
+		let below: number | null = null;
+		for (const p of depsOf(n)) {
+			if (!entries.has(p)) continue;
+			below = own.has(p) ? p : heldBy(p);
+			if (below !== null) break;
+		}
 		holder.set(n, below);
 		return below;
 	};
@@ -110,31 +146,64 @@ export function queueModel(input: QueueModelInput): QueueModel {
 		attention.push(held);
 	}
 
-	// Stacks of the free PRs: a free PR whose parent is free joins its parent's stack.
+	// Priority: a git stack shares its most urgent member's own; what a PR depends on (git parent or
+	// declared) takes on the priority of what depends on it, never the other way, so a lifted
+	// dependency does not lift its other git children.
 	const freeSet = new Set(free);
-	const children = new Map<number, number[]>();
-	const roots: number[] = [];
-	for (const n of free) {
-		const p = parentOf(n);
-		if (p !== null && freeSet.has(p)) children.set(p, [...(children.get(p) ?? []), n]);
-		else roots.push(n);
+	const inFree = (n: number) => depsOf(n).filter((p) => freeSet.has(p));
+	const own0 = new Map(free.map((n) => [n, RANK[entries.get(n)!.priority]]));
+	const gitRoot = (n: number): number => {
+		const p = gitParent(n);
+		return p !== null && freeSet.has(p) ? gitRoot(p) : n;
+	};
+	const stackRank = new Map<number, number>();
+	for (const n of free) stackRank.set(gitRoot(n), Math.min(stackRank.get(gitRoot(n)) ?? Infinity, own0.get(n)!));
+	const eff = new Map(free.map((n) => [n, stackRank.get(gitRoot(n))!]));
+	for (let changed = true; changed; ) {
+		changed = false;
+		for (const n of free) {
+			for (const p of inFree(n)) {
+				if (eff.get(p)! > eff.get(n)!) {
+					eff.set(p, eff.get(n)!);
+					changed = true;
+				}
+			}
+		}
 	}
-	const stacks: QueueStack[] = roots.map((root) => {
+
+	// Stacks: free PRs of one priority joined by git parents and declarations.
+	const unit = new Map(free.map((n) => [n, n]));
+	const find = (n: number): number => (unit.get(n) === n ? n : find(unit.get(n)!));
+	for (const n of free) for (const p of inFree(n)) if (eff.get(p) === eff.get(n)) unit.set(find(n), find(p));
+	const groups = new Map<number, number[]>();
+	for (const n of free) groups.set(find(n), [...(groups.get(find(n)) ?? []), n]);
+
+	const stacks: QueueStack[] = [...groups.values()].map((group) => {
+		const set = new Set(group);
+		const needs = new Map(group.map((n) => [n, inFree(n).filter((p) => set.has(p))]));
 		const members: number[] = [];
 		const within = new Map<number, number | null>();
+		const placed = new Set<number>();
+		// Preorder from the PRs that need nothing here; a PR that needs several goes right after the
+		// last of them is placed. A plain stack is a tree, and this is its preorder.
 		const visit = (n: number, up: number | null) => {
 			members.push(n);
 			within.set(n, up);
-			for (const c of [...(children.get(n) ?? [])].sort(byOrder)) visit(c, n);
+			placed.add(n);
+			const kids = group.filter((c) => needs.get(c)!.includes(n)).sort(byOrder);
+			for (const c of kids) if (!placed.has(c) && needs.get(c)!.every((p) => placed.has(p))) visit(c, n);
 		};
-		visit(root, null);
+		for (const r of group.filter((n) => needs.get(n)!.length === 0).sort(byOrder)) visit(r, null);
+		const outside = members.flatMap((m) => depsOf(m).filter((p) => !set.has(p)));
 		const es = members.map((m) => entries.get(m)!);
 		return {
-			root,
+			root: members[0],
 			members,
 			parentOf: within,
-			on: parentOf(root),
-			priority: es.reduce<Priority>((best, e) => (RANK[e.priority] < RANK[best] ? e.priority : best), 'low'),
+			needs,
+			on: outside.find((p) => inflight.has(p)) ?? null,
+			after: [...new Set(outside.filter((p) => freeSet.has(p)))],
+			priority: PRIORITIES[Math.min(...members.map((m) => eff.get(m)!))],
 			enqueuedAt: Math.min(...es.map((e) => e.enqueuedAt))
 		};
 	});
@@ -164,11 +233,16 @@ export function fillBatch(model: QueueModel, opts: { config: BatchConfig; inflig
 	const express = model.stacks[0].priority === 'urgent';
 	const candidates = express ? model.stacks.filter((s) => s.priority === 'urgent') : model.stacks;
 	const batch: number[] = [];
+	const taken = new Set<number>();
 	let oldest = Infinity;
 	for (const s of candidates) {
 		const left = config.maxBatch - batch.length;
 		if (left <= 0) break;
-		batch.push(...s.members.slice(0, left));
+		// Never before what it depends on: a stack that follows another goes only with it.
+		if (s.after.some((p) => !taken.has(p))) continue;
+		const part = s.members.slice(0, left);
+		batch.push(...part);
+		for (const p of part) taken.add(p);
 		oldest = Math.min(oldest, s.enqueuedAt);
 	}
 	if (!express && batch.length < config.maxBatch && config.collectWindowMs > 0) {
@@ -181,19 +255,23 @@ export function fillBatch(model: QueueModel, opts: { config: BatchConfig; inflig
 /** One by one: the head stack that sits on nothing being tested, whole; nothing while a run is in flight. */
 export function serialPick(model: QueueModel, opts: { inflight: number }): number[] | null {
 	if (opts.inflight > 0) return null;
-	return model.stacks.find((s) => s.on === null)?.members ?? null;
+	return model.stacks.find((s) => s.on === null && s.after.length === 0)?.members ?? null;
 }
 
 /**
  * What the queue tests next: in batches, a new batch filled from the queue model; one by one, the
  * head stack whole.
  */
-export function planNextBatch(input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial'; held?: Map<number, Hold> }): Plan {
+export function planNextBatch(
+	input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial'; held?: Map<number, Hold>; dependencies?: DependencyGraph }
+): Plan {
 	const inflight = new Set(input.inflight.flat());
 	const conflicts = [...(input.conflicts ?? [])].map(([pr, reason]) => [pr, { code: 'conflict' as const, reason }] as const);
 	const admitted = plannedAdmission(input);
 	const admission = (n: number) => input.held?.get(n) ?? admitted(n);
-	const model = queueModel({ queue: input.queue, admission, analysis: input.analysis, inflight, problems: new Map(conflicts) });
+	// A known conflict is said before a problem with the PR's declarations.
+	const problems = new Map([...(input.dependencies?.problems ?? []), ...conflicts]);
+	const model = queueModel({ queue: input.queue, admission, analysis: input.analysis, inflight, problems, deps: input.dependencies });
 	const fill: FillResult =
 		input.strategy === 'serial'
 			? { batch: serialPick(model, { inflight: input.inflight.length }), express: false, waitUntil: null }
@@ -230,7 +308,13 @@ export interface BoardItem {
 }
 
 export interface QueueBoard {
-	stacks: Array<{ root: number; on: number | null; priority: Priority; rows: Array<{ pr: number; depth: number; parent: number | null; after?: number[] }> }>;
+	stacks: Array<{
+		root: number;
+		on: number | null;
+		priority: Priority;
+		/** `also`: what the PR depends on here besides the row it is drawn under; `after`: PRs it conflicts with ahead. */
+		rows: Array<{ pr: number; depth: number; parent: number | null; also?: number[]; after?: number[] }>;
+	}>;
 	attention: Held[];
 }
 
@@ -238,10 +322,10 @@ export interface QueueBoard {
  * The queue model as the queue page shows it, from the queue rows and the holds the planner
  * recorded: the same stacks, order and reasons the planners work from.
  */
-export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight: Set<number>): QueueBoard {
+export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight: Set<number>, deps?: DependencyGraph): QueueBoard {
 	const live = items.filter((i) => i.status !== 'merged' && i.status !== 'cancelled' && !inflight.has(i.pr));
 	const byPr = new Map(live.map((i) => [i.pr, i]));
-	const problems = new Map<number, { code: HoldCode; reason: string }>();
+	const problems = new Map<number, { code: HoldCode; reason: string }>(deps?.problems ?? []);
 	for (const i of live) {
 		if (i.status === 'conflict') problems.set(i.pr, { code: 'conflict', reason: i.message ?? 'Merge conflict' });
 		if (i.status === 'failed') problems.set(i.pr, { code: 'failed', reason: i.message ?? 'Failed' });
@@ -260,7 +344,8 @@ export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight
 		admission,
 		analysis,
 		inflight,
-		problems
+		problems,
+		deps
 	});
 	return {
 		stacks: model.stacks.map((s) => {
@@ -273,7 +358,8 @@ export function queueBoard(items: BoardItem[], analysis: StackAnalysis, inflight
 					const parent = s.parentOf.get(pr) ?? null;
 					depth.set(pr, parent === null ? 0 : depth.get(parent)! + 1);
 					const after = byPr.get(pr)?.after ?? [];
-					return { pr, depth: depth.get(pr)!, parent, ...(after.length ? { after } : {}) };
+					const also = (s.needs.get(pr) ?? []).filter((d) => d !== parent);
+					return { pr, depth: depth.get(pr)!, parent, ...(also.length ? { also } : {}), ...(after.length ? { after } : {}) };
 				})
 			};
 		}),
