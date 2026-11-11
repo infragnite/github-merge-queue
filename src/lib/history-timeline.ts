@@ -30,6 +30,15 @@ export function historyTimeline<R extends HistoryRow>(recent: BatchCard[], histo
 		else out.push({ kind: 'pr', key: `h${row.id}`, at: done, row });
 	}
 	for (const b of batches) b.rows.sort((x, y) => b.card.prs.findIndex((p) => p.pr === x.pr_number) - b.card.prs.findIndex((p) => p.pr === y.pr_number));
-	out.push(...batches.map(({ kind, key, at, card, rows }) => ({ kind, key, at, card, rows })));
+	out.push(
+		...batches.map(({ kind, key, at, card, rows }) => ({
+			kind,
+			key,
+			at,
+			// Titles of PRs no longer open are known only from what the history kept.
+			card: { ...card, prs: card.prs.map((p) => ({ ...p, title: p.title || rows.find((r) => r.pr_number === p.pr)?.pr_title || '' })) },
+			rows
+		}))
+	);
 	return out.sort((x, y) => y.at - x.at || (x.kind === 'pr' ? -1 : 1));
 }

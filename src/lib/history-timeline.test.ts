@@ -31,6 +31,11 @@ describe('history: finished batches and merged PRs in one list', () => {
 		expect(t[0]).toMatchObject({ kind: 'batch', rows: [{ pr_number: 3 }, { pr_number: 4 }] });
 	});
 
+	test('a batch PR without a known title takes the one its history row kept', () => {
+		const t = historyTimeline([batch(1, [1, 2], '2026-11-11 09:00:00', '2026-11-11 09:30:00')], [row(11, 1, '2026-11-11 09:31:00')]);
+		expect(t[0].kind === 'batch' && t[0].card.prs.map((p) => p.title)).toEqual(['PR 1', '']);
+	});
+
 	test('a PR that went through a failed batch and landed in a later one belongs to the later one', () => {
 		const recent = [batch(2, [1], '2026-11-11 10:00:00', '2026-11-11 10:30:00'), batch(1, [1, 2], '2026-11-11 09:00:00', '2026-11-11 09:30:00', 'failed')];
 		const t = historyTimeline(recent, [row(11, 1, '2026-11-11 10:31:00')]);
