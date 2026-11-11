@@ -13,6 +13,7 @@
 		depth = 0,
 		parent = null,
 		after = [],
+		also = [],
 		why = null,
 		needsSomeone = false,
 		warnings = [],
@@ -31,6 +32,8 @@
 		parent?: number | null;
 		/** PRs ahead it conflicts with: it goes once they land. */
 		after?: number[];
+		/** PRs in line above it that it also depends on (`Depends-On:`), besides the one it sits under. */
+		also?: number[];
 		/** Why the planner holds it, for a row under "Waiting" or "Needs attention". */
 		why?: string | null;
 		/** The hold needs someone to act, not only time. */
@@ -81,6 +84,9 @@
 			{#if parent !== null}
 				<a href={prLink(parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Stacked on #{parent}; lands after it">on #{parent}</a>
 			{/if}
+			{#each also as d (d)}
+				<a href={prLink(d)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Depends on #{d}; lands after it">needs #{d}</a>
+			{/each}
 			{#if after.length}
 				<span class="shrink-0 rounded bg-gray-100 px-1 text-xs text-gray-600" title="Conflicts with {after.map((n) => `#${n}`).join(', ')}, ahead of it; it goes once they land">after {after.map((n) => `#${n}`).join(' ')}</span>
 			{/if}

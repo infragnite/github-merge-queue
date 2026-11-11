@@ -9,7 +9,7 @@ import {
 } from '$lib/server/db';
 import { getOpenPRs, rateLimitOf, getPR } from '$lib/server/github';
 import { atLeast, AuthError, requireRole, type Caller, type Role } from '$lib/server/api-auth';
-import { ApiError, boardItem, changeEntry, enqueue } from '$lib/server/api-service';
+import { ApiError, boardItem, changeEntry, enqueue, storedDependencies } from '$lib/server/api-service';
 import { webCaller } from '$lib/server/web-auth';
 import { knownPublic, noteReadOnlyView, publicHistory, publicQueueItem, prUrl } from '$lib/server/public-view';
 import { savingsFor } from '$lib/server/ci-savings';
@@ -124,7 +124,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 			const w = a.analysis.prs.get(i.pr)?.issues.filter((x) => x.severity === 'warning').map((x) => x.message) ?? [];
 			if (w.length) warnings[i.pr] = w;
 		}
-		return { ...queueBoard(boardItems, a.analysis, inflight), warnings, error: a.error };
+		return { ...queueBoard(boardItems, a.analysis, inflight, storedDependencies(rawItems, a.analysis)), warnings, error: a.error };
 	});
 
 	const queuedNumbers = new Set(queueItems.map((i) => i.pr_number));

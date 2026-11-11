@@ -137,6 +137,8 @@ const STEP_IDS: Record<string, string | null> = {
 	restack: 'restack',
 	'retarget-base': 'retarget',
 	queue: 'queue-parent',
+	'queue-dependency': 'queue-dependency',
+	'edit-dependencies': 'edit-dependencies',
 	'resolve-conflict': 'resolve-conflict',
 	'mark-ready': 'mark-ready',
 	'wait-for': null,

@@ -11,6 +11,7 @@
 //
 // Everything here is pure; the runtime builds branches, runs CI and lands.
 
+import type { DependencyGraph } from './deps';
 import type { PRStackInfo, StackAnalysis } from './stacks';
 
 export type Priority = 'urgent' | 'normal' | 'low';
@@ -776,34 +777,62 @@ export function planRedBatch(input: {
 	tried: (n: number, alone: boolean) => boolean;
 	/** Every PR still in the queue, also those being tested in another batch. */
 	live?: Set<number>;
+	/** Git parents and declared dependencies (see deps.ts); by default only git parents. */
+	dependencies?: Pick<DependencyGraph, 'depsOf' | 'problems'>;
 }): Pick<Plan, 'batch' | 'express' | 'held'> {
 	const { queue, states, analysis, config, tried } = input;
 	const held: Plan['held'] = [];
 	const ok = new Map<number, QueueEntry>();
 	for (const e of queue) {
-		const a = admit(states.get(e.pr)!, analysis, config);
+		const problem = input.dependencies?.problems.get(e.pr);
+		const a: Admission | Hold = problem ? { ok: false, ...problem } : admit(states.get(e.pr)!, analysis, config);
 		if (a.ok) ok.set(e.pr, e);
 		else held.push({ pr: e.pr, admission: a });
 	}
 	const queued = input.live ?? new Set(queue.map((e) => e.pr));
+	const depsOf =
+		input.dependencies?.depsOf ??
+		((n: number) => {
+			const p = openParent(analysis, n);
+			return p === null ? [] : [p];
+		});
+	/** `n` with everything it depends on, each after what it needs; null when one of them can't go. */
 	const chainOf = (n: number): number[] | null => {
-		const out = [n];
-		for (let p = openParent(analysis, n); p !== null; p = openParent(analysis, p)) {
-			if (out.includes(p)) return null; // a cycle in the analysis: never loop
-			if (!ok.has(p)) {
-				if (!held.some((h) => h.pr === n)) held.push({
-					pr: n,
-					admission: {
-						ok: false,
-						code: 'parent-not-ready',
-						reason: queued.has(p) ? `Stacked on #${p}, which can't be batched yet` : `Stacked on #${p}, which isn't merged or queued; queue #${p} first`
-					}
-				});
-				return null;
+		const out: number[] = [];
+		const seen = new Set<number>();
+		let blocked: { below: number; on: number } | null = null;
+		const visit = (m: number) => {
+			if (seen.has(m) || blocked) return; // seen: never loops, whatever the graph
+			seen.add(m);
+			for (const p of depsOf(m)) {
+				if (!ok.has(p)) {
+					blocked ??= { below: m, on: p };
+					return;
+				}
+				visit(p);
 			}
-			out.unshift(p);
-		}
-		return out;
+			out.push(m);
+		};
+		visit(n);
+		if (!blocked) return out;
+		const { below, on: p } = blocked;
+		const stacked = openParent(analysis, below) === p;
+		if (!held.some((h) => h.pr === n))
+			held.push({
+				pr: n,
+				admission: {
+					ok: false,
+					code: 'parent-not-ready',
+					reason: stacked
+						? queued.has(p)
+							? `Stacked on #${p}, which can't be batched yet`
+							: `Stacked on #${p}, which isn't merged or queued; queue #${p} first`
+						: queued.has(p)
+							? `Depends on #${p}, which can't be batched yet`
+							: `Depends on #${p}, which isn't merged or queued; queue #${p} first`
+				}
+			});
+		return null;
 	};
 	const ordered = [...ok.values()].sort(byQueueOrder((e) => PRIORITY_RANK[e.priority]));
 	const chains = (alone: boolean) =>

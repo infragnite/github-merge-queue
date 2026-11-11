@@ -11,6 +11,7 @@ import { COMMENT_MODES, DEFAULT_BATCH_CONFIG, type BatchConfig, type CommentMode
 import type { BatchRow } from './batch-store';
 import { restackCommand, type PRStackInfo, type StackAnalysis, type StackIssue } from './stacks';
 import { queueBoard, type BoardItem } from './queue-model';
+import { dependencyGraph, type DependencyGraph } from './deps';
 import type { HoldCode } from './batching';
 import type { QueueItem, Repo } from '$lib/types';
 
@@ -30,7 +31,9 @@ export type NextAction =
 	| { do: 'queue'; pr: number; why: string }
 	| { do: 'fix'; why: string }
 	| { do: 'mark-ready'; why: string }
-	| { do: 'resolve-conflict'; cmd: string; why: string };
+	| { do: 'resolve-conflict'; cmd: string; why: string }
+	| { do: 'queue-dependency'; pr: number; why: string }
+	| { do: 'edit-dependencies'; why: string };
 
 type Q = QueueItem & { priority?: Priority };
 
@@ -60,6 +63,19 @@ export function boardItem(i: QueueItem, message: string | null = i.error_message
 const NO_STACKS: StackAnalysis = { prs: new Map(), stacks: [], issues: [] };
 
 /**
+ * What queued PRs depend on, from what the planner last read of their descriptions: so the queue
+ * page and the API order the queue as the planner does, without asking GitHub.
+ */
+export function storedDependencies(items: Array<QueueItem & { depends_on?: string | null }>, analysis: StackAnalysis): DependencyGraph {
+	const on = new Map<number, number[]>();
+	for (const i of items) {
+		const d = store.dependsOn(i);
+		if (d.length) on.set(i.pr_number, d);
+	}
+	return dependencyGraph(analysis, { on, problems: new Map() });
+}
+
+/**
  * Queue items in the order the queue takes them, from the planners' own queue model: PRs being
  * tested, in their batches' order; then whole stacks (a stack goes by its most urgent member and
  * its earliest place in line, children after their parent); then held PRs. Without a stack
@@ -67,7 +83,8 @@ const NO_STACKS: StackAnalysis = { prs: new Map(), stacks: [], issues: [] };
  */
 function inQueueOrder(repoId: number, items: Q[], analysis: StackAnalysis | null): Q[] {
 	const testing = store.getActiveBatches(repoId).flatMap(inBatchNow);
-	const board = queueBoard(items.map((i) => boardItem(i)), analysis ?? NO_STACKS, new Set(testing));
+	const a = analysis ?? NO_STACKS;
+	const board = queueBoard(items.map((i) => boardItem(i)), a, new Set(testing), storedDependencies(items, a));
 	const order = [...new Set([...testing, ...board.stacks.flatMap((s) => s.rows.map((r) => r.pr)), ...board.attention.map((h) => h.pr)])];
 	const at = new Map(order.map((n, k) => [n, k]));
 	// Rows the model leaves out (merged, cancelled) keep their place after the rest; the sort is stable.
@@ -155,6 +172,10 @@ function holdActions(it: QueueItem, hold: store.Hold): NextAction[] {
 		case 'stale-approval':
 		case 'changes-requested':
 			return [{ do: 'fix', why: hold.reason }];
+		case 'dependency-closed':
+		case 'dependency-invalid':
+		case 'dependency-cycle':
+			return [{ do: 'edit-dependencies', why: hold.reason }];
 		case 'deferred': {
 			// It conflicts with PRs ahead of it: there is nothing to do but wait for them to land.
 			const ahead = store.deferredFor(it as QueueItem & { deferred_for?: string | null });
@@ -169,7 +190,17 @@ function holdActions(it: QueueItem, hold: store.Hold): NextAction[] {
 export function stackState(repo: Repo, n: number, analysis: StackAnalysis) {
 	const info = analysis.prs.get(n);
 	if (!info) throw new ApiError(404, `#${n} is not an open pull request in ${repo.owner}/${repo.name}`);
-	const queued = new Set(db.getQueueItems(repo.id).map((i) => i.pr_number));
+	const items = db.getQueueItems(repo.id) as Array<QueueItem & { depends_on?: string | null }>;
+	const queued = new Set(items.map((i) => i.pr_number));
+	// What it declares (`Depends-On:`), as the planner last read it, and the queued PRs declaring it.
+	const mine = items.find((i) => i.pr_number === n);
+	const dependsOn = mine ? store.dependsOn(mine) : [];
+	const neededBy = items.filter((i) => store.dependsOn(i).includes(n)).map((i) => i.pr_number);
+	const dependencyActions: NextAction[] = dependsOn.map((d) =>
+		queued.has(d)
+			? { do: 'wait-for', pr: d, why: `Depends on #${d}; the queue lands #${d} first, or in the same batch` }
+			: { do: 'queue-dependency', pr: d, why: `Depends on #${d}, which isn't queued; queue #${d} so this PR can follow it` }
+	);
 	// The stack from its root down, parents before children.
 	let root = n;
 	while (analysis.prs.get(root)?.parent != null && analysis.prs.has(analysis.prs.get(root)!.parent!)) {
@@ -186,8 +217,10 @@ export function stackState(repo: Repo, n: number, analysis: StackAnalysis) {
 		expectedBase: info.expectedBase,
 		stack: tree(analysis, root),
 		issues: info.issues,
+		dependsOn,
+		neededBy,
 		queue: queueEntry(repo.id, n, analysis),
-		nextActions: [...queueActions(repo, n, info), ...nextActions(info, analysis, repo.default_branch, queued)]
+		nextActions: [...queueActions(repo, n, info), ...nextActions(info, analysis, repo.default_branch, queued), ...dependencyActions]
 	};
 }
 
