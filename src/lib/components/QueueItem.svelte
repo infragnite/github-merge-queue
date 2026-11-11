@@ -115,7 +115,7 @@
 				onchange={(e) => e.currentTarget.form?.requestSubmit()}
 				class="rounded border border-border-subtle bg-transparent py-0.5 pl-1 pr-6 text-xs text-gray-600"
 				aria-label="Priority of #{item.pr_number}"
-				title="Urgent PRs go first, in a small express batch"
+				title="Urgent PRs go first, together in an express batch"
 			>
 				<option value="urgent" disabled={!canUrgent && priority !== 'urgent'}>urgent</option>
 				<option value="normal">normal</option>
