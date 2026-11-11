@@ -11,6 +11,7 @@
 	import { queueSummary } from '$lib/queue-summary';
 	import { page } from '$app/state';
 	import AddPrDialog from '$lib/components/AddPrDialog.svelte';
+	import { touchDrag } from '$lib/touch-drag';
 
 	let { data, form } = $props();
 
@@ -132,7 +133,12 @@
 		return () => clearInterval(id);
 	});
 
-	function handleDragStart(index: number) {
+	function handleDragStart(e: DragEvent, index: number) {
+		// Some mobile browsers start a native drag on a long press; touch drags go through touchDrag.
+		if (touch.dragging) {
+			e.preventDefault();
+			return;
+		}
 		dragIndex = index;
 	}
 
@@ -148,7 +154,11 @@
 
 	async function handleDrop(e: DragEvent, dropIndex: number) {
 		e.preventDefault();
-		if (dragIndex === null || dragIndex === dropIndex || needle) {
+		await reorder(dragIndex, dropIndex);
+	}
+
+	async function reorder(dragIndex: number | null, dropIndex: number | null) {
+		if (dragIndex === null || dropIndex === null || dragIndex === dropIndex || needle) {
 			handleDragEnd();
 			return;
 		}
@@ -175,6 +185,65 @@
 		await invalidateAll();
 		reordering = false;
 		handleDragEnd();
+	}
+
+	// Touch and pen: the grip drags at once, the rest of a card after a long press (see touchDrag).
+	let touchEl: Element | null = null;
+	let touchPointer = 0;
+	const touch = touchDrag({
+		start: (index) => {
+			try {
+				touchEl?.setPointerCapture(touchPointer);
+			} catch {
+				return false; // the pointer is already gone
+			}
+			dragIndex = index;
+			dragOverIndex = index;
+			navigator.vibrate?.(10);
+			return true;
+		},
+		over: (index) => (dragOverIndex = index),
+		drop: (from, to) => reorder(from, to),
+		cancel: handleDragEnd
+	});
+
+	// Once a touch drag runs the page must not scroll under it. Needs a non-passive listener,
+	// which Svelte's ontouchmove isn't.
+	$effect(() => {
+		const block = (e: TouchEvent) => {
+			if (touch.dragging) e.preventDefault();
+		};
+		document.addEventListener('touchmove', block, { passive: false });
+		return () => document.removeEventListener('touchmove', block);
+	});
+
+	const stackUnder = (e: PointerEvent) => {
+		const el = document.elementFromPoint(e.clientX, e.clientY)?.closest<HTMLElement>('[data-stack-index]');
+		return el ? Number(el.dataset.stackIndex) : null;
+	};
+
+	function handlePointerDown(e: PointerEvent, index: number) {
+		if (e.pointerType === 'mouse') return;
+		const target = e.target as Element;
+		const handle = !!target.closest('[data-drag-handle]');
+		// Links and buttons keep their own long press (and taps).
+		if (!handle && target.closest('a, button, summary, input, select')) return;
+		if (handle) e.preventDefault();
+		touchEl = e.currentTarget as Element;
+		touchPointer = e.pointerId;
+		touch.down(index, { x: e.clientX, y: e.clientY, over: index }, { handle });
+	}
+
+	function handlePointerMove(e: PointerEvent) {
+		if (e.pointerType === 'mouse') return;
+		touch.move({ x: e.clientX, y: e.clientY, over: touch.dragging ? stackUnder(e) : null });
+	}
+
+	function handlePointerEnd(e: PointerEvent) {
+		if (e.pointerType === 'mouse') return;
+		// A mouse drag fires pointercancel when the HTML5 drag takes over; that is skipped above.
+		if (e.type === 'pointercancel') touch.cancel();
+		else touch.up();
 	}
 
 </script>
@@ -327,11 +396,17 @@
 							<div
 								role="listitem"
 								draggable={drag ? 'true' : undefined}
-								ondragstart={drag ? () => handleDragStart(index) : undefined}
+								ondragstart={drag ? (e) => handleDragStart(e, index) : undefined}
 								ondragover={drag ? (e) => handleDragOver(e, index) : undefined}
 								ondrop={drag ? (e) => handleDrop(e, index) : undefined}
 								ondragend={drag ? handleDragEnd : undefined}
-								class="border-b border-border-subtle last:border-b-0 {st.rows.length > 1 ? 'border-l-2 border-l-sky-200' : ''} {dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-t-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
+								onpointerdown={drag ? (e) => handlePointerDown(e, index) : undefined}
+								onpointermove={drag ? handlePointerMove : undefined}
+								onpointerup={drag ? handlePointerEnd : undefined}
+								onpointercancel={drag ? handlePointerEnd : undefined}
+								oncontextmenu={drag ? (e) => touch.blocksMenu && e.preventDefault() : undefined}
+								data-stack-index={index}
+								class="{drag ? 'pointer-coarse:select-none pointer-coarse:[-webkit-touch-callout:none]' : ''} border-b border-border-subtle last:border-b-0 {st.rows.length > 1 ? 'border-l-2 border-l-sky-200' : ''} {dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-t-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
 							>
 								{#each st.rows as r, k (r.pr)}
 									<QueueItem

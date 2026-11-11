@@ -53,6 +53,17 @@
 	const note = $derived(why);
 	const noteTone = $derived(needsSomeone ? 'text-red-700' : 'text-gray-500');
 	const prLink = (n: number) => `https://github.com/${repoOwner}/${repoName}/pull/${n}`;
+
+	// Svelte adds touchstart as passive: a non-passive one keeps a press on the grip from selecting
+	// text or opening the callout.
+	let handle = $state<HTMLSpanElement | null>(null);
+	$effect(() => {
+		if (!handle) return;
+		const el = handle;
+		const prevent = (e: TouchEvent) => e.preventDefault();
+		el.addEventListener('touchstart', prevent, { passive: false });
+		return () => el.removeEventListener('touchstart', prevent);
+	});
 </script>
 
 <div
@@ -62,7 +73,14 @@
 	style={depth ? `padding-left: ${0.75 + depth * 1.25}rem` : undefined}
 >
 	{#if reorderable}
-		<span class="hidden shrink-0 cursor-grab text-gray-300 hover:text-gray-500 active:cursor-grabbing sm:inline" title="Drag to reorder" aria-hidden="true">
+		<!-- Shown on wide screens and on any touch screen, where it is the way to drag (no long press needed). -->
+		<span
+			bind:this={handle}
+			data-drag-handle
+			class="hidden shrink-0 cursor-grab touch-none text-gray-300 select-none hover:text-gray-500 active:cursor-grabbing sm:inline pointer-coarse:inline [-webkit-touch-callout:none]"
+			title="Drag to reorder"
+			aria-hidden="true"
+		>
 			<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
 				<circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
 				<circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
