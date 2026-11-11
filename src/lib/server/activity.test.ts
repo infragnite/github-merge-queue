@@ -50,6 +50,7 @@ function fakeDeps(over: { git?: Partial<QueueDeps['git']>; github?: Partial<Queu
 			readiness: async () => ({ ciGreen: true, approvedShas: [], changesRequested: false }),
 			pushBranch: async () => {},
 			pushHead: async () => {},
+			pushKeepsApproval: async () => true,
 			deleteBranch: async () => {},
 			retargetBase: async () => {},
 			squashMerge: async () => ({ merged: true, sha: 'm' }),
