@@ -8,8 +8,9 @@
 		why,
 		repoOwner,
 		repoName,
+		warnings = [],
 		readonly = false
-	}: { item: ViewItem; why: string | null; repoOwner: string; repoName: string; readonly?: boolean } = $props();
+	}: { item: ViewItem; why: string | null; repoOwner: string; repoName: string; warnings?: string[]; readonly?: boolean } = $props();
 
 	const action = (n: string) => `/repos/${repoOwner}/${repoName}?/${n}`;
 	const conflict = $derived(item.status === 'conflict');
@@ -24,6 +25,9 @@
 			<span class="min-w-0 truncate">{item.pr_title}</span>
 			<span class="shrink-0">· {item.author_login}</span>
 		</p>
+		{#each warnings as w, i (i)}
+			<p class="mt-0.5 text-xs text-amber-700">{w}</p>
+		{/each}
 	</div>
 	{#if !readonly}
 		<div class="flex shrink-0 items-center gap-2">
@@ -45,7 +49,7 @@
 				}}
 			>
 				<input type="hidden" name="item_id" value={item.id} />
-				<button type="submit" class="rounded-md px-2 py-1.5 text-xs text-gray-500 hover:bg-red-50 hover:text-red-700">Remove</button>
+				<button type="submit" class="rounded-md border border-border-subtle px-3 py-1.5 text-xs font-medium text-gray-600 hover:border-red-200 hover:bg-red-50 hover:text-red-700">Remove</button>
 			</form>
 		</div>
 	{/if}

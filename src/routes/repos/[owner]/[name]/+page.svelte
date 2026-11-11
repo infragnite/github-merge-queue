@@ -152,13 +152,15 @@
 			return;
 		}
 
-		// Whole stacks move; everything else keeps its place after them.
-		const order = (board?.stacks ?? []).map((s: BoardStack) => s.rows.map((r) => items.get(r.pr)!.id));
+		// Whole stacks move, by the indices of the list as shown; PRs being formed into a batch stay
+		// first and everything else keeps its place after them.
+		const order = lineStacks.map((s: BoardStack) => s.rows.map((r) => items.get(r.pr)!.id));
 		const [moved] = order.splice(dragIndex, 1);
 		order.splice(dropIndex, 0, moved);
-		const rows = order.flat();
+		const byPosition = [...data.queueItems].sort((a, b) => a.position - b.position);
+		const rows = [...byPosition.filter((i) => forming.has(i.pr_number)).map((i) => i.id), ...order.flat()];
 		const inRows = new Set(rows);
-		const orderedIds = [...rows, ...[...data.queueItems].sort((a, b) => a.position - b.position).map((i) => i.id).filter((id) => !inRows.has(id))];
+		const orderedIds = [...rows, ...byPosition.map((i) => i.id).filter((id) => !inRows.has(id))];
 		reordering = true;
 
 		const formData = new FormData();
@@ -196,19 +198,17 @@
 					{data.repo.owner}<span class="text-gray-400">/</span>{data.repo.name}
 				</a>
 			</h1>
-			<p class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-gray-500">
+			<p class="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-gray-500">
 				<span>into <span class="font-mono text-gray-700">{data.repo.default_branch}</span></span>
 				{#if pipe?.master}
 					{@const m = MASTER[pipe.master.state] ?? { label: pipe.master.state, tone: 'text-gray-700', dot: 'bg-gray-400', hint: '' }}
 					<span class="inline-flex items-center gap-1 {m.tone}" title={m.hint}><span class="h-1.5 w-1.5 rounded-full {m.dot}" aria-hidden="true"></span>{m.label} <span class="font-mono">{pipe.master.sha.slice(0, 7)}</span></span>
 				{/if}
-				<span class="text-gray-300" aria-hidden="true">·</span>
 				{#if data.readonly}
 					<span>{batchMode ? `batches of up to ${data.limits.maxBatch}` : 'one by one'}</span>
 				{:else}
 					<a href="/repos/{data.repo.owner}/{data.repo.name}/settings#strategy" class="hover:text-indigo-600" title="How the queue merges PRs; change it in the queue settings">{batchMode ? `batches of up to ${data.limits.maxBatch}` : 'one by one'}</a>
 				{/if}
-				<span class="text-gray-300" aria-hidden="true">·</span>
 				<SavingsCard savings={data.savings} />
 			</p>
 		</div>
@@ -272,9 +272,9 @@
 			>
 				{v.label}
 				{#if v.key === 'attention' && attention.length > 0}
-					<span class="inline-flex h-5 min-w-5 items-center justify-center gap-1 rounded-full bg-red-600 px-1.5 text-[11px] font-semibold tabular-nums text-white" aria-label="{attention.length} need attention"
+					<span class="inline-flex h-5 min-w-5 items-center justify-center gap-1 rounded-full bg-red-600 px-1.5 text-[11px] font-semibold tabular-nums text-white" aria-hidden="true"
 						><svg class="h-3 w-3" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.1 2.6a1 1 0 011.8 0l5.8 10.6a1 1 0 01-.9 1.5H2.2a1 1 0 01-.9-1.5zM7.25 6v3.5h1.5V6zm0 4.75v1.5h1.5v-1.5z" /></svg>{attention.length}</span
-					>
+					><span class="sr-only">: {attention.length} PR{attention.length === 1 ? '' : 's'} held</span>
 				{/if}
 			</a>
 		{/each}
@@ -311,7 +311,7 @@
 
 			<section class="min-w-0 space-y-3 lg:sticky lg:top-4" aria-labelledby="in-line">
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-					<h2 id="in-line" class="text-xs font-semibold uppercase tracking-wide text-gray-500">In line <span class="tabular-nums text-gray-400">{inLine}</span></h2>
+					<h2 id="in-line" class="text-xs font-semibold uppercase tracking-wide text-gray-500">In line <span class="tabular-nums text-gray-500">{inLine}</span></h2>
 					{#if data.queueItems.length > 0}
 						<input type="search" bind:value={search} placeholder="Find #, title or author" class="ml-auto w-full rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm sm:w-48" aria-label="Find a PR in the queue" />
 					{/if}
@@ -320,7 +320,7 @@
 				{#if data.queueItems.length === 0}
 					<p class="rounded-xl border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">Queue is empty.{#if !readonly} Add a pull request to start.{/if}</p>
 				{:else if shownStacks.length > 0}
-					<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
+					<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised lg:max-h-[calc(100dvh-8rem)] lg:overflow-y-auto" role="list">
 						{#each shownStacks as st, index (st.root)}
 							{@const drag = !batchMode && !needle && data.can.reorder && !readonly}
 							<div
@@ -351,7 +351,7 @@
 							</div>
 						{/each}
 					</div>
-					<p class="text-xs text-gray-400">{batchMode ? 'Urgent first, then in line order; a stack goes as one.' : data.can.reorder ? 'Drag to reorder; a stack goes as one.' : 'In line order; a stack goes as one.'}</p>
+					<p class="text-xs text-gray-500">{batchMode ? 'Urgent first, then in line order; a stack goes as one.' : data.can.reorder ? 'Drag to reorder; a stack goes as one.' : 'In line order; a stack goes as one.'}</p>
 				{:else if needle}
 					<p class="text-sm text-gray-500">No queued PR matches “{search}”.</p>
 				{:else if board}
@@ -367,7 +367,7 @@
 				<p class="text-sm text-gray-600">These PRs are held until someone acts. Each one says what to do; the queue takes them again once it is done.</p>
 				<div class="divide-y divide-border-subtle overflow-hidden rounded-xl border border-border-subtle bg-surface-raised">
 					{#each attention as h (h.pr)}
-						<AttentionRow item={items.get(h.pr)!} why={h.reason} repoOwner={data.repo.owner} repoName={data.repo.name} {readonly} />
+						<AttentionRow item={items.get(h.pr)!} why={h.reason} warnings={board?.warnings[h.pr] ?? []} repoOwner={data.repo.owner} repoName={data.repo.name} {readonly} />
 					{/each}
 				</div>
 			{/if}
@@ -376,7 +376,7 @@
 		<section aria-label="History" class="space-y-3">
 			<div class="flex flex-wrap items-center gap-2">
 				{#each [{ k: 'all', l: 'All' }, { k: 'landed', l: 'Landed' }, { k: 'failed', l: 'Failed' }] as f (f.k)}
-					<button type="button" onclick={() => (outcome = f.k)} aria-pressed={outcome === f.k} class="rounded-full px-3 py-1 text-xs font-medium ring-1 ring-inset {outcome === f.k ? 'bg-gray-900 text-white ring-gray-900' : 'text-gray-600 ring-border-subtle hover:bg-surface-sunken'}">{f.l}</button>
+					<button type="button" onclick={() => (outcome = f.k)} aria-pressed={outcome === f.k} class="rounded-full px-3 py-1.5 text-xs font-medium ring-1 ring-inset {outcome === f.k ? 'bg-gray-900 text-white ring-gray-900' : 'text-gray-600 ring-border-subtle hover:bg-surface-sunken'}">{f.l}</button>
 				{/each}
 				<input type="search" bind:value={historySearch} placeholder="PR #" class="ml-auto w-28 rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm" aria-label="Find a PR in the history" />
 			</div>
@@ -393,10 +393,11 @@
 								{#if e.kind === 'batch'}
 									<details class="group">
 										<summary class="flex min-w-0 cursor-pointer list-none items-center gap-3 px-4 py-2.5 hover:bg-surface-sunken/60 [&::-webkit-details-marker]:hidden">
+											<svg class="h-3 w-3 shrink-0 text-gray-400 transition-transform group-open:rotate-90" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5z" /></svg>
 											<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] {ok ? 'bg-green-50 text-green-700' : outcomeOf(e) === 'failed' ? 'bg-red-50 text-red-700' : 'bg-gray-100 text-gray-500'}" aria-hidden="true">{ok ? '✓' : outcomeOf(e) === 'failed' ? '✕' : '–'}</span>
 											<span class="shrink-0 font-medium text-gray-900">{e.card.express ? 'Urgent batch' : 'Batch'} #{e.card.number}</span>
 											<span class="min-w-0 truncate text-gray-500">{e.card.prs.length} PR{e.card.prs.length === 1 ? '' : 's'} · {e.card.status === 'superseded' ? 'rebuilt' : e.card.status}{e.card.bisection.length ? ` · ${e.card.bisection.length} bisection step${e.card.bisection.length === 1 ? '' : 's'}` : ''}</span>
-											<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-400">{took(e.card)} · {clockTime(e.at)}</span>
+											<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-500">{took(e.card)} · {clockTime(e.at)}</span>
 										</summary>
 										<ul class="space-y-0.5 border-t border-border-subtle bg-surface-sunken/40 px-4 py-2 text-[13px]">
 											{#each e.card.prs as pr (pr.pr)}
@@ -415,7 +416,7 @@
 										<a href={e.row.pr_url} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{e.row.pr_number}</a>
 										<span class="min-w-0 truncate text-gray-900">{e.row.pr_title}</span>
 										<span class="hidden shrink-0 text-xs text-gray-500 sm:inline">{e.row.author_login}</span>
-										<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-400"><span class={ok ? 'text-green-700' : 'text-red-700'}>{e.row.status}</span> · {clockTime(e.at)}</span>
+										<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-500"><span class={ok ? 'text-green-700' : 'text-red-700'}>{e.row.status}</span> · {clockTime(e.at)}</span>
 									</div>
 								{/if}
 							</li>

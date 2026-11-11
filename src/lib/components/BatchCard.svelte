@@ -39,7 +39,25 @@
 	const p = $derived(batch.progress);
 	const status = $derived(runStatus(batch));
 	const stats = $derived(batchStats(batch, now));
-	const note = $derived(batch.kind === 'batch' ? null : runNote(batch, stopsEarly));
+	const note = $derived(runNote(batch, stopsEarly));
+	const waiting = $derived(!batch.finishedAt && ['testing', 'retrying'].includes(batch.status));
+	// Close the actions menu on a click outside it or on Escape.
+	function dismiss(el: HTMLDetailsElement) {
+		const close = (e: Event) => {
+			if (!el.open) return;
+			if (e instanceof KeyboardEvent ? e.key === 'Escape' : !el.contains(e.target as Node)) el.open = false;
+		};
+		document.addEventListener('click', close);
+		document.addEventListener('keydown', close);
+		return {
+			destroy: () => {
+				document.removeEventListener('click', close);
+				document.removeEventListener('keydown', close);
+			}
+		};
+	}
+	// A big batch lists its first PRs; the rest fold away.
+	const MAX_PRS = 8;
 	const live = $derived(!batch.finishedAt || status === 'failing');
 
 	const fmt = (ms: number) => {
@@ -61,7 +79,7 @@
 	// A bisection, PR by PR: cleared, still suspect, in a step running now, or pinned down.
 	const SEG: Record<string, { cls: string; label: string }> = {
 		cleared: { cls: 'bg-green-500', label: 'cleared' },
-		checking: { cls: 'bg-sky-400', label: 'in a running step' },
+		checking: { cls: 'bg-sky-400', label: 'in a step' },
 		suspect: { cls: 'bg-gray-300', label: 'suspect' },
 		failing: { cls: 'bg-red-500', label: 'failing' }
 	};
@@ -78,6 +96,16 @@
 	const prLink = (n: number, url = '') => url || `https://github.com/${owner}/${name}/pull/${n}`;
 </script>
 
+{#snippet prRow(pr: Card['prs'][number])}
+	<li class="flex min-w-0 items-center gap-2" style="padding-left: {pr.depth}rem">
+					{#if pr.depth > 0}<span class="text-gray-300" aria-hidden="true">└</span>{/if}
+					{#if bisecting}<span class="h-1.5 w-1.5 shrink-0 rounded-full {SEG[segOf(pr)].cls}" title={SEG[segOf(pr)].label} aria-label={SEG[segOf(pr)].label}></span>{/if}
+					<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{pr.pr}</a>
+					<span class="min-w-0 truncate text-gray-800" title={pr.trail || pr.title}>{pr.title}</span>
+					{#if pr.link && pr.link !== 'healthy'}<span class="shrink-0 rounded bg-amber-50 px-1.5 text-[11px] text-amber-800">{pr.link}</span>{/if}
+				</li>
+{/snippet}
+
 {#snippet jobsBar(pr: NonNullable<Card['progress']>, small: boolean)}
 	<div class="flex overflow-hidden rounded-full bg-gray-100 {small ? 'h-1 w-16 shrink-0' : 'h-1.5'}" role="progressbar" aria-valuenow={pr.done} aria-valuemax={pr.total} aria-label="CI jobs finished">
 		<div class="bg-green-500" style="width: {pct(pr.done - pr.failed, pr.total)}%"></div>
@@ -87,14 +115,14 @@
 {/snippet}
 
 <article id="batch-{batch.id}" class="scroll-mt-4 rounded-xl border border-border-subtle bg-surface-raised p-3 shadow-sm sm:p-4">
-	<header class="flex min-w-0 items-center gap-2">
+	<header class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
 		<span class="h-2 w-2 shrink-0 rounded-full {DOT[status] ?? 'bg-gray-300'} {live ? 'motion-safe:animate-pulse' : ''}" aria-hidden="true"></span>
 		<h3 class="shrink-0 text-sm font-semibold text-gray-900">{title}</h3>
-		{#if batch.kind === 'batch'}<span class="shrink-0 text-xs text-gray-500">{batch.prs.length} PR{batch.prs.length === 1 ? '' : 's'}</span>{/if}
-		<StatusChip {status} label={status === 'passed' && batch.kind === 'batch' ? 'passed, landing' : null} />
+		{#if batch.kind === 'batch'}<span class="hidden shrink-0 text-xs text-gray-500 sm:inline">{batch.prs.length} PR{batch.prs.length === 1 ? '' : 's'}</span>{/if}
+		<span class="min-w-0 truncate"><StatusChip {status} label={status === 'passed' && batch.kind === 'batch' ? 'passed, landing' : null} /></span>
 		<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-500" title="Started {batch.createdAt} UTC">{fmt(stats.elapsedMs)}</span>
-		<details class="relative shrink-0">
-			<summary class="flex h-7 w-7 cursor-pointer list-none items-center justify-center rounded-md text-gray-500 hover:bg-surface-sunken hover:text-gray-800 [&::-webkit-details-marker]:hidden" aria-label="Actions for {title}">
+		<details class="relative shrink-0" use:dismiss>
+			<summary class="flex h-9 w-9 cursor-pointer list-none items-center justify-center rounded-md text-gray-500 hover:bg-surface-sunken hover:text-gray-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 sm:h-7 sm:w-7 [&::-webkit-details-marker]:hidden" aria-label="Actions for {title}">
 				<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>
 			</summary>
 			<div class="absolute right-0 z-10 mt-1 w-52 overflow-hidden rounded-lg border border-border-subtle bg-surface-raised py-1 text-sm shadow-lg">
@@ -121,13 +149,13 @@
 	<!-- Statistics: the jobs of its CI, or how far its bisection has got. -->
 	{#if bisecting}
 		<div class="mt-2.5">
-			<div class="flex h-1.5 gap-px overflow-hidden rounded-full" role="img" aria-label="{segCount('cleared')} cleared, {segCount('suspect') + segCount('checking')} suspect, {segCount('failing')} failing">
+			<div class="flex h-1.5 gap-px overflow-hidden rounded-full" role="img" aria-label="{segCount('cleared')} cleared, {segCount('checking')} in a step, {segCount('suspect')} suspect, {segCount('failing')} failing">
 				{#each segs as s (s.pr)}<div class="flex-1 {SEG[s.seg].cls}" title="#{s.pr}: {SEG[s.seg].label}"></div>{/each}
 			</div>
 			<p class="mt-1 flex flex-wrap gap-x-3 text-xs text-gray-500">
-				<span><span class="font-medium tabular-nums text-gray-800">{segCount('cleared')}</span> cleared</span>
-				<span><span class="font-medium tabular-nums text-gray-800">{segCount('suspect') + segCount('checking')}</span> suspect</span>
-				{#if segCount('failing')}<span><span class="font-medium tabular-nums text-gray-800">{segCount('failing')}</span> failing</span>{/if}
+				{#each ['cleared', 'checking', 'suspect', 'failing'] as k (k)}
+					{#if segCount(k)}<span class="inline-flex items-center gap-1"><span class="h-1.5 w-1.5 rounded-full {SEG[k].cls}" aria-hidden="true"></span><span class="font-medium tabular-nums text-gray-800">{segCount(k)}</span> {SEG[k].label}</span>{/if}
+				{/each}
 				<span><span class="font-medium tabular-nums text-gray-800">{stats.runs?.total}</span> step{stats.runs?.total === 1 ? '' : 's'}</span>
 			</p>
 		</div>
@@ -141,9 +169,11 @@
 				{#if stats.jobs.failed}<span class="text-red-700"><span class="font-medium tabular-nums">{stats.jobs.failed}</span> failed{batch.kind !== 'batch' ? `: ${p.failedJobs.join(', ')}` : ''}</span>{/if}
 			</p>
 		</div>
-		{#if progressError}<p class="mt-1 text-xs text-gray-500">Last known progress; reading it now failed.</p>{/if}
-	{:else if live}
-		<p class="mt-2 text-xs text-gray-500">{progressError ? 'Could not read CI progress.' : 'Waiting for its CI to start.'}</p>
+		{#if progressError}<p class="mt-1 text-xs text-gray-500" title={progressError}>Last known progress; reading it now failed: {progressError}</p>{/if}
+	{:else if progressError}
+		<p class="mt-2 text-xs text-gray-500" title={progressError}>Could not read CI progress: {progressError}</p>
+	{:else if waiting}
+		<p class="mt-2 text-xs text-gray-500">Waiting for its CI to start.</p>
 	{/if}
 	{#if note}<p class="mt-1.5 text-xs text-gray-600">{note}</p>{/if}
 
@@ -158,11 +188,11 @@
 				<div class="flex min-w-0 items-center gap-2 px-3 py-2 text-sm">
 					<span class="h-1.5 w-1.5 shrink-0 rounded-full {rs === 'failing' ? 'bg-red-500' : 'bg-sky-500'}" aria-hidden="true"></span>
 					<a href={actionsUrl(owner, name, run.branch)} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600" title="GitHub Actions runs of {run.branch}">Step {stepNo(run)}</a>
-					<span class="min-w-0 truncate font-mono text-xs text-gray-500">{run.prs.length === 1 ? `#${run.prs[0].pr} alone` : run.prs.map((x) => `#${x.pr}`).join(' ')}</span>
+					<span class="min-w-0 truncate font-mono text-xs text-gray-500" title={run.prs.map((x) => `#${x.pr}`).join(' ')}>{run.prs.length === 1 ? `#${run.prs[0].pr} alone` : run.prs.map((x) => `#${x.pr}`).join(' ')}</span>
 					{#if rs === 'failing'}<StatusChip status="failing" />{/if}
 					<span class="ml-auto flex shrink-0 items-center gap-2">
-						{#if run.progress}{@render jobsBar(run.progress, true)}<span class="w-11 text-right text-xs tabular-nums text-gray-500">{run.progress.done}/{run.progress.total}</span>{/if}
-						<span class="hidden w-12 text-right text-xs tabular-nums text-gray-400 sm:inline">{fmt(batchStats(run, now).elapsedMs)}</span>
+						{#if run.progress}<span class="hidden sm:flex">{@render jobsBar(run.progress, true)}</span><span class="w-11 text-right text-xs tabular-nums text-gray-500">{run.progress.done}/{run.progress.total}</span>{/if}
+						<span class="hidden w-12 text-right text-xs tabular-nums text-gray-500 sm:inline">{fmt(batchStats(run, now).elapsedMs)}</span>
 					</span>
 				</div>
 			{/each}
@@ -172,16 +202,16 @@
 	{#if batch.kind === 'batch'}
 		{#if batch.context.length > 0}<p class="mt-2 text-xs text-gray-500">On top of {batch.context.map((n) => `#${n}`).join(' ')}, which passed</p>{/if}
 		<ul class="mt-2.5 space-y-0.5 text-[13px]">
-			{#each open as pr (pr.pr)}
-				<li class="flex min-w-0 items-center gap-2" style="padding-left: {pr.depth}rem">
-					{#if pr.depth > 0}<span class="text-gray-300" aria-hidden="true">└</span>{/if}
-					{#if bisecting}<span class="h-1.5 w-1.5 shrink-0 rounded-full {SEG[segOf(pr)].cls}" title={SEG[segOf(pr)].label} aria-label={SEG[segOf(pr)].label}></span>{/if}
-					<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{pr.pr}</a>
-					<span class="min-w-0 truncate text-gray-800" title={pr.trail || pr.title}>{pr.title}</span>
-					{#if pr.link && pr.link !== 'healthy'}<span class="shrink-0 rounded bg-amber-50 px-1.5 text-[11px] text-amber-800">{pr.link}</span>{/if}
-				</li>
-			{/each}
+			{#each open.slice(0, MAX_PRS) as pr (pr.pr)}{@render prRow(pr)}{/each}
 		</ul>
+		{#if open.length > MAX_PRS}
+			<details class="mt-1">
+				<summary class="cursor-pointer select-none text-xs text-gray-500 hover:text-gray-800">+{open.length - MAX_PRS} more</summary>
+				<ul class="mt-0.5 space-y-0.5 text-[13px]">
+					{#each open.slice(MAX_PRS) as pr (pr.pr)}{@render prRow(pr)}{/each}
+				</ul>
+			</details>
+		{/if}
 		{#if folded.length > 0 || finished.length > 0}
 			<details class="mt-2 text-xs text-gray-500">
 				<summary class="cursor-pointer select-none hover:text-gray-800">
