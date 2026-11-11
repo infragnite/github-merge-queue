@@ -7,8 +7,9 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
 import { RateLimitedError } from './rate-limit';
-import { baselineCommit, buildBatch, GitRunner } from './batch-builder';
+import { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } from './batch-builder';
 import { replay } from './rebase';
+import { mergeDriverEnv } from './merge-drivers';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { currentStackAnalysis } from './stack-runtime';
 import { bumpGeneration, memoByGeneration } from './wake';
@@ -166,7 +167,7 @@ export class Mirror {
 			mkdirSync(dir, { recursive: true });
 			new GitRunner(dir).run(['init', '-q', '--bare']);
 		}
-		this.git = new GitRunner(dir);
+		this.git = new GitRunner(dir, mergeDriverEnv(dir));
 	}
 
 	private get url() {
@@ -347,6 +348,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			build: async (base, members) => buildBatch(mirror.git, base, members),
 			restack: async (head, upstream, onto) => replay(mirror.git, { head, upstream, onto }),
 			baseline: async (base) => baselineCommit(mirror.git, base),
+			mergeTrees: async (onto, head) => mergeTrees(mirror.git, onto, head),
+			mergeCommit: async (tree, parents, message) => queueMergeCommit(mirror.git, tree, parents, message),
 			changed: async (from, to) => mirror.git.run(['diff', '--name-only', from, to]).out.split('\n').filter(Boolean)
 		},
 		ci: {

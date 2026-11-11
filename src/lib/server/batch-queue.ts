@@ -140,6 +140,13 @@ export interface QueueGit {
 	restack(head: string, upstream: string, onto: string): Promise<ReplayResult>;
 	/** A commit with `base`'s own tree on top of it, to test the default branch alone. */
 	baseline(base: string): Promise<string>;
+	/**
+	 * Merging `head` onto `onto`: with the queue's merge drivers (as batches are built), and as a plain
+	 * line merge (as GitHub merges). Each is the merged tree, or null when it conflicts.
+	 */
+	mergeTrees(onto: string, head: string): Promise<{ queue: string | null; line: string | null }>;
+	/** A merge commit of `tree` on `parents` (first parent first), made by the queue. */
+	mergeCommit(tree: string, parents: string[], message: string): Promise<string>;
 	/** The paths that differ between two commits. */
 	changed(from: string, to: string): Promise<string[]>;
 }
@@ -820,6 +827,36 @@ class Tick {
 				if (!(await this.waitForHead(n, head))) {
 					this.pause(`GitHub did not pick up the restacked head of #${n} in time`);
 					return false;
+				}
+			} else {
+				// GitHub squash-merges with a plain line merge. Where the queue's merge drivers merged a
+				// file it would conflict on (or merge differently), merge master into the PR first with the
+				// tree the queue merged; GitHub's squash of that head is then this tree.
+				const t = await this.d.git.mergeTrees(master, head);
+				if (t.queue !== null && t.line !== t.queue) {
+					if (!this.skipped.size && t.queue !== step.tree) {
+						this.pause(`Could not merge ${def} into #${n} to land it: the result differs from the tested tree`);
+						return false;
+					}
+					if (!p.sameRepo) {
+						this.pause(`#${n} comes from a fork and needs ${def} merged into it with the queue's merge drivers; the queue can't push to it`);
+						return false;
+					}
+					const merge = await this.d.git.mergeCommit(t.queue, [head, master], `Merge ${def} into ${p.headRef}`);
+					try {
+						await this.d.github.pushHead(p.headRef, merge, head);
+					} catch (e) {
+						if (e instanceof RateLimitedError) throw e;
+						this.pause(`Could not push the merge of ${def} into #${n}: ${e instanceof Error ? e.message : e}`);
+						return false;
+					}
+					store.recordRebasedHead(this.repoId, n, head, merge, true);
+					this.event(n, 'rebased', { from: head, to: merge, onto: def, reason: `merged ${def} with the queue's merge drivers to land` });
+					head = merge;
+					if (!(await this.waitForHead(n, head))) {
+						this.pause(`GitHub did not pick up the new head of #${n} in time`);
+						return false;
+					}
 				}
 			}
 			if (p.baseRef !== def) await this.d.github.retargetBase(n, def);

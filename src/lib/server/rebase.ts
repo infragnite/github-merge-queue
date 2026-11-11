@@ -23,10 +23,12 @@ export type ReplayResult =
 	| { ok: true; head: string; tree: string; replayed: number }
 	| { ok: false; reason: string; conflicts: string[] };
 
-const MERGE_TREE = ['merge-tree', '--write-tree', '--name-only', '--no-messages'];
+// Attributes come from `onto`, the commit the result lands on, never from the PR being replayed.
+const mergeTree = (onto: string) => [`--attr-source=${onto}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
 
 export function replay(git: GitRunner, { head, upstream, onto, date }: ReplayInput): ReplayResult {
-	const whole = git.run([...MERGE_TREE, `--merge-base=${upstream}`, onto, head], { allowFail: true });
+	const mergeArgs = mergeTree(onto);
+	const whole = git.run([...mergeArgs, `--merge-base=${upstream}`, onto, head], { allowFail: true });
 	const lines = whole.out.split('\n').filter(Boolean);
 	if (whole.code !== 0) {
 		const conflicts = whole.code === 1 ? lines.slice(1) : [];
@@ -48,7 +50,7 @@ export function replay(git: GitRunner, { head, upstream, onto, date }: ReplayInp
 	let tipTree = git.run(['rev-parse', `${onto}^{tree}`]).out;
 	let replayed = 0;
 	for (const c of commits) {
-		const r = git.run([...MERGE_TREE, `--merge-base=${c}^`, tip, c], { allowFail: true });
+		const r = git.run([...mergeArgs, `--merge-base=${c}^`, tip, c], { allowFail: true });
 		const out = r.out.split('\n').filter(Boolean);
 		if (r.code !== 0) {
 			const conflicts = r.code === 1 ? out.slice(1) : [];

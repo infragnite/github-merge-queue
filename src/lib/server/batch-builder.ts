@@ -12,7 +12,10 @@
 //   would produce; the queue does exactly that restack when it lands the child
 //   (see rebase.ts), so GitHub's squash merge gives the tree tested here.
 //
-// Needs git >= 2.40 (`merge-tree --write-tree --merge-base`).
+// Each merge reads `.gitattributes` from the base, so a file the base routes to one of the queue's
+// merge drivers (merge-drivers.ts) merges with it, given the driver environment on the runner.
+//
+// Needs git >= 2.40 (`merge-tree --write-tree --merge-base`, `--attr-source`).
 
 import { execFile, execFileSync } from 'node:child_process';
 
@@ -165,7 +168,8 @@ export function buildBatch(
 	let tipTree = git.run(['rev-parse', `${baseSha}^{tree}`]).out;
 	const commits: BuiltCommit[] = [];
 	for (const m of members) {
-		const args = ['merge-tree', '--write-tree', '--name-only', '--no-messages'];
+		// Attributes come from the base, never from a PR: they pick the queue's merge drivers.
+		const args = [`--attr-source=${baseSha}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
 		// The parent may have moved on after the child branched: the child's work
 		// starts at the newest parent commit it contains, not at the parent's head.
 		const fork = m.parentHeadSha ? git.run(['merge-base', m.parentHeadSha, m.headSha]).out : null;
@@ -203,4 +207,32 @@ export function buildBatch(
 		tipTree = tree;
 	}
 	return { ok: true, headSha: tip, tree: tipTree, commits };
+}
+
+/** git's empty tree: as `--attr-source` it reads no attributes, so no merge driver applies. */
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+/**
+ * `head` merged onto `onto` twice: with the queue's merge drivers (attributes from `onto`, as a
+ * batch is built) and as a plain line merge (as GitHub merges). Each is the tree, or null on a conflict.
+ */
+export function mergeTrees(git: GitRunner, onto: string, head: string): { queue: string | null; line: string | null } {
+	const tree = (attrs: string) => {
+		const r = git.run([`--attr-source=${attrs}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages', onto, head], { allowFail: true });
+		return r.code === 0 ? r.out.split('\n')[0] : null;
+	};
+	return { queue: tree(onto), line: tree(EMPTY_TREE) };
+}
+
+/** A merge commit of `tree` on `parents`, committed by the queue. */
+export function queueMergeCommit(git: GitRunner, tree: string, parents: string[], message: string): string {
+	return git.run(['commit-tree', tree, ...parents.flatMap((p) => ['-p', p]), '-F', '-'], {
+		input: `${message}\n`,
+		env: {
+			GIT_AUTHOR_NAME: 'merge-queue',
+			GIT_AUTHOR_EMAIL: 'merge-queue@users.noreply.github.com',
+			GIT_COMMITTER_NAME: 'merge-queue',
+			GIT_COMMITTER_EMAIL: 'merge-queue@users.noreply.github.com'
+		}
+	}).out;
 }
