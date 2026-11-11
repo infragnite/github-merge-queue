@@ -63,6 +63,9 @@ class World {
 	forks = new Set<number>();
 	/** GitHub won't give the branch rules (an outage, a missing permission). */
 	pushPolicyFails = false;
+	/** The reads of the branch rules (1-based) GitHub answers with an error. */
+	pushPolicyFailOn = new Set<number>();
+	pushPolicyCalls = 0;
 	/** False: the default branch's rules dismiss an approval on a push to the PR. */
 	pushKeepsApproval = true;
 
@@ -201,7 +204,8 @@ class World {
 					git.git('branch', '-f', branch, sha);
 				},
 				pushKeepsApproval: async () => {
-					if (this.pushPolicyFails) throw new Error('GitHub API error 502');
+					this.pushPolicyCalls++;
+					if (this.pushPolicyFails || this.pushPolicyFailOn.has(this.pushPolicyCalls)) throw new Error('GitHub API error 502');
 					return this.pushKeepsApproval;
 				},
 				pushHead: async (branch, sha, expected) => {
@@ -283,6 +287,13 @@ function pr(n: number, opts: { file?: string; from?: string; base?: string; appr
 
 async function run(ticks = 30) {
 	for (let i = 0; i < ticks; i++) await tickBatchQueue(world.deps());
+}
+
+/** Ticks as the processor does: a tick that fails stops there, and the next one starts over. */
+async function runThrough(ticks = 30) {
+	const failures: string[] = [];
+	for (let i = 0; i < ticks; i++) await tickBatchQueue(world.deps()).catch((e) => failures.push(e instanceof Error ? e.message : String(e)));
+	return failures;
 }
 
 const queued = () => db.getQueueItems(repo.id).map((i) => ({ pr: i.pr_number, status: i.status }));
@@ -986,6 +997,49 @@ describe('batch queue runtime', () => {
 			expect(git.git('show', `main:${LANE}`)).toBe('# expected failures\na.kt\nd.kt');
 		});
 
+		test('a failed read of the branch rules at planning holds no PR: once GitHub answers, the PRs build with the driver', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			world.pushPolicyFailOn = new Set([1, 2]);
+			await runThrough();
+			expect(world.started[0].prs).toEqual([1, 2]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.comments.filter((c) => c.pr === 2)).toEqual([]);
+			expect(git.git('show', `main:${LANE}`)).toBe('# expected failures\na.kt\nd.kt');
+		});
+
+		test('a failed read of the branch rules at landing is no reason to say a push would dismiss an approval', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			// The first read plans the batch with the driver; the next one, at landing, fails.
+			world.pushPolicyFailOn = new Set([2]);
+			await runThrough();
+			expect(world.comments.filter((c) => /dismiss/.test(c.body))).toEqual([]);
+			expect(item(2)).toBeUndefined();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+		});
+
+		test('a failed read of the branch rules is no reason to tell a child to restack itself: the next tick restacks it', async () => {
+			lists();
+			git.branch('pr1', 'main');
+			git.commit('pr1', 'pr1', 'pr1.txt');
+			git.openPR(1, 'pr1', 'main');
+			world.approved.add(1);
+			db.addToQueue(repo.id, 1, 'PR 1', 'https://example.test/pull/1', 'dev', '', 'dev');
+			removing(2, ['a.kt', 'b.kt', 'd.kt'], { from: 'pr1', base: 'pr1' });
+			keepOnly('main', ['a.kt', 'c.kt', 'd.kt'], 'main removes b');
+			git.rebase('pr1', 'main');
+			world.pushPolicyFailOn = new Set([1]);
+			await runThrough();
+			// The only word to #2 is that the queue restacked it.
+			expect(world.comments.filter((c) => c.pr === 2).map((c) => c.body.split(' (')[0])).toEqual(['The merge queue restacked this PR onto #1']);
+			expect(world.pushedHeads[0]).toMatchObject({ branch: 'pr2' });
+			expect(world.merged).toEqual([1, 2]);
+		});
+
 		test('a fork PR is built by lines: behind a PR whose neighbouring line it changes it waits, then is held; the queue never pauses', async () => {
 			lists();
 			removing(1, ['a.kt', 'c.kt', 'd.kt']);
@@ -1263,16 +1317,20 @@ describe('batch queue runtime', () => {
 			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
 		});
 
-		test('branch rules GitHub will not give stop no planning: the queue lands what needs no push, and pushes nothing', async () => {
+		test('branch rules GitHub will not give stop the tick, not the queue: nothing is pushed or said, and the next tick lands it all', async () => {
 			world.pushKeepsApproval = true;
 			world.pushPolicyFails = true;
 			pr(1);
 			pr(2, { from: 'pr1', base: 'pr1' });
 			pr(3);
-			await run();
+			expect((await runThrough(3)).length).toBe(3);
+			expect(world.started).toEqual([]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(world.comments).toEqual([]);
+			world.pushPolicyFails = false;
+			expect(await runThrough()).toEqual([]);
 			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
 			expect(world.merged).toEqual([1, 2, 3]);
-			expect(world.pushedHeads).toEqual([]);
 		});
 
 		test('a stack lands parent-first without pushing to the child', async () => {
