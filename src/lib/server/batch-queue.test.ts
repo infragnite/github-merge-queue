@@ -378,23 +378,29 @@ describe('batch queue runtime', () => {
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')).toMatchObject({ landed: [1, 2, 3], ejected: [4] });
 	});
 
-	test('an urgent PR runs between two bisection steps, and the bisection then goes on from where it was', async () => {
+	test('an urgent PR starts beside a running bisection step and lands first; the step that passed on the old branch runs again', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
 		pr(2);
 		pr(3);
 		pr(4, { file: 'x-breaks-master.txt' });
 		world.breakingFiles.add('x-breaks-master.txt');
+		// The bisection's first step takes long.
+		world.hold = (prs) => prs.join() === '1,2';
 		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
 		pr(5);
 		store.setQueuePriority(repo.id, 5, 'urgent');
+		// #5 doesn't wait for the step: it starts beside it, on the default branch, and lands.
+		for (let i = 0; i < 10 && !world.merged.includes(5); i++) await tickBatchQueue(world.deps());
+		expect(world.merged).toEqual([5]);
+		world.hold = () => false;
 		await run(60);
-		// #5 lands after the step that was running, before the next one; nothing is tested twice.
-		expect(world.merged).toEqual([1, 2, 5, 3]);
+		expect(world.merged).toEqual([5, 1, 2, 3]);
 		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
 			'batch 1,2,3,4',
 			'step 1,2',
 			'batch 5',
+			'step 1,2',
 			'step 3',
 			'step 4'
 		]);
@@ -403,7 +409,61 @@ describe('batch queue runtime', () => {
 		expect(batches.find((b) => b.members.length === 4)).toMatchObject({ status: 'landed', landed: [1, 2, 3], ejected: [4] });
 	});
 
-	test('an urgent batch that fails between two bisection steps is bisected first, and the first bisection then goes on', async () => {
+	test('a bisection step that lands before the urgent batch beside it sends that batch to run again on the new branch', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.join() === '1,2';
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		pr(5);
+		store.setQueuePriority(repo.id, 5, 'urgent');
+		for (let i = 0; i < 10 && !world.started.some((x) => x.prs.join() === '5'); i++) await tickBatchQueue(world.deps());
+		// Now #5 takes long, and the step finishes first.
+		world.hold = (prs) => prs.join() === '5';
+		for (let i = 0; i < 10 && !world.merged.includes(2); i++) await tickBatchQueue(world.deps());
+		expect(world.merged).toEqual([1, 2]);
+		world.hold = () => false;
+		await run(60);
+		expect(world.merged).toEqual([1, 2, 5, 3]);
+		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
+			'batch 1,2,3,4',
+			'step 1,2',
+			'batch 5',
+			'batch 5',
+			'step 3',
+			'step 4'
+		]);
+	});
+
+	test('urgent PRs queued while an urgent batch runs beside a bisection wait for it, then go together', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.join() === '1,2' || prs.join() === '5';
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		pr(5);
+		store.setQueuePriority(repo.id, 5, 'urgent');
+		for (let i = 0; i < 10 && !world.started.some((x) => x.prs.join() === '5'); i++) await tickBatchQueue(world.deps());
+		pr(6);
+		pr(7);
+		store.setQueuePriority(repo.id, 6, 'urgent');
+		store.setQueuePriority(repo.id, 7, 'urgent');
+		for (let i = 0; i < 3; i++) await tickBatchQueue(world.deps());
+		// One urgent batch beside a bisection at a time.
+		expect(world.started.filter((x) => !x.branch.includes('-bisect-')).map((x) => x.prs.join())).toEqual(['1,2,3,4', '5']);
+		world.hold = (prs) => prs.join() === '1,2';
+		for (let i = 0; i < 10 && !world.started.some((x) => x.prs.join() === '6,7'); i++) await tickBatchQueue(world.deps());
+		expect(world.started.filter((x) => !x.branch.includes('-bisect-')).map((x) => x.prs.join())).toEqual(['1,2,3,4', '5', '6,7']);
+		expect(world.merged).toEqual([5]);
+	});
+
+	test('an urgent batch that fails beside a bisection is bisected first, and the first bisection then goes on', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
 		pr(2);
@@ -421,6 +481,8 @@ describe('batch queue runtime', () => {
 		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
 			'batch 1,2,3,4',
 			'step 1,2',
+			// It starts beside the running step, which lands first: it runs again on the new branch.
+			'batch 5,6',
 			'batch 5,6',
 			'step 5',
 			'step 6',
@@ -894,6 +956,39 @@ describe('batch queue runtime', () => {
 		expect(git.git('show', 'main:shared.txt')).toBe('child rewrote it');
 		expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+	});
+
+	describe('count baselines', () => {
+		const BASELINE = 'clippy-baseline.tsv';
+		const rows = (...r: [number, string][]) => r.map(([n, finding]) => `${n}\tsrc/a.rs\t${finding}\n`).join('');
+		/** A queued, approved PR #n off main whose baseline is `text`. */
+		const lowering = (n: number, text: string) => {
+			git.branch(`pr${n}`, 'main');
+			git.git('checkout', '-q', `pr${n}`);
+			writeFileSync(`${git.dir}/${BASELINE}`, text);
+			git.git('commit', '-qam', `pr${n}`);
+			git.openPR(n, `pr${n}`, 'main');
+			world.approved.add(n);
+			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+		};
+
+		test('two PRs that lower the same count land together, with the counts summed', async () => {
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/.gitattributes`, `${BASELINE} merge=count-baseline\n`);
+			writeFileSync(`${git.dir}/${BASELINE}`, rows([3, 'needless borrow'], [5, 'single match']));
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'baseline');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			lowering(1, rows([3, 'needless borrow'], [4, 'single match']));
+			lowering(2, rows([2, 'needless borrow'], [3, 'single match']));
+			await run();
+			expect(world.started[0].prs).toEqual([1, 2]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(git.git('show', `main:${BASELINE}`)).toBe(rows([2, 'needless borrow'], [2, 'single match']).trimEnd());
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+		});
 	});
 
 	describe('sorted-set lists', () => {

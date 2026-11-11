@@ -14,6 +14,15 @@
 // entries, an entry out of order or repeated), it falls back to git's line merge and its conflict
 // markers.
 //
+// `count-baseline` is for a list of counts, one line per key: `<count><TAB><key>`, a whole number
+// then everything after the first tab, unique keys, whole lines in byte order, such as krusty's
+// clippy-baseline.tsv (`count<TAB>file<TAB>finding`). Two branches that each fix some of a finding
+// change the same line, which a line merge reports as a conflict, but the counts add up: the
+// merged count of a key is the base count plus what each side changed (a missing key counts 0),
+// and a key whose count is no longer above 0 is dropped. It writes the lines back in byte order.
+// When a version does not parse that way (a count that is not a whole number, a line without a
+// tab, a key listed twice, lines out of order), it falls back to git's line merge.
+//
 // Git reads drivers only from config, so the queue passes them in the environment of its own git
 // runs (`mergeDriverEnv`); a merge it does not run (GitHub's own) never sees them. GitHub's merge
 // reads no merge attributes at all, `merge=union` included, so where the queue merges as GitHub
@@ -76,6 +85,56 @@ const text = (header ? header + '\\n' : '') + entries.map((e) => e + '\\n').join
 fs.writeFileSync(ours, text, 'latin1');
 `;
 
+export const COUNT_BASELINE_DRIVER = 'count-baseline';
+
+/** The driver program, run by git as `node <file> %O %A %B`; the result replaces `%A`. */
+export const COUNT_BASELINE_SOURCE = `'use strict';
+// Written by the merge queue (merge-drivers.ts); rewritten on every start.
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+
+const [base, ours, theirs] = process.argv.slice(2);
+
+function lineMerge() {
+	const r = spawnSync('git', ['merge-file', '-L', 'ours', '-L', 'base', '-L', 'theirs', ours, base, theirs], { stdio: 'inherit' });
+	process.exit(r.status === null ? 2 : r.status);
+}
+
+// Each key's count, or null when the file is not a count list.
+function counts(file) {
+	const lines = fs.readFileSync(file, 'latin1').split('\\n');
+	if (lines[lines.length - 1] === '') lines.pop();
+	const m = new Map();
+	for (let k = 0; k < lines.length; k++) {
+		const tab = lines[k].indexOf('\\t');
+		if (tab < 0 || !/^[0-9]+$/.test(lines[k].slice(0, tab))) return null;
+		const key = lines[k].slice(tab + 1);
+		if (m.has(key) || (k > 0 && lines[k - 1] >= lines[k])) return null;
+		m.set(key, Number(lines[k].slice(0, tab)));
+	}
+	return m;
+}
+
+const o = counts(base);
+const a = counts(ours);
+const b = counts(theirs);
+if (!o || !a || !b) lineMerge();
+
+const lines = [];
+for (const key of new Set([...a.keys(), ...b.keys()])) {
+	const n = (a.get(key) ?? 0) + (b.get(key) ?? 0) - (o.get(key) ?? 0);
+	if (n > 0) lines.push(n + '\\t' + key);
+}
+lines.sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+fs.writeFileSync(ours, lines.map((l) => l + '\\n').join(''), 'latin1');
+`;
+
+/** The drivers the queue provides: name, how git describes it, and its program. */
+const DRIVERS: [name: string, label: string, source: string][] = [
+	[SORTED_SET_DRIVER, 'sorted set of lines (merge queue)', SORTED_SET_SOURCE],
+	[COUNT_BASELINE_DRIVER, 'counts per key (merge queue)', COUNT_BASELINE_SOURCE]
+];
+
 /** Single-quotes `s` for the shell git runs a driver with. */
 function shellQuote(s: string): string {
 	return `'${s.replace(/'/g, `'\\''`)}'`;
@@ -110,22 +169,20 @@ function writeAtomically(file: string, text: string) {
  */
 export function mergeDriverEnv(dir: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const folder = resolve(dir, 'merge-drivers');
-	const file = join(folder, `${SORTED_SET_DRIVER}.cjs`);
 	mkdirSync(folder, { recursive: true });
-	let current: string | null = null;
-	try {
-		current = readFileSync(file, 'utf8');
-	} catch {
-		current = null;
+	const entries: [string, string][] = [];
+	for (const [name, label, source] of DRIVERS) {
+		const file = join(folder, `${name}.cjs`);
+		let current: string | null = null;
+		try {
+			current = readFileSync(file, 'utf8');
+		} catch {
+			current = null;
+		}
+		if (current !== source) writeAtomically(file, source);
+		entries.push([`merge.${name}.name`, label], [`merge.${name}.driver`, `${shellQuote(process.execPath)} ${shellQuote(file)} %O %A %B`]);
 	}
-	if (current !== SORTED_SET_SOURCE) writeAtomically(file, SORTED_SET_SOURCE);
-	return gitConfigEnv(
-		[
-			[`merge.${SORTED_SET_DRIVER}.name`, 'sorted set of lines (merge queue)'],
-			[`merge.${SORTED_SET_DRIVER}.driver`, `${shellQuote(process.execPath)} ${shellQuote(file)} %O %A %B`]
-		],
-		base
-	);
+	return gitConfigEnv(entries, base);
 }
 
 /** The oldest git the queue merges with: `--attr-source` came in 2.41 (`merge-tree --write-tree --merge-base` in 2.40). */
