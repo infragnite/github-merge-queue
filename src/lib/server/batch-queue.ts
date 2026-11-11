@@ -411,18 +411,23 @@ class Tick {
 		const p = await this.pr(n);
 		// Told this conflict on this head already (it was tried again and still conflicts): the check says it again, no new comment.
 		const was = it ? store.storedHold(it as QueueItem & { hold?: string | null }) : null;
-		const toldBefore = !!was?.told && was.code === code && was.head === p.headSha && was.reason === reason;
+		// Kept quiet by the comment setting, and still not wanted, counts as told.
+		const same = !!was && was.code === code && was.head === p.headSha && was.reason === reason;
+		const toldBefore = same && (!!was?.told || (!!was?.quiet && !this.speaks('attention')));
+		// A conflict with the default branch may go away when the branch moves: it is checked again then. A
+		// restack's conflict (old parent commits) and a workflow change wait for a push.
+		const save = (told: boolean) =>
+			it && store.setHold(it.id, { code, reason, head: p.headSha, told, ...(told ? {} : { quiet: true }), ...(base ? { base } : {}), ...(parent !== undefined ? { parent } : {}) });
 		if (it) {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
-			// A conflict with the default branch may go away when the branch moves: it is checked again then. A
-			// restack's conflict (old parent commits) and a workflow change wait for a push.
-			store.setHold(it.id, { code, reason, head: p.headSha, told: true, ...(base ? { base } : {}), ...(parent !== undefined ? { parent } : {}) });
+			save(toldBefore);
 		}
 		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
 		if (code === 'conflict') await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
-		if (!toldBefore && this.speaks('attention')) await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
+		// Saved as told only once the comment is posted: one that failed is posted on the next try.
+		if (!toldBefore && (await this.say(n, holdNotice(hold), 'attention'))) save(true);
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
 	}
@@ -1601,6 +1606,8 @@ class Tick {
 			// Gone or landed: it won't move again, so the restack is tried against what is there now.
 			const gone = !parent || parent.state !== 'open';
 			if (!gone && parent.headSha === hold.base) return;
+			// A bisection skips restacks: back in line now, it would be told its stack is broken, then this conflict again.
+			if (store.getActiveBatches(this.repoId).some((b) => b.status === 'bisecting')) return;
 			db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 			await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
 			this.event(it.pr_number, 'requeued', { reason: gone ? `#${hold.parent} is no longer open` : `#${hold.parent} moved`, headSha: p.headSha });
@@ -1610,13 +1617,17 @@ class Tick {
 		if (hold?.code === 'conflict' && (!hold.base || hold.base === master)) return;
 		// Saved before conflicts kept a base: checked once, unless it is a restack's (its parent's old commits are still in it).
 		if (hold?.code !== 'conflict') {
+			// A workflow change or a fork's restack, by its reason: those wait for a push.
+			if (/(may not push|can't push to a fork)$/.test(it.error_message ?? '')) return;
 			const info = (await this.analysis()).prs.get(it.pr_number);
 			if (info?.issues.some((i) => (i.kind === 'parent-rebased' || i.kind === 'parent-merged') && (i.staleCommits?.length ?? 0) > 0)) return;
 		}
 		await this.d.git.fetch([master, p.headSha]);
 		const r = await this.d.git.build(master, [{ pr: it.pr_number, headSha: p.headSha, title: p.title, parentHeadSha: null }]);
 		if (!r.ok) {
-			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told: true, ...(hold?.quiet ? { quiet: true } : {}), base: master });
+			// Saved before holds were: it was told then. One saved since keeps whether it was.
+			const told = hold?.code === 'conflict' ? !!hold.told : true;
+			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told, ...(hold?.quiet ? { quiet: true } : {}), base: master });
 			return;
 		}
 		db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
