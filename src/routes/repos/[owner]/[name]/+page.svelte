@@ -234,13 +234,38 @@
 		touch.down(index, { x: e.clientX, y: e.clientY, over: index }, { handle });
 	}
 
+	// The page can't scroll under a touch drag, so near the top or bottom edge it scrolls itself
+	// (the list when it scrolls on its own, on wide screens; the page otherwise), as a mouse drag does.
+	const EDGE_PX = 64;
+	let edge: { list: HTMLElement; e: PointerEvent; frame: number } | null = null;
+	function autoScroll() {
+		if (!edge || !touch.dragging) return void (edge = null);
+		const { list, e } = edge;
+		const box = list.scrollHeight > list.clientHeight ? list.getBoundingClientRect() : { top: 0, bottom: innerHeight };
+		const step = e.clientY < box.top + EDGE_PX ? -12 : e.clientY > box.bottom - EDGE_PX ? 12 : 0;
+		if (step) {
+			if (list.scrollHeight > list.clientHeight) list.scrollBy(0, step);
+			else scrollBy(0, step);
+			const over = stackUnder(e);
+			if (over !== null) touch.move({ x: e.clientX, y: e.clientY, over });
+		}
+		edge.frame = requestAnimationFrame(autoScroll);
+	}
+
 	function handlePointerMove(e: PointerEvent) {
 		if (e.pointerType === 'mouse') return;
 		touch.move({ x: e.clientX, y: e.clientY, over: touch.dragging ? stackUnder(e) : null });
+		if (!touch.dragging) return;
+		const list = (e.currentTarget as Element).closest<HTMLElement>('[role="list"]');
+		if (!list) return;
+		if (edge) edge.e = e;
+		else edge = { list, e, frame: requestAnimationFrame(autoScroll) };
 	}
 
 	function handlePointerEnd(e: PointerEvent) {
 		if (e.pointerType === 'mouse') return;
+		if (edge) cancelAnimationFrame(edge.frame);
+		edge = null;
 		// A mouse drag fires pointercancel when the HTML5 drag takes over; that is skipped above.
 		if (e.type === 'pointercancel') touch.cancel();
 		else touch.up();
