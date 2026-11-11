@@ -668,6 +668,36 @@ describe('batch queue runtime', () => {
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 	});
 
+	test('a restack conflict tried again after its parent moved, and still conflicting, is not told again', async () => {
+		pr(1, { file: 'shared.txt' });
+		pr(2, { from: 'pr1', base: 'pr1', file: 'shared.txt' });
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'parent rewrote it\n');
+		git.git('commit', '-q', '--amend', '-am', 'pr1 rewritten');
+		await run(3);
+		git.commit('pr1', 'pr1 more', 'pr1-more.txt'); // the parent moves; #2 still conflicts with it
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		expect(world.comments.filter((c) => c.pr === 2)).toHaveLength(1);
+	});
+
+	test('a restack conflict whose parent then lands is tried again, not left waiting on a parent that will not move', async () => {
+		pr(1, { file: 'shared.txt' });
+		pr(2, { from: 'pr1', base: 'pr1', file: 'shared.txt' });
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'parent rewrote it\n');
+		git.git('commit', '-q', '--amend', '-am', 'pr1 rewritten');
+		await run(3);
+		const head = git.sha('pr2');
+		git.merge(1, 'squash');
+		git.pr(1).state = 'closed';
+		git.pr(1).merged = true;
+		await run(3);
+		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'requeued').map((e) => e.data)).toEqual([{ reason: '#1 is no longer open', headSha: head }]);
+	});
+
 	test('a conflict saved over a hold of another kind keeps its own kind and base after a failed check', async () => {
 		pr(1, { file: 'same.txt' });
 		pr(2, { file: 'same.txt' });
