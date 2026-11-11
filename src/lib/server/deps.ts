@@ -117,7 +117,7 @@ export function declaredDeps(refs: Map<number, DepRef[]>, target: (pr: number) =
 				continue;
 			}
 			if (r.pr === n) {
-				problem({ code: 'dependency-invalid', reason: `${line} names this pull request itself` });
+				problem({ code: 'dependency-invalid', reason: 'A `Depends-On:` line names this pull request itself' });
 				continue;
 			}
 			const t = target(r.pr).state;

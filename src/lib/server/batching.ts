@@ -820,17 +820,18 @@ export function planRedBatch(input: {
 		if (!held.some((h) => h.pr === n))
 			held.push({
 				pr: n,
-				admission: {
-					ok: false,
-					code: 'parent-not-ready',
-					reason: stacked
-						? queued.has(p)
-							? `Stacked on #${p}, which can't be batched yet`
-							: `Stacked on #${p}, which isn't merged or queued; queue #${p} first`
-						: queued.has(p)
-							? `Depends on #${p}, which can't be batched yet`
-							: `Depends on #${p}, which isn't merged or queued; queue #${p} first`
-				}
+				admission:
+					!stacked && !queued.has(p)
+						? { ok: false, code: 'dependency-not-queued', reason: `Depends on #${p}, which isn't queued` }
+						: {
+								ok: false,
+								code: 'parent-not-ready',
+								reason: stacked
+									? queued.has(p)
+										? `Stacked on #${p}, which can't be batched yet`
+										: `Stacked on #${p}, which isn't merged or queued; queue #${p} first`
+									: `Depends on #${p}, which can't be batched yet`
+							}
 			});
 		return null;
 	};

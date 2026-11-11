@@ -82,7 +82,7 @@
 		<div class="flex min-w-0 items-center gap-1.5">
 			<p class="min-w-0 truncate text-gray-700" title={item.pr_title}>{item.pr_title}</p>
 			{#if parent !== null}
-				<a href={prLink(parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Stacked on #{parent}; lands after it">on #{parent}</a>
+				<a href={prLink(parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Lands after #{parent}">on #{parent}</a>
 			{/if}
 			{#each also as d (d)}
 				<a href={prLink(d)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Depends on #{d}; lands after it">needs #{d}</a>

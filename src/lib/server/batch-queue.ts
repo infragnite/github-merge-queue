@@ -209,6 +209,9 @@ function sqliteMs(ts: string): number {
 
 /** Dependencies seen merged (`repo#pr`): a merge is final. */
 const MERGED = new Set<string>();
+/** Dependencies seen closed or missing (`repo#pr`), asked again only after a while: a reopen is rare. */
+const SETTLED = new Map<string, { state: 'closed' | 'missing'; at: number }>();
+const SETTLED_TTL_MS = 5 * 60_000;
 
 class Tick {
 	private readonly prs = new Map<number, LivePR>();
@@ -365,8 +368,9 @@ class Tick {
 		const items = this.items();
 		for (const it of items) {
 			const p = await this.pr(it.pr_number).catch((e) => {
-				if (e instanceof RateLimitedError) throw e;
-				return null;
+				// A queued PR deleted meanwhile has no description; anything else is a real failure.
+				if ((e as { status?: number })?.status === 404) return null;
+				throw e;
 			});
 			const r = parseDependsOn(p?.body, this.d.repo);
 			if (r.length) refs.set(it.pr_number, r);
@@ -379,19 +383,31 @@ class Tick {
 				targets.set(n, { state: 'merged' });
 				continue;
 			}
+			const settled = SETTLED.get(key);
+			if (settled && this.d.now() - settled.at < SETTLED_TTL_MS) {
+				targets.set(n, { state: settled.state });
+				continue;
+			}
 			const p = await this.pr(n).catch((e) => {
 				if ((e as { status?: number })?.status === 404) return null;
 				throw e;
 			});
-			targets.set(n, { state: !p ? 'missing' : p.state === 'open' ? 'open' : p.merged ? 'merged' : 'closed' });
+			const state = !p ? 'missing' : p.state === 'open' ? 'open' : p.merged ? 'merged' : 'closed';
+			targets.set(n, { state });
+			if (state === 'closed' || state === 'missing') {
+				if (SETTLED.size >= 5000) SETTLED.clear();
+				SETTLED.set(key, { state, at: this.d.now() });
+			} else SETTLED.delete(key);
 			if (p?.merged) {
 				if (MERGED.size >= 5000) MERGED.clear();
 				MERGED.add(key);
 			}
 		}
 		const declared = declaredDeps(refs, (n) => targets.get(n) ?? { state: 'missing' });
+		const gitParent = (n: number) => analysis.prs.get(n)?.parent ?? null;
 		for (const it of items) {
-			const now = declared.on.get(it.pr_number) ?? [];
+			// What the description adds to the stack: the git parent is shown as a stack already.
+			const now = (declared.on.get(it.pr_number) ?? []).filter((p) => p !== gitParent(it.pr_number));
 			if (JSON.stringify(now) !== JSON.stringify(store.dependsOn(it as QueueItem & { depends_on?: string | null }))) store.setDependsOn(it.id, now);
 		}
 		this.depsCache = dependencyGraph(analysis, declared);
@@ -671,7 +687,7 @@ class Tick {
 		const declaredAt = (await this.dependencies()).declaredOf;
 		for (const c of result.commits) {
 			const deps = declaredAt(c.pr);
-			steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: parentAt(c.pr), attrs: masterSha, ...(deps.length ? { deps } : {}) };
+			steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: parentAt(c.pr), attrs: masterSha, deps };
 		}
 		const batch = store.insertBatch({
 			repoId: this.repoId,
@@ -1485,6 +1501,9 @@ class Tick {
 		}
 		// A run that never started (its push failed, or its PRs did not build on the new branch) shows nothing.
 		const all = [batch, ...runs.filter((r) => r.status !== 'cancelled')];
+		// What each PR was batched with, and anything declared since: never tested without either.
+		const depsNow = await this.depsOf();
+		const needsOf = (n: number) => [...new Set([...depsNow(n), ...(batch.steps[n]?.deps ?? [])])];
 		const plan = planBisection({
 			runs: all.map((r) => ({
 				context: r.context.filter((n) => !landed.has(n)),
@@ -1494,7 +1513,7 @@ class Tick {
 			})),
 			remaining,
 			masterTree,
-			parentOf: await this.depsOf(),
+			parentOf: needsOf,
 			// Known green: the base the batch failed on (its failure was only acted on once that was
 			// settled), every tree this bisection landed, and the current branch (ejecting waits for it to settle).
 			trusted: (t) => t === masterTree || t === (runs[0]?.base_tree ?? batch.base_tree) || runs.some((r) => r.status === 'landed' && r.tree_sha === t),
@@ -1535,10 +1554,9 @@ class Tick {
 			store.leaveBatch(batch.id, out.filter((n) => batch.members.includes(n)), { ejected: true });
 			// PRs that only declared a dependency on one are not to blame: they go back in line,
 			// and wait there for it to be queued again.
-			const depsOf = await this.depsOf();
 			const gone = new Set(out);
 			const needsGone = (n: number, seen = new Set<number>()): boolean =>
-				depsOf(n).some((p) => gone.has(p) || (!seen.has(p) && (seen.add(p), needsGone(p, seen))));
+				needsOf(n).some((p) => gone.has(p) || (!seen.has(p) && (seen.add(p), needsGone(p, seen))));
 			const dependents = remaining.filter((n) => !gone.has(n) && needsGone(n));
 			if (dependents.length) {
 				const ejectedList = [...gone].map((n) => `#${n}`).join(', ');

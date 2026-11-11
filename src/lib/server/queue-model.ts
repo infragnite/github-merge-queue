@@ -146,33 +146,35 @@ export function queueModel(input: QueueModelInput): QueueModel {
 		attention.push(held);
 	}
 
-	// Priority: a git stack shares its most urgent member's; a declared dependency takes on the
-	// priority of what depends on it, never the other way.
+	// Priority: a git stack shares its most urgent member's own; what a PR depends on (git parent or
+	// declared) takes on the priority of what depends on it, never the other way, so a lifted
+	// dependency does not lift its other git children.
 	const freeSet = new Set(free);
 	const inFree = (n: number) => depsOf(n).filter((p) => freeSet.has(p));
-	const eff = new Map(free.map((n) => [n, RANK[entries.get(n)!.priority]]));
+	const own0 = new Map(free.map((n) => [n, RANK[entries.get(n)!.priority]]));
+	const gitRoot = (n: number): number => {
+		const p = gitParent(n);
+		return p !== null && freeSet.has(p) ? gitRoot(p) : n;
+	};
+	const stackRank = new Map<number, number>();
+	for (const n of free) stackRank.set(gitRoot(n), Math.min(stackRank.get(gitRoot(n)) ?? Infinity, own0.get(n)!));
+	const eff = new Map(free.map((n) => [n, stackRank.get(gitRoot(n))!]));
 	for (let changed = true; changed; ) {
 		changed = false;
 		for (const n of free) {
 			for (const p of inFree(n)) {
-				const both = Math.min(eff.get(n)!, eff.get(p)!);
-				if (eff.get(p)! > both) {
-					eff.set(p, both);
-					changed = true;
-				}
-				if (p === gitParent(n) && eff.get(n)! > both) {
-					eff.set(n, both);
+				if (eff.get(p)! > eff.get(n)!) {
+					eff.set(p, eff.get(n)!);
 					changed = true;
 				}
 			}
 		}
 	}
 
-	// Stacks: free PRs joined by git parents, and by declarations between PRs of one priority.
+	// Stacks: free PRs of one priority joined by git parents and declarations.
 	const unit = new Map(free.map((n) => [n, n]));
 	const find = (n: number): number => (unit.get(n) === n ? n : find(unit.get(n)!));
-	const joins = (n: number, p: number) => p === gitParent(n) || eff.get(p) === eff.get(n);
-	for (const n of free) for (const p of inFree(n)) if (joins(n, p)) unit.set(find(n), find(p));
+	for (const n of free) for (const p of inFree(n)) if (eff.get(p) === eff.get(n)) unit.set(find(n), find(p));
 	const groups = new Map<number, number[]>();
 	for (const n of free) groups.set(find(n), [...(groups.get(find(n)) ?? []), n]);
 
