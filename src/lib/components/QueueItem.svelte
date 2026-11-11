@@ -56,6 +56,17 @@
 	const note = $derived(why);
 	const noteTone = $derived(needsSomeone ? 'text-red-700' : 'text-gray-500');
 	const prLink = (n: number) => `https://github.com/${repoOwner}/${repoName}/pull/${n}`;
+
+	// Svelte adds touchstart as passive: a non-passive one keeps a press on the grip from selecting
+	// text or opening the callout.
+	let handle = $state<HTMLSpanElement | null>(null);
+	$effect(() => {
+		if (!handle) return;
+		const el = handle;
+		const prevent = (e: TouchEvent) => e.preventDefault();
+		el.addEventListener('touchstart', prevent, { passive: false });
+		return () => el.removeEventListener('touchstart', prevent);
+	});
 </script>
 
 <div
@@ -65,7 +76,14 @@
 	style={depth ? `padding-left: ${0.75 + depth * 1.25}rem` : undefined}
 >
 	{#if reorderable}
-		<span class="hidden shrink-0 cursor-grab text-gray-300 hover:text-gray-500 active:cursor-grabbing sm:inline" title="Drag to reorder" aria-hidden="true">
+		<!-- Shown on wide screens and on any touch screen, where it is the way to drag (no long press needed). -->
+		<span
+			bind:this={handle}
+			data-drag-handle
+			class="hidden shrink-0 cursor-grab touch-none text-gray-300 select-none hover:text-gray-500 active:cursor-grabbing sm:inline pointer-coarse:inline [-webkit-touch-callout:none]"
+			title="Drag to reorder"
+			aria-hidden="true"
+		>
 			<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
 				<circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
 				<circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
@@ -74,7 +92,7 @@
 		</span>
 	{/if}
 	{#if position !== null}
-		<span class="w-6 shrink-0 text-right text-xs tabular-nums text-gray-400" title="Place in line">{position}</span>
+		<span class="w-6 shrink-0 text-right text-xs tabular-nums text-gray-500" title="Place in line">{position}</span>
 	{/if}
 	{#if depth > 0}<span class="shrink-0 text-gray-400" aria-hidden="true">└</span>{/if}
 	<a href={item.pr_url} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600">#{item.pr_number}</a>
@@ -107,9 +125,9 @@
 			<p class="truncate text-xs text-amber-700" title={w}>{w}</p>
 		{/each}
 	</div>
-	<span class="hidden shrink-0 text-xs text-gray-400 md:inline">{item.author_login}</span>
+	<span class="hidden shrink-0 text-xs text-gray-500 md:inline lg:hidden 2xl:inline">{item.author_login}</span>
 	{#if batchMode && priority !== 'normal'}
-		<span class="shrink-0 rounded px-1.5 py-0.5 text-xs font-medium {priority === 'urgent' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'}">{priority}</span>
+		<span class="shrink-0 rounded px-1.5 py-0.5 text-xs font-medium {priority === 'urgent' ? 'bg-indigo-50 text-indigo-700' : 'bg-gray-100 text-gray-500'}">{priority}</span>
 	{/if}
 	{#if showStatus}<StatusBadge status={item.status} />{/if}
 	{#if !readonly && batchMode && (item.status === 'queued' || item.status === 'conflict')}
@@ -135,7 +153,7 @@
 		{:else if item.status === 'failed'}
 			<form method="POST" action={action('retry')} use:enhance>
 				<input type="hidden" name="item_id" value={item.id} />
-				<button type="submit" class="rounded p-1 text-gray-400 hover:bg-indigo-50 hover:text-indigo-600" title="Put back in the queue" aria-label="Retry #{item.pr_number}">
+				<button type="submit" class="rounded p-2 text-gray-500 sm:p-1 hover:bg-indigo-50 hover:text-indigo-600" title="Put back in the queue" aria-label="Retry #{item.pr_number}">
 					<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
 						<path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
 					</svg>
@@ -151,7 +169,7 @@
 				}}
 			>
 				<input type="hidden" name="item_id" value={item.id} />
-				<button type="submit" class="rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-600" title="Remove from queue" aria-label="Remove #{item.pr_number} from the queue">
+				<button type="submit" class="rounded p-2 text-gray-500 sm:p-1 hover:bg-red-50 hover:text-red-600" title="Remove from queue" aria-label="Remove #{item.pr_number} from the queue">
 					<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
 						<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
 					</svg>

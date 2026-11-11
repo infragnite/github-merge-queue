@@ -222,7 +222,7 @@ export const actions: Actions = {
 			markDirty(repo.id);
 		}),
 
-	/** Batch mode's order: urgent PRs go first, in an express batch (urgent needs maintain). */
+	/** Batch mode's order: urgent PRs go first, in the urgent batch (urgent needs maintain). */
 	setPriority: (event) =>
 		guarded(event, 'write', 'Changing a priority', async ({ repo, me, form }) => {
 			const n = intField(form, 'pr_number');
@@ -253,7 +253,8 @@ export const actions: Actions = {
 			} catch {
 				throw new ApiError(404, `#${n} was not found on GitHub`);
 			}
-			enqueue(repo, me, pr, {});
+			// Urgent needs maintain; enqueue checks it.
+			enqueue(repo, me, pr, { priority: form.get('priority') ?? undefined });
 			markDirty(repo.id);
 		}),
 

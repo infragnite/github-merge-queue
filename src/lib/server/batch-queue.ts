@@ -1377,7 +1377,8 @@ class Tick {
 		return this.d.now() - store.batchCreatedMs(b) > this.settings().config.ciTimeoutMs;
 	}
 
-	async advanceHead(head: BatchRow, rest: BatchRow[], interleave = false) {
+	/** `startRuns`: a bisection may start its next step (not while an urgent batch runs beside it). */
+	async advanceHead(head: BatchRow, rest: BatchRow[], interleave = false, startRuns = true) {
 		if (head.status === 'testing' || head.status === 'retrying') {
 			const r = await this.ciResult(head);
 			if (r === 'pending') {
@@ -1440,7 +1441,7 @@ class Tick {
 			}
 			return;
 		}
-		if (head.status === 'bisecting') await this.bisect(head, interleave);
+		if (head.status === 'bisecting') await this.bisect(head, interleave, startRuns);
 	}
 
 	/**
@@ -1448,7 +1449,7 @@ class Tick {
 	 * branch lands at once, failing groups are split and run again on top of it. Everything is
 	 * planned from the recorded runs, so a restart picks it up where it was.
 	 */
-	async bisect(batch: BatchRow, interleave = false) {
+	async bisect(batch: BatchRow, interleave = false, startRuns = true) {
 		const runs = store.getBisectRuns(batch.id);
 		for (const run of runs) {
 			if (run.ci_result !== 'pending') continue;
@@ -1578,6 +1579,8 @@ class Tick {
 			this.log(`batch ${batch.number}: bisection waits for an urgent batch`);
 			return;
 		}
+		// An urgent batch runs beside it: the next step starts on whatever branch it leaves.
+		if (!startRuns && plan.start.length) return;
 		for (const g of plan.start) await this.startBisectRun(batch, { context: [], members: g }, runs.length, masterSha, masterTree);
 	}
 
@@ -2244,19 +2247,39 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		// pipeline: keep the head, rebuild the rest on top of it.
 		// An urgent batch run between two steps of a bisection is built on master beside it, not on
 		// top of it: it goes first, and the bisection waits for it.
-		const between = active[0].status === 'bisecting' ? active.find((b, i) => i > 0 && b.express && b.base_sha !== active[0].head_sha) : undefined;
+		let between = active[0].status === 'bisecting' ? active.find((b, i) => i > 0 && b.express && b.base_sha !== active[0].head_sha) : undefined;
+		// An urgent batch beside a bisection whose step landed meanwhile tests a branch that is gone: it runs again.
+		if (between && between.status !== 'bisecting' && between.base_sha !== masterSha) {
+			await t.supersede([between], 'the bisection beside it landed first');
+			active = active.filter((b) => b !== between);
+			between = undefined;
+		}
 		const loose = active.findIndex((b, i) => i > 0 && b !== between && b.base_sha !== active[i - 1].head_sha);
 		if (loose > 0) {
 			await t.supersede(active.slice(loose));
 			active = active.slice(0, loose);
 		}
-		if (between && active.includes(between)) await t.advanceHead(between, []);
-		else await t.advanceHead(active[0], active.slice(1), true);
+		if (between && active.includes(between)) {
+			await t.advanceHead(between, []);
+			if (store.getQueueSettings(deps.repo.id).pausedReason) return;
+			// The bisection's step goes on beside it, unless the urgent batch is bisecting itself (it goes
+			// first) or just landed (the bisection follows the new branch next tick).
+			const now = store.getBatch(between.id)!;
+			if (now.status !== 'bisecting' && (await deps.github.defaultBranchSha()) === masterSha) {
+				const head = store.getBatch(active[0].id)!;
+				if (head.status === 'bisecting') await t.advanceHead(head, active.filter((b) => b.id !== head.id && b.id !== between!.id), false, false);
+			}
+		} else await t.advanceHead(active[0], active.slice(1), true);
 		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 		active = store.getActiveBatches(deps.repo.id);
 	}
 	// Don't plan new work on top of a bisection: its base is about to change. Holds are still said.
 	if (active.some((b) => b.status === 'bisecting')) {
+		// Urgent PRs don't wait for a running step: one urgent batch runs beside the bisection, on the
+		// default branch. Whichever lands second runs again on the branch the first one left.
+		if (!active.some((b, i) => i > 0 && b.express) && (await deps.github.defaultBranchSha()) === masterSha) {
+			if ((await t.plan(active, masterSha, { urgentOnly: true })) === 'started') active = store.getActiveBatches(deps.repo.id);
+		}
 		await t.plan(active, masterSha, { holdsOnly: true });
 		return;
 	}
