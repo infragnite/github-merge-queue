@@ -4,13 +4,14 @@ process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
 const { tickBatchQueue, startTry, retireBatches, recoverInterrupted, cancelBatch } = await import('./batch-queue');
-const { baselineCommit, buildBatch, GitRunner } = await import('./batch-builder');
+const { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } = await import('./batch-builder');
 const { replay } = await import('./rebase');
+const { mergeDriverEnv } = await import('./merge-drivers');
 const { analyzeStacks } = await import('./stacks');
 const { enqueue } = await import('./api-service');
 const events = await import('./events');
 import { GitSandbox } from './testing/git-sandbox';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import type { LivePR, PRCheckState, QueueDeps } from './batch-queue';
 import { ejectedNotice, holdCheck, holdNotice, readNotice } from './hold-format';
 import { RateLimitedError } from './rate-limit';
@@ -109,7 +110,7 @@ class World {
 	}
 
 	deps(): QueueDeps {
-		const runner = new GitRunner(git.dir);
+		const runner = new GitRunner(git.dir, mergeDriverEnv(`${git.dir}/.git`));
 		return {
 			repo,
 			now: () => Date.now() + this.started.length,
@@ -122,6 +123,8 @@ class World {
 				build: async (base, members) => buildBatch(runner, base, members),
 				restack: async (head, upstream, onto) => replay(runner, { head, upstream, onto }),
 				baseline: async (base) => baselineCommit(runner, base),
+				mergeTrees: async (onto, head) => mergeTrees(runner, onto, head),
+				mergeCommit: async (tree, parents, message) => queueMergeCommit(runner, tree, parents, message),
 				changed: async (from, to) => git.git('diff', '--name-only', from, to).split('\n').filter(Boolean)
 			},
 			ci: {
@@ -829,6 +832,38 @@ describe('batch queue runtime', () => {
 		expect(git.git('show', 'main:shared.txt')).toBe('child rewrote it');
 		expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+	});
+
+	test('two PRs that remove neighbouring lines of a sorted-set list land together; the second gets master merged in first', async () => {
+		git.git('checkout', '-q', 'main');
+		writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\n');
+		mkdirSync(`${git.dir}/lists`, { recursive: true });
+		writeFileSync(`${git.dir}/lists/lane.txt`, '# expected failures\na.kt\nb.kt\nc.kt\nd.kt\n');
+		git.git('add', '-A');
+		git.git('commit', '-qm', 'lists');
+		store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+		const removing = (n: number, keep: string[]) => {
+			git.branch(`pr${n}`, 'main');
+			git.git('checkout', '-q', `pr${n}`);
+			writeFileSync(`${git.dir}/lists/lane.txt`, `# expected failures\n${keep.map((k) => `${k}\n`).join('')}`);
+			git.git('commit', '-qam', `pr${n}`);
+			git.openPR(n, `pr${n}`, 'main');
+			world.approved.add(n);
+			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+		};
+		removing(1, ['a.kt', 'c.kt', 'd.kt']);
+		removing(2, ['a.kt', 'b.kt', 'd.kt']);
+		const head2 = git.sha('pr2');
+		await run();
+		expect(world.started[0].prs).toEqual([1, 2]);
+		expect(world.merged).toEqual([1, 2]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(git.git('show', 'main:lists/lane.txt')).toBe('# expected failures\na.kt\nd.kt');
+		expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+		// Only #2 needed it, and the new head is a merge on top of the reviewed one (no rewrite).
+		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+		const pushed = world.pushedHeads[0].sha;
+		expect(git.git('rev-list', '--parents', '-n', '1', pushed).split(' ').slice(1)[0]).toBe(head2);
 	});
 
 	test('a stacked child whose parent moved on is tested with the parent\'s new commits', async () => {

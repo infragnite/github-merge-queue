@@ -42,7 +42,7 @@ function fakeDeps(over: { git?: Partial<QueueDeps['git']>; github?: Partial<Queu
 		now: () => clock.t,
 		analysis: over.analysis ?? (async () => ({ prs: new Map(), stacks: [], issues: [] })),
 		// `changed` is in QueueGit from #42 on; the cast below keeps this file checking before and after it.
-		git: { fetch: async () => {}, changed: async () => [] as string[], tree: async () => 't', build: async () => ok, restack: async () => ({ ok: true, head: 'new', tree: 't', replayed: 1 }), baseline: async () => 'b', ...over.git },
+		git: { fetch: async () => {}, changed: async () => [] as string[], tree: async () => 't', build: async () => ok, restack: async () => ({ ok: true, head: 'new', tree: 't', replayed: 1 }), baseline: async () => 'b', mergeTrees: async () => ({ queue: 't', line: 't' }), mergeCommit: async () => 'm', ...over.git },
 		github: {
 			defaultBranchSha: async () => 'master',
 			pr: async (n: number) => live(n),
