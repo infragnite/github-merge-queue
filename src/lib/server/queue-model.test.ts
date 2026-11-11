@@ -4,7 +4,7 @@ import { fillBatch, plannedAdmission, queueBoard, queueModel, serialPick, type B
 import { entry, MIN, NOW, ready, stacks } from './testing/stack-fixture';
 import type { StackAnalysis } from './stacks';
 
-const config: BatchConfig = { ...DEFAULT_BATCH_CONFIG, requireApproval: true, collectWindowMs: 0, maxBatch: 8, depth: 2, expressMax: 2 };
+const config: BatchConfig = { ...DEFAULT_BATCH_CONFIG, requireApproval: true, collectWindowMs: 0, maxBatch: 8, depth: 2 };
 
 function model(
 	queue: QueueEntry[],
@@ -177,14 +177,20 @@ describe('filling a new batch from the queue model', () => {
 		expect(fill(m, { inflight: 2 })).toEqual({ batch: null, express: false, waitUntil: null });
 	});
 
-	test('an urgent stack gets an express batch of urgent stacks, a whole stack even past expressMax', () => {
+	test('an urgent stack gets an express batch of every urgent stack, whole', () => {
 		const m = model([entry(1, 90), entry(2, 80, 'urgent'), entry(3, 70), entry(4, 60), entry(5, 50, 'urgent')], stacks([1, 2, 3, 4, 5], { 3: 2, 4: 3 }));
-		expect(fill(m)).toEqual({ batch: [2, 3, 4], express: true, waitUntil: null });
+		expect(fill(m)).toEqual({ batch: [2, 3, 4, 5], express: true, waitUntil: null });
 	});
 
-	test('an express batch takes urgent stacks while they fit expressMax', () => {
-		const m = model([entry(1, 90), entry(2, 80, 'urgent'), entry(3, 70, 'urgent'), entry(4, 60, 'urgent')], stacks([1, 2, 3, 4]));
-		expect(fill(m)).toEqual({ batch: [2, 3], express: true, waitUntil: null });
+	test('an express batch takes every urgent stack, with no limit of its own', () => {
+		const m = model([entry(1, 90), entry(2, 80, 'urgent'), entry(3, 70, 'urgent'), entry(4, 60, 'urgent'), entry(5, 50, 'urgent')], stacks([1, 2, 3, 4, 5]));
+		expect(fill(m)).toEqual({ batch: [2, 3, 4, 5], express: true, waitUntil: null });
+	});
+
+	test('an express batch is cut at the batch size like any batch', () => {
+		const m = model([entry(1, 90), entry(2, 80, 'urgent'), entry(3, 70), entry(4, 60, 'urgent'), entry(5, 50, 'urgent')], stacks([1, 2, 3, 4, 5], { 3: 2 }));
+		expect(fill(m, { config: { maxBatch: 3 } })).toEqual({ batch: [2, 3, 4], express: true, waitUntil: null });
+		expect(fill(m, { config: { maxBatch: 1 } })).toEqual({ batch: [2], express: true, waitUntil: null });
 	});
 
 	test('a partial batch waits for the collect window of its oldest PR', () => {
