@@ -11,6 +11,7 @@
 	import { queueSummary } from '$lib/queue-summary';
 	import { page } from '$app/state';
 	import AddPrDialog from '$lib/components/AddPrDialog.svelte';
+	import { touchDrag } from '$lib/touch-drag';
 
 	let { data, form } = $props();
 
@@ -116,6 +117,8 @@
 	};
 
 	async function refresh() {
+		// Not while a PR is being dragged: the rows would move under the finger or the mouse.
+		if (dragIndex !== null) return;
 		refreshing = true;
 		await invalidateAll();
 		refreshing = false;
@@ -132,7 +135,12 @@
 		return () => clearInterval(id);
 	});
 
-	function handleDragStart(index: number) {
+	function handleDragStart(e: DragEvent, index: number) {
+		// Some mobile browsers start a native drag on a long press; touch drags go through touchDrag.
+		if (touch.dragging) {
+			e.preventDefault();
+			return;
+		}
 		dragIndex = index;
 	}
 
@@ -148,7 +156,11 @@
 
 	async function handleDrop(e: DragEvent, dropIndex: number) {
 		e.preventDefault();
-		if (dragIndex === null || dragIndex === dropIndex || needle) {
+		await reorder(dragIndex, dropIndex);
+	}
+
+	async function reorder(dragIndex: number | null, dropIndex: number | null) {
+		if (dragIndex === null || dropIndex === null || dragIndex === dropIndex || needle) {
 			handleDragEnd();
 			return;
 		}
@@ -175,6 +187,132 @@
 		await invalidateAll();
 		reordering = false;
 		handleDragEnd();
+	}
+
+	// Touch and pen: the grip drags at once, the rest of a stack after a long press (see touchDrag).
+	// Stacks are tracked by their root PR, so a refresh that moves rows can't swap what is dropped.
+	const stackAt = (root: number) => shownStacks.findIndex((s: BoardStack) => s.root === root);
+	let touchEl: Element | null = null;
+	let touchPointer = 0;
+	const touch = touchDrag({
+		start: (root) => {
+			try {
+				touchEl?.setPointerCapture(touchPointer);
+			} catch {
+				return false; // the pointer is already gone
+			}
+			dragIndex = stackAt(root);
+			dragOverIndex = dragIndex;
+			navigator.vibrate?.(10);
+			return true;
+		},
+		over: (root) => (dragOverIndex = stackAt(root)),
+		drop: (from, to) => {
+			const [f, t] = [stackAt(from), stackAt(to)];
+			// The stack left the line while it was held: nothing to move.
+			if (f < 0 || t < 0) return handleDragEnd();
+			reorder(f, t);
+		},
+		cancel: handleDragEnd
+	});
+	const draggable = $derived(!batchMode && !needle && data.can.reorder && !readonly);
+	// A phone keeps the native long-press drag off; its drags go through touchDrag.
+	let coarse = $state(false);
+
+	// The end of a gesture is heard on the document: the row that captured the pointer may have been
+	// re-rendered away. Once a drag runs the page must not scroll under it, which needs a non-passive
+	// touchmove listener (Svelte's ontouchmove is passive).
+	$effect(() => {
+		const mq = matchMedia('(pointer: coarse)');
+		coarse = mq.matches;
+		const media = () => (coarse = mq.matches);
+		const block = (e: TouchEvent) => {
+			if (touch.dragging) e.preventDefault();
+		};
+		mq.addEventListener('change', media);
+		document.addEventListener('touchmove', block, { passive: false });
+		document.addEventListener('pointermove', handlePointerMove);
+		document.addEventListener('pointerup', handlePointerEnd);
+		document.addEventListener('pointercancel', handlePointerEnd);
+		document.addEventListener('lostpointercapture', handlePointerEnd, true);
+		return () => {
+			mq.removeEventListener('change', media);
+			document.removeEventListener('touchmove', block);
+			document.removeEventListener('pointermove', handlePointerMove);
+			document.removeEventListener('pointerup', handlePointerEnd);
+			document.removeEventListener('pointercancel', handlePointerEnd);
+			document.removeEventListener('lostpointercapture', handlePointerEnd, true);
+			stopEdge();
+			touch.stop();
+		};
+	});
+	// Reordering turned off mid-drag (a search, the mode switched): the drag ends without a drop.
+	$effect(() => {
+		if (!draggable) {
+			stopEdge();
+			touch.stop();
+		}
+	});
+
+	const stackUnder = (e: PointerEvent) => {
+		const el = document.elementFromPoint(e.clientX, e.clientY)?.closest<HTMLElement>('[data-stack-root]');
+		return el ? Number(el.dataset.stackRoot) : null;
+	};
+	const point = (e: PointerEvent) => ({ x: e.clientX, y: e.clientY, over: stackUnder(e) });
+
+	function handlePointerDown(e: PointerEvent, root: number) {
+		if (e.pointerType === 'mouse') return;
+		const target = e.target as Element;
+		const handle = !!target.closest('[data-drag-handle]');
+		// Links and buttons keep their own long press (and taps).
+		if (!handle && target.closest('a, button, summary, input, select')) return;
+		if (handle) e.preventDefault();
+		if (!touch.blocksMenu) {
+			touchEl = e.currentTarget as Element;
+			touchPointer = e.pointerId;
+		}
+		touch.down(e.pointerId, root, { x: e.clientX, y: e.clientY, over: root }, { handle });
+	}
+
+	// The page can't scroll under a touch drag, so near the top or bottom edge it scrolls itself
+	// (the list when it scrolls on its own, on wide screens; the page otherwise), as a mouse drag does.
+	const EDGE_PX = 64;
+	let edge: { list: HTMLElement; e: PointerEvent; frame: number } | null = null;
+	function stopEdge() {
+		if (edge) cancelAnimationFrame(edge.frame);
+		edge = null;
+	}
+	function autoScroll() {
+		if (!edge || !touch.dragging) return stopEdge();
+		const { list, e } = edge;
+		const own = list.scrollHeight > list.clientHeight;
+		const box = own ? list.getBoundingClientRect() : { top: 0, bottom: innerHeight };
+		const step = e.clientY < box.top + EDGE_PX ? -12 : e.clientY > box.bottom - EDGE_PX ? 12 : 0;
+		if (step) {
+			if (own) list.scrollBy(0, step);
+			else scrollBy(0, step);
+			touch.move(e.pointerId, point(e));
+		}
+		edge.frame = requestAnimationFrame(autoScroll);
+	}
+
+	function handlePointerMove(e: PointerEvent) {
+		if (e.pointerType === 'mouse') return;
+		touch.move(e.pointerId, touch.dragging ? point(e) : { x: e.clientX, y: e.clientY, over: null });
+		if (!touch.dragging || e.pointerId !== touchPointer) return;
+		if (edge) edge.e = e;
+		else {
+			const list = document.querySelector<HTMLElement>('[data-line-list]');
+			if (list) edge = { list, e, frame: requestAnimationFrame(autoScroll) };
+		}
+	}
+
+	function handlePointerEnd(e: PointerEvent) {
+		// A mouse drag fires pointercancel when the HTML5 drag takes over.
+		if (e.pointerType === 'mouse') return;
+		if (e.pointerId === touchPointer) stopEdge();
+		if (e.type === 'pointerup') touch.up(e.pointerId, point(e));
+		else touch.cancel(e.pointerId);
 	}
 
 </script>
@@ -321,17 +459,20 @@
 				{#if data.queueItems.length === 0}
 					<p class="rounded-xl border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">Queue is empty.{#if !readonly} Add a pull request to start.{/if}</p>
 				{:else if shownStacks.length > 0}
-					<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised lg:max-h-[calc(100dvh-8rem)] lg:overflow-y-auto" role="list">
+					<div data-line-list class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised lg:max-h-[calc(100dvh-8rem)] lg:overflow-y-auto" role="list">
 						{#each shownStacks as st, index (st.root)}
-							{@const drag = !batchMode && !needle && data.can.reorder && !readonly}
+							{@const drag = draggable}
 							<div
 								role="listitem"
-								draggable={drag ? 'true' : undefined}
-								ondragstart={drag ? () => handleDragStart(index) : undefined}
+								draggable={drag && !coarse ? 'true' : undefined}
+								ondragstart={drag ? (e) => handleDragStart(e, index) : undefined}
 								ondragover={drag ? (e) => handleDragOver(e, index) : undefined}
 								ondrop={drag ? (e) => handleDrop(e, index) : undefined}
 								ondragend={drag ? handleDragEnd : undefined}
-								class="border-b border-border-subtle last:border-b-0 {st.rows.length > 1 ? 'border-l-2 border-l-sky-200' : ''} {dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-t-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
+								onpointerdown={drag ? (e) => handlePointerDown(e, st.root) : undefined}
+								oncontextmenu={drag ? (e) => touch.blocksMenu && e.preventDefault() : undefined}
+								data-stack-root={st.root}
+								class="{drag ? 'pointer-coarse:select-none pointer-coarse:[-webkit-touch-callout:none]' : ''} border-b border-border-subtle last:border-b-0 {st.rows.length > 1 ? 'border-l-2 border-l-sky-200' : ''} {dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-t-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
 							>
 								{#each st.rows as r, k (r.pr)}
 									<QueueItem
