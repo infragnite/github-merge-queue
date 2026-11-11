@@ -463,7 +463,7 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([5]);
 	});
 
-	test('an urgent batch that fails between two bisection steps is bisected first, and the first bisection then goes on', async () => {
+	test('an urgent batch that fails beside a bisection is bisected first, and the first bisection then goes on', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
 		pr(2);
@@ -481,6 +481,8 @@ describe('batch queue runtime', () => {
 		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
 			'batch 1,2,3,4',
 			'step 1,2',
+			// It starts beside the running step, which lands first: it runs again on the new branch.
+			'batch 5,6',
 			'batch 5,6',
 			'step 5',
 			'step 6',
