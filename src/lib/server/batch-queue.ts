@@ -412,7 +412,8 @@ class Tick {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
 			// What it conflicts with may change without a push (the default branch moves): checked again then.
-			if (code === 'conflict') store.setHold(it.id, { code, reason, head: p.headSha, told: true, base: await this.d.github.defaultBranchSha() });
+			// A workflow change waits for a push (after the permission is granted), whatever the branch does.
+			store.setHold(it.id, { code, reason, head: p.headSha, told: true, ...(code === 'conflict' ? { base: await this.d.github.defaultBranchSha() } : {}) });
 		}
 		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
@@ -1585,11 +1586,12 @@ class Tick {
 	/** A conflict with the default branch, its head unchanged: back in line once the branch moved and it merges cleanly. */
 	async recheckConflict(it: QueueItem, p: LivePR, master: string) {
 		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
-		if (hold?.code !== 'conflict' || !hold.base || hold.base === master) return;
+		// Saved before the queue kept the base (or with none): checked now, and its base kept from then on.
+		if (hold?.code === 'workflow-permission' || (hold?.code === 'conflict' && hold.base === master)) return;
 		await this.d.git.fetch([master, p.headSha]);
 		const r = await this.d.git.build(master, [{ pr: it.pr_number, headSha: p.headSha, title: p.title, parentHeadSha: null }]);
 		if (!r.ok) {
-			store.setHold(it.id, { ...hold, base: master });
+			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told: true, ...hold, base: master });
 			return;
 		}
 		db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
