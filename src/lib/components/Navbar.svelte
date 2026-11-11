@@ -5,8 +5,8 @@
 
 <nav class="border-b border-border-subtle bg-surface-raised">
 	<div class="mx-auto flex h-14 max-w-6xl items-center justify-between px-4 sm:px-6 lg:px-8">
-		<!-- Logo -->
-		<div class="flex items-center gap-6">
+		<!-- Logo: the dashboard, which lists the repositories. Each repository's settings are on its own page. -->
+		<div class="flex items-center">
 			<a href="/" class="flex items-center gap-2.5">
 				<div class="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600">
 					<svg class="h-4 w-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
@@ -16,14 +16,6 @@
 				<span class="text-sm font-semibold text-gray-900">Merge Queue</span>
 			</a>
 
-			<div class="hidden items-center gap-1 sm:flex">
-				<a href="/" class="rounded-md px-3 py-1.5 text-sm text-gray-600 transition-colors hover:bg-surface-sunken hover:text-gray-900">
-					Dashboard
-				</a>
-				<a href="/settings" class="rounded-md px-3 py-1.5 text-sm text-gray-600 transition-colors hover:bg-surface-sunken hover:text-gray-900">
-					Settings
-				</a>
-			</div>
 		</div>
 
 		<!-- User Menu -->
