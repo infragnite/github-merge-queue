@@ -552,6 +552,8 @@ export interface Hold {
 	quiet?: boolean;
 	/** A conflict with the default branch: that branch's head when it conflicted. It is checked again once the branch moves. */
 	base?: string;
+	/** A restack's conflict with its rebased parent: that parent, whose head `base` is. It is tried again once the parent moves. */
+	parent?: number;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {

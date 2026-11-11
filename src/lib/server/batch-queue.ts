@@ -406,7 +406,7 @@ class Tick {
 	 * told on the PR. A push clears it and the PR is picked up again.
 	 */
 	/** `base`: the default branch head it conflicted with alone; the conflict is checked again once the branch moves. Without one, only a push retries it. */
-	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict', base?: string) {
+	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict', base?: string, parent?: number) {
 		const it = this.item(n);
 		const p = await this.pr(n);
 		if (it) {
@@ -414,7 +414,7 @@ class Tick {
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
 			// A conflict with the default branch may go away when the branch moves: it is checked again then. A
 			// restack's conflict (old parent commits) and a workflow change wait for a push.
-			store.setHold(it.id, { code, reason, head: p.headSha, told: true, ...(base ? { base } : {}) });
+			store.setHold(it.id, { code, reason, head: p.headSha, told: true, ...(base ? { base } : {}), ...(parent !== undefined ? { parent } : {}) });
 		}
 		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
@@ -1589,6 +1589,18 @@ class Tick {
 	async recheckConflict(it: QueueItem, p: LivePR, master: string) {
 		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
 		if (hold?.code === 'workflow-permission') return;
+		// A restack's conflict with its rebased parent: back in line once the parent moved; the restack tries again.
+		if (hold?.code === 'conflict' && hold.parent !== undefined) {
+			const now = (await this.pr(hold.parent).catch((e) => {
+				if (e instanceof RateLimitedError) throw e;
+				return null;
+			}))?.headSha;
+			if (!now || now === hold.base) return;
+			db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
+			await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
+			this.event(it.pr_number, 'requeued', { reason: `#${hold.parent} moved`, headSha: p.headSha });
+			return;
+		}
 		// Saved with the default branch it conflicted with: checked once that moved. Saved without one: a restack's conflict, for a push.
 		if (hold?.code === 'conflict' && (!hold.base || hold.base === master)) return;
 		// Saved before conflicts kept a base: checked once, unless it is a restack's (its parent's old commits are still in it).
@@ -1649,7 +1661,11 @@ class Tick {
 					n,
 					`restacking onto ${ontoName} needs conflict resolution: ${r.reason}`,
 					r.conflicts,
-					`git fetch origin ${rebased ? `pull/${info.parent}/head` : def} && git rebase --onto FETCH_HEAD ${upstream}`
+					`git fetch origin ${rebased ? `pull/${info.parent}/head` : def} && git rebase --onto FETCH_HEAD ${upstream}`,
+					'conflict',
+					// Onto a rebased parent: tried again once that parent moves. Onto the default branch: a push.
+					rebased ? onto : undefined,
+					rebased ? info.parent : undefined
 				);
 				continue;
 			}
