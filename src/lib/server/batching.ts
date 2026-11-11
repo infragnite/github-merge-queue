@@ -334,6 +334,32 @@ export function descendants(analysis: StackAnalysis, prs: Iterable<number>): Set
 // Bisection
 
 /** A commit to test: `context` (known good on the base) plus `members`, in order. */
+/**
+ * The head of `batch` that a passed `try` run already tested on this default branch, or null. A
+ * try tests one PR's head alone on the default branch, and a stacked PR's head carries its
+ * parents' commits, so a try of `n` stands for `n` with its ancestors: the prefix must be exactly
+ * those, at the start of the batch (nothing else under it), and keep its stack whole (no PR behind
+ * it in the batch sits on it). The first such prefix wins; the caller still checks that building it
+ * gives the tree the try tested.
+ */
+export function triedPrefix(batch: number[], parentOf: (n: number) => number | null, passed: (n: number) => boolean): number[] | null {
+	for (let k = 1; k <= batch.length; k++) {
+		const n = batch[k - 1];
+		if (!passed(n)) continue;
+		const prefix = batch.slice(0, k);
+		const ancestors = new Set<number>();
+		for (let p = parentOf(n), i = 0; p !== null && i < batch.length; p = parentOf(p), i++) ancestors.add(p);
+		if (!prefix.every((m) => m === n || ancestors.has(m))) continue;
+		const inPrefix = new Set(prefix);
+		const splits = batch.slice(k).some((m) => {
+			for (let p = parentOf(m), i = 0; p !== null && i < batch.length; p = parentOf(p), i++) if (inPrefix.has(p)) return true;
+			return false;
+		});
+		if (!splits) return prefix;
+	}
+	return null;
+}
+
 export interface TestGroup {
 	context: number[];
 	members: number[];
