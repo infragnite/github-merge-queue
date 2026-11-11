@@ -207,6 +207,9 @@ function sqliteMs(ts: string): number {
 	return Date.parse(ts.includes('T') ? ts : `${ts.replace(' ', 'T')}Z`);
 }
 
+/** Dependencies seen merged (`repo#pr`): a merge is final. */
+const MERGED = new Set<string>();
+
 class Tick {
 	private readonly prs = new Map<number, LivePR>();
 	/** This tick's list of open PRs, read once (null: not read yet, or stale after a landing). */
@@ -370,11 +373,21 @@ class Tick {
 		}
 		const targets = new Map<number, DepTarget>();
 		for (const n of new Set([...refs.values()].flat().flatMap((r) => (r.kind === 'pr' ? [r.pr] : [])))) {
+			// A merged PR stays merged: asked once, not on every tick while its dependents wait.
+			const key = `${this.repoId}#${n}`;
+			if (MERGED.has(key)) {
+				targets.set(n, { state: 'merged' });
+				continue;
+			}
 			const p = await this.pr(n).catch((e) => {
 				if ((e as { status?: number })?.status === 404) return null;
 				throw e;
 			});
 			targets.set(n, { state: !p ? 'missing' : p.state === 'open' ? 'open' : p.merged ? 'merged' : 'closed' });
+			if (p?.merged) {
+				if (MERGED.size >= 5000) MERGED.clear();
+				MERGED.add(key);
+			}
 		}
 		const declared = declaredDeps(refs, (n) => targets.get(n) ?? { state: 'missing' });
 		for (const it of items) {
