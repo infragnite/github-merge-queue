@@ -120,7 +120,7 @@ describe('what each declared dependency means for the PR', () => {
 			reason: '`Depends-On: other/lib#3` is in another repository; only pull requests of this one can be dependencies'
 		});
 		expect(one([{ kind: 'pr', pr: 7, text: '#7' }], { 7: 'missing' })).toEqual({ code: 'dependency-invalid', reason: '`Depends-On: #7` is not a pull request here' });
-		expect(one([{ kind: 'pr', pr: 10, text: '#10' }])).toEqual({ code: 'dependency-invalid', reason: '`Depends-On: #10` names this pull request itself' });
+		expect(one([{ kind: 'pr', pr: 10, text: '#10' }])).toEqual({ code: 'dependency-invalid', reason: 'A `Depends-On:` line names this pull request itself' });
 	});
 
 	test('a problem holds the PR even when its other dependencies are fine; the first problem is the one said', () => {

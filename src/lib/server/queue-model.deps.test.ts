@@ -174,6 +174,26 @@ describe('priority flows down to dependencies, never up to dependents', () => {
 		expect(fillBatch(later, { config, inflightBatches: 1, now: NOW }).batch).toEqual([3, 2]);
 	});
 
+	test("urgency lifts only what the urgent PR needs, not the rest of its dependency's git stack", () => {
+		// 11 is stacked on 10 by git; the urgent 20 declares 10. 10 rides with 20; 11 is not needed.
+		const m = model([entry(10, 60), entry(11, 50), entry(20, 40, 'urgent')], stacks([10, 11, 20], { 11: 10 }), { 20: [10] });
+		expect(shape(m).stacks).toEqual([
+			{ members: [10, 20], on: null, priority: 'urgent' },
+			{ members: [11], on: null, priority: 'normal' }
+		]);
+		expect(m.stacks[1].after).toEqual([10]);
+		expect(fillBatch(m, { config, inflightBatches: 0, now: NOW })).toEqual({ batch: [10, 20], express: true, waitUntil: null });
+	});
+
+	test("urgency lifts the git parents of what an urgent PR needs, since that needs them too", () => {
+		// 2 is stacked on 1; the urgent 9 declares 2: both 1 and 2 ride with it, 1's other child 3 does not.
+		const m = model([entry(1, 60), entry(2, 50), entry(3, 45), entry(9, 40, 'urgent')], stacks([1, 2, 3, 9], { 2: 1, 3: 1 }), { 9: [2] });
+		expect(shape(m).stacks).toEqual([
+			{ members: [1, 2, 9], on: null, priority: 'urgent' },
+			{ members: [3], on: null, priority: 'normal' }
+		]);
+	});
+
 	test('a low PR that depends on a normal one follows it in the same batch', () => {
 		const m = model([entry(1, 60), entry(2, 50, 'low'), entry(3, 40)], stacks([1, 2, 3]), { 2: [1] });
 		expect(m.stacks.map((s) => s.members)).toEqual([[1], [3], [2]]);

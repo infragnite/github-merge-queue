@@ -3099,6 +3099,49 @@ describe('declared dependencies (Depends-On) at runtime', () => {
 		expect(world.comments.filter((c) => c.pr === 2).map((c) => readNotice(c.body)?.code)).toContain('dependency-not-queued');
 	});
 
+	test('a closed dependency is asked about once, not on every tick', async () => {
+		pr(1);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.close(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1, #77');
+		world.deleted.add(77);
+		await run(1);
+		const calls = world.prCalls;
+		await run(5);
+		expect(world.prCalls).toBe(calls);
+	});
+
+	test('declaring the git parent again records nothing extra', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		world.bodies.set(2, 'Depends-On: #1');
+		world.hold = () => true;
+		await run(1);
+		const it = db.getQueueItems(repo.id).find((i) => i.pr_number === 2)! as { depends_on?: string | null };
+		expect(store.dependsOn(it)).toEqual([]);
+	});
+
+	test('bisection keeps the dependencies a PR was batched with, even if its description changes meanwhile', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'x-breaks-master.txt' });
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		world.breakingFiles.add('x-breaks-master.txt');
+		// The bisection runs take long; meanwhile #2's author drops the line.
+		world.hold = (prs) => prs.length < 3;
+		await run(4);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('bisecting');
+		world.bodies.set(2, 'No dependencies.');
+		world.hold = () => false;
+		await run(40);
+		const batch = store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!;
+		const runs = world.started.filter((r) => r.branch.startsWith(`${batch.branch}-bisect-`));
+		for (const r of runs) if (r.prs.includes(2)) expect(r.prs, JSON.stringify(runs)).toContain(1);
+		expect(batch.landed).not.toContain(2);
+	});
+
 	test('landing: a dependency pushed to after the batch was built stays out, and its dependent with it', async () => {
 		pr(1);
 		pr(2);

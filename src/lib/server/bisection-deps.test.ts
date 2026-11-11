@@ -3,7 +3,9 @@
 // its dependencies, in a run or in a landing; only a run of a PR alone ejects it.
 
 import { describe, expect, test } from 'vitest';
-import { forkSplit, planBisection, splitPoint, type BisectRun } from './batching';
+import { DEFAULT_BATCH_CONFIG, forkSplit, planBisection, planRedBatch, splitPoint, type BisectRun } from './batching';
+import { dependencyGraph } from './deps';
+import { entry, ready, stacks } from './testing/stack-fixture';
 
 type DepsOf = (n: number) => number[];
 
@@ -241,5 +243,34 @@ describe('bisection simulation with declared dependencies', { timeout: 120_000 }
 				}
 			}
 		}
+	});
+});
+
+describe('a red default branch with declared dependencies', () => {
+	test("a dependency that isn't queued is held with the same code as on a green branch", () => {
+		const analysis = stacks([1, 2]);
+		const plan = planRedBatch({
+			queue: [entry(2, 10)],
+			states: new Map([[2, ready(2)]]),
+			analysis,
+			config: { ...DEFAULT_BATCH_CONFIG, requireApproval: true },
+			tried: () => false,
+			dependencies: dependencyGraph(analysis, { on: new Map([[2, [1]]]), problems: new Map() })
+		});
+		expect(plan.batch).toBe(null);
+		expect(plan.held).toEqual([{ pr: 2, admission: { ok: false, code: 'dependency-not-queued', reason: "Depends on #1, which isn't queued" } }]);
+	});
+
+	test('a dependency queued but held waits, as a stacked parent does', () => {
+		const analysis = stacks([1, 2]);
+		const plan = planRedBatch({
+			queue: [entry(1, 20), entry(2, 10)],
+			states: new Map([[1, ready(1, { draft: true })], [2, ready(2)]]),
+			analysis,
+			config: { ...DEFAULT_BATCH_CONFIG, requireApproval: true },
+			tried: () => false,
+			dependencies: dependencyGraph(analysis, { on: new Map([[2, [1]]]), problems: new Map() })
+		});
+		expect(plan.held.find((h) => h.pr === 2)?.admission).toEqual({ ok: false, code: 'parent-not-ready', reason: "Depends on #1, which can't be batched yet" });
 	});
 });
