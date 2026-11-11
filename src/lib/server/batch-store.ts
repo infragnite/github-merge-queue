@@ -554,6 +554,9 @@ export interface Hold {
 	base?: string;
 	/** A restack's conflict with its rebased parent: that parent, whose head `base` is. It is tried again once the parent moves. */
 	parent?: number;
+	/** A conflict's files and fix, for its comment when that is posted on a later tick. */
+	files?: string[];
+	fix?: string;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {

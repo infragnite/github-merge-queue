@@ -417,7 +417,7 @@ class Tick {
 		// A conflict with the default branch may go away when the branch moves: it is checked again then. A
 		// restack's conflict (old parent commits) and a workflow change wait for a push.
 		const save = (told: boolean) =>
-			it && store.setHold(it.id, { code, reason, head: p.headSha, told, ...(told ? {} : { quiet: true }), ...(base ? { base } : {}), ...(parent !== undefined ? { parent } : {}) });
+			it && store.setHold(it.id, { code, reason, head: p.headSha, told, ...(told ? {} : { quiet: true }), ...(base ? { base } : {}), ...(parent !== undefined ? { parent } : {}), ...(files.length ? { files } : {}), ...(fix ? { fix } : {}) });
 		if (it) {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
@@ -426,10 +426,10 @@ class Tick {
 		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
 		if (code === 'conflict') await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
-		// Saved as told only once the comment is posted: one that failed is posted on the next try.
-		if (!toldBefore && (await this.say(n, holdNotice(hold), 'attention'))) save(true);
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
+		// Saved as told only once the comment is posted: one that failed (or was rate limited) is posted on a later tick.
+		if (!toldBefore && (await this.say(n, holdNotice(hold), 'attention'))) save(true);
 	}
 
 	/** Holds the PRs of a batch that change a workflow; returns how many it held. */
@@ -1595,7 +1595,16 @@ class Tick {
 
 	/** A conflict with the default branch, its head unchanged: back in line once the branch moved and it merges cleanly. */
 	async recheckConflict(it: QueueItem, p: LivePR, master: string) {
-		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
+		let hold = store.storedHold(it as QueueItem & { hold?: string | null });
+		// Its comment failed, or the setting kept it quiet and now allows it: posted now.
+		if (hold && !hold.told && hold.head === p.headSha && (hold.code === 'conflict' || hold.code === 'workflow-permission')) {
+			const notice = { pr: it.pr_number, head: p.headSha, code: hold.code as 'conflict' | 'workflow-permission', reason: hold.reason, files: hold.files ?? [], ...(hold.fix ? { fix: hold.fix } : {}) };
+			if (await this.say(it.pr_number, holdNotice(notice), 'attention')) {
+				const { quiet: _, ...rest } = hold;
+				hold = { ...rest, told: true };
+				store.setHold(it.id, hold);
+			}
+		}
 		if (hold?.code === 'workflow-permission') return;
 		// A restack's conflict with its rebased parent: back in line once the parent moved; the restack tries again.
 		if (hold?.code === 'conflict' && hold.parent !== undefined) {
@@ -1627,7 +1636,8 @@ class Tick {
 		if (!r.ok) {
 			// Saved before holds were: it was told then. One saved since keeps whether it was.
 			const told = hold?.code === 'conflict' ? !!hold.told : true;
-			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told, ...(hold?.quiet ? { quiet: true } : {}), base: master });
+			const keep = hold?.code === 'conflict' ? { ...(hold.files ? { files: hold.files } : {}), ...(hold.fix ? { fix: hold.fix } : {}) } : {};
+			store.setHold(it.id, { code: 'conflict', reason: it.error_message ?? 'Merge conflict', head: p.headSha, told, ...(hold?.quiet ? { quiet: true } : {}), base: master, ...keep });
 			return;
 		}
 		db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
