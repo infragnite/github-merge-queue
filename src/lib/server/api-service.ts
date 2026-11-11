@@ -40,9 +40,19 @@ function inBatchNow(b: BatchRow): number[] {
 /** Statuses of a PR still waiting in line or being tested. */
 export const WAITING_STATUSES = ['queued', 'checking', 'updating', 'merging', 'conflict'];
 
+const RANK: Record<Priority, number> = { urgent: 0, normal: 1, low: 2 };
+
+/** Queue items in the order the queue takes them: those being tested, then by priority, then by place in line. */
+function inQueueOrder(repoId: number, items: Q[]): Q[] {
+	const testing = new Set(store.getActiveBatches(repoId).flatMap(inBatchNow));
+	const key = (i: Q) => (testing.has(i.pr_number) ? -1 : RANK[i.priority ?? 'normal']);
+	// The rows come in place-in-line order, and the sort is stable.
+	return [...items].sort((a, b) => key(a) - key(b));
+}
+
 /** Where a PR stands in the queue; null when it isn't in it. */
 export function queueEntry(repoId: number, n: number) {
-	const items = db.getQueueItems(repoId) as Q[];
+	const items = inQueueOrder(repoId, db.getQueueItems(repoId) as Q[]);
 	const waiting = items.filter((i) => WAITING_STATUSES.includes(i.status));
 	const idx = waiting.findIndex((i) => i.pr_number === n);
 	if (idx < 0) return null;
@@ -199,7 +209,7 @@ export function batchSummary(b: BatchRow) {
 export function queueState(repo: Repo) {
 	const s = store.getQueueSettings(repo.id);
 	const inBatch = new Set(store.getActiveBatches(repo.id).flatMap(inBatchNow));
-	const waiting = (db.getQueueItems(repo.id) as Q[])
+	const waiting = inQueueOrder(repo.id, db.getQueueItems(repo.id) as Q[])
 		.filter((i) => !['merged', 'failed', 'cancelled'].includes(i.status))
 		.map((i, idx) => ({
 			pr: i.pr_number,
