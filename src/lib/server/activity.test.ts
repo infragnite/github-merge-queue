@@ -78,7 +78,7 @@ describe('activity of a queue step', () => {
 		await d.github.pr(2);
 		await d.git.fetch(['master', 'head1', 'head2']);
 		const started = clock.t;
-		await d.git.build('master', [member(1), member(2)]);
+		await d.git.build('master', [member(1), member(2)], { attrs: 'master' });
 		clock.t += 42_000;
 		const pushing = d.github.pushBranch('mq/batch-5', 'batch');
 		clock.t += 3_000;
@@ -111,7 +111,7 @@ describe('activity of a queue step', () => {
 		const fetched = clock.t;
 		await d.git.fetch(['master', 'head1']);
 		clock.t += 60_000;
-		await d.git.build('master', [member(1)]);
+		await d.git.build('master', [member(1)], { attrs: 'master' });
 		expect(activityOf(REPO.id).phase).toMatchObject({ kind: 'forming', since: fetched });
 	});
 
@@ -128,8 +128,8 @@ describe('activity of a queue step', () => {
 			}
 		});
 		const d = trackActivity(deps);
-		await d.git.build('master', [member(1), member(2), member(3)]);
-		const p = d.git.build('master', [{ ...member(2), parentHeadSha: null }]);
+		await d.git.build('master', [member(1), member(2), member(3)], { attrs: 'master' });
+		const p = d.git.build('master', [{ ...member(2), parentHeadSha: null }], { attrs: 'master' });
 		expect(activityOf(REPO.id)).toMatchObject({
 			phase: { kind: 'forming', label: 'Forming a batch', prs: [1, 2, 3] },
 			step: { label: 'checking #2 against main', prs: [2] }
@@ -142,7 +142,7 @@ describe('activity of a queue step', () => {
 		const push = gate();
 		const { deps } = fakeDeps({ github: { pushBranch: () => push.promise } });
 		const d = trackActivity(deps, { buildKind: () => 'bisect' });
-		await d.git.build('base', [member(1), member(2)]);
+		await d.git.build('base', [member(1), member(2)], { attrs: 'master' });
 		expect(activityOf(REPO.id).phase).toMatchObject({ kind: 'bisect', label: 'Preparing a bisection step', prs: [1, 2] });
 		const p = d.github.pushBranch('mq/batch-5-bisect-2-99', 'x');
 		expect(activityOf(REPO.id).phase).toMatchObject({ kind: 'bisect', branch: 'mq/batch-5-bisect-2-99' });
@@ -155,7 +155,7 @@ describe('activity of a queue step', () => {
 		const labels: string[] = [];
 		for (const branch of ['mq/batch-1', 'mq/batch-1-bisect-1-5', 'mq/try-4-5', 'mq/base-5']) {
 			const d = trackActivity(deps);
-			await d.git.build('master', [member(4)]);
+			await d.git.build('master', [member(4)], { attrs: 'master' });
 			await d.github.pushBranch(branch, 'x');
 			labels.push(activityOf(REPO.id).phase!.label);
 			clearActivity(REPO.id);
@@ -168,7 +168,7 @@ describe('activity of a queue step', () => {
 		await withActivity(
 			deps,
 			async (d) => {
-				await d.git.build('master', [member(4)]);
+				await d.git.build('master', [member(4)], { attrs: 'master' });
 				expect(activityOf(REPO.id).phase).toMatchObject({ kind: 'try', label: 'Starting a try run', prs: [4] });
 			},
 			{ buildKind: () => 'try' }
@@ -188,7 +188,7 @@ describe('activity of a queue step', () => {
 		const { deps } = fakeDeps({ git: { restack: () => rebase.promise }, github: { pushHead: () => push.promise } });
 		const d = trackActivity(deps);
 		await d.github.pr(4);
-		const r = d.git.restack('head4', 'stale', 'parent');
+		const r = d.git.restack('head4', 'stale', 'parent', 'master');
 		expect(activityOf(REPO.id)).toMatchObject({ phase: { kind: 'restack', label: 'Restacking #4', prs: [4] }, step: { label: 'rebasing #4', prs: [4] } });
 		rebase.resolve({ ok: true, head: 'new4', tree: 't', replayed: 1 });
 		await r;
@@ -206,7 +206,7 @@ describe('activity of a queue step', () => {
 		await d.github.pr(1);
 		await d.github.pr(2);
 		await d.github.squashMerge(1, 'PR 1 (#1)', 'head1');
-		await d.git.restack('head2', 'fork', 'm1');
+		await d.git.restack('head2', 'fork', 'm1', 'm1');
 		expect(activityOf(REPO.id).phase).toMatchObject({ kind: 'landing', label: 'Landing', prs: [1, 2] });
 		const p = d.github.squashMerge(2, 'PR 2 (#2)', 'new2');
 		expect(activityOf(REPO.id)).toMatchObject({ phase: { kind: 'landing', prs: [1, 2] }, step: { label: 'merging #2 into main', prs: [2] } });
@@ -224,7 +224,7 @@ describe('activity of a queue step', () => {
 			}
 		});
 		await withActivity(deps, async (d) => {
-			await d.git.build('master', [member(1), member(2)]);
+			await d.git.build('master', [member(1), member(2)], { attrs: 'master' });
 			await d.github.pushBranch('mq/batch-5', 'x').catch(() => {});
 		});
 		expect(activityOf(REPO.id)).toEqual({
@@ -241,12 +241,12 @@ describe('activity of a queue step', () => {
 		});
 		// Other steps succeeding don't clear it; the same step does.
 		await withActivity(deps, async (d) => {
-			await d.git.build('master', [member(3)]);
+			await d.git.build('master', [member(3)], { attrs: 'master' });
 		});
 		expect(activityOf(REPO.id).failure).not.toBeNull();
 		fail = false;
 		await withActivity(deps, async (d) => {
-			await d.git.build('master', [member(3)]);
+			await d.git.build('master', [member(3)], { attrs: 'master' });
 			await d.github.pushBranch('mq/batch-6', 'x');
 		});
 		expect(activityOf(REPO.id).failure).toBeNull();
@@ -285,7 +285,7 @@ describe('activity of a queue step', () => {
 		let seen: ReturnType<typeof activityOf> | null = null;
 		await expect(
 			withActivity(deps, async (d) => {
-				await d.git.build('master', [member(1)]);
+				await d.git.build('master', [member(1)], { attrs: 'master' });
 				clock.t += 5_000;
 				seen = activityOf(REPO.id);
 				throw new Error('later step failed');
@@ -307,7 +307,7 @@ describe('activity of a queue step', () => {
 
 	test("one repository's activity is not another's", async () => {
 		const { deps } = fakeDeps();
-		await trackActivity(deps).git.build('master', [member(1)]);
+		await trackActivity(deps).git.build('master', [member(1)], { attrs: 'master' });
 		expect(activityOf(REPO.id + 1)).toEqual({ since: null, phase: null, step: null, failure: null });
 	});
 });
