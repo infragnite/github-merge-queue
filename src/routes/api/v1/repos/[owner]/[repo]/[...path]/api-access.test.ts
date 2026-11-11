@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 
 process.env.DATABASE_PATH = ':memory:';
 
-const gh = { user: 'dev' as string | null, sees: true, role: 'admin', down: false };
+const gh = { user: 'dev' as string | null, sees: true, role: 'admin', down: false, stackCalls: 0 };
 vi.mock('$lib/server/github', async (orig) => ({
 	...(await orig<typeof import('$lib/server/github')>()),
 	userForToken: vi.fn(async () => (gh.user ? { login: gh.user } : null)),
@@ -11,7 +11,15 @@ vi.mock('$lib/server/github', async (orig) => ({
 		if (gh.down) throw new TypeError('fetch failed');
 		return gh.sees ? { permissions: { admin: true, maintain: true, push: true, pull: true }, scopes: 'repo' } : null;
 	}),
-	collaboratorRole: vi.fn(async () => gh.role)
+	collaboratorRole: vi.fn(async () => gh.role),
+	// Counts what the stack analysis asks GitHub for.
+	stackClient: vi.fn(() => ({
+		listOpenPRs: async () => (gh.stackCalls++, []),
+		listRecentlyClosedPRs: async () => (gh.stackCalls++, []),
+		getBranchSha: async () => (gh.stackCalls++, 'base'),
+		compare: async () => (gh.stackCalls++, null)
+	})),
+	rateLimitOf: vi.fn(async () => ({ low: false }))
 }));
 
 const db = await import('$lib/server/db');
@@ -82,5 +90,12 @@ describe('agent API access', () => {
 		let last = 0;
 		for (let i = 0; i < 300 && last !== 429; i++) last = (await call('GET', 'queue', { ip: '203.0.113.9', token: null })).status;
 		expect(last).toBe(429);
+	});
+
+	test('polling the queue reuses the stack analysis, so it costs no GitHub calls per request', async () => {
+		expect((await call('GET', 'queue')).status).toBe(200);
+		gh.stackCalls = 0;
+		for (let i = 0; i < 5; i++) expect((await call('GET', 'queue', { ip: `198.51.100.${10 + i}` })).status).toBe(200);
+		expect(gh.stackCalls).toBe(0);
 	});
 });
