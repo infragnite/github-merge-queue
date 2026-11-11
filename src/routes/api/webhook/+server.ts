@@ -15,6 +15,7 @@ import {
 import { closedPRReason } from '$lib/server/stack-runtime';
 import { getActiveBatches, getQueueSettings, updateQueueSettings } from '$lib/server/batch-store';
 import { forgetVisibility } from '$lib/server/public-view';
+import { changesBranchRules, forgetPushPolicy } from '$lib/server/push-policy';
 import { bumpGeneration, markDirty } from '$lib/server/wake';
 import { commentFromPayload } from '$lib/server/pr-commands';
 import { runLiveCommand } from '$lib/server/pr-commands-live';
@@ -89,6 +90,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	const repo = getRepoByOwnerName(owner, name);
 	if (!repo) return json({ ok: true });
 	if (changesPRs(event, payload)) bumpGeneration(repo.id);
+	if (changesBranchRules(event)) forgetPushPolicy(repo.id);
 	if (wakesQueue(event, payload)) {
 		markDirty(repo.id);
 		if (event === 'check_suite') {

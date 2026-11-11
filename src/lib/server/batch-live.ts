@@ -10,6 +10,7 @@ import { RateLimitedError } from './rate-limit';
 import { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } from './batch-builder';
 import { replay } from './rebase';
 import { mergeDriverEnv } from './merge-drivers';
+import { pushKeepsApprovalCached } from './push-policy';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { currentStackAnalysis } from './stack-runtime';
 import { bumpGeneration, memoByGeneration } from './wake';
@@ -345,7 +346,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
 			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
-			build: async (base, members) => buildBatch(mirror.git, base, members),
+			build: async (base, members, opts) => buildBatch(mirror.git, base, members, opts),
 			restack: async (head, upstream, onto) => replay(mirror.git, { head, upstream, onto }),
 			baseline: async (base) => baselineCommit(mirror.git, base),
 			mergeTrees: async (onto, head) => mergeTrees(mirror.git, onto, head),
@@ -462,6 +463,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				bumpGeneration(repo.id);
 				await mirror.pushLease(branch, sha, expected);
 			},
+			pushKeepsApproval: () => pushKeepsApprovalCached(repo.id, () => github.pushKeepsApproval(owner, name, repo.default_branch)),
 			deleteBranch: (branch) => github.deleteBranch(owner, name, branch),
 			retargetBase: async (n, base) => {
 				bumpGeneration(repo.id);

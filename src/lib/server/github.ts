@@ -323,6 +323,53 @@ export async function listReviews(owner: string, repo: string, n: number): Promi
 	return out;
 }
 
+/** A rule from `GET /repos/{owner}/{repo}/rules/branches/{branch}`. */
+export interface BranchRule {
+	type: string;
+	parameters?: Record<string, unknown>;
+}
+
+/**
+ * Classic branch protection's review settings: the body of
+ * `GET .../branches/{branch}/protection/required_pull_request_reviews`, null when the branch has
+ * none, or 'unreadable' when the App may not read them (they need the Administration permission).
+ */
+export type ClassicReviews = Record<string, unknown> | null | 'unreadable';
+
+/**
+ * Whether a push to a PR's head leaves the PR mergeable without a new approval under these rules:
+ * no rule that requires an approval also dismisses one on a push, asks the last push to be
+ * approved by someone else, or asks a commit not attributed to the author to be approved. Rules
+ * the App can't read count as ones that would, since a push can't be taken back.
+ */
+export function pushKeepsApprovalFrom(rules: BranchRule[], classic: ClassicReviews): boolean {
+	if (classic === 'unreadable') return false;
+	const needs = (p: Record<string, unknown>, dismiss: string) =>
+		Number(p.required_approving_review_count ?? 0) > 0 &&
+		(!!p[dismiss] || !!p.require_last_push_approval || !!p.require_extra_approval_for_unattributed_changes);
+	if (rules.some((r) => r.type === 'pull_request' && needs(r.parameters ?? {}, 'dismiss_stale_reviews_on_push'))) return false;
+	return !(classic && needs(classic, 'dismiss_stale_reviews'));
+}
+
+/** `pushKeepsApprovalFrom` for `branch` as GitHub has its rules now: two or three API calls. */
+export async function pushKeepsApproval(owner: string, repo: string, branch: string): Promise<boolean> {
+	const path = `/repos/${owner}/${repo}`;
+	const [rules, b] = await Promise.all([
+		ghFetchAsApp(`${path}/rules/branches/${refPath(branch)}?per_page=100`) as Promise<BranchRule[]>,
+		ghFetchAsApp(`${path}/branches/${refPath(branch)}`)
+	]);
+	let classic: ClassicReviews = null;
+	// `protected` is also true for a branch only rulesets cover; `protection.enabled` is classic protection.
+	if (b?.protected && b?.protection?.enabled !== false) {
+		try {
+			classic = await ghFetchAsApp(`${path}/branches/${refPath(branch)}/protection/required_pull_request_reviews`);
+		} catch (e) {
+			if (!(e instanceof GitHubError && e.status === 404)) classic = 'unreadable';
+		}
+	}
+	return pushKeepsApprovalFrom(rules, classic);
+}
+
 export async function deleteBranch(owner: string, repo: string, branch: string) {
 	try {
 		await ghFetchAsApp(`/repos/${owner}/${repo}/git/refs/heads/${refPath(branch)}`, { method: 'DELETE' });

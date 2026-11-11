@@ -9,11 +9,14 @@
 //   parent commit it contains) as the merge base, so only its own commits are
 //   applied (the parent's changes are already in the batch as the parent's
 //   squash commit). This is what restacking the child onto the default branch
-//   would produce; the queue does exactly that restack when it lands the child
-//   (see rebase.ts), so GitHub's squash merge gives the tree tested here.
+//   would produce; the queue does that restack when it lands the child, if
+//   GitHub's squash of the child as it is would not give the tree tested here
+//   (see rebase.ts).
 //
 // Each merge reads `.gitattributes` from the base, so a file the base routes to one of the queue's
 // merge drivers (merge-drivers.ts) merges with it, given the driver environment on the runner.
+// With `drivers: false` (a repo where the queue can't push to a PR without dismissing its
+// approval) every file merges line by line, as GitHub merges it.
 //
 // Needs git >= 2.40 (`merge-tree --write-tree --merge-base`, `--attr-source`).
 
@@ -44,6 +47,8 @@ export interface BuildOptions {
 	author?: { name: string; email: string };
 	/** Fixed commit date (seconds since epoch) for reproducible SHAs, e.g. in tests. */
 	date?: number;
+	/** False: every file merges line by line, as GitHub merges it, whatever the base's `.gitattributes` says. */
+	drivers?: boolean;
 }
 
 /** Strips credentials from text that may end up in logs. */
@@ -147,6 +152,9 @@ export function baselineCommit(git: GitRunner, baseSha: string): string {
 	}).out;
 }
 
+/** git's empty tree: as `--attr-source` it reads no attributes, so no merge driver applies. */
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
 /** Applies `members` in order on top of `baseSha`. Stops at the first PR that conflicts. */
 export function buildBatch(
 	git: GitRunner,
@@ -169,7 +177,7 @@ export function buildBatch(
 	const commits: BuiltCommit[] = [];
 	for (const m of members) {
 		// Attributes come from the base, never from a PR: they pick the queue's merge drivers.
-		const args = [`--attr-source=${baseSha}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
+		const args = [`--attr-source=${opts.drivers === false ? EMPTY_TREE : baseSha}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
 		// The parent may have moved on after the child branched: the child's work
 		// starts at the newest parent commit it contains, not at the parent's head.
 		const fork = m.parentHeadSha ? git.run(['merge-base', m.parentHeadSha, m.headSha]).out : null;
@@ -208,9 +216,6 @@ export function buildBatch(
 	}
 	return { ok: true, headSha: tip, tree: tipTree, commits };
 }
-
-/** git's empty tree: as `--attr-source` it reads no attributes, so no merge driver applies. */
-const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 /**
  * `head` merged onto `onto` twice: with the queue's merge drivers (attributes from `onto`, as a
