@@ -53,6 +53,7 @@ class World {
 	refuseMerge = new Set<number>();
 	/** GitHub answers merges with a rate-limit refusal. */
 	rateLimited = false;
+	commentsFail = false;
 	openListCalls = 0;
 	prCalls = 0;
 	/** PRs GitHub answers 404 for. */
@@ -235,6 +236,7 @@ class World {
 					this.statuses.push({ sha, state });
 				},
 				comment: async (pr, body) => {
+					if (this.commentsFail) throw new Error('Server Error');
 					this.comments.push({ pr, body });
 				}
 			}
@@ -696,6 +698,59 @@ describe('batch queue runtime', () => {
 		git.pr(1).merged = true;
 		await run(3);
 		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'requeued').map((e) => e.data)).toEqual([{ reason: '#1 is no longer open', headSha: head }]);
+	});
+
+	test('a restack conflict whose comment failed is told when it is tried again and still conflicts', async () => {
+		pr(1, { file: 'shared.txt' });
+		pr(2, { from: 'pr1', base: 'pr1', file: 'shared.txt' });
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'parent rewrote it\n');
+		git.git('commit', '-q', '--amend', '-am', 'pr1 rewritten');
+		world.commentsFail = true;
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		world.commentsFail = false;
+		git.commit('pr1', 'pr1 more', 'pr1-more.txt'); // the parent moves; #2 still conflicts with it
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		expect(world.comments.filter((c) => c.pr === 2)).toHaveLength(1);
+	});
+
+	test('a restack conflict waits while a bisection runs, so its author is told once', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'shared.txt' });
+		pr(2, { from: 'pr1', base: 'pr1', file: 'shared.txt' });
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'parent rewrote it\n');
+		git.git('commit', '-q', '--amend', '-am', 'pr1 rewritten');
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		expect(world.started.some((x) => x.branch.includes('-bisect-'))).toBe(true);
+		git.commit('pr1', 'pr1 more', 'pr1-more.txt'); // the parent moves mid-bisection; #2 still conflicts with it
+		for (let i = 0; i < 3; i++) await tickBatchQueue(world.deps());
+		world.hold = () => false;
+		await run(40);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		expect(world.comments.filter((c) => c.pr === 2)).toHaveLength(1);
+	});
+
+	test('a workflow change held before holds were saved is not checked again by itself', async () => {
+		world.workflowsDenied = true;
+		pr(1, { file: '.github/workflows/ci.yml' });
+		await run();
+		expect(queued()).toEqual([{ pr: 1, status: 'conflict' }]);
+		store.setHold(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id, null);
+		git.commit('main', 'm1', 'x-main.txt');
+		await run();
+		expect(queued()).toEqual([{ pr: 1, status: 'conflict' }]);
+		expect(world.comments.filter((c) => c.pr === 1)).toHaveLength(1);
 	});
 
 	test('a conflict saved over a hold of another kind keeps its own kind and base after a failed check', async () => {
