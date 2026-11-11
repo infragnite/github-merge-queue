@@ -717,6 +717,17 @@ describe('batch queue runtime', () => {
 		expect(world.comments.filter((c) => c.pr === 2)).toHaveLength(1);
 	});
 
+	test('a conflict with the default branch whose comment failed is told on a later tick, the branch unchanged', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		world.commentsFail = true;
+		await run();
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		world.commentsFail = false;
+		await run(3);
+		expect(world.comments).toEqual([{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'conflict', reason: 'Conflicts with main', files: ['same.txt'], fix: 'git fetch origin main && git rebase origin/main' }) }]);
+	});
+
 	test('a restack conflict waits while a bisection runs, so its author is told once', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1, { file: 'shared.txt' });
