@@ -34,6 +34,22 @@ describe('queue events', () => {
 		expect((await waitForEvents(r, { after: got.cursor, pr: 2 })).events).toEqual([]);
 	});
 
+	test('history is kept for about a year, not a week, so it can be analysed later', () => {
+		const r = repo();
+		const at = (days: number) =>
+			db.getDb().prepare(`INSERT INTO queue_events (repo_id, pr_number, kind, created_at) VALUES (?, 1, 'queued', datetime('now', ?))`).run(r, `-${days} days`);
+		at(30);
+		at(300);
+		at(500);
+		// pruning runs every few hundred events
+		for (let i = 0; i < 500; i++) emitEvent(r, 2, 'queued');
+		const ages = db
+			.getDb()
+			.prepare(`SELECT CAST(round(julianday('now') - julianday(created_at)) AS INTEGER) AS days FROM queue_events WHERE repo_id = ? AND pr_number = 1 ORDER BY id`)
+			.all(r) as Array<{ days: number }>;
+		expect(ages.map((a) => a.days)).toEqual([30, 300]);
+	});
+
 	test('times out empty, keeping the cursor', async () => {
 		const r = repo();
 		const got = await waitForEvents(r, { after: 0, waitMs: 50 });

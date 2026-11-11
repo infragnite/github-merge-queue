@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, test } from 'vitest';
 process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
 const store = await import('./batch-store');
-const { jobCost, computeSavings, recordRunCosts, savingsFor, landedBy } = await import('./ci-savings');
+const { jobCost, computeSavings, recordRunCosts, savingsFor, landedBy, actionsJobsFor } = await import('./ci-savings');
 
 const MIN = 60_000;
 const t = (min: number) => new Date(Date.UTC(2026, 10, 10, 0, min)).toISOString();
@@ -16,6 +16,21 @@ describe('jobCost', () => {
 			{ name: 'lint', status: 'completed', started_at: t(0), completed_at: t(2) }
 		]);
 		expect(c).toEqual({ jobMs: 20 * MIN, rerunMs: 10 * MIN, wallMs: 20 * MIN, jobs: 3, done: true });
+	});
+
+	test('when it ran, how long its jobs waited for a runner, and how many attempts it took', () => {
+		const c = jobCost([
+			{ id: 1, run_id: 9, run_attempt: 1, name: 'test', status: 'completed', conclusion: 'failure', created_at: t(0), started_at: t(2), completed_at: t(10) },
+			{ id: 2, run_id: 9, run_attempt: 2, name: 'test', status: 'completed', conclusion: 'success', created_at: t(11), started_at: t(12), completed_at: t(20) },
+			{ id: 3, run_id: 9, run_attempt: 1, name: 'lint', status: 'completed', conclusion: 'success', created_at: t(0), started_at: t(3), completed_at: t(4) }
+		]);
+		expect(c).toMatchObject({ queueMs: 6 * MIN, startMs: Date.parse(t(2)), endMs: Date.parse(t(20)), attempts: 2 });
+	});
+
+	test('jobs without a queue time or attempt (check runs) count as one attempt with no wait', () => {
+		const c = jobCost([{ name: 'x', status: 'completed', started_at: t(0), completed_at: t(1) }]);
+		expect(c).toMatchObject({ queueMs: 0, attempts: 1, startMs: Date.parse(t(0)), endMs: Date.parse(t(1)) });
+		expect(jobCost([])).toMatchObject({ startMs: null, endMs: null });
 	});
 
 	test('a job still running means the run is not done', () => {
@@ -101,6 +116,54 @@ describe('recording', () => {
 		expect(v.perRun?.jobMs).toBe(20 * MIN);
 		expect(v.windows.find((w) => w.key === 'all')).toMatchObject({ landed: 2, runs: 1, savedMs: 20 * MIN });
 	});
+});
+
+test('every job attempt of a run is kept, with its runner wait, so CI can be analysed by job later', async () => {
+	const user = db.upsertUser(4, 'dev4', null, null);
+	db.addRepo('acme', 'jobs', 'main', user);
+	const id = db.getRepoByOwnerName('acme', 'jobs')!.id;
+	const b = store.insertBatch({ repoId: id, kind: 'batch', branch: 'mq/j', baseSha: 'b', headSha: 'jjj', treeSha: 't', baseTree: 'bt', members: [1, 2], heads: {} });
+	store.setBatchCI(b.id, 'success');
+	store.setBatchStatus(b.id, 'landed');
+	const jobs = [
+		{ id: 11, run_id: 7, run_attempt: 1, workflow_name: 'ci', runner_name: 'r-1', name: 'test', status: 'completed', conclusion: 'failure', created_at: t(0), started_at: t(2), completed_at: t(10) },
+		{ id: 12, run_id: 7, run_attempt: 2, workflow_name: 'ci', runner_name: 'r-2', name: 'test', status: 'completed', conclusion: 'success', created_at: t(11), started_at: t(12), completed_at: t(20) }
+	];
+	expect(await recordRunCosts({ id }, async () => jobs)).toBe(1);
+	expect(db.getDb().prepare('SELECT job_ms, rerun_ms, wall_ms, jobs, queue_ms, started_ms, ended_ms, attempts FROM ci_runs WHERE batch_id = ?').get(b.id)).toEqual({
+		job_ms: 16 * MIN,
+		rerun_ms: 8 * MIN,
+		wall_ms: 18 * MIN,
+		jobs: 2,
+		queue_ms: 3 * MIN,
+		started_ms: Date.parse(t(2)),
+		ended_ms: Date.parse(t(20)),
+		attempts: 2
+	});
+	expect(db.getDb().prepare('SELECT job_id, run_id, attempt, workflow, name, conclusion, runner, created_ms, started_ms, completed_ms FROM ci_jobs WHERE batch_id = ? ORDER BY job_id').all(b.id)).toEqual([
+		{ job_id: 11, run_id: 7, attempt: 1, workflow: 'ci', name: 'test', conclusion: 'failure', runner: 'r-1', created_ms: Date.parse(t(0)), started_ms: Date.parse(t(2)), completed_ms: Date.parse(t(10)) },
+		{ job_id: 12, run_id: 7, attempt: 2, workflow: 'ci', name: 'test', conclusion: 'success', runner: 'r-2', created_ms: Date.parse(t(11)), started_ms: Date.parse(t(12)), completed_ms: Date.parse(t(20)) }
+	]);
+});
+
+test('actionsJobsFor: every attempt of every workflow run on the commit, page by page', async () => {
+	const job = (id: number) => ({ id, run_id: 0, run_attempt: 1, name: `j${id}`, status: 'completed', conclusion: 'success', created_at: t(0), started_at: t(1), completed_at: t(2) });
+	const asked: string[] = [];
+	const get = async (path: string) => {
+		asked.push(path);
+		if (path.startsWith('/repos/o/r/actions/runs?')) return { workflow_runs: [{ id: 1 }, { id: 2 }] };
+		if (path.includes('/runs/1/jobs') && path.endsWith('page=1')) return { jobs: Array.from({ length: 100 }, (_, i) => job(i)) };
+		if (path.includes('/runs/1/jobs')) return { jobs: [job(100)] };
+		return { jobs: [job(200)] };
+	};
+	const jobs = await actionsJobsFor(get, 'o', 'r', 'abc');
+	expect(jobs.map((j) => j.id)).toEqual([...Array.from({ length: 101 }, (_, i) => i), 200]);
+	expect(asked).toEqual([
+		'/repos/o/r/actions/runs?head_sha=abc&per_page=100',
+		'/repos/o/r/actions/runs/1/jobs?filter=all&per_page=100&page=1',
+		'/repos/o/r/actions/runs/1/jobs?filter=all&per_page=100&page=2',
+		'/repos/o/r/actions/runs/2/jobs?filter=all&per_page=100&page=1'
+	]);
 });
 
 test('a run over long ago with no jobs is recorded empty, so it cannot hold up the rest', async () => {

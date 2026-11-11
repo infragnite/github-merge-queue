@@ -336,6 +336,11 @@ describe('batch queue runtime', () => {
 		expect(world.reruns.get(world.started[0].head)).toBe(1);
 		expect(world.started).toHaveLength(1);
 		expect(world.merged).toEqual([1, 2]);
+		// kept for later analysis: how often it was re-run, when its result came in, what it ran with
+		const b = store.getRecentBatches(repo.id)[0];
+		expect(b.retries).toBe(1);
+		expect(b.ci_done_at).not.toBeNull();
+		expect(b.settings).toEqual({ mode: 'batch', config: store.getQueueSettings(repo.id).config });
 	});
 
 	test('bisects a real break, ejects the breaker with a comment, lands the rest', async () => {
@@ -1640,6 +1645,7 @@ describe('batch queue runtime', () => {
 		expect(world.merged.sort()).toEqual([2, 3, 4]);
 		const second = store.getRecentBatches(repo.id).find((b) => b.members.join() === '3,4' && b.status === 'superseded');
 		expect(second).toBeDefined();
+		expect(second!.end_reason).toBe('below-failed');
 		expect(mainFiles()).toEqual(['pr2.txt', 'pr3.txt', 'pr4.txt']);
 	});
 
@@ -1663,6 +1669,7 @@ describe('batch queue runtime', () => {
 		// the batch, a check of the new master alone (it came from outside the queue), the rebuilt batch
 		expect(world.started.map((x) => x.prs)).toEqual([[1, 2], [], [1, 2]]);
 		expect(store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').map((b) => b.status).sort()).toEqual(['landed', 'superseded']);
+		expect(store.getRecentBatches(repo.id).find((b) => b.status === 'superseded')!.end_reason).toBe('master-moved');
 		expect(world.merged).toEqual([1, 2]);
 	});
 
@@ -2553,7 +2560,9 @@ describe('batch queue runtime', () => {
 		const r = await cancelBatch(world.deps(), b.id, 'anton');
 		expect(r).toEqual({ requeued: [1, 2], rebuilt: [] });
 		expect(store.getBatch(b.id)!.status).toBe('cancelled');
+		expect(store.getBatch(b.id)!.end_reason).toBe('cancelled by anton');
 		expect(store.getBisectRuns(b.id).map((x) => x.status)).toEqual(runs.map(() => 'cancelled'));
+		expect(store.getBisectRuns(b.id).map((x) => x.end_reason)).toEqual(runs.map(() => 'cancelled by anton'));
 		for (const x of runs) expect(world.cancelled).toContain(x.head);
 		expect(queued()).toEqual([
 			{ pr: 1, status: 'queued' },
@@ -2574,6 +2583,7 @@ describe('batch queue runtime', () => {
 		const r = await cancelBatch(world.deps(), first.id, 'anton');
 		expect(r).toEqual({ requeued: [1], rebuilt: [second.id] });
 		expect(store.getBatch(second.id)!.status).toBe('superseded');
+		expect(store.getBatch(second.id)!.end_reason).toBe('below-cancelled');
 		expect(store.getActiveBatches(repo.id)).toEqual([]);
 		world.hold = () => false;
 		await run();
