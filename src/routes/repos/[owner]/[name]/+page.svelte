@@ -1,12 +1,14 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
-	import { actionsUrl } from '$lib/actions-link';
 	import { invalidateAll } from '$app/navigation';
 	import QueueItem from '$lib/components/QueueItem.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import BatchCard from '$lib/components/BatchCard.svelte';
 	import SavingsCard from '$lib/components/SavingsCard.svelte';
-	import { runOrder } from '$lib/run-order';
+	import PrepCard from '$lib/components/PrepCard.svelte';
+	import { runningWork } from '$lib/running-work';
+	import { historyTimeline } from '$lib/history-timeline';
+	import { page } from '$app/state';
 
 	let { data, form } = $props();
 
@@ -62,11 +64,16 @@
 	const shownStacks = $derived((board?.stacks ?? []).filter((s: BoardStack) => s.rows.some((r) => matchesPr(r.pr))));
 	const inLine = $derived((board?.stacks ?? []).reduce((n: number, s: BoardStack) => n + s.rows.length, 0));
 	const attention = $derived((board?.attention ?? []).filter((h: BoardHeld) => items.has(h.pr)));
-	// What runs CI now: the batches and their bisection steps. What comes next is not guessed.
-	// The check of the default branch is a run too: ejections wait for it.
-	// The queue's own work (forming a batch, a restack, landing) goes first: it shows nowhere else while it runs.
-	const runs = $derived(pipe ? runOrder({ active: pipe.active, upNext: [], express: false, master: pipe.master ? { ...pipe.master, branch: data.repo.default_branch } : null, activity: pipe.activity, now: clock + skew }) : []);
-	const forming = $derived(pipe?.activity?.phase?.kind === 'forming' ? pipe.activity.phase : null);
+	// Everything running now, the queue's own preparation first, in the order it holds the runners.
+	const work = $derived(pipe ? runningWork({ active: pipe.active, master: pipe.master ? { ...pipe.master, branch: data.repo.default_branch } : null, activity: pipe.activity, now: clock + skew }) : []);
+	const view = $derived(((v) => (v === 'attention' || v === 'history' ? v : 'now'))(page.url.searchParams.get('view')));
+	// Finished batches and the PRs that left the queue, in one list.
+	const timeline = $derived(historyTimeline(pipe?.recent ?? [], data.history));
+	const when = (ms: number) => {
+		const d = new Date(ms);
+		const today = new Date(clock).toDateString() === d.toDateString();
+		return today ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+	};
 
 	const MASTER: Record<string, { label: string; tone: string; hint: string }> = {
 		green: { label: 'green', tone: 'bg-green-100 text-green-800', hint: 'Batches build on it' },
@@ -175,6 +182,7 @@
 			</div>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
+			<SavingsCard savings={data.savings} />
 			{#if !data.readonly}
 			<a
 				href="/repos/{data.repo.owner}/{data.repo.name}/settings"
@@ -232,76 +240,51 @@
 		</form>
 	{/if}
 
-	<SavingsCard savings={data.savings} />
+	<!-- Views: what runs now and the line; what needs someone; what already happened. -->
+	<nav class="flex gap-1 border-b border-border-subtle text-sm" aria-label="Queue views">
+		{#each [{ key: 'now', label: 'Now' }, { key: 'attention', label: 'Needs attention' }, { key: 'history', label: 'History' }] as v (v.key)}
+			<a
+				href={v.key === 'now' ? `/repos/${data.repo.owner}/${data.repo.name}` : `?view=${v.key}`}
+				data-sveltekit-noscroll
+				data-sveltekit-replacestate
+				aria-current={view === v.key ? 'page' : undefined}
+				class="-mb-px inline-flex items-center gap-1.5 border-b-2 px-3 py-2 {view === v.key ? 'border-indigo-600 font-medium text-gray-900' : 'border-transparent text-gray-500 hover:text-gray-800'}"
+			>
+				{v.label}
+				{#if v.key === 'now' && work.length > 0}
+					<span class="rounded-full bg-amber-100 px-1.5 text-xs tabular-nums text-amber-800">{work.length}</span>
+				{:else if v.key === 'attention' && attention.length > 0}
+					<span class="inline-flex items-center gap-0.5 rounded-full bg-red-600 px-1.5 text-xs font-semibold tabular-nums text-white" aria-label="{attention.length} need attention"><span aria-hidden="true">!</span>{attention.length}</span>
+				{/if}
+			</a>
+		{/each}
+	</nav>
 
-	<!-- Wide screens: the queue in the wide column (golden ratio), what's happening now beside it. -->
-	<div class="grid grid-cols-1 gap-5 lg:grid-cols-[1.618fr_1fr]">
-		<!-- Side column: Now and Needs attention. On a phone this comes first. -->
-		<aside class="min-w-0 space-y-5 lg:sticky lg:top-4 lg:order-2 lg:max-h-[calc(100vh-2rem)] lg:self-start lg:overflow-y-auto">
-			{#if runs.length > 0}
-				<section aria-labelledby="run-order">
-					<h2 id="run-order" class="mb-2 text-base font-semibold text-gray-900">Run order</h2>
-					<ol class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised text-sm">
-						{#each runs as r, i (r.key)}
-							<!-- The queue's own work: its step and running time go on a line of their own. -->
-							{@const own = r.key === 'activity' || r.state === 'failed'}
-							<li class="flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-1.5 last:border-b-0 {r.state === 'running' ? 'bg-amber-50/60' : r.state === 'failed' ? 'bg-red-50' : ''} {own ? 'flex-wrap' : ''}" role={r.state === 'failed' ? 'alert' : undefined}>
-								<span class="w-4 shrink-0 text-center text-xs text-gray-400">
-									{#if r.state === 'running'}<span class="inline-block h-2 w-2 rounded-full bg-amber-400 motion-safe:animate-pulse" role="img" aria-label="running"></span>{:else if r.state === 'failed'}<span class="inline-block h-2 w-2 rounded-full bg-red-500" role="img" aria-label="failed"></span>{:else}{i + 1 - runs.filter((x) => x.state !== 'next').length}{/if}
-								</span>
-								{#if r.batch !== null}
-									<a href="#batch-{r.batch}" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600">{r.label}</a>
-								{:else}
-									<span class="shrink-0 font-medium {r.state === 'failed' ? 'text-red-800' : r.urgent ? 'text-indigo-700' : 'text-gray-900'}">{r.label}</span>
-								{/if}
-								{#if !own}<span class="shrink-0 text-xs text-gray-500">{r.detail}</span>{/if}
-								<span class="min-w-0 truncate text-xs text-gray-400" title={r.prs.map((n) => `#${n}`).join(' ')}>{r.prs.map((n) => `#${n}`).join(' ')}</span>
-								{#if r.branch}<a href={actionsUrl(data.repo.owner, data.repo.name, r.branch)} target="_blank" rel="noopener" class="ml-auto shrink-0 text-xs text-gray-500 hover:text-indigo-600" title="GitHub Actions runs of {r.branch}">Actions</a>{/if}
-								{#if own}<span class="min-w-0 basis-full break-words pl-6 text-xs tabular-nums {r.state === 'failed' ? 'font-mono text-red-700' : 'text-gray-600'}">{r.detail}</span>{/if}
-							</li>
-						{/each}
-					</ol>
-				</section>
-			{/if}
-			{#if pipe}
-				<section class="space-y-3" aria-labelledby="now">
-					<h2 id="now" class="text-base font-semibold text-gray-900">
-						{batchMode ? 'Batches' : 'Being tested'}
-					</h2>
-					{#if pipe.active.length === 0}
-						<p class="text-sm text-gray-500">
-							{forming ? `Forming a batch of ${forming.prs.map((n) => `#${n}`).join(' ')}; its CI starts once its branch is pushed.` : batchMode && inLine ? 'Nothing is being tested; the next batch starts when the collect window ends or it is full.' : 'Nothing is being tested.'}
-						</p>
-					{/if}
-					{#each pipe.active as batch (batch.id)}
-						<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} stopsEarly={data.stopsEarly} />
+	{#if view === 'now'}
+		<!-- Running work first: the queue's preparation, then the runs in the order they hold the runners. -->
+		<section aria-labelledby="running" class="space-y-3">
+			<h2 id="running" class="text-base font-semibold text-gray-900">Running</h2>
+			{#if !pipe}
+				<p class="text-sm text-gray-500">Loading…</p>
+			{:else if work.length === 0}
+				<p class="text-sm text-gray-500">{batchMode && inLine ? 'Nothing is running; the next batch starts when the collect window ends or it is full.' : 'Nothing is running.'}</p>
+			{:else}
+				<div class="grid grid-cols-1 items-start gap-3 xl:grid-cols-2">
+					{#each work as w (w.key)}
+						{#if w.kind === 'run'}
+							<BatchCard batch={w.card} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} stopsEarly={data.stopsEarly} prep={w.prep} now={clock + skew} />
+						{:else}
+							<PrepCard slot={w.slot} />
+						{/if}
 					{/each}
-				</section>
+				</div>
 			{/if}
+		</section>
 
-		</aside>
-
-		<!-- Main column: Up next and the queue. -->
-		<div class="min-w-0 space-y-5 lg:order-1">
-			{#if attention.length > 0}
-				<section aria-label="Needs attention">
-					<h2 class="mb-2 text-base font-semibold text-red-800">Needs attention · {attention.length}</h2>
-					<div class="overflow-hidden rounded-xl border border-red-200 bg-surface-raised" role="list">
-						{#each attention as h (h.pr)}
-							<div role="listitem">
-								<QueueItem {readonly} canUrgent={data.can.urgent} item={items.get(h.pr)!} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} why={h.reason} needsSomeone warnings={board?.warnings[h.pr] ?? []} />
-							</div>
-						{/each}
-					</div>
-				</section>
-			{/if}
-
+		<section class="space-y-3" aria-label="In line">
 			{#if data.queueItems.length === 0}
-				<div class="rounded-xl border border-dashed border-gray-300 bg-surface-raised p-12 text-center">
-					<svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
-						<path stroke-linecap="round" stroke-linejoin="round" d="M3 4h13M3 8h9m-9 4h6m4 0l4-4m0 0l4 4m-4-4v12" />
-					</svg>
-					<h3 class="mt-4 text-sm font-medium text-gray-900">Queue is empty</h3>
+				<div class="rounded-xl border border-dashed border-gray-300 bg-surface-raised p-8 text-center">
+					<h3 class="text-sm font-medium text-gray-900">Queue is empty</h3>
 					{#if !readonly}<p class="mt-1 text-sm text-gray-500">Add a pull request to start the merge queue.</p>{/if}
 				</div>
 			{:else}
@@ -322,83 +305,83 @@
 				{#if board?.error}<p class="text-sm text-red-600">{board.error}</p>{/if}
 
 				{#if shownStacks.length > 0}
-					<section aria-label="In line">
-						<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
-							{#each shownStacks as st, index (st.root)}
-								{@const drag = !batchMode && !needle && data.can.reorder && !readonly}
-								<div
-									role="listitem"
-									draggable={drag ? 'true' : undefined}
-									ondragstart={drag ? () => handleDragStart(index) : undefined}
-									ondragover={drag ? (e) => handleDragOver(e, index) : undefined}
-									ondrop={drag ? (e) => handleDrop(e, index) : undefined}
-									ondragend={drag ? handleDragEnd : undefined}
-									class="border-b border-border-subtle last:border-b-0 {st.rows.length > 1 ? 'border-l-2 border-l-sky-200' : ''} {dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-t-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
-								>
-									{#each st.rows as r, k (r.pr)}
-										<QueueItem
-											{readonly}
-											canUrgent={data.can.urgent}
-											item={items.get(r.pr)!}
-											position={k === 0 ? index + 1 : null}
-											repoOwner={data.repo.owner}
-											repoName={data.repo.name}
-											reorderable={drag && k === 0}
-											{batchMode}
-											depth={r.depth}
-											parent={k === 0 ? st.on : null}
-											after={r.after ?? []}
-											warnings={board?.warnings[r.pr] ?? []}
-										/>
-									{/each}
-								</div>
-							{/each}
-						</div>
-					</section>
+					<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
+						{#each shownStacks as st, index (st.root)}
+							{@const drag = !batchMode && !needle && data.can.reorder && !readonly}
+							<div
+								role="listitem"
+								draggable={drag ? 'true' : undefined}
+								ondragstart={drag ? () => handleDragStart(index) : undefined}
+								ondragover={drag ? (e) => handleDragOver(e, index) : undefined}
+								ondrop={drag ? (e) => handleDrop(e, index) : undefined}
+								ondragend={drag ? handleDragEnd : undefined}
+								class="border-b border-border-subtle last:border-b-0 {st.rows.length > 1 ? 'border-l-2 border-l-sky-200' : ''} {dragOverIndex === index && dragIndex !== index ? 'border-t-2 border-t-indigo-400' : ''} {dragIndex === index ? 'opacity-40' : ''} {reordering ? 'pointer-events-none' : ''}"
+							>
+								{#each st.rows as r, k (r.pr)}
+									<QueueItem
+										{readonly}
+										canUrgent={data.can.urgent}
+										item={items.get(r.pr)!}
+										position={k === 0 ? index + 1 : null}
+										repoOwner={data.repo.owner}
+										repoName={data.repo.name}
+										reorderable={drag && k === 0}
+										{batchMode}
+										depth={r.depth}
+										parent={k === 0 ? st.on : null}
+										after={r.after ?? []}
+										warnings={board?.warnings[r.pr] ?? []}
+									/>
+								{/each}
+							</div>
+						{/each}
+					</div>
 				{:else if needle}
 					<p class="text-sm text-gray-500">No queued PR matches “{search}”.</p>
 				{:else if board && inLine === 0}
-					<p class="text-sm text-gray-500">Nothing can go now.</p>
+					<p class="text-sm text-gray-500">Nothing is waiting in line.</p>
 				{/if}
-
 			{/if}
-
-			{#if pipe && pipe.recent.length > 0}
-				<details class="rounded-xl border border-border-subtle bg-surface-raised p-3">
-					<summary class="cursor-pointer text-sm font-medium text-gray-700">Recent batches · {pipe.recent.length}</summary>
-					<div class="mt-3 space-y-2">
-						{#each pipe.recent as batch (batch.id)}
-							<BatchCard {batch} owner={data.repo.owner} name={data.repo.name} nested />
-						{/each}
+		</section>
+	{:else if view === 'attention'}
+		<section aria-label="Needs attention">
+			{#if attention.length === 0}
+				<p class="text-sm text-gray-500">{board ? 'Nothing needs attention.' : 'Loading…'}</p>
+			{:else}
+				<p class="mb-2 text-xs text-gray-500">Held back until someone acts; each says what to do.</p>
+				<div class="overflow-hidden rounded-xl border border-red-200 bg-surface-raised" role="list">
+					{#each attention as h (h.pr)}
+						<div role="listitem">
+							<QueueItem {readonly} canUrgent={data.can.urgent} item={items.get(h.pr)!} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} why={h.reason} needsSomeone warnings={board?.warnings[h.pr] ?? []} />
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</section>
+	{:else}
+		<section aria-label="History" class="space-y-2">
+			{#if timeline.length === 0}
+				<p class="text-sm text-gray-500">{pipe ? 'Nothing has finished yet.' : 'Loading…'}</p>
+			{/if}
+			{#each timeline as e (e.key)}
+				<div class="flex gap-3">
+					<time class="w-20 shrink-0 pt-3 text-right text-xs tabular-nums text-gray-400" datetime={new Date(e.at).toISOString()} title={new Date(e.at).toLocaleString()}>{when(e.at)}</time>
+					<div class="min-w-0 flex-1">
+						{#if e.kind === 'batch'}
+							<BatchCard batch={e.card} owner={data.repo.owner} name={data.repo.name} stopsEarly={data.stopsEarly} now={clock + skew} />
+						{:else}
+							<div class="flex min-w-0 flex-wrap items-center gap-2 rounded-xl border border-border-subtle bg-surface-raised px-4 py-2.5 text-sm">
+								<a href={e.row.pr_url} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{e.row.pr_number}</a>
+								<span class="min-w-0 flex-1 truncate text-gray-600">{e.row.pr_title}</span>
+								<span class="hidden text-xs text-gray-500 sm:inline">{e.row.author_login}</span>
+								<StatusBadge status={e.row.status} />
+							</div>
+						{/if}
 					</div>
-				</details>
-			{/if}
-
-			<!-- History -->
-			{#if data.history.length > 0}
-				<details class="rounded-xl border border-border-subtle bg-surface-raised">
-					<summary class="cursor-pointer px-4 py-2.5 text-sm font-medium text-gray-700">History · {data.history.length}</summary>
-					<div class="overflow-x-auto">
-						<table class="w-full text-sm">
-							<tbody class="divide-y divide-border-subtle">
-								{#each data.history as h (h.id)}
-									<tr class="hover:bg-surface-sunken/50">
-										<td class="px-4 py-2">
-											<a href={h.pr_url} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{h.pr_number}</a>
-											<span class="ml-1.5 text-gray-500">{h.pr_title}</span>
-										</td>
-										<td class="hidden px-4 py-2 text-gray-500 sm:table-cell">{h.author_login}</td>
-										<td class="px-4 py-2"><StatusBadge status={h.status} /></td>
-										<td class="hidden whitespace-nowrap px-4 py-2 text-gray-400 sm:table-cell">{new Date(h.completed_at + 'Z').toLocaleString()}</td>
-									</tr>
-								{/each}
-							</tbody>
-						</table>
-					</div>
-				</details>
-			{/if}
-		</div>
-	</div>
+				</div>
+			{/each}
+		</section>
+	{/if}
 </div>
 
 <!-- Add PR Dialog -->
