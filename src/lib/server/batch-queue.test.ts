@@ -593,6 +593,29 @@ describe('batch queue runtime', () => {
 		expect(world.labels.get(2)).toEqual(new Set());
 	});
 
+	test('a conflict with the default branch is checked again when the branch moves, without a push', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		await run();
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		const head = git.sha('pr2');
+		// Nothing changes on the default branch: it stays held, and is told only once.
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		// The default branch drops the conflicting file: #2 now merges cleanly, and goes without a push.
+		git.git('checkout', '-q', 'main');
+		git.git('rm', '-q', 'same.txt');
+		git.git('commit', '-qm', 'drop same.txt');
+		await run();
+		expect(git.sha('pr2')).toBe(head);
+		expect(world.merged).toEqual([1, 2]);
+		expect(world.labels.get(2)).toEqual(new Set());
+		expect(world.comments.map((c) => c.pr)).toEqual([2]);
+		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'requeued').map((e) => e.data)).toEqual([
+			{ reason: 'no longer conflicts with main', headSha: head }
+		]);
+	});
+
 	test('lands a stack parent-first and retargets the child', async () => {
 		pr(1);
 		pr(2, { from: 'pr1', base: 'pr1' }); // stacked on #1
