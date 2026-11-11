@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { pushKeepsApprovalFrom as from, type BranchRule, type ClassicReviews } from './github';
+import { pushKeepsApprovalFrom as from, readClassicReviews, type BranchRule, type ClassicReviews } from './github';
+import { GitHubError } from './github-retry';
 import { changesBranchRules, forgetPushPolicy, pushRulesCached } from './push-policy';
 
 /** The answer for a queue that does not require an approval itself. */
@@ -100,5 +101,31 @@ describe('the per-repo cache of the rules', () => {
 		await new Promise((r) => setTimeout(r, 0));
 		expect(await pushRulesCached(904, async () => (++reads, none), 1)).toEqual(none);
 		expect(reads).toBe(2);
+	});
+});
+
+describe("reading a branch's classic review protection", () => {
+	const fails = (status: number) => async () => {
+		throw new GitHubError(status, `GitHub API error ${status}`);
+	};
+
+	test('settings GitHub gives are the answer; a 404 is no review protection', async () => {
+		const reviews = { required_approving_review_count: 1, dismiss_stale_reviews: true };
+		expect(await readClassicReviews(async () => reviews)).toEqual(reviews);
+		expect(await readClassicReviews(fails(404))).toBeNull();
+	});
+
+	test('a 403 (the App lacks the Administration permission) leaves the rulesets to decide', async () => {
+		expect(await readClassicReviews(fails(403))).toBe('unreadable');
+	});
+
+	test('a server or network error is no answer: it throws, so nothing is cached and nothing is pushed', async () => {
+		await expect(readClassicReviews(fails(500))).rejects.toThrow('GitHub API error 500');
+		await expect(readClassicReviews(fails(502))).rejects.toThrow('GitHub API error 502');
+		await expect(
+			readClassicReviews(async () => {
+				throw new TypeError('fetch failed');
+			})
+		).rejects.toThrow('fetch failed');
 	});
 });
