@@ -143,10 +143,17 @@ export interface QueueGit {
 	/** Makes sure the mirror has these commits. */
 	fetch(shas: string[]): Promise<void>;
 	tree(sha: string): Promise<string>;
-	/** With `drivers` false, files merge line by line, as GitHub merges them, whatever `.gitattributes` says. */
-	build(baseSha: string, members: BatchMember[], opts?: { drivers?: boolean }): Promise<BuildResult>;
-	/** `git rebase --onto onto upstream head`, when it needs no conflict resolution. */
-	restack(head: string, upstream: string, onto: string): Promise<ReplayResult>;
+	/**
+	 * Builds `members` on `baseSha`. `attrs` is the default branch's head: its `.gitattributes` pick
+	 * the queue's merge drivers, never a PR's or a batch ahead's. With `drivers` false the merges run
+	 * without the queue's drivers, as GitHub merges (the repository's other attributes still apply).
+	 */
+	build(baseSha: string, members: BatchMember[], opts: { attrs: string; drivers?: boolean }): Promise<BuildResult>;
+	/**
+	 * `git rebase --onto onto upstream head`, when it needs no conflict resolution, with the merge
+	 * drivers of the default branch's head `attrs` (never of `onto`, which may be a parent PR).
+	 */
+	restack(head: string, upstream: string, onto: string, attrs: string): Promise<ReplayResult>;
 	/** A commit with `base`'s own tree on top of it, to test the default branch alone. */
 	baseline(base: string): Promise<string>;
 	/**
@@ -173,6 +180,8 @@ export interface QueueDeps {
 }
 
 /** Why a PR deferred behind `ahead` waits. */
+/** A fork PR that merges with the default branch only with the queue's merge drivers, which the queue can't push to it. */
+const forkDriverReason = (def: string) => `it lands as tested only once merged with ${def}, and the queue can't push to a fork`;
 const deferredReason = (ahead: number[]) => `Conflicts with ${ahead.map((a) => `#${a}`).join(' ')} ahead of it; waits for them to land`;
 
 const LIVE = ['queued', 'checking', 'updating', 'merging', 'conflict'];
@@ -295,8 +304,8 @@ class Tick {
 	 * result, which takes a push to the PR head when GitHub's line merge differs; otherwise every
 	 * file merges as GitHub merges it.
 	 */
-	async buildOn(baseSha: string, members: BatchMember[]): Promise<BuildResult> {
-		return this.d.git.build(baseSha, members, { drivers: await this.canPushHeads() });
+	async buildOn(baseSha: string, members: BatchMember[], attrs: string): Promise<BuildResult> {
+		return this.d.git.build(baseSha, members, { attrs, drivers: await this.canPushHeads() });
 	}
 
 	async analysis(): Promise<StackAnalysis> {
@@ -516,11 +525,14 @@ class Tick {
 	async build(baseSha: string, prs: number[], below: number[], masterSha: string) {
 		const members = await this.members(prs, below);
 		await this.d.git.fetch([baseSha, masterSha, ...members.map((m) => m.headSha)]);
-		const r = await this.buildOn(baseSha, members);
-		if (r.ok) return { result: r, members };
+		const r = await this.buildOn(baseSha, members, masterSha);
+		if (r.ok) {
+			if (await this.holdForkDriverMerges(baseSha, members, r.commits, [...below, ...prs], masterSha)) return null;
+			return { result: r, members };
+		}
 
 		const bad = members.find((m) => m.pr === r.pr)!;
-		const alone = await this.buildOn(masterSha, [{ ...bad, parentHeadSha: null }]);
+		const alone = await this.buildOn(masterSha, [{ ...bad, parentHeadSha: null }], masterSha);
 		const it = this.item(r.pr);
 		if (alone.ok && it) {
 			const ahead = [...below, ...prs.slice(0, prs.indexOf(r.pr))];
@@ -536,6 +548,40 @@ class Tick {
 			await this.conflict(r.pr, why, alone.ok ? r.conflicts : alone.conflicts, await this.rebaseCommand(r.pr), 'conflict', alone.ok ? undefined : masterSha);
 		}
 		return null;
+	}
+
+	/**
+	 * GitHub squash-merges a PR with a plain line merge, so a PR that merges only with the queue's
+	 * merge drivers lands after the queue pushes a merge of the default branch into it, which it
+	 * can't do to a fork. Such a fork PR is held (its conflict is with the default branch: its author
+	 * rebases) or waits (the conflict is with PRs ahead of it), and the batch is planned without it.
+	 * Returns true when it held or deferred one.
+	 */
+	async holdForkDriverMerges(baseSha: string, members: BatchMember[], commits: { pr: number; sha: string }[], order: number[], masterSha: string): Promise<boolean> {
+		// Without the drivers, a batch merges as GitHub does: nothing to push.
+		if (!(await this.canPushHeads())) return false;
+		for (const [i, m] of members.entries()) {
+			// A stacked fork PR is never admitted; its parent's restack is what lands it.
+			if (m.parentHeadSha) continue;
+			if ((await this.pr(m.pr)).sameRepo) continue;
+			const tip = i ? commits[i - 1].sha : baseSha;
+			const t = await this.d.git.mergeTrees(tip, m.headSha);
+			if (t.queue === null || t.line === t.queue) continue;
+			const alone = tip === masterSha ? t : await this.d.git.mergeTrees(masterSha, m.headSha);
+			const it = this.item(m.pr);
+			if (alone.queue !== null && alone.line === alone.queue && it) {
+				const ahead = order.slice(0, order.indexOf(m.pr));
+				store.setDeferredFor(it.id, ahead);
+				db.updateQueueItemStatus(it.id, 'queued', deferredReason(ahead));
+				this.event(m.pr, 'deferred', { behind: ahead, reason: "from a fork, and merges with the PRs ahead only with the queue's merge drivers" });
+				this.log(`#${m.pr} deferred: from a fork, and merges with the PRs ahead only with the queue's merge drivers`);
+			} else {
+				const def = this.d.repo.default_branch;
+				await this.conflict(m.pr, forkDriverReason(def), [], `git fetch origin ${def} && git merge FETCH_HEAD`);
+			}
+			return true;
+		}
+		return false;
 	}
 
 	async startBatch(
@@ -842,6 +888,7 @@ class Tick {
 				const why = p.sameRepo ? `a push from the queue would dismiss its approval under ${def}'s rules` : "the queue can't push to a fork";
 				await this.conflict(
 					n,
+					// The same words as planning's hold of a fork PR (forkDriverReason).
 					`it lands as tested only once ${step.fork ? 'restacked onto' : 'merged with'} ${def}, and ${why}`,
 					[],
 					step.fork ? `git fetch origin ${def} && git rebase --onto FETCH_HEAD ${step.fork}` : `git fetch origin ${def} && git merge FETCH_HEAD`
@@ -853,7 +900,7 @@ class Tick {
 			} else if (step.fork) {
 				// A stacked child: its parent just landed as a squash commit, so restack the child's own
 				// commits onto master; GitHub's squash of the restacked head is then the tested tree.
-				const r = await this.d.git.restack(head, step.fork, master);
+				const r = await this.d.git.restack(head, step.fork, master, master);
 				if (this.skipped.size && !r.ok) {
 					// It only applied on top of a PR left out: back in line with it.
 					this.log(`#${n} does not apply without the PRs left out of batch ${batch.number}; back in line`);
@@ -1496,7 +1543,7 @@ class Tick {
 			const parent = parentOf(m.pr);
 			if (m.parentHeadSha && parent !== null && batch.heads[parent]) m.parentHeadSha = batch.heads[parent];
 		}
-		const r = await this.buildOn(baseSha, members);
+		const r = await this.buildOn(baseSha, members, baseSha);
 		if (!r.ok) {
 			// They don't apply on the default branch as it is now (something landed meanwhile): not a
 			// CI failure, and no run; they go back in line, where a conflict is handled the usual way.
@@ -1562,7 +1609,7 @@ class Tick {
 		const masterSha = await this.d.github.defaultBranchSha();
 		const member: BatchMember = { pr: n, headSha: p.headSha, title: p.title, parentHeadSha: null };
 		await this.d.git.fetch([masterSha, p.headSha]);
-		const r = await this.buildOn(masterSha, [member]);
+		const r = await this.buildOn(masterSha, [member], masterSha);
 		if (!r.ok) throw new Error(`#${n} does not apply on ${this.d.repo.default_branch}: ${r.reason.replace(/^#\d+ /, '')}`);
 		const branch = `mq/try-${n}-${this.d.now()}`;
 		store.intendBranch(this.repoId, branch, r.headSha);
@@ -1721,7 +1768,7 @@ class Tick {
 			if (info?.issues.some((i) => (i.kind === 'parent-rebased' || i.kind === 'parent-merged') && (i.staleCommits?.length ?? 0) > 0)) return false;
 		}
 		await this.d.git.fetch([master, p.headSha]);
-		const r = await this.d.git.build(master, [{ pr: it.pr_number, headSha: p.headSha, title: p.title, parentHeadSha: null }]);
+		const r = await this.buildOn(master, [{ pr: it.pr_number, headSha: p.headSha, title: p.title, parentHeadSha: null }], master);
 		if (!r.ok) {
 			// Saved before holds were: it was told then. One saved since keeps whether it was.
 			const told = hold?.code === 'conflict' ? !!hold.told : true;
@@ -1757,12 +1804,14 @@ class Tick {
 			if (!issue || stale.length === 0) continue;
 			const p = await this.pr(n);
 			if (p.state !== 'open') continue;
+			// The default branch's attributes pick the merge drivers, even onto a parent's head.
+			const master = await this.d.github.defaultBranchSha();
 			let onto: string;
 			if (rebased) {
 				if (!a.prs.has(info.parent)) continue;
 				onto = (await this.pr(info.parent)).headSha;
 			} else {
-				onto = await this.d.github.defaultBranchSha();
+				onto = master;
 			}
 			const upstream = stale[stale.length - 1];
 			const ontoName = rebased ? `#${info.parent}` : def;
@@ -1771,8 +1820,8 @@ class Tick {
 				await this.conflict(n, `its parent #${info.parent} was ${rebased ? 'rewritten' : 'merged'} and ${why}`, [], `git fetch origin ${rebased ? `pull/${info.parent}/head` : def} && git rebase --onto FETCH_HEAD ${upstream}`);
 				continue;
 			}
-			await this.d.git.fetch([p.headSha, upstream, onto]);
-			const r = await this.d.git.restack(p.headSha, upstream, onto);
+			await this.d.git.fetch([p.headSha, upstream, onto, master]);
+			const r = await this.d.git.restack(p.headSha, upstream, onto, master);
 			if (!r.ok) {
 				await this.conflict(
 					n,

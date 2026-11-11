@@ -180,11 +180,11 @@ export function trackActivity(deps: QueueDeps, opts: TrackOptions = {}): QueueDe
 				buildFailed = !probe && !r.ok;
 				return r;
 			},
-			restack: (head, upstream, onto) => {
+			restack: (head, upstream, onto, attrs) => {
 				const prs = prsOf([head]);
 				if (a.phase?.kind !== 'landing') setPhase('restack', prs);
 				else for (const n of prs) if (!a.phase.prs.includes(n)) a.phase.prs.push(n);
-				return step('restack', `rebasing ${prs.length ? prList(prs) : 'a PR'}`, prs, () => git.restack(head, upstream, onto));
+				return step('restack', `rebasing ${prs.length ? prList(prs) : 'a PR'}`, prs, () => git.restack(head, upstream, onto, attrs));
 			},
 			baseline: (base) => {
 				setPhase('master', []);

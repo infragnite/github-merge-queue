@@ -15,9 +15,15 @@
 // markers.
 //
 // Git reads drivers only from config, so the queue passes them in the environment of its own git
-// runs (`mergeDriverEnv`); a merge it does not run (GitHub's own) never sees them.
+// runs (`mergeDriverEnv`); a merge it does not run (GitHub's own) never sees them. Without them, a
+// path routed to `sorted-set` falls back to git's line merge, while the repository's other
+// attributes (`merge=union`, `binary`, ...) still apply, as they do in GitHub's merge.
+//
+// The driver handles a file as bytes (latin1 maps each byte to one character), so entries in any
+// encoding keep their bytes, and byte order is the order of those characters.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 export const SORTED_SET_DRIVER = 'sorted-set';
@@ -37,14 +43,14 @@ function lineMerge() {
 
 // A header (leading comment and blank lines) and the entries after it, or null when it is not a set.
 function split(file) {
-	const lines = fs.readFileSync(file, 'utf8').split('\\n');
+	const lines = fs.readFileSync(file, 'latin1').split('\\n');
 	if (lines[lines.length - 1] === '') lines.pop();
 	let i = 0;
 	while (i < lines.length && (lines[i].startsWith('#') || lines[i].trim() === '')) i++;
 	const entries = lines.slice(i);
 	for (let k = 0; k < entries.length; k++) {
 		if (entries[k].startsWith('#') || entries[k].trim() === '') return null;
-		if (k > 0 && Buffer.compare(Buffer.from(entries[k - 1]), Buffer.from(entries[k])) >= 0) return null;
+		if (k > 0 && entries[k - 1] >= entries[k]) return null;
 	}
 	return { header: lines.slice(0, i).join('\\n'), entries };
 }
@@ -65,9 +71,9 @@ const inB = new Set(b.entries);
 const kept = new Set();
 for (const e of a.entries) if (inB.has(e) || !inO.has(e)) kept.add(e);
 for (const e of b.entries) if (!inO.has(e)) kept.add(e);
-const entries = [...kept].sort((x, y) => Buffer.compare(Buffer.from(x), Buffer.from(y)));
+const entries = [...kept].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
 const text = (header ? header + '\\n' : '') + entries.map((e) => e + '\\n').join('');
-fs.writeFileSync(ours, text);
+fs.writeFileSync(ours, text, 'latin1');
 `;
 
 /** Single-quotes `s` for the shell git runs a driver with. */
@@ -76,10 +82,33 @@ function shellQuote(s: string): string {
 }
 
 /**
- * Writes the driver programs under `dir` and returns the environment that registers them with git
- * (`GIT_CONFIG_*`, so no config file changes). Pass it to the git runs that merge for the queue.
+ * `entries` as `GIT_CONFIG_*` variables appended after those already in `base` (the server's own,
+ * such as `safe.directory`), which a run's environment would otherwise replace.
  */
-export function mergeDriverEnv(dir: string): NodeJS.ProcessEnv {
+export function gitConfigEnv(entries: [key: string, value: string][], base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const start = Number(base.GIT_CONFIG_COUNT ?? 0);
+	if (!Number.isInteger(start) || start < 0) throw new Error(`GIT_CONFIG_COUNT is not a count: ${base.GIT_CONFIG_COUNT}`);
+	const env: NodeJS.ProcessEnv = { GIT_CONFIG_COUNT: String(start + entries.length) };
+	entries.forEach(([key, value], i) => {
+		env[`GIT_CONFIG_KEY_${start + i}`] = key;
+		env[`GIT_CONFIG_VALUE_${start + i}`] = value;
+	});
+	return env;
+}
+
+/** Writes `text` to `file` through a temporary file and a rename, so a git run never reads half of it. */
+function writeAtomically(file: string, text: string) {
+	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	writeFileSync(tmp, text);
+	renameSync(tmp, file);
+}
+
+/**
+ * Writes the driver programs under `dir` and returns the environment that registers them with git
+ * (`GIT_CONFIG_*`, after the server's own, so no config file changes). Pass it to the git runs that
+ * merge for the queue.
+ */
+export function mergeDriverEnv(dir: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const folder = resolve(dir, 'merge-drivers');
 	const file = join(folder, `${SORTED_SET_DRIVER}.cjs`);
 	mkdirSync(folder, { recursive: true });
@@ -89,12 +118,33 @@ export function mergeDriverEnv(dir: string): NodeJS.ProcessEnv {
 	} catch {
 		current = null;
 	}
-	if (current !== SORTED_SET_SOURCE) writeFileSync(file, SORTED_SET_SOURCE);
-	return {
-		GIT_CONFIG_COUNT: '2',
-		GIT_CONFIG_KEY_0: `merge.${SORTED_SET_DRIVER}.name`,
-		GIT_CONFIG_VALUE_0: 'sorted set of lines (merge queue)',
-		GIT_CONFIG_KEY_1: `merge.${SORTED_SET_DRIVER}.driver`,
-		GIT_CONFIG_VALUE_1: `${shellQuote(process.execPath)} ${shellQuote(file)} %O %A %B`
-	};
+	if (current !== SORTED_SET_SOURCE) writeAtomically(file, SORTED_SET_SOURCE);
+	return gitConfigEnv(
+		[
+			[`merge.${SORTED_SET_DRIVER}.name`, 'sorted set of lines (merge queue)'],
+			[`merge.${SORTED_SET_DRIVER}.driver`, `${shellQuote(process.execPath)} ${shellQuote(file)} %O %A %B`]
+		],
+		base
+	);
+}
+
+/** The oldest git the queue merges with: `--attr-source` came in 2.41 (`merge-tree --write-tree --merge-base` in 2.40). */
+export const MIN_GIT_VERSION = '2.41';
+
+/** Why the git that printed `version` (`git version x.y.z`) can't run the queue's merges, or null when it can. */
+export function gitVersionProblem(version: string): string | null {
+	const m = /^git version (\d+)\.(\d+)/.exec(version.trim());
+	if (!m) return `Could not read the git version from "${version.trim()}"; the merge queue needs git ${MIN_GIT_VERSION} or newer`;
+	const [major, minor] = MIN_GIT_VERSION.split('.').map(Number);
+	const [a, b] = [Number(m[1]), Number(m[2])];
+	if (a > major || (a === major && b >= minor)) return null;
+	return `git ${a}.${b} is too old for the merge queue, which needs git ${MIN_GIT_VERSION} or newer (for --attr-source); upgrade git on the server`;
+}
+
+let gitProblem: string | null | undefined;
+
+/** Throws when the server's git can't run the queue's merges. Asks git once per process. */
+export function requireGitVersion() {
+	if (gitProblem === undefined) gitProblem = gitVersionProblem(execFileSync('git', ['--version'], { encoding: 'utf8' }));
+	if (gitProblem) throw new Error(gitProblem);
 }
