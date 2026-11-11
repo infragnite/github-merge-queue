@@ -647,6 +647,27 @@ describe('batch queue runtime', () => {
 		expect(world.comments.filter((c) => c.pr === 2)).toHaveLength(1);
 	});
 
+	test('a restack that conflicted with its rebased parent is tried again once the parent moves, without a push to it', async () => {
+		pr(1, { file: 'shared.txt' });
+		pr(2, { from: 'pr1', base: 'pr1', file: 'shared.txt' });
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		const old = git.sha('pr1');
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'parent rewrote it\n');
+		git.git('commit', '-q', '--amend', '-am', 'pr1 rewritten');
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		const head = git.sha('pr2');
+		// The parent's author puts its content back in a new commit: #2's commit replays cleanly again.
+		git.git('checkout', '-q', 'pr1');
+		git.git('checkout', '-q', old, '--', 'shared.txt');
+		git.git('commit', '-qam', 'pr1 restores shared.txt');
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'queued' }]);
+		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'requeued').map((e) => e.data)).toEqual([{ reason: '#1 moved', headSha: head }]);
+		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+	});
+
 	test('a conflict saved over a hold of another kind keeps its own kind and base after a failed check', async () => {
 		pr(1, { file: 'same.txt' });
 		pr(2, { file: 'same.txt' });
