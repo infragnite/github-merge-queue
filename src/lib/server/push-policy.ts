@@ -1,15 +1,19 @@
-// Whether the queue may push to a PR head without costing the PR its approval, per repository.
+// The default branch's rules that decide whether the queue may push to a PR head without costing
+// the PR its approval, per repository (see `pushKeepsApprovalFrom`).
 //
-// It is read from the default branch's rules (rulesets and classic branch protection) and kept for
-// hours: the rules change rarely, and a tick must not spend API calls on them. A change to a
-// ruleset or branch protection rule (webhook) forgets the repository's answer at once.
+// They are read from the rulesets and classic branch protection and kept for hours: the rules
+// change rarely, and a tick must not spend API calls on them. A change to a ruleset or branch
+// protection rule (webhook) forgets the repository's rules at once. The rules are kept, not the
+// answer, so a change to the queue's own settings (requireApproval) applies at once.
+
+import type { PushRules } from './github';
 
 const TTL_MS = 6 * 60 * 60 * 1000;
 
-const cache = new Map<number, { until: number; value: Promise<boolean> }>();
+const cache = new Map<number, { until: number; value: Promise<PushRules> }>();
 
-/** The repository's answer, loaded with `load` when it has none or it is older than the TTL. */
-export function pushKeepsApprovalCached(repoId: number, load: () => Promise<boolean>, now = Date.now()): Promise<boolean> {
+/** The repository's rules, loaded with `load` when it has none or they are older than the TTL. */
+export function pushRulesCached(repoId: number, load: () => Promise<PushRules>, now = Date.now()): Promise<PushRules> {
 	const hit = cache.get(repoId);
 	if (hit && hit.until > now) return hit.value;
 	const value = load();
@@ -21,7 +25,7 @@ export function pushKeepsApprovalCached(repoId: number, load: () => Promise<bool
 	return value;
 }
 
-/** Forgets the repository's answer, after its rules changed. */
+/** Forgets the repository's rules, after they changed. */
 export function forgetPushPolicy(repoId: number) {
 	cache.delete(repoId);
 }

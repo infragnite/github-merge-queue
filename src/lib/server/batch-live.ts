@@ -10,7 +10,7 @@ import { RateLimitedError } from './rate-limit';
 import { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } from './batch-builder';
 import { replay } from './rebase';
 import { gitConfigEnv, mergeDriverEnv, requireGitVersion } from './merge-drivers';
-import { pushKeepsApprovalCached } from './push-policy';
+import { pushRulesCached } from './push-policy';
 import { getQueueSettings, type CISettings } from './batch-store';
 import { currentStackAnalysis } from './stack-runtime';
 import { bumpGeneration, memoByGeneration } from './wake';
@@ -467,7 +467,10 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				bumpGeneration(repo.id);
 				await mirror.pushLease(branch, sha, expected);
 			},
-			pushKeepsApproval: () => pushKeepsApprovalCached(repo.id, () => github.pushKeepsApproval(owner, name, repo.default_branch)),
+			pushKeepsApproval: async () => {
+				const r = await pushRulesCached(repo.id, () => github.pushRules(owner, name, repo.default_branch));
+				return github.pushKeepsApprovalFrom(r.rules, r.classic, { queueRequiresApproval: getQueueSettings(repo.id).config.requireApproval });
+			},
 			deleteBranch: (branch) => github.deleteBranch(owner, name, branch),
 			retargetBase: async (n, base) => {
 				bumpGeneration(repo.id);

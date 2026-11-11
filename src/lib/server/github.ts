@@ -336,23 +336,33 @@ export interface BranchRule {
  */
 export type ClassicReviews = Record<string, unknown> | null | 'unreadable';
 
+/** A branch's rules that decide whether a push to a PR costs its approval. */
+export interface PushRules {
+	rules: BranchRule[];
+	classic: ClassicReviews;
+}
+
 /**
  * Whether a push to a PR's head leaves the PR mergeable without a new approval under these rules:
  * no rule that requires an approval also dismisses one on a push, asks the last push to be
- * approved by someone else, or asks a commit not attributed to the author to be approved. Rules
- * the App can't read count as ones that would, since a push can't be taken back.
+ * approved by someone else, or asks one more approval for unattributed changes; and, where the
+ * queue requires an approval itself (`queueRequiresApproval`), no rule dismisses one on a push
+ * (the queue's check counts only approvals GitHub still has). Rules the App can't read count as
+ * ones that would, since a push can't be taken back.
  */
-export function pushKeepsApprovalFrom(rules: BranchRule[], classic: ClassicReviews): boolean {
+export function pushKeepsApprovalFrom(rules: BranchRule[], classic: ClassicReviews, opts: { queueRequiresApproval: boolean }): boolean {
 	if (classic === 'unreadable') return false;
-	const needs = (p: Record<string, unknown>, dismiss: string) =>
-		Number(p.required_approving_review_count ?? 0) > 0 &&
-		(!!p[dismiss] || !!p.require_last_push_approval || !!p.require_extra_approval_for_unattributed_changes);
-	if (rules.some((r) => r.type === 'pull_request' && needs(r.parameters ?? {}, 'dismiss_stale_reviews_on_push'))) return false;
-	return !(classic && needs(classic, 'dismiss_stale_reviews'));
+	const costs = (p: Record<string, unknown>, dismiss: string) => {
+		// GitHub applies the last-push and unattributed-change rules only with a non-zero count.
+		if (Number(p.required_approving_review_count ?? 0) > 0) return !!p[dismiss] || !!p.require_last_push_approval || !!p.require_extra_approval_for_unattributed_changes;
+		return opts.queueRequiresApproval && !!p[dismiss];
+	};
+	if (rules.some((r) => r.type === 'pull_request' && costs(r.parameters ?? {}, 'dismiss_stale_reviews_on_push'))) return false;
+	return !(classic && costs(classic, 'dismiss_stale_reviews'));
 }
 
-/** `pushKeepsApprovalFrom` for `branch` as GitHub has its rules now: two or three API calls. */
-export async function pushKeepsApproval(owner: string, repo: string, branch: string): Promise<boolean> {
+/** `branch`'s rules as GitHub has them now, for `pushKeepsApprovalFrom`: two or three API calls. */
+export async function pushRules(owner: string, repo: string, branch: string): Promise<PushRules> {
 	const path = `/repos/${owner}/${repo}`;
 	const [rules, b] = await Promise.all([
 		ghFetchAsApp(`${path}/rules/branches/${refPath(branch)}?per_page=100`) as Promise<BranchRule[]>,
@@ -367,7 +377,7 @@ export async function pushKeepsApproval(owner: string, repo: string, branch: str
 			if (!(e instanceof GitHubError && e.status === 404)) classic = 'unreadable';
 		}
 	}
-	return pushKeepsApprovalFrom(rules, classic);
+	return { rules, classic };
 }
 
 export async function deleteBranch(owner: string, repo: string, branch: string) {
