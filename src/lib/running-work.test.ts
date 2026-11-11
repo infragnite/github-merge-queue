@@ -55,7 +55,7 @@ describe('running work, in the order it holds the runners', () => {
 		expect(keys(runningWork({ active: [card(4, { prs: [pr(2)] })], activity, now: at + 1000 }))).toEqual(['failure', 'activity', 'run4']);
 	});
 
-	test('preparing a bisection step goes inside its batch, and that batch goes on top of the runs', () => {
+	test('preparing a bisection step goes on top inside its batch; the batch keeps its place, so cards never jump', () => {
 		const b13 = card(13, { status: 'bisecting', ci: 'failure', prs: [pr(1, { verdict: 'unknown' }), pr(2, { verdict: 'unknown' })] });
 		const u14 = card(14, { express: true, prs: [pr(9)] });
 		const activity: ActivityView = {
@@ -65,17 +65,17 @@ describe('running work, in the order it holds the runners', () => {
 			failure: null
 		};
 		const w = runningWork({ active: [b13, u14], activity, now: at + 5000 });
-		expect(keys(w)).toEqual(['run13', 'run14']);
-		expect(w[0]).toMatchObject({ kind: 'run', prep: [{ label: 'Preparing a bisection step', detail: 'merging #1, 5 s', prs: [1] }] });
-		expect(w[1]).toMatchObject({ kind: 'run', prep: [] });
+		expect(keys(w)).toEqual(['run14', 'run13']);
+		expect(w[1]).toMatchObject({ kind: 'run', prep: [{ label: 'Preparing a bisection step', detail: 'merging #1, 5 s', prs: [1] }] });
+		expect(w[0]).toMatchObject({ kind: 'run', prep: [] });
 	});
 
 	test('a failed bisection step preparation shows inside its batch too', () => {
 		const b13 = card(13, { status: 'bisecting', ci: 'failure', prs: [pr(1, { verdict: 'unknown' }), pr(2, { verdict: 'unknown' })] });
 		const failure = { phase: 'Preparing a bisection step', step: 'merging #2', prs: [2], message: 'conflict', at };
 		const w = runningWork({ active: [card(12, { prs: [pr(5)] }), b13], activity: { ...idle, failure }, now: at + 1000 });
-		expect(keys(w)).toEqual(['run13', 'run12']);
-		expect(w[0]).toMatchObject({ prep: [{ key: 'failure', state: 'failed', label: 'Preparing a bisection step failed' }] });
+		expect(keys(w)).toEqual(['run12', 'run13']);
+		expect(w[1]).toMatchObject({ prep: [{ key: 'failure', state: 'failed', label: 'Preparing a bisection step failed' }] });
 	});
 
 	test('preparing a bisection step no batch carries stays on its own', () => {
@@ -87,7 +87,8 @@ describe('running work, in the order it holds the runners', () => {
 		const b4 = card(4, { status: 'passed', ci: 'success', prs: [pr(2), pr(3)] });
 		const activity: ActivityView = { since: at, phase: { kind: 'landing', label: 'Landing', prs: [2, 3], branch: null, since: at }, step: { label: 'merging #2 into master', prs: [2], since: at }, failure: null };
 		const w = runningWork({ active: [card(3, { prs: [pr(1)] }), b4], activity, now: at });
-		expect(keys(w)).toEqual(['run4', 'run3']);
+		expect(keys(w)).toEqual(['run3', 'run4']);
+		expect(w[1]).toMatchObject({ prep: [{ label: 'Landing' }] });
 	});
 
 	test('the check of the default branch after a landing is a run of its own, after the preparation', () => {
