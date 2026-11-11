@@ -958,6 +958,39 @@ describe('batch queue runtime', () => {
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 	});
 
+	describe('count baselines', () => {
+		const BASELINE = 'clippy-baseline.tsv';
+		const rows = (...r: [number, string][]) => r.map(([n, finding]) => `${n}\tsrc/a.rs\t${finding}\n`).join('');
+		/** A queued, approved PR #n off main whose baseline is `text`. */
+		const lowering = (n: number, text: string) => {
+			git.branch(`pr${n}`, 'main');
+			git.git('checkout', '-q', `pr${n}`);
+			writeFileSync(`${git.dir}/${BASELINE}`, text);
+			git.git('commit', '-qam', `pr${n}`);
+			git.openPR(n, `pr${n}`, 'main');
+			world.approved.add(n);
+			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+		};
+
+		test('two PRs that lower the same count land together, with the counts summed', async () => {
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/.gitattributes`, `${BASELINE} merge=count-baseline\n`);
+			writeFileSync(`${git.dir}/${BASELINE}`, rows([3, 'needless borrow'], [5, 'single match']));
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'baseline');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			lowering(1, rows([3, 'needless borrow'], [4, 'single match']));
+			lowering(2, rows([2, 'needless borrow'], [3, 'single match']));
+			await run();
+			expect(world.started[0].prs).toEqual([1, 2]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(git.git('show', `main:${BASELINE}`)).toBe(rows([2, 'needless borrow'], [2, 'single match']).trimEnd());
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+		});
+	});
+
 	describe('sorted-set lists', () => {
 		const LANE = 'lists/lane.txt';
 		const HEADER = '# expected failures\n';
