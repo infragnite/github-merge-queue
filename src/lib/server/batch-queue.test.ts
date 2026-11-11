@@ -1022,6 +1022,25 @@ describe('batch queue runtime', () => {
 			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 		});
 
+		test('a failed read of the branch rules at landing stops it before the first merge, so the batch lands whole on the next tick', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			world.pushPolicyFailOn = new Set([2]);
+			let mergedAtFailure: number[] | null = null;
+			for (let i = 0; i < 30; i++) {
+				await tickBatchQueue(world.deps()).catch(() => {
+					mergedAtFailure ??= [...world.merged];
+				});
+			}
+			expect(mergedAtFailure).toEqual([]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.started.map((s) => s.prs)).toEqual([[1, 2]]);
+			expect(store.getLandingIntent(repo.id)).toBeNull();
+			expect(store.getMasterHealth(repo.id)?.state).toBe('green');
+			expect(world.comments.filter((c) => /interrupted/.test(c.body))).toEqual([]);
+		});
+
 		test('a failed read of the branch rules is no reason to tell a child to restack itself: the next tick restacks it', async () => {
 			lists();
 			git.branch('pr1', 'main');
