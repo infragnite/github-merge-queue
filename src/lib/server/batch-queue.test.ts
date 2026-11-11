@@ -629,6 +629,37 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 2]);
 	});
 
+	test('a restack that needs conflict resolution waits for a push: the default branch moving does not retry it', async () => {
+		pr(1, { file: 'shared.txt' });
+		pr(2, { from: 'pr1', base: 'pr1', file: 'shared.txt' });
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		// #1 is rewritten under #2: replaying #2's own commit onto it conflicts.
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'parent rewrote it\n');
+		git.git('commit', '-q', '--amend', '-am', 'pr1 rewritten');
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		git.commit('main', 'm1', 'x-main.txt');
+		await run(3);
+		git.commit('main', 'm2', 'x-main2.txt');
+		await run(3);
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		expect(world.comments.filter((c) => c.pr === 2)).toHaveLength(1);
+	});
+
+	test('a conflict saved over a hold of another kind keeps its own kind and base after a failed check', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		await run();
+		const item = () => db.getQueueItems(repo.id).find((i) => i.pr_number === 2)! as ReturnType<typeof db.getQueueItems>[number] & { hold?: string | null };
+		// As saved before conflicts kept a base: the hold it had while queued.
+		store.setHold(item().id, { code: 'deferred', reason: 'Conflicts with #1 ahead of it; waits for them to land', released: true });
+		git.commit('main', 'm1', 'x-main.txt');
+		await run(1);
+		expect(store.storedHold(item())).toMatchObject({ code: 'conflict', base: git.sha('main') });
+		expect(store.storedHold(item())?.released).toBeUndefined();
+	});
+
 	test('a workflow change the app may not push is not checked again by itself: only a push retries it', async () => {
 		world.workflowsDenied = true;
 		pr(1, { file: '.github/workflows/ci.yml' });
