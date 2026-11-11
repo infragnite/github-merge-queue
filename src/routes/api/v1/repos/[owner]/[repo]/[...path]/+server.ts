@@ -95,7 +95,8 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 			case 'GET stacks':
 				return json(api.stacksState(await analyzeRepoStacks(repo)));
 			case 'GET queue':
-				return json(api.queueState(repo));
+				// Without the stacks (GitHub unreachable) every PR is a stack of its own.
+				return json(api.queueState(repo, await analyzeRepoStacks(repo).catch(() => null)));
 			case 'POST pulls/:n/queue': {
 				const pr = await github.getPR(repo.owner, repo.name, n);
 				return json(api.enqueue(repo, caller, pr, await body()), { status: 201 });
