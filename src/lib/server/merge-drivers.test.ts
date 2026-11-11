@@ -193,11 +193,6 @@ describe('the driver environment', () => {
 });
 
 describe('the line merge GitHub makes', () => {
-	let plain: GitRunner;
-	beforeEach(() => {
-		plain = new GitRunner(git.dir);
-	});
-
 	/** Branches `ours` and `theirs` off main, each changing the given files. */
 	const branches = (ours: Record<string, string>, theirs: Record<string, string>) => {
 		for (const [name, files] of [['ours', ours], ['theirs', theirs]] as const) {
@@ -217,34 +212,42 @@ describe('the line merge GitHub makes', () => {
 		write('main', BASE, ATTRS);
 	});
 
-	test("keeps the repository's other merge attributes: a union file merges in both", () => {
+	test("ignores every merge attribute, union too, as GitHub's merge does; the queue's merge applies them", () => {
+		// GitHub's merge doesn't honor .gitattributes merge drivers: github.com/orgs/community/discussions/9288
 		branches({ 'notes.txt': lines('one', 'two') }, { 'notes.txt': lines('one', 'three') });
-		const t = mergeTrees(runner, plain, git.sha('ours'), git.sha('theirs'));
-		expect(t.queue).not.toBeNull();
-		expect(t.line).toBe(t.queue);
-		expect(git.git('show', `${t.line}:notes.txt`)).toBe('one\ntwo\nthree');
+		const t = mergeTrees(runner, git.sha('ours'), git.sha('theirs'), git.sha('main'));
+		expect(t.line).toBeNull();
+		expect(git.git('show', `${t.queue}:notes.txt`)).toBe('one\ntwo\nthree');
 	});
 
 	test('a sorted-set list merges only with the queue driver; the line merge conflicts', () => {
 		branches({ [LIST]: lines(...HEADER, 'a.kt', 'c.kt', 'd.kt', 'e.kt') }, { [LIST]: lines(...HEADER, 'a.kt', 'b.kt', 'd.kt', 'e.kt') });
-		const t = mergeTrees(runner, plain, git.sha('ours'), git.sha('theirs'));
+		const t = mergeTrees(runner, git.sha('ours'), git.sha('theirs'), git.sha('main'));
 		expect(git.git('show', `${t.queue}:${LIST}`)).toBe(list('a.kt', 'd.kt', 'e.kt'));
 		expect(t.line).toBeNull();
 	});
 
 	test('changes far apart in a sorted-set list give the same tree either way', () => {
 		branches({ [LIST]: lines(...HEADER, 'b.kt', 'c.kt', 'd.kt', 'e.kt') }, { [LIST]: lines(...HEADER, 'a.kt', 'b.kt', 'c.kt', 'd.kt') });
-		const t = mergeTrees(runner, plain, git.sha('ours'), git.sha('theirs'));
+		const t = mergeTrees(runner, git.sha('ours'), git.sha('theirs'), git.sha('main'));
 		expect(t.queue).not.toBeNull();
 		expect(t.line).toBe(t.queue);
 	});
 
-	test('attributes come from the commit merged onto, not from the PR', () => {
+	test('the drivers come from the attributes given, not from the commit merged onto or the PR', () => {
+		// `ours` stands for master after a PR that dropped the attributes landed; `theirs` adds them itself.
+		const routed = git.sha('main');
+		branches(
+			{ [LIST]: lines(...HEADER, 'a.kt', 'c.kt', 'd.kt', 'e.kt'), '.gitattributes': '' },
+			{ [LIST]: lines(...HEADER, 'a.kt', 'b.kt', 'd.kt', 'e.kt'), '.gitattributes': ATTRS }
+		);
+		const t = mergeTrees(runner, git.sha('ours'), git.sha('theirs'), routed);
+		expect(t.line).toBeNull();
+		expect(t.queue).not.toBeNull();
 		git.git('checkout', '-q', 'main');
 		writeFileSync(join(git.dir, '.gitattributes'), '');
 		git.git('commit', '-q', '-am', 'no attributes');
-		branches({ [LIST]: lines(...HEADER, 'a.kt', 'c.kt', 'd.kt', 'e.kt') }, { [LIST]: lines(...HEADER, 'a.kt', 'b.kt', 'd.kt', 'e.kt'), '.gitattributes': ATTRS });
-		expect(mergeTrees(runner, plain, git.sha('ours'), git.sha('theirs'))).toEqual({ queue: null, line: null });
+		expect(mergeTrees(runner, git.sha('ours'), git.sha('theirs'), git.sha('main'))).toEqual({ queue: null, line: null });
 	});
 });
 
@@ -261,5 +264,10 @@ describe('the git version', () => {
 
 	test('the git these tests run on passes', () => {
 		expect(() => requireGitVersion()).not.toThrow();
+	});
+
+	test('an old git fails the merge that needs it, with the reason', () => {
+		expect(() => requireGitVersion(() => 'git version 2.40.1')).toThrow(/git 2\.40 is too old/);
+		expect(() => requireGitVersion(() => 'git version 2.45.2')).not.toThrow();
 	});
 });

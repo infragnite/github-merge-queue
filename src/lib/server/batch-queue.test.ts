@@ -61,8 +61,8 @@ class World {
 	deleted = new Set<number>();
 	/** PRs opened from a fork. */
 	forks = new Set<number>();
-	/** The line merge reports what the queue's merge drivers make (as if GitHub merged the same). */
-	lineMergeHidden = false;
+	/** GitHub won't give the branch rules (an outage, a missing permission). */
+	pushPolicyFails = false;
 	/** False: the default branch's rules dismiss an approval on a push to the PR. */
 	pushKeepsApproval = true;
 
@@ -115,7 +115,6 @@ class World {
 
 	deps(): QueueDeps {
 		const runner = new GitRunner(git.dir, mergeDriverEnv(`${git.dir}/.git`));
-		const plain = new GitRunner(git.dir);
 		return {
 			repo,
 			now: () => Date.now() + this.started.length,
@@ -125,13 +124,10 @@ class World {
 			git: {
 				fetch: async () => {},
 				tree: async (sha) => git.git('rev-parse', `${sha}^{tree}`),
-				build: async (base, members, opts) => buildBatch(opts.drivers === false ? plain : runner, base, members, { attrs: opts.attrs }),
+				build: async (base, members, opts) => buildBatch(runner, base, members, opts),
 				restack: async (head, upstream, onto, attrs) => replay(runner, { head, upstream, onto, attrs }),
 				baseline: async (base) => baselineCommit(runner, base),
-				mergeTrees: async (onto, head) => {
-					const t = mergeTrees(runner, plain, onto, head);
-					return this.lineMergeHidden ? { queue: t.queue, line: t.queue } : t;
-				},
+				mergeTrees: async (onto, head, attrs) => mergeTrees(runner, onto, head, attrs),
 				mergeCommit: async (tree, parents, message) => queueMergeCommit(runner, tree, parents, message),
 				changed: async (from, to) => git.git('diff', '--name-only', from, to).split('\n').filter(Boolean)
 			},
@@ -204,7 +200,10 @@ class World {
 					}
 					git.git('branch', '-f', branch, sha);
 				},
-				pushKeepsApproval: async () => this.pushKeepsApproval,
+				pushKeepsApproval: async () => {
+					if (this.pushPolicyFails) throw new Error('GitHub API error 502');
+					return this.pushKeepsApproval;
+				},
 				pushHead: async (branch, sha, expected) => {
 					if (git.sha(branch) !== expected) throw new Error('stale info');
 					git.git('branch', '-f', branch, sha);
@@ -872,13 +871,15 @@ describe('batch queue runtime', () => {
 			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
 		};
 		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n);
+		/** A fork PR's conflict notice: its author fetches this repository by URL, since a fork's origin is the fork. */
 		const forkHold = (n: number) =>
 			holdNotice({
 				pr: n,
 				head: git.sha(`pr${n}`),
 				code: 'conflict',
-				reason: "it lands as tested only once merged with main, and the queue can't push to a fork",
-				fix: 'git fetch origin main && git merge FETCH_HEAD'
+				reason: 'Conflicts with main',
+				files: [LANE],
+				fix: `git fetch https://github.com/acme/${repo.name}.git main && git rebase FETCH_HEAD`
 			});
 
 		test('two PRs that remove neighbouring lines land together; the second gets master merged in first', async () => {
@@ -985,7 +986,7 @@ describe('batch queue runtime', () => {
 			expect(git.git('show', `main:${LANE}`)).toBe('# expected failures\na.kt\nd.kt');
 		});
 
-		test('a fork PR that merges with a PR ahead only through the driver waits for it, then is held; the queue never pauses', async () => {
+		test('a fork PR is built by lines: behind a PR whose neighbouring line it changes it waits, then is held; the queue never pauses', async () => {
 			lists();
 			removing(1, ['a.kt', 'c.kt', 'd.kt']);
 			removing(2, ['a.kt', 'b.kt', 'd.kt'], { fork: true });
@@ -994,13 +995,13 @@ describe('batch queue runtime', () => {
 			expect(world.started.map((s) => s.prs)).toEqual([[1]]);
 			expect(world.merged).toEqual([1]);
 			expect(world.pushedHeads).toEqual([]);
-			expect(item(2)).toMatchObject({ status: 'conflict', error_message: "it lands as tested only once merged with main, and the queue can't push to a fork" });
+			expect(item(2)).toMatchObject({ status: 'conflict', error_message: 'Conflicts with main' });
 			expect(world.comments).toEqual([{ pr: 2, body: forkHold(2) }]);
 			expect(world.prChecks.filter((c) => c.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required' });
 			expect(world.labels.get(2)?.has('needs-rebase')).toBe(true);
 		});
 
-		test('a fork PR whose only conflict with main is in a sorted-set list is held at once, and the rest goes on', async () => {
+		test('a fork PR whose only conflict with main is in a sorted-set list is held at once, before any run, and the rest goes on', async () => {
 			lists();
 			removing(1, ['a.kt', 'b.kt', 'd.kt'], { fork: true });
 			keepOnly('main', ['a.kt', 'c.kt', 'd.kt'], 'main removes b');
@@ -1014,23 +1015,51 @@ describe('batch queue runtime', () => {
 			expect(world.comments).toEqual([{ pr: 1, body: forkHold(1) }]);
 		});
 
-		test('a fork PR that needs the driver only at landing is held there, and the rest of its batch lands', async () => {
+		test('every build of a fork PR is by lines: batch, bisection and try runs', async () => {
 			lists();
 			removing(1, ['a.kt', 'c.kt', 'd.kt']);
-			removing(2, ['a.kt', 'b.kt', 'd.kt'], { fork: true });
-			pr(3);
-			// Planning sees no difference (as if the default branch had moved since); landing does.
-			world.lineMergeHidden = true;
-			while (!world.started.length) await tickBatchQueue(world.deps());
-			world.lineMergeHidden = false;
+			removing(2, ['b.kt', 'c.kt', 'd.kt'], { fork: true });
+			world.ciRed.clear();
+			const d = world.deps();
+			const builds: { prs: number[]; drivers: (boolean | undefined)[]; all?: boolean }[] = [];
+			const spy = (deps: QueueDeps) => {
+				const build = deps.git.build;
+				deps.git.build = async (base, members, opts) => {
+					builds.push({ prs: members.map((m) => m.pr), drivers: members.map((m) => m.drivers), all: opts.drivers });
+					return build(base, members, opts);
+				};
+				return deps;
+			};
+			// The batch fails, so both PRs are tested again apart.
+			world.everythingFails = true;
+			await tickBatchQueue(spy(d));
+			for (let k = 0; k < 6; k++) await tickBatchQueue(spy(world.deps()));
+			world.everythingFails = false;
+			await startTry(spy(world.deps()), 2);
+			const of2 = builds.filter((b) => b.prs.includes(2));
+			expect(of2.length).toBeGreaterThanOrEqual(3);
+			expect(of2.every((b) => b.drivers[b.prs.indexOf(2)] === false)).toBe(true);
+			expect(builds.filter((b) => b.prs.includes(1)).every((b) => b.drivers[b.prs.indexOf(1)] === undefined)).toBe(true);
+		});
+
+		test('a PR landed before it that drops the attributes does not change how a PR after it lands: no pause', async () => {
+			lists();
+			// #1 drops the sorted-set attribute; #2 and #3 remove neighbouring lines. All three are one batch.
+			git.branch('pr1', 'main');
+			git.git('checkout', '-q', 'pr1');
+			writeFileSync(`${git.dir}/.gitattributes`, '');
+			git.git('commit', '-qam', 'pr1 drops the attributes');
+			git.openPR(1, 'pr1', 'main');
+			world.approved.add(1);
+			db.addToQueue(repo.id, 1, 'PR 1', 'https://example.test/pull/1', 'dev', '', 'dev');
+			removing(2, ['a.kt', 'c.kt', 'd.kt']);
+			removing(3, ['a.kt', 'b.kt', 'd.kt']);
 			await run();
-			expect(world.started[0].prs).toEqual([1, 2, 3]);
 			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
-			expect(world.merged).toEqual([1, 3]);
-			expect(world.pushedHeads).toEqual([]);
-			expect(item(2)?.status).toBe('conflict');
-			expect(world.comments.filter((c) => c.pr === 2)).toEqual([{ pr: 2, body: forkHold(2) }]);
-			expect(mainFiles()).toEqual(['pr3.txt']);
+			expect(world.started[0].prs).toEqual([1, 2, 3]);
+			expect(world.merged).toEqual([1, 2, 3]);
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr3']);
 		});
 
 		test('a fork PR whose list changes merge by lines too lands as usual', async () => {
@@ -1119,7 +1148,9 @@ describe('batch queue runtime', () => {
 			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
 			const item = db.getQueueItems(repo.id).find((i) => i.pr_number === 2);
 			expect(item?.status).toBe('conflict');
-			expect(item?.error_message).toMatch(/lands as tested only once merged with main, and the queue can't push to a fork/);
+			// A fork PR merges by lines: it waits behind #1 and is then told to rebase, before any run of its own.
+			expect(item?.error_message).toBe('Conflicts with main');
+			expect(world.started.map((s) => s.prs)).toEqual([[1]]);
 		});
 
 		test('lists whose headers both sides changed are a conflict, as git reports it: nothing is pushed', async () => {
@@ -1209,7 +1240,7 @@ describe('batch queue runtime', () => {
 			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
 		});
 
-		test("without the queue's drivers, the repository's other merge attributes still apply: a union file merges", async () => {
+		test("without the queue's drivers no merge attribute applies, union neither, as in GitHub's merge", async () => {
 			git.git('checkout', '-q', 'main');
 			writeFileSync(`${git.dir}/.gitattributes`, 'lists/** merge=sorted-set\nnotes.txt merge=union\n');
 			writeFileSync(`${git.dir}/notes.txt`, 'one\n');
@@ -1226,10 +1257,22 @@ describe('batch queue runtime', () => {
 				db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
 			}
 			await run();
-			expect(world.started[0].prs).toEqual([1, 2]);
-			expect(world.merged).toEqual([1, 2]);
+			expect(world.started.map((s) => s.prs)).toEqual([[1]]);
+			expect(world.merged).toEqual([1]);
 			expect(world.pushedHeads).toEqual([]);
-			expect(git.git('show', 'main:notes.txt')).toBe('one\ntwo\nthree');
+			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
+		});
+
+		test('branch rules GitHub will not give stop no planning: the queue lands what needs no push, and pushes nothing', async () => {
+			world.pushKeepsApproval = true;
+			world.pushPolicyFails = true;
+			pr(1);
+			pr(2, { from: 'pr1', base: 'pr1' });
+			pr(3);
+			await run();
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(world.merged).toEqual([1, 2, 3]);
+			expect(world.pushedHeads).toEqual([]);
 		});
 
 		test('a stack lands parent-first without pushing to the child', async () => {

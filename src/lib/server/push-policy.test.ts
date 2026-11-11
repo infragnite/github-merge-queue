@@ -58,8 +58,9 @@ describe('whether a push to a PR keeps its approval', () => {
 		expect(pushKeepsApprovalFrom([], { required_approving_review_count: 1, require_last_push_approval: true })).toBe(false);
 	});
 
-	test('classic protection the App may not read counts as taking it away', () => {
-		expect(pushKeepsApprovalFrom([], 'unreadable')).toBe(false);
+	test('classic protection the App may not read (it needs Administration) leaves the rulesets to decide', () => {
+		expect(pushKeepsApprovalFrom([], 'unreadable')).toBe(true);
+		expect(pushKeepsApprovalFrom([pr({ required_approving_review_count: 1, dismiss_stale_reviews_on_push: true })], 'unreadable')).toBe(false);
 	});
 });
 
