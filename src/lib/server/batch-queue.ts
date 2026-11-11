@@ -409,6 +409,9 @@ class Tick {
 	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict', base?: string, parent?: number) {
 		const it = this.item(n);
 		const p = await this.pr(n);
+		// Told this conflict on this head already (it was tried again and still conflicts): the check says it again, no new comment.
+		const was = it ? store.storedHold(it as QueueItem & { hold?: string | null }) : null;
+		const toldBefore = !!was?.told && was.code === code && was.head === p.headSha && was.reason === reason;
 		if (it) {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
@@ -419,7 +422,7 @@ class Tick {
 		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
 		if (code === 'conflict') await this.d.github.label(n, CONFLICT_LABEL, true).catch(this.bestEffort('github.label'));
-		if (this.speaks('attention')) await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
+		if (!toldBefore && this.speaks('attention')) await this.d.github.comment(n, holdNotice(hold)).catch(this.bestEffort('github.comment'));
 		this.event(n, 'conflict', { reason, files, fix, headSha: p.headSha });
 		this.log(`#${n} has a conflict: ${reason}`);
 	}
@@ -1591,14 +1594,16 @@ class Tick {
 		if (hold?.code === 'workflow-permission') return;
 		// A restack's conflict with its rebased parent: back in line once the parent moved; the restack tries again.
 		if (hold?.code === 'conflict' && hold.parent !== undefined) {
-			const now = (await this.pr(hold.parent).catch((e) => {
+			const parent = await this.pr(hold.parent).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				return null;
-			}))?.headSha;
-			if (!now || now === hold.base) return;
+			});
+			// Gone or landed: it won't move again, so the restack is tried against what is there now.
+			const gone = !parent || parent.state !== 'open';
+			if (!gone && parent.headSha === hold.base) return;
 			db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 			await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
-			this.event(it.pr_number, 'requeued', { reason: `#${hold.parent} moved`, headSha: p.headSha });
+			this.event(it.pr_number, 'requeued', { reason: gone ? `#${hold.parent} is no longer open` : `#${hold.parent} moved`, headSha: p.headSha });
 			return;
 		}
 		// Saved with the default branch it conflicted with: checked once that moved. Saved without one: a restack's conflict, for a push.
