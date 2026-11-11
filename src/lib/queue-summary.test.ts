@@ -19,11 +19,20 @@ describe('the one-line summary over the running work', () => {
 		expect(queueSummary([slot('activity', 'Forming a batch'), run(b1), run(b2), run(t)], 6)).toEqual([
 			{ label: 'batches', value: 2 },
 			{ label: 'bisecting', value: 1 },
-			{ label: 'try runs', value: 1 },
+			{ label: 'try run', value: 1 },
 			{ label: 'preparing', value: 1 },
 			{ label: 'jobs running', value: 20 },
 			{ label: 'jobs waiting for a runner', value: 70 },
 			{ label: 'in line', value: 6 }
+		]);
+	});
+
+	test('labels agree with their number', () => {
+		const t = (id: number) => run(card(id, { kind: 'try' }));
+		expect(queueSummary([run(card(1, {})), t(2), t(3)], 1)).toEqual([
+			{ label: 'batch', value: 1 },
+			{ label: 'try runs', value: 2 },
+			{ label: 'in line', value: 1 }
 		]);
 	});
 

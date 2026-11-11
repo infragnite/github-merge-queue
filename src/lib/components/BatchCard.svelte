@@ -128,7 +128,7 @@
 				<span><span class="font-medium tabular-nums text-gray-800">{segCount('cleared')}</span> cleared</span>
 				<span><span class="font-medium tabular-nums text-gray-800">{segCount('suspect') + segCount('checking')}</span> suspect</span>
 				{#if segCount('failing')}<span><span class="font-medium tabular-nums text-gray-800">{segCount('failing')}</span> failing</span>{/if}
-				<span>step <span class="font-medium tabular-nums text-gray-800">{stats.runs?.total}</span></span>
+				<span><span class="font-medium tabular-nums text-gray-800">{stats.runs?.total}</span> step{stats.runs?.total === 1 ? '' : 's'}</span>
 			</p>
 		</div>
 	{:else if p && stats.jobs}

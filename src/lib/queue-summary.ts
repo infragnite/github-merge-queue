@@ -27,14 +27,16 @@ export function queueSummary(work: WorkItem[], inLine: number): SummaryPart[] {
 		running += p.running;
 		waiting += Math.max(0, p.total - p.done - p.running);
 	}
+	const n = (one: string, many: string, value: number): SummaryPart => ({ label: value === 1 ? one : many, value });
+	const failedSteps = preps.filter((s) => s.state === 'failed').length;
 	const parts: SummaryPart[] = [
-		{ label: 'batches', value: batches.length },
+		n('batch', 'batches', batches.length),
 		{ label: 'bisecting', value: batches.filter((b) => b.status === 'bisecting').length },
-		{ label: 'try runs', value: runs.filter((c) => c.kind === 'try').length },
+		n('try run', 'try runs', runs.filter((c) => c.kind === 'try').length),
 		{ label: 'preparing', value: preps.filter((s) => s.state === 'running').length },
-		{ label: 'step failed', value: preps.filter((s) => s.state === 'failed').length },
-		{ label: 'jobs running', value: running },
-		{ label: 'jobs waiting for a runner', value: waiting }
+		n('step failed', 'steps failed', failedSteps),
+		n('job running', 'jobs running', running),
+		n('job waiting for a runner', 'jobs waiting for a runner', waiting)
 	];
 	return [...parts.filter((x) => x.value > 0), { label: 'in line', value: inLine }];
 }

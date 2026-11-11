@@ -101,9 +101,9 @@
 			<p class="truncate text-xs text-amber-700" title={w}>{w}</p>
 		{/each}
 	</div>
-	<span class="hidden shrink-0 text-xs text-gray-400 md:inline">{item.author_login}</span>
+	<span class="hidden shrink-0 text-xs text-gray-400 md:inline lg:hidden 2xl:inline">{item.author_login}</span>
 	{#if batchMode && priority !== 'normal'}
-		<span class="shrink-0 rounded px-1.5 py-0.5 text-xs font-medium {priority === 'urgent' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'}">{priority}</span>
+		<span class="shrink-0 rounded px-1.5 py-0.5 text-xs font-medium {priority === 'urgent' ? 'bg-indigo-50 text-indigo-700' : 'bg-gray-100 text-gray-500'}">{priority}</span>
 	{/if}
 	{#if showStatus}<StatusBadge status={item.status} />{/if}
 	{#if !readonly && batchMode && (item.status === 'queued' || item.status === 'conflict')}

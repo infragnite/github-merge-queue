@@ -285,7 +285,7 @@
 		{#if pipe}
 			<p class="flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-600" aria-label="Summary">
 				{#each summary as part (part.label)}
-					<span><span class="font-semibold tabular-nums {part.label === 'step failed' ? 'text-red-700' : 'text-gray-900'}">{part.value}</span> {part.label}</span>
+					<span><span class="font-semibold tabular-nums {part.label.includes('failed') ? 'text-red-700' : 'text-gray-900'}">{part.value}</span> {part.label}</span>
 				{/each}
 			</p>
 		{/if}
