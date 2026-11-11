@@ -3207,15 +3207,60 @@ describe('a passed try stands in for a run on the same default branch', () => {
 		expect(world.comments).toEqual([{ pr: 3, body: expect.stringMatching(/Removed from the queue/) }]);
 	});
 
-	test('in batches, a tried PR behind others is batched with them as usual', async () => {
+	test('in batches, a tried PR behind others goes first and lands without a run; the rest is batched after it', async () => {
+		open(1);
+		open(2);
+		open(3);
+		await tried(3);
+		queue(1);
+		queue(2);
+		queue(3);
+		await run();
+		expect(runs()).toEqual([[1, 2]]);
+		expect(world.merged).toEqual([3, 1, 2]);
+	});
+
+	test('in batches, a tried low-priority PR goes ahead of normal ones too', async () => {
 		open(1);
 		open(2);
 		await tried(2);
 		queue(1);
 		queue(2);
+		store.setQueuePriority(repo.id, 2, 'low');
 		await run();
-		expect(runs()).toEqual([[1, 2]]);
+		expect(runs()).toEqual([[1]]);
+		expect(world.merged).toEqual([2, 1]);
+	});
+
+	test('urgent PRs go before a tried PR, which is then tested on what they changed', async () => {
+		open(1);
+		open(2);
+		await tried(2);
+		queue(1);
+		queue(2);
+		store.setQueuePriority(repo.id, 1, 'urgent');
+		await run();
+		expect(runs()).toEqual([[1], [2]]);
 		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('a tried PR does not jump into a pipeline in flight: it is batched on top as usual', async () => {
+		store.updateQueueSettings(repo.id, { config: { depth: 2 } });
+		open(1);
+		open(2);
+		open(3);
+		await tried(3);
+		queue(1);
+		world.hold = (prs) => prs.includes(1);
+		await tickBatchQueue(world.deps());
+		expect(runs()).toEqual([[1]]);
+		queue(2);
+		queue(3);
+		await tickBatchQueue(world.deps());
+		expect(runs()).toEqual([[1], [2, 3]]);
+		world.hold = () => false;
+		await run();
+		expect(world.merged).toEqual([1, 2, 3]);
 	});
 
 	test('a stack whose tip passed a try lands whole without a new run', async () => {
@@ -3239,6 +3284,18 @@ describe('a passed try stands in for a run on the same default branch', () => {
 		await run();
 		expect(runs()).toEqual([[1, 2]]);
 		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('one by one: a tried PR behind another goes first', async () => {
+		store.updateQueueSettings(repo.id, { mode: 'serial' });
+		open(1);
+		open(2);
+		await tried(2);
+		queue(1);
+		queue(2);
+		await run();
+		expect(runs()).toEqual([[1]]);
+		expect(world.merged).toEqual([2, 1]);
 	});
 
 	test('one by one: a tried PR lands without a run, and the next is tested as usual', async () => {

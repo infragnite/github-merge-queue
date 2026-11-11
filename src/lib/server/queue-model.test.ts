@@ -9,7 +9,7 @@ const config: BatchConfig = { ...DEFAULT_BATCH_CONFIG, requireApproval: true, co
 function model(
 	queue: QueueEntry[],
 	analysis: StackAnalysis,
-	opts: { states?: PRState[]; inflight?: number[]; conflicts?: Record<number, string>; config?: Partial<BatchConfig> } = {}
+	opts: { states?: PRState[]; inflight?: number[]; conflicts?: Record<number, string>; config?: Partial<BatchConfig>; landable?: number[] } = {}
 ): QueueModel {
 	const states = new Map(queue.map((e) => [e.pr, ready(e.pr)]));
 	for (const s of opts.states ?? []) states.set(s.pr, s);
@@ -18,7 +18,8 @@ function model(
 		admission: plannedAdmission({ states, analysis, config: { ...config, ...opts.config } }),
 		analysis,
 		inflight: new Set(opts.inflight ?? []),
-		problems: new Map(Object.entries(opts.conflicts ?? {}).map(([k, v]) => [Number(k), { code: 'conflict' as const, reason: v }]))
+		problems: new Map(Object.entries(opts.conflicts ?? {}).map(([k, v]) => [Number(k), { code: 'conflict' as const, reason: v }])),
+		...(opts.landable ? { landable: new Set(opts.landable) } : {})
 	});
 }
 
@@ -441,5 +442,67 @@ describe('the queue page: the model from what the planner recorded', () => {
 	test('a PR left checking by an interrupted run is in line again', () => {
 		const b = queueBoard([item(1, 50, { status: 'checking' })], stacks([1]), new Set());
 		expect(b.stacks.map((s) => s.root)).toEqual([1]);
+	});
+});
+
+describe('a stack a passed try already tested goes first, after urgent stacks', () => {
+	const order = (m: QueueModel) => m.stacks.map((s) => s.members);
+
+	test('a lone PR that can land on its try goes ahead of normal and low PRs queued before it', () => {
+		const m = model([entry(1, 90), entry(2, 80, 'low'), entry(3, 70), entry(4, 60, 'low')], stacks([1, 2, 3, 4]), { landable: [4] });
+		expect(order(m)).toEqual([[4], [1], [3], [2]]);
+		expect(m.stacks[0]).toMatchObject({ landable: true });
+		expect(m.stacks.slice(1).map((s) => s.landable)).toEqual([false, false, false]);
+	});
+
+	test('urgent stacks stay first: an urgent PR can break what the try tested', () => {
+		const m = model([entry(1, 90), entry(2, 80, 'urgent'), entry(3, 70), entry(5, 60, 'urgent')], stacks([1, 2, 3, 5]), { landable: [3] });
+		expect(order(m)).toEqual([[2], [5], [3], [1]]);
+	});
+
+	test('among urgent stacks, one that can land on its try goes first', () => {
+		const m = model([entry(1, 90, 'urgent'), entry(2, 80, 'urgent')], stacks([1, 2]), { landable: [2] });
+		expect(order(m)).toEqual([[2], [1]]);
+	});
+
+	test('two that can land keep their order: the second one’s try is stale once the first lands', () => {
+		const m = model([entry(1, 90), entry(2, 80), entry(3, 70)], stacks([1, 2, 3]), { landable: [3, 2] });
+		expect(order(m)).toEqual([[2], [3], [1]]);
+	});
+
+	test('a stack goes first only when its tip’s try covers all of it', () => {
+		// 1 <- 2: the try of 2 tested 1 and 2
+		expect(order(model([entry(9, 99), entry(1, 90), entry(2, 80)], stacks([1, 2, 9], { 2: 1 }), { landable: [2] }))).toEqual([[1, 2], [9]]);
+		// the try of the parent left the child out: it stays in place
+		expect(order(model([entry(9, 99), entry(1, 90), entry(2, 80)], stacks([1, 2, 9], { 2: 1 }), { landable: [1] }))).toEqual([[9], [1, 2]]);
+		// a fork 1 <- 2, 1 <- 3: no single try tested it
+		expect(order(model([entry(9, 99), entry(1, 90), entry(2, 80), entry(3, 70)], stacks([1, 2, 3, 9], { 2: 1, 3: 1 }), { landable: [2, 3] }))).toEqual([[9], [1, 2, 3]]);
+	});
+
+	test('a held child does not keep its stack from going on its parent’s try', () => {
+		// 1 <- 2 with 2 a draft: the stack that can go is 1 alone, and 1 passed a try
+		const m = model([entry(9, 99), entry(1, 90), entry(2, 80)], stacks([1, 2, 9], { 2: 1 }), { landable: [1], states: [ready(2, { draft: true })] });
+		expect(order(m)).toEqual([[1], [9]]);
+	});
+
+	test('a stack on a PR being tested never lands on a try: its try was not on top of that PR', () => {
+		const m = model([entry(9, 99), entry(2, 80)], stacks([1, 2, 9], { 2: 1 }), { inflight: [1], landable: [2] });
+		expect(order(m)).toEqual([[9], [2]]);
+		expect(m.stacks.every((s) => !s.landable)).toBe(true);
+	});
+
+	test('in batches, a stack that can land on its try goes alone at once, without waiting to collect more', () => {
+		const m = model([entry(1, 1), entry(2, 1)], stacks([1, 2]), { landable: [2] });
+		expect(fillBatch(m, { config: { ...config, collectWindowMs: 60 * MIN }, inflightBatches: 0, now: NOW })).toEqual({ batch: [2], express: false, waitUntil: null });
+	});
+
+	test('an urgent stack that can land on its try still goes in the express batch with the other urgent ones', () => {
+		const m = model([entry(1, 90, 'urgent'), entry(2, 80, 'urgent'), entry(3, 70)], stacks([1, 2, 3]), { landable: [2] });
+		expect(fillBatch(m, { config, inflightBatches: 0, now: NOW })).toEqual({ batch: [2, 1], express: true, waitUntil: null });
+	});
+
+	test('one by one, it is the head stack', () => {
+		const m = model([entry(1, 90), entry(2, 80)], stacks([1, 2]), { landable: [2] });
+		expect(serialPick(m, { inflight: 0 })).toEqual([2]);
 	});
 });
