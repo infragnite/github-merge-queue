@@ -422,10 +422,13 @@ class Tick {
 		}
 	}
 
-	/** Every active batch from `from` on is rebuilt later; their PRs go back to the queue. */
-	async supersede(batches: BatchRow[], why = 'a batch below it failed or master moved') {
+	/**
+	 * Every active batch from `from` on is rebuilt later; their PRs go back to the queue. `code` is
+	 * kept on the batch as why it ended (`why` is what its PRs are told).
+	 */
+	async supersede(batches: BatchRow[], code: string, why = 'a batch below it failed or master moved') {
 		for (const b of batches) {
-			store.setBatchStatus(b.id, 'superseded');
+			store.setBatchStatus(b.id, 'superseded', code);
 			this.requeue(b.members);
 			await this.retire(b);
 			for (const n of b.members) {
@@ -1001,7 +1004,7 @@ class Tick {
 		if (baseline) {
 			// A check of an older default branch: this landing's tree is known now.
 			await this.retire(baseline);
-			store.setBatchStatus(baseline.id, 'superseded');
+			store.setBatchStatus(baseline.id, 'superseded', 'landed-over');
 		}
 		const ref = this.settings().ci.dispatchRef;
 		const verifying = (await this.maybeRefreshCaches()) && (!ref || ref === this.d.repo.default_branch);
@@ -1152,7 +1155,7 @@ class Tick {
 		const prev = store.getRunningBaseline(this.repoId);
 		if (prev) {
 			await this.retire(prev);
-			store.setBatchStatus(prev.id, 'superseded');
+			store.setBatchStatus(prev.id, 'superseded', 'master-moved');
 		}
 		const head = await this.d.git.baseline(masterSha);
 		const branch = `mq/base-${this.d.now()}`;
@@ -1266,10 +1269,10 @@ class Tick {
 				await this.retire(b);
 				this.log(`batch ${b.number} fixed ${this.d.repo.default_branch}`);
 			} else if (!this.settings().pausedReason) {
-				await this.supersede([b]);
+				await this.supersede([b], 'landing-stopped');
 			}
 			// Master moved (or landing stopped): the siblings are rebuilt next tick.
-			await this.supersede(store.getActiveBatches(this.repoId).filter((x) => x.id !== b.id));
+			await this.supersede(store.getActiveBatches(this.repoId).filter((x) => x.id !== b.id), 'master-moved');
 			return true;
 		}
 		return true;
@@ -1286,7 +1289,7 @@ class Tick {
 			const r = await this.ciResult(head);
 			if (r === 'pending') {
 				if (this.timedOut(head)) {
-					await this.supersede([head, ...rest]);
+					await this.supersede([head, ...rest], 'ci-timeout');
 					this.pause(`Batch ${head.number} (${head.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
 				}
 				return;
@@ -1302,7 +1305,7 @@ class Tick {
 				// batch's tree, so bisection starts at once; only its verdict waits for the branch.
 				if (this.masterState(head.base_tree) === 'checking') return;
 				if (this.masterState(head.base_tree) === 'red') {
-					await this.supersede(rest);
+					await this.supersede(rest, 'below-failed');
 					await this.failedOnRed(head);
 					return;
 				}
@@ -1318,7 +1321,7 @@ class Tick {
 				return;
 			} else {
 				// Everything built on top of a failed batch has to be rebuilt.
-				await this.supersede(rest);
+				await this.supersede(rest, 'below-failed');
 				if (head.members.length === 1) {
 					store.setBatchStatus(head.id, 'failed');
 					await this.retire(head);
@@ -1340,7 +1343,7 @@ class Tick {
 				store.setBatchStatus(head.id, 'landed');
 				await this.retire(head);
 			} else if (!this.settings().pausedReason) {
-				await this.supersede([head, ...rest]);
+				await this.supersede([head, ...rest], 'landing-stopped');
 			}
 			return;
 		}
@@ -1569,7 +1572,7 @@ class Tick {
 			store.branchPushed(this.repoId, branch);
 		} catch (e) {
 			// Never ran: not evidence against its PRs. The run is planned again after a resume.
-			store.setBatchStatus(run.id, 'cancelled');
+			store.setBatchStatus(run.id, 'cancelled', 'start-failed');
 			// After a rate limit the branch intent stays, so the sweep deletes the branch after the reset.
 			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
@@ -2095,12 +2098,12 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 				t.log(`master moved; batch ${b.number} bisects on top of it`);
 				store.rebaseBatch(b.id, masterSha, tree);
 			}
-			await t.supersede(active.slice(1).filter((b) => b.status !== 'bisecting'));
+			await t.supersede(active.slice(1).filter((b) => b.status !== 'bisecting'), 'master-moved');
 			active = store.getActiveBatches(deps.repo.id);
 			await t.checkMaster(masterSha);
 		} else if (active[0].base_tree !== tree) {
 			t.log('master moved outside the queue; rebuilding the pipeline');
-			await t.supersede(active);
+			await t.supersede(active, 'master-moved');
 			active = [];
 		}
 	}
@@ -2114,7 +2117,7 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		const between = active[0].status === 'bisecting' ? active.find((b, i) => i > 0 && b.express && b.base_sha !== active[0].head_sha) : undefined;
 		const loose = active.findIndex((b, i) => i > 0 && b !== between && b.base_sha !== active[i - 1].head_sha);
 		if (loose > 0) {
-			await t.supersede(active.slice(loose));
+			await t.supersede(active.slice(loose), 'off-pipeline');
 			active = active.slice(0, loose);
 		}
 		if (between && active.includes(between)) await t.advanceHead(between, []);
@@ -2162,11 +2165,11 @@ export async function recoverInterrupted(deps: QueueDeps): Promise<void> {
 export async function retireBatches(deps: QueueDeps): Promise<void> {
 	const t = new Tick(deps);
 	await t.recoverInterrupted();
-	await t.supersede(store.getActiveBatches(deps.repo.id));
+	await t.supersede(store.getActiveBatches(deps.repo.id), 'retired');
 	const base = store.getRunningBaseline(deps.repo.id);
 	if (base) {
 		await t.retire(base);
-		store.setBatchStatus(base.id, 'superseded');
+		store.setBatchStatus(base.id, 'superseded', 'retired');
 		store.clearMasterHealth(deps.repo.id);
 	}
 }
@@ -2187,10 +2190,11 @@ export async function cancelBatch(deps: QueueDeps, id: number, by: string): Prom
 	const waiting = (x: BatchRow) => x.members.filter((n) => t.item(n)?.status === 'checking');
 	const requeued = waiting(b);
 	const above = active.filter((x) => x.id > id);
-	await t.supersede([b], `batch ${b.number} was cancelled by ${by}`);
-	store.setBatchStatus(id, 'cancelled');
-	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled');
-	await t.supersede(above, `batch ${b.number} below it was cancelled`);
+	const reason = `cancelled by ${by}`;
+	await t.supersede([b], reason, `batch ${b.number} was cancelled by ${by}`);
+	store.setBatchStatus(id, 'cancelled', reason);
+	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled', reason);
+	await t.supersede(above, 'below-cancelled', `batch ${b.number} below it was cancelled`);
 	t.event(null, 'cancelled', { batch: id, number: b.number, by, requeued, rebuilt: above.map((x) => x.id) });
 	t.log(`batch ${b.number} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
 	return { requeued, rebuilt: above.map((x) => x.id) };

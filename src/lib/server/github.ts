@@ -1,3 +1,4 @@
+import { actionsJobsFor } from './ci-savings';
 import { env } from '$env/dynamic/private';
 import { createSign } from 'crypto';
 import {
@@ -523,16 +524,8 @@ export async function actionsJobsForSha(owner: string, repo: string, sha: string
 }
 
 /** Every Actions job ever run on a commit, every attempt, with its times (for what CI cost). */
-export async function actionsJobTimesForSha(owner: string, repo: string, sha: string) {
-	type Job = { name: string; status: string; started_at: string | null; completed_at: string | null };
-	const out: Job[] = [];
-	for (let page = 1; page <= 5; page++) {
-		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/commits/${sha}/check-runs?filter=all&app_id=${ACTIONS_APP_ID}&per_page=100&page=${page}`);
-		const runs = data.check_runs as Job[];
-		out.push(...runs);
-		if (runs.length < 100) break;
-	}
-	return out;
+export function actionsJobAttemptsForSha(owner: string, repo: string, sha: string) {
+	return actionsJobsFor((path) => ghFetchAsApp(path), owner, repo, sha);
 }
 
 export async function workflowRunsForSha(owner: string, repo: string, sha: string) {

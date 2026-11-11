@@ -15,7 +15,7 @@ describe('jobCost', () => {
 			{ name: 'test', status: 'completed', started_at: t(12), completed_at: t(20) },
 			{ name: 'lint', status: 'completed', started_at: t(0), completed_at: t(2) }
 		]);
-		expect(c).toEqual({ jobMs: 20 * MIN, rerunMs: 10 * MIN, wallMs: 20 * MIN, jobs: 3, done: true });
+		expect(c).toMatchObject({ jobMs: 20 * MIN, rerunMs: 10 * MIN, wallMs: 20 * MIN, jobs: 3, done: true });
 	});
 
 	test('when it ran, how long its jobs waited for a runner, and how many attempts it took', () => {

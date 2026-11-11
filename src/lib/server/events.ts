@@ -39,7 +39,8 @@ export interface QueueEvent {
 const bus = new EventEmitter();
 bus.setMaxListeners(0);
 
-const KEEP_DAYS = 7;
+// Kept long enough to analyse the queue's history later (wait times, holds, ejections, pauses).
+const KEEP_DAYS = 400;
 let inserts = 0;
 
 export function emitEvent(repoId: number, pr: number | null, kind: QueueEventKind, data: Record<string, unknown> = {}) {

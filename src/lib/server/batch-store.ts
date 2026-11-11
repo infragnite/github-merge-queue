@@ -61,6 +61,14 @@ export interface BatchRow {
 	ci_result: 'pending' | 'success' | 'failure';
 	created_at: string;
 	finished_at: string | null;
+	/** When its latest CI result came in (null while none has, and in rows from before it was recorded). */
+	ci_done_at: string | null;
+	/** How often its failed jobs were re-run. */
+	retries: number;
+	/** Why it ended early, when it did: a code such as `master-moved`, `below-failed` or `cancelled by <login>`. */
+	end_reason: string | null;
+	/** The mode and config it was planned with (null in rows from before it was recorded). */
+	settings: { mode: QueueMode; config: BatchConfig } | null;
 }
 
 export interface BatchStep {
@@ -156,6 +164,24 @@ export function migrateBatches(database: Database.Database) {
 			jobs INTEGER NOT NULL
 		);
 
+		-- Every Actions job attempt of a queue-started run, for analysis by job: runner wait is
+		-- started_ms - created_ms, run time completed_ms - started_ms (epoch ms).
+		CREATE TABLE IF NOT EXISTS ci_jobs (
+			job_id INTEGER PRIMARY KEY,
+			batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+			repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+			run_id INTEGER,
+			attempt INTEGER NOT NULL DEFAULT 1,
+			workflow TEXT,
+			name TEXT NOT NULL,
+			conclusion TEXT,
+			runner TEXT,
+			created_ms INTEGER,
+			started_ms INTEGER,
+			completed_ms INTEGER
+		);
+		CREATE INDEX IF NOT EXISTS ci_jobs_batch ON ci_jobs(batch_id);
+
 		-- Heads the queue produced by restacking a PR, so the approval and CI of
 		-- the head it replaced carry over (the change itself is the same).
 		CREATE TABLE IF NOT EXISTS rebased_heads (
@@ -221,7 +247,12 @@ export function migrateBatches(database: Database.Database) {
 		['left_prs', `TEXT NOT NULL DEFAULT '[]'`],
 		['ejected', `TEXT NOT NULL DEFAULT '[]'`],
 		// A batch's number within its repository, counting only batches (not bisection or baseline runs).
-		['number', 'INTEGER']
+		['number', 'INTEGER'],
+		// For later analysis: when the CI result came in, re-runs, why it ended early, what it ran with.
+		['ci_done_at', 'TEXT'],
+		['retries', 'INTEGER NOT NULL DEFAULT 0'],
+		['end_reason', 'TEXT'],
+		['settings', 'TEXT']
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
@@ -250,6 +281,16 @@ export function migrateBatches(database: Database.Database) {
 		}
 		database.prepare(`INSERT INTO done_migrations (name) VALUES (?)`).run(backfill);
 	})();
+	// What a run cost, beyond its totals: runner wait, when it ran, how many attempts (null in older rows).
+	const runCols = database.prepare(`PRAGMA table_info(ci_runs)`).all() as Array<{ name: string }>;
+	for (const [name, ddl] of [
+		['queue_ms', 'INTEGER'],
+		['started_ms', 'INTEGER'],
+		['ended_ms', 'INTEGER'],
+		['attempts', 'INTEGER']
+	]) {
+		if (!runCols.some((c) => c.name === name)) database.exec(`ALTER TABLE ci_runs ADD COLUMN ${name} ${ddl}`);
+	}
 	const settingsCols = database.prepare(`PRAGMA table_info(queue_settings)`).all() as Array<{ name: string }>;
 	if (!settingsCols.some((c) => c.name === 'public_view')) database.exec(`ALTER TABLE queue_settings ADD COLUMN public_view INTEGER NOT NULL DEFAULT 0`);
 	// Bisection runs used to keep status 'testing' after their result came in; their status now
@@ -324,8 +365,9 @@ export function setQueuePriority(repoId: number, prNumber: number, priority: Pri
 
 // --- batches ---
 
-type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs' | 'ejected' | 'number'> & {
+type RawBatch = Omit<BatchRow, 'members' | 'context' | 'express' | 'heads' | 'steps' | 'landed' | 'left_prs' | 'ejected' | 'number' | 'settings'> & {
 	number: number | null;
+	settings: string | null;
 	members: string;
 	landed: string | null;
 	left_prs: string | null;
@@ -347,8 +389,14 @@ function parse(r: RawBatch): BatchRow {
 		number: r.number ?? r.id,
 		heads: JSON.parse(r.heads),
 		steps: JSON.parse(r.steps),
-		express: !!r.express
+		express: !!r.express,
+		settings: r.settings ? JSON.parse(r.settings) : null
 	};
+}
+
+function snapshot(repoId: number): string {
+	const { mode, config } = getQueueSettings(repoId);
+	return JSON.stringify({ mode, config });
 }
 
 export function insertBatch(b: {
@@ -368,8 +416,8 @@ export function insertBatch(b: {
 }): BatchRow {
 	const r = getDb()
 		.prepare(
-			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number, settings)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 		.run(
 			b.repoId,
@@ -387,7 +435,8 @@ export function insertBatch(b: {
 			b.express ? 1 : 0,
 			b.kind === 'batch'
 				? (getDb().prepare(`SELECT COALESCE(MAX(number), 0) + 1 AS n FROM batches WHERE repo_id = ? AND kind = 'batch'`).get(b.repoId) as { n: number }).n
-				: null
+				: null,
+			snapshot(b.repoId)
 		);
 	return getBatch(Number(r.lastInsertRowid))!;
 }
@@ -506,13 +555,15 @@ export function getRecentBatches(repoId: number, limit = 50): BatchRow[] {
 	).map(parse);
 }
 
-export function setBatchStatus(id: number, status: BatchStatus) {
+/** `reason` says why it ended early (see `BatchRow.end_reason`); without one, a reason given before stays. */
+export function setBatchStatus(id: number, status: BatchStatus, reason?: string) {
 	const done = ['landed', 'failed', 'superseded', 'cancelled'].includes(status);
 	getDb()
 		.prepare(
-			`UPDATE batches SET status = ?, finished_at = CASE WHEN ? THEN datetime('now') ELSE finished_at END WHERE id = ?`
+			`UPDATE batches SET status = ?, finished_at = CASE WHEN ? THEN datetime('now') ELSE finished_at END,
+			   end_reason = COALESCE(?, end_reason) WHERE id = ?`
 		)
-		.run(status, done ? 1 : 0, id);
+		.run(status, done ? 1 : 0, reason ?? null, id);
 }
 
 /** When a batch was created, in epoch ms. */
@@ -521,11 +572,13 @@ export function batchCreatedMs(b: BatchRow): number {
 }
 
 export function setBatchRetried(id: number, at: number) {
-	getDb().prepare(`UPDATE batches SET retried_at = ?, ci_result = 'pending' WHERE id = ?`).run(at, id);
+	getDb().prepare(`UPDATE batches SET retried_at = ?, ci_result = 'pending', retries = retries + 1 WHERE id = ?`).run(at, id);
 }
 
 export function setBatchCI(id: number, result: BatchRow['ci_result']) {
-	getDb().prepare('UPDATE batches SET ci_result = ? WHERE id = ?').run(result, id);
+	getDb()
+		.prepare(`UPDATE batches SET ci_result = ?, ci_done_at = CASE WHEN ? = 'pending' THEN ci_done_at ELSE datetime('now') END WHERE id = ?`)
+		.run(result, result, id);
 }
 
 // --- queue item extras ---

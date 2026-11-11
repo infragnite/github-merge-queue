@@ -5,7 +5,24 @@
 import { getDb } from './db';
 import type { BatchRow } from './batch-store';
 
-type Job = { name: string; status: string; started_at: string | null; completed_at: string | null };
+/**
+ * An Actions job attempt, as the workflow-jobs API gives it. Check runs (and older callers) carry
+ * only the name, status and times.
+ */
+export type Job = {
+	id?: number;
+	run_id?: number;
+	run_attempt?: number;
+	workflow_name?: string | null;
+	runner_name?: string | null;
+	name: string;
+	status: string;
+	conclusion?: string | null;
+	/** When the job was queued: its wait for a runner is from here to `started_at`. */
+	created_at?: string | null;
+	started_at: string | null;
+	completed_at: string | null;
+};
 
 export interface JobCost {
 	/** Summed run time of every job, every attempt. */
@@ -17,10 +34,19 @@ export interface JobCost {
 	jobs: number;
 	/** Every job finished. */
 	done: boolean;
+	/** Summed wait of the jobs for a runner (0 when the jobs don't say when they were queued). */
+	queueMs: number;
+	/** First job's start and last job's end, epoch ms; null without a finished job. */
+	startMs: number | null;
+	endMs: number | null;
+	/** Highest workflow run attempt among the jobs (1 when they don't say). */
+	attempts: number;
 }
 
 export function jobCost(jobs: Job[]): JobCost {
 	let jobMs = 0;
+	let queueMs = 0;
+	let attempts = 1;
 	let first = Infinity;
 	let last = -Infinity;
 	const latest = new Map<string, { start: number; ms: number }>();
@@ -31,6 +57,9 @@ export function jobCost(jobs: Job[]): JobCost {
 		if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) continue;
 		const ms = end - start;
 		jobMs += ms;
+		const queued = j.created_at ? Date.parse(j.created_at) : NaN;
+		if (Number.isFinite(queued) && queued <= start) queueMs += start - queued;
+		if (j.run_attempt && j.run_attempt > attempts) attempts = j.run_attempt;
 		first = Math.min(first, start);
 		last = Math.max(last, end);
 		const l = latest.get(j.name);
@@ -42,9 +71,35 @@ export function jobCost(jobs: Job[]): JobCost {
 		rerunMs: jobMs - latestMs,
 		wallMs: last > first ? last - first : 0,
 		jobs: jobs.length,
-		done: jobs.length > 0 && jobs.every((j) => j.status === 'completed')
+		done: jobs.length > 0 && jobs.every((j) => j.status === 'completed'),
+		queueMs,
+		startMs: Number.isFinite(first) ? first : null,
+		endMs: Number.isFinite(last) ? last : null,
+		attempts
 	};
 }
+
+/**
+ * Every job attempt of every workflow run on a commit, through `get` (a GitHub API GET returning
+ * parsed JSON). The workflow-jobs API, unlike check runs, says when each job was queued.
+ */
+export async function actionsJobsFor(get: (path: string) => Promise<any>, owner: string, repo: string, sha: string): Promise<Job[]> {
+	const runs = ((await get(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=100`)).workflow_runs ?? []) as Array<{ id: number }>;
+	const out: Job[] = [];
+	for (const run of runs) {
+		for (let page = 1; page <= 5; page++) {
+			const jobs = ((await get(`/repos/${owner}/${repo}/actions/runs/${run.id}/jobs?filter=all&per_page=100&page=${page}`)).jobs ?? []) as Job[];
+			out.push(...jobs);
+			if (jobs.length < 100) break;
+		}
+	}
+	return out;
+}
+
+const msOf = (t: string | null | undefined) => {
+	const ms = t ? Date.parse(t) : NaN;
+	return Number.isFinite(ms) ? ms : null;
+};
 
 const FINISHED = ['landed', 'failed', 'superseded', 'cancelled'];
 /** A finished run whose jobs still haven't all completed this long after is recorded as it is. */
@@ -81,15 +136,30 @@ export async function recordRunCosts(
 	for (const b of unrecorded(repo.id, 50)) {
 		if (calls >= maxCalls) break;
 		calls++;
-		const cost = jobCost(await jobsFor(b.head_sha));
+		const jobs = await jobsFor(b.head_sha);
+		const cost = jobCost(jobs);
 		// Over by its status but still showing running jobs, or none at all (a run that never
 		// started, or an old bisection row without a finish time): recorded as it is once it has
 		// been over long enough, so such rows can't hold up the ones behind them.
 		const settled = now - toMs(b.finished_at ?? b.created_at) > SETTLE_MS;
 		if (!cost.done && !settled) continue;
-		getDb()
-			.prepare('INSERT OR REPLACE INTO ci_runs (batch_id, repo_id, job_ms, rerun_ms, wall_ms, jobs) VALUES (?, ?, ?, ?, ?, ?)')
-			.run(b.id, repo.id, cost.jobMs, cost.rerunMs, cost.wallMs, cost.jobs);
+		const job = getDb().prepare(
+			`INSERT OR REPLACE INTO ci_jobs (job_id, batch_id, repo_id, run_id, attempt, workflow, name, conclusion, runner, created_ms, started_ms, completed_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		);
+		getDb().transaction(() => {
+			getDb()
+				.prepare(
+					`INSERT OR REPLACE INTO ci_runs (batch_id, repo_id, job_ms, rerun_ms, wall_ms, jobs, queue_ms, started_ms, ended_ms, attempts)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+				)
+				.run(b.id, repo.id, cost.jobMs, cost.rerunMs, cost.wallMs, cost.jobs, cost.queueMs, cost.startMs, cost.endMs, cost.attempts);
+			// Per job attempt, for analysis by job (slow or flaky jobs, runner waits); check runs have no job id.
+			for (const j of jobs) {
+				if (j.id == null) continue;
+				job.run(j.id, b.id, repo.id, j.run_id ?? null, j.run_attempt ?? 1, j.workflow_name ?? null, j.name, j.conclusion ?? null, j.runner_name ?? null, msOf(j.created_at), msOf(j.started_at), msOf(j.completed_at));
+			}
+		})();
 		recorded++;
 	}
 	return recorded;
