@@ -133,7 +133,18 @@ export type AdmissionCode =
 	| 'wrong-base';
 
 /** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
-export type HoldCode = AdmissionCode | 'conflict' | 'workflow-permission' | 'failed' | 'deferred' | 'parent-not-queued' | 'parent-held';
+export type HoldCode =
+	| AdmissionCode
+	| 'conflict'
+	| 'workflow-permission'
+	| 'failed'
+	| 'deferred'
+	| 'parent-not-queued'
+	| 'parent-held'
+	| 'dependency-not-queued'
+	| 'dependency-closed'
+	| 'dependency-invalid'
+	| 'dependency-cycle';
 
 const EVERY_HOLD: Record<HoldCode, true> = {
 	draft: true,
@@ -150,7 +161,11 @@ const EVERY_HOLD: Record<HoldCode, true> = {
 	failed: true,
 	deferred: true,
 	'parent-not-queued': true,
-	'parent-held': true
+	'parent-held': true,
+	'dependency-not-queued': true,
+	'dependency-closed': true,
+	'dependency-invalid': true,
+	'dependency-cycle': true
 };
 
 /** Every hold code: stable ids, shown on the PR and in its hidden block, so agents can switch on them. */
@@ -175,6 +190,14 @@ export function holdAdvice(code: HoldCode): string {
 			return 'Point its base at the default branch, or at the branch of the queued PR it builds on.';
 		case 'parent-not-queued':
 			return 'Queue the PR it builds on; a stacked PR goes only with the PRs under it.';
+		case 'dependency-not-queued':
+			return 'Queue the PR it depends on, or remove that Depends-On line.';
+		case 'dependency-closed':
+			return 'Reopen the PR it depends on, or remove that Depends-On line.';
+		case 'dependency-invalid':
+			return 'Fix or remove that Depends-On line.';
+		case 'dependency-cycle':
+			return 'Remove one Depends-On line of the cycle.';
 		case 'conflict':
 			return 'Rebase it and push:';
 		case 'workflow-permission':
