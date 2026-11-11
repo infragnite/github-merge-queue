@@ -713,6 +713,8 @@ class Tick {
 		this.skipped = await this.notLandable(batch, prs, src);
 		const part = prs.filter((n) => !this.skipped.has(n));
 		if (!part.length) return false;
+		// Read before anything merges: rules GitHub won't give stop the tick here, not halfway through.
+		await this.canPushHeads();
 		// Recorded before the first merge: a crash before it is cleared is finished by `recoverLanding`.
 		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs: part, group: prs });
 		const merged: number[] = [];
