@@ -9,7 +9,7 @@ import {
 } from '$lib/server/db';
 import { getOpenPRs, rateLimitOf, getPR } from '$lib/server/github';
 import { atLeast, AuthError, requireRole, type Caller, type Role } from '$lib/server/api-auth';
-import { ApiError, changeEntry, enqueue } from '$lib/server/api-service';
+import { ApiError, boardItem, changeEntry, enqueue } from '$lib/server/api-service';
 import { webCaller } from '$lib/server/web-auth';
 import { knownPublic, noteReadOnlyView, publicHistory, publicQueueItem, prUrl } from '$lib/server/public-view';
 import { savingsFor } from '$lib/server/ci-savings';
@@ -23,7 +23,6 @@ import { emitEvent } from '$lib/server/events';
 import { markDirty } from '$lib/server/wake';
 import { dashboardStackAnalysis } from '$lib/server/stack-runtime';
 import { queueBoard, type BoardItem, type QueueBoard } from '$lib/server/queue-model';
-import type { HoldCode } from '$lib/server/batching';
 import type { StackAnalysis } from '$lib/server/stacks';
 import type { Repo } from '$lib/types';
 import type { PageServerLoad, Actions } from './$types';
@@ -70,19 +69,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 	});
 	// The queue as the planners see it: the rows, with the holds the planner recorded. A read-only
 	// viewer gets only the messages the public row keeps.
-	const boardItems: BoardItem[] = rawItems.map((i, k) => {
-		const hold = currentHold(i);
-		return {
-			pr: i.pr_number,
-			status: i.status,
-			priority: i.priority ?? 'normal',
-			position: i.position,
-			enqueuedAt: Date.parse(i.created_at.replace(' ', 'T') + (i.created_at.includes('Z') ? '' : 'Z')),
-			hold: hold ? { code: hold.code as HoldCode, reason: hold.reason } : null,
-			message: queueItems[k].error_message,
-			after: deferredFor(i as typeof i & { deferred_for?: string | null })
-		};
-	});
+	const boardItems: BoardItem[] = rawItems.map((i, k) => boardItem(i, queueItems[k].error_message));
 
 	let openPrs: Array<{
 		number: number;
@@ -174,7 +161,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		board,
 		pipeline,
 		mode: settings.mode,
-		limits: { maxBatch: settings.config.maxBatch, expressMax: settings.config.expressMax },
+		limits: { maxBatch: settings.config.maxBatch },
 		// Whether runs of several PRs stop at their first failure, for why a run goes on.
 		stopsEarly: settings.config.stopOnFirstFailure,
 		history: getRepoHistory(repo.id).map((h) => {

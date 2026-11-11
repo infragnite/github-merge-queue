@@ -543,6 +543,28 @@ describe('/mq status', () => {
 		expect(hidden(body)).toMatchObject({ pr: 2, queue: { position: 2, priority: 'low', status: 'queued' } });
 	});
 
+	test('an urgent PR queued last is first in line', async () => {
+		api.enqueue(repo, writer, pull(1), {});
+		api.enqueue(repo, writer, pull(2), {});
+		api.enqueue(repo, { login: 'mia', role: 'maintain', app: false }, pull(3), { priority: 'urgent' });
+		await run('/mq status', 'rae', 3);
+		const body = deps.replies[0][1];
+		expect(body).toMatch(/^In the merge queue: position 1 of 3, urgent priority/m);
+		expect(hidden(body)).toMatchObject({ pr: 3, queue: { position: 1, priority: 'urgent' } });
+	});
+
+	test('an urgent child takes its whole stack to the front, parent first', async () => {
+		api.enqueue(repo, writer, pull(1), {});
+		api.enqueue(repo, writer, pull(2), {});
+		api.enqueue(repo, { login: 'mia', role: 'maintain', app: false }, pull(3), { priority: 'urgent' });
+		deps.parents = { 3: 2 };
+		await run('/mq status', 'rae', 2);
+		await run('/mq status', 'rae', 3);
+		await run('/mq status', 'rae', 1);
+		expect(deps.replies.map(([, body]) => hidden(body).queue?.position)).toEqual([1, 2, 3]);
+		expect(deps.replies[1][1]).toMatch(/^In the merge queue: position 2 of 3, urgent priority/m);
+	});
+
 	test('a PR in a batch names the batch', async () => {
 		api.enqueue(repo, writer, pull(1), {});
 		const b = batchOf([1]);

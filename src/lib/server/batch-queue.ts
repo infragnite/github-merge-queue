@@ -1433,7 +1433,7 @@ class Tick {
 		}
 		if (gone.length || changed.length) {
 			if (changed.length) this.log(`batch ${batch.number}: ${changed.map((n) => `#${n}`).join(' ')} changed since it was batched; back in line`);
-			const out = await this.leaveBisection(batch, [...gone, ...changed]);
+			const out = await this.leaveBisection(batch, [...gone, ...changed], `pushed while batch ${batch.number} was bisecting`);
 			remaining.splice(0, remaining.length, ...remaining.filter((n) => !out.includes(n)));
 		}
 		// A run that never started (its push failed, or its PRs did not build on the new branch) shows nothing.
@@ -1463,7 +1463,7 @@ class Tick {
 			} else if (!this.settings().pausedReason) {
 				// It can no longer land as tested (a PR was pushed to, closed, or lost its approval):
 				// those PRs leave the bisection and go back in line to be tested as they are now.
-				await this.leaveBisection(batch, plan.prs.filter((n) => !store.getBatch(batch.id)!.landed.includes(n)));
+				await this.leaveBisection(batch, plan.prs.filter((n) => !store.getBatch(batch.id)!.landed.includes(n)), `could not land as tested from batch ${batch.number}`);
 			}
 			return;
 		}
@@ -1490,7 +1490,7 @@ class Tick {
 		if (plan.requeue.length) {
 			store.leaveBatch(batch.id, plan.requeue);
 			await this.requeueAfterFailure(plan.requeue, batch);
-			await this.leaveBisection(batch, plan.requeue);
+			await this.leaveBisection(batch, plan.requeue, null);
 		}
 		if (plan.done) {
 			if (!ejectWaits) await this.finishBisection(batch, runs, batch.landed.length > 0);
@@ -1510,7 +1510,8 @@ class Tick {
 	 * queue). The PRs stacked on them leave too: tested without their parent, a child would land
 	 * the parent's commits as they were when batched, around the parent's own review.
 	 */
-	async leaveBisection(batch: BatchRow, prs: number[]): Promise<number[]> {
+	/** `why`: what the timeline and each PR's check say, for those back in line (null when the caller says it). */
+	async leaveBisection(batch: BatchRow, prs: number[], why: string | null): Promise<number[]> {
 		const now = store.getBatch(batch.id)!;
 		const parentOf = await this.parentOf();
 		const parent = (n: number) => {
@@ -1531,7 +1532,23 @@ class Tick {
 		}
 		const all = [...out];
 		store.leaveBatch(batch.id, all);
+		const back = all.filter((n) => this.item(n)?.status === 'checking');
 		this.requeue(all);
+		if (why === null) return all;
+		for (const n of back) {
+			// A child went with the PR it is stacked on, which left for its own reason.
+			let root = n;
+			while (!prs.includes(root) && parent(root) !== null) root = parent(root)!;
+			const reason = prs.includes(n) ? why : `went with #${root}, which left batch ${batch.number}`;
+			// A PR closed or deleted meanwhile isn't back in line: the queue drops it.
+			const p = await this.pr(n).catch((e) => {
+				if (e instanceof RateLimitedError) throw e;
+				return null;
+			});
+			if (!p || p.state !== 'open') continue;
+			this.event(n, 'requeued', { reason, batch: batch.id, number: batch.number });
+			await this.d.github.setPRCheck(p.headSha, { state: 'queued', title: short(`Back in line: ${reason}`) }).catch(this.bestEffort('github.setPRCheck'));
+		}
 		return all;
 	}
 
@@ -1557,7 +1574,7 @@ class Tick {
 		if (!r.ok) {
 			// They don't apply on the default branch as it is now (something landed meanwhile): not a
 			// CI failure, and no run; they go back in line, where a conflict is handled the usual way.
-			await this.leaveBisection(batch, g.members);
+			await this.leaveBisection(batch, g.members, `no longer builds on ${this.d.repo.default_branch}; batch ${batch.number} goes on without it`);
 			this.log(`batch ${batch.number}: ${g.members.map((n) => `#${n}`).join(' ')} no longer build on the default branch; back in line`);
 			return;
 		}

@@ -15,6 +15,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import type { LivePR, PRCheckState, QueueDeps } from './batch-queue';
 import { ejectedNotice, holdCheck, holdNotice, readNotice } from './hold-format';
 import { RateLimitedError } from './rate-limit';
+import { DEFAULT_BATCH_CONFIG, type BatchConfig } from './batching';
 
 let git: GitSandbox;
 let repo: { id: number; owner: string; name: string; default_branch: string };
@@ -471,6 +472,48 @@ describe('batch queue runtime', () => {
 		expect(queued()).toEqual([]);
 		const first = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
 		expect(first).toMatchObject({ status: 'landed', landed: [2, 3], left_prs: [1, 4] });
+	});
+
+	test('a setting that no longer exists is dropped from the saved settings', () => {
+		store.updateQueueSettings(repo.id, { config: { expressMax: 2 } as Partial<BatchConfig> });
+		expect(store.getQueueSettings(repo.id).config).not.toHaveProperty('expressMax');
+		expect(Object.keys(store.getQueueSettings(repo.id).config).sort()).toEqual(Object.keys(DEFAULT_BATCH_CONFIG).sort());
+	});
+
+	test('a PR that leaves a bisection says why: the timeline and its check name the push and the batch', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.includes(1) && prs.length < 4;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.prs.join() === '1,2'); i++) await tickBatchQueue(world.deps());
+		expect(world.started.some((x) => x.prs.join() === '1,2')).toBe(true);
+		const batch = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
+		git.commit('pr1', 'late change', 'pr1-late.txt');
+		await tickBatchQueue(world.deps());
+		const why = `pushed while batch ${batch.number} was bisecting`;
+		expect(events.listEvents(repo.id, { pr: 1 }).filter((e) => e.kind === 'requeued').map((e) => e.data)).toEqual([{ reason: why, batch: batch.id, number: batch.number }]);
+		expect(world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').at(0)).toMatchObject({ state: 'queued', title: `Back in line: ${why}` });
+	});
+
+	test('a PR stacked on one that leaves a bisection says it went with its parent', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.includes(1) && prs.length < 4;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-') && x.prs.includes(1)); i++) await tickBatchQueue(world.deps());
+		expect(world.started.some((x) => x.branch.includes('-bisect-') && x.prs.includes(1))).toBe(true);
+		const batch = store.getRecentBatches(repo.id).filter((b) => b.kind === 'batch').at(-1)!;
+		git.commit('pr1', 'late change', 'pr1-late.txt');
+		await tickBatchQueue(world.deps());
+		expect(events.listEvents(repo.id, { pr: 2 }).filter((e) => e.kind === 'requeued').map((e) => e.data)).toEqual([
+			{ reason: `went with #1, which left batch ${batch.number}`, batch: batch.id, number: batch.number }
+		]);
 	});
 
 	test('a PR stacked on one that leaves the bisection leaves with it, and never lands its parent as batched', async () => {

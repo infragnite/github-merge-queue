@@ -199,9 +199,11 @@ describe('planning a batch', () => {
 		expect(p.express).toBe(true);
 	});
 
-	test('express batches hold at most expressMax urgent PRs', () => {
-		const q = [entry(1, 3, 'urgent'), entry(2, 2, 'urgent'), entry(3, 1, 'urgent')];
-		expect(plan(q, stacks([1, 2, 3])).batch).toEqual([1, 2]);
+	test('every urgent PR goes in one express batch', () => {
+		const q = [entry(1, 3, 'urgent'), entry(2, 2, 'urgent'), entry(3, 1, 'urgent'), entry(4, 0)];
+		const p = plan(q, stacks([1, 2, 3, 4]));
+		expect(p.batch).toEqual([1, 2, 3]);
+		expect(p.express).toBe(true);
 	});
 
 	test('low priority goes after normal', () => {

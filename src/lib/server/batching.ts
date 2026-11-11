@@ -61,8 +61,6 @@ export interface BatchConfig {
 	collectWindowMs: number;
 	/** Batches in flight at once, each built on the one before it. */
 	depth: number;
-	/** Most PRs in an express batch for urgent PRs (a stack under one may exceed it). */
-	expressMax: number;
 	/** Only approved PRs may enter a batch. */
 	requireApproval: boolean;
 	/** The approval must be on the PR's current head, not an earlier push. */
@@ -110,7 +108,6 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	maxBatch: 8,
 	collectWindowMs: 60 * 60 * 1000,
 	depth: 2,
-	expressMax: 2,
 	requireApproval: true,
 	approvalOnHead: true,
 	autoRebase: true,

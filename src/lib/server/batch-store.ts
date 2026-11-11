@@ -271,6 +271,13 @@ export function migrateBatches(database: Database.Database) {
 
 // --- settings ---
 
+/** The saved config over the defaults, without settings that no longer exist (such as the old urgent batch size). */
+function knownConfig(saved: Partial<BatchConfig>): BatchConfig {
+	const config = { ...DEFAULT_BATCH_CONFIG };
+	for (const k of Object.keys(config) as (keyof BatchConfig)[]) if (saved[k] !== undefined) (config as Record<string, unknown>)[k] = saved[k];
+	return config;
+}
+
 export function getQueueSettings(repoId: number): RepoQueueSettings {
 	const row = getDb()
 		.prepare('SELECT mode, config, ci, paused_reason, public_view FROM queue_settings WHERE repo_id = ?')
@@ -278,7 +285,7 @@ export function getQueueSettings(repoId: number): RepoQueueSettings {
 	if (!row) return { mode: 'serial', config: { ...DEFAULT_BATCH_CONFIG }, ci: { ...DEFAULT_CI }, pausedReason: null, publicView: false };
 	return {
 		mode: row.mode,
-		config: { ...DEFAULT_BATCH_CONFIG, ...(JSON.parse(row.config) as Partial<BatchConfig>) },
+		config: knownConfig(JSON.parse(row.config) as Partial<BatchConfig>),
 		ci: { ...DEFAULT_CI, ...(JSON.parse(row.ci) as Partial<CISettings>) },
 		pausedReason: row.paused_reason,
 		publicView: row.public_view === 1

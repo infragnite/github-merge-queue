@@ -251,7 +251,7 @@ async function status(repo: Repo, deps: CommandDeps, n: number): Promise<string>
 		console.warn(`[commands] status of #${n}: no stack analysis:`, e instanceof Error ? e.message : e);
 	}
 	const known = analysis?.prs.has(n) ? api.stackState(repo, n, analysis) : null;
-	const found = known?.queue ?? api.queueEntry(repo.id, n);
+	const found = known?.queue ?? api.queueEntry(repo.id, n, analysis);
 	const entry = found && { ...found, lastMessage: found.lastMessage && unname(found.lastMessage, n) };
 	const it = db.getQueueItems(repo.id).find((i) => i.pr_number === n);
 	const held = it ? store.currentHold(it) : null;

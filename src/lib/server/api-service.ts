@@ -10,6 +10,8 @@ import { requireRole, type Caller } from './api-auth';
 import { COMMENT_MODES, DEFAULT_BATCH_CONFIG, type BatchConfig, type CommentMode, type Priority } from './batching';
 import type { BatchRow } from './batch-store';
 import { restackCommand, type PRStackInfo, type StackAnalysis, type StackIssue } from './stacks';
+import { queueBoard, type BoardItem } from './queue-model';
+import type { HoldCode } from './batching';
 import type { QueueItem, Repo } from '$lib/types';
 
 export class ApiError extends Error {
@@ -40,9 +42,41 @@ function inBatchNow(b: BatchRow): number[] {
 /** Statuses of a PR still waiting in line or being tested. */
 export const WAITING_STATUSES = ['queued', 'checking', 'updating', 'merging', 'conflict'];
 
-/** Where a PR stands in the queue; null when it isn't in it. */
-export function queueEntry(repoId: number, n: number) {
-	const items = db.getQueueItems(repoId) as Q[];
+/** A queue row as the queue model reads it, with the hold the planner recorded while it is current. */
+export function boardItem(i: QueueItem, message: string | null = i.error_message): BoardItem {
+	const hold = store.currentHold(i as Q & { hold?: string | null });
+	return {
+		pr: i.pr_number,
+		status: i.status as BoardItem['status'],
+		priority: i.priority ?? 'normal',
+		position: i.position,
+		enqueuedAt: Date.parse(i.created_at.replace(' ', 'T') + (i.created_at.includes('Z') ? '' : 'Z')),
+		hold: hold ? { code: hold.code as HoldCode, reason: hold.reason } : null,
+		message,
+		after: store.deferredFor(i as Q & { deferred_for?: string | null })
+	};
+}
+
+const NO_STACKS: StackAnalysis = { prs: new Map(), stacks: [], issues: [] };
+
+/**
+ * Queue items in the order the queue takes them, from the planners' own queue model: PRs being
+ * tested, in their batches' order; then whole stacks (a stack goes by its most urgent member and
+ * its earliest place in line, children after their parent); then held PRs. Without a stack
+ * analysis every PR is a stack of its own.
+ */
+function inQueueOrder(repoId: number, items: Q[], analysis: StackAnalysis | null): Q[] {
+	const testing = store.getActiveBatches(repoId).flatMap(inBatchNow);
+	const board = queueBoard(items.map((i) => boardItem(i)), analysis ?? NO_STACKS, new Set(testing));
+	const order = [...new Set([...testing, ...board.stacks.flatMap((s) => s.rows.map((r) => r.pr)), ...board.attention.map((h) => h.pr)])];
+	const at = new Map(order.map((n, k) => [n, k]));
+	// Rows the model leaves out (merged, cancelled) keep their place after the rest; the sort is stable.
+	return [...items].sort((a, b) => (at.get(a.pr_number) ?? order.length) - (at.get(b.pr_number) ?? order.length));
+}
+
+/** Where a PR stands in the queue; null when it isn't in it. Pass the stack analysis when there is one. */
+export function queueEntry(repoId: number, n: number, analysis: StackAnalysis | null = null) {
+	const items = inQueueOrder(repoId, db.getQueueItems(repoId) as Q[], analysis);
 	const waiting = items.filter((i) => WAITING_STATUSES.includes(i.status));
 	const idx = waiting.findIndex((i) => i.pr_number === n);
 	if (idx < 0) return null;
@@ -152,7 +186,7 @@ export function stackState(repo: Repo, n: number, analysis: StackAnalysis) {
 		expectedBase: info.expectedBase,
 		stack: tree(analysis, root),
 		issues: info.issues,
-		queue: queueEntry(repo.id, n),
+		queue: queueEntry(repo.id, n, analysis),
 		nextActions: [...queueActions(repo, n, info), ...nextActions(info, analysis, repo.default_branch, queued)]
 	};
 }
@@ -196,10 +230,10 @@ export function batchSummary(b: BatchRow) {
 	};
 }
 
-export function queueState(repo: Repo) {
+export function queueState(repo: Repo, analysis: StackAnalysis | null = null) {
 	const s = store.getQueueSettings(repo.id);
 	const inBatch = new Set(store.getActiveBatches(repo.id).flatMap(inBatchNow));
-	const waiting = (db.getQueueItems(repo.id) as Q[])
+	const waiting = inQueueOrder(repo.id, db.getQueueItems(repo.id) as Q[], analysis)
 		.filter((i) => !['merged', 'failed', 'cancelled'].includes(i.status))
 		.map((i, idx) => ({
 			pr: i.pr_number,
