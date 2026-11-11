@@ -30,7 +30,7 @@ import { withRepoLock } from '$lib/server/repo-lock';
 import { liveDeps } from '$lib/server/batch-live';
 import { withActivity } from '$lib/server/activity';
 import { requireRole } from '$lib/server/api-auth';
-import { analyzeRepoStacks } from '$lib/server/stack-runtime';
+import { analyzeRepoStacks, dashboardStackAnalysis } from '$lib/server/stack-runtime';
 import { AuthError, bearer, resolveCaller, type AuthGitHub } from '$lib/server/api-auth';
 import * as api from '$lib/server/api-service';
 import { RequestLimiter, addressKey } from '$lib/server/request-limit';
@@ -95,8 +95,9 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 			case 'GET stacks':
 				return json(api.stacksState(await analyzeRepoStacks(repo)));
 			case 'GET queue':
+				// The dashboard's analysis: at most one fresh one a minute, none while the rate limit is low.
 				// Without the stacks (GitHub unreachable) every PR is a stack of its own.
-				return json(api.queueState(repo, await analyzeRepoStacks(repo).catch(() => null)));
+				return json(api.queueState(repo, await dashboardStackAnalysis(repo).catch(() => null)));
 			case 'POST pulls/:n/queue': {
 				const pr = await github.getPR(repo.owner, repo.name, n);
 				return json(api.enqueue(repo, caller, pr, await body()), { status: 201 });
