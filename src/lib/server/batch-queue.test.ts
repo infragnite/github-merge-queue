@@ -616,6 +616,30 @@ describe('batch queue runtime', () => {
 		]);
 	});
 
+	test('a conflict recorded before the queue kept its base is checked again too', async () => {
+		pr(1, { file: 'same.txt' });
+		pr(2, { file: 'same.txt' });
+		await run();
+		expect(queued()).toEqual([{ pr: 2, status: 'conflict' }]);
+		store.setHold(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)!.id, null);
+		git.git('checkout', '-q', 'main');
+		git.git('rm', '-q', 'same.txt');
+		git.git('commit', '-qm', 'drop same.txt');
+		await run();
+		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('a workflow change the app may not push is not checked again by itself: only a push retries it', async () => {
+		world.workflowsDenied = true;
+		pr(1, { file: '.github/workflows/ci.yml' });
+		await run();
+		world.workflowsDenied = false;
+		git.commit('main', 'm1', 'x-main.txt');
+		await run();
+		expect(world.merged).toEqual([]);
+		expect(queued()).toEqual([{ pr: 1, status: 'conflict' }]);
+	});
+
 	test('lands a stack parent-first and retargets the child', async () => {
 		pr(1);
 		pr(2, { from: 'pr1', base: 'pr1' }); // stacked on #1
