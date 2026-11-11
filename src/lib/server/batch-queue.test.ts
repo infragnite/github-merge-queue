@@ -1280,6 +1280,8 @@ describe('batch queue runtime', () => {
 		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
 		db.updateQueueItemHeadSha(item(1).id, git.sha('pr1'));
 		db.updateQueueItemStatus(item(1).id, 'conflict', 'Conflicts with main in src/a.ts');
+		// As the queue saves a conflict: with the default branch it conflicted with, so it isn't checked again yet.
+		store.setHold(item(1).id, { code: 'conflict', reason: 'Conflicts with main in src/a.ts', told: true, base: git.sha('main') });
 		await tickBatchQueue(world.deps());
 		expect(world.started).toEqual([]);
 		expect(item(2).error_message).toBe('Waits for #1: conflicts with main in src/a.ts');
