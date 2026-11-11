@@ -2,12 +2,13 @@
 	import { enhance } from '$app/forms';
 	import { invalidateAll } from '$app/navigation';
 	import QueueItem from '$lib/components/QueueItem.svelte';
-	import StatusBadge from '$lib/components/StatusBadge.svelte';
+	import AttentionRow from '$lib/components/AttentionRow.svelte';
 	import BatchCard from '$lib/components/BatchCard.svelte';
 	import SavingsCard from '$lib/components/SavingsCard.svelte';
 	import PrepCard from '$lib/components/PrepCard.svelte';
 	import { runningWork } from '$lib/running-work';
-	import { historyTimeline } from '$lib/history-timeline';
+	import { historyOutcome, historyTimeline, type HistoryEntry } from '$lib/history-timeline';
+	import { queueSummary } from '$lib/queue-summary';
 	import { page } from '$app/state';
 
 	let { data, form } = $props();
@@ -60,26 +61,57 @@
 		const i = items.get(n);
 		return !needle || String(n).startsWith(needle) || (!!i && (i.pr_title.toLowerCase().includes(needle) || i.author_login.toLowerCase().includes(needle)));
 	};
+	// PRs a batch is being formed from show in its preparation row, not again in line.
+	const forming = $derived(new Set(pipe?.activity?.phase?.kind === 'forming' ? pipe.activity.phase.prs : []));
+	const lineStacks = $derived((board?.stacks ?? []).map((s: BoardStack) => ({ ...s, rows: s.rows.filter((r) => !forming.has(r.pr)) })).filter((s: BoardStack) => s.rows.length > 0));
 	// A stack shows whole while any of its PRs matches the search.
-	const shownStacks = $derived((board?.stacks ?? []).filter((s: BoardStack) => s.rows.some((r) => matchesPr(r.pr))));
-	const inLine = $derived((board?.stacks ?? []).reduce((n: number, s: BoardStack) => n + s.rows.length, 0));
+	const shownStacks = $derived(lineStacks.filter((s: BoardStack) => s.rows.some((r) => matchesPr(r.pr))));
+	const inLine = $derived(lineStacks.reduce((n: number, s: BoardStack) => n + s.rows.length, 0));
 	const attention = $derived((board?.attention ?? []).filter((h: BoardHeld) => items.has(h.pr)));
 	// Everything running now, the queue's own preparation first, in the order it holds the runners.
 	const work = $derived(pipe ? runningWork({ active: pipe.active, master: pipe.master ? { ...pipe.master, branch: data.repo.default_branch } : null, activity: pipe.activity, now: clock + skew }) : []);
 	const view = $derived(((v) => (v === 'attention' || v === 'history' ? v : 'now'))(page.url.searchParams.get('view')));
-	// Finished batches and the PRs that left the queue, in one list.
+	const summary = $derived(queueSummary(work, inLine));
+	// Finished batches and the PRs that left the queue, in one list, by day, filtered.
+	let outcome = $state('all');
+	let historySearch = $state('');
 	const timeline = $derived(historyTimeline(pipe?.recent ?? [], data.history));
-	const when = (ms: number) => {
-		const d = new Date(ms);
-		const today = new Date(clock).toDateString() === d.toDateString();
-		return today ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+	const outcomeOf = (e: HistoryEntry) => historyOutcome(e);
+	const shownHistory = $derived(
+		timeline.filter((e) => {
+			if (outcome !== 'all' && historyOutcome(e) !== outcome) return false;
+			const q = historySearch.trim().replace(/^#/, '');
+			if (!q) return true;
+			return e.kind === 'pr' ? String(e.row.pr_number).startsWith(q) : e.card.prs.some((x) => String(x.pr).startsWith(q)) || String(e.card.number) === q;
+		})
+	);
+	const dayLabel = (ms: number) => {
+		const d = new Date(ms).toDateString();
+		if (d === new Date(clock).toDateString()) return 'Today';
+		if (d === new Date(clock - 86_400_000).toDateString()) return 'Yesterday';
+		return new Date(ms).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+	};
+	const historyDays = $derived(
+		shownHistory.reduce((days: { label: string; entries: HistoryEntry[] }[], e) => {
+			const label = dayLabel(e.at);
+			const last = days.at(-1);
+			if (last?.label === label) last.entries.push(e);
+			else days.push({ label, entries: [e] });
+			return days;
+		}, [])
+	);
+	const clockTime = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+	const took = (c: { createdAt: string; finishedAt: string | null }) => {
+		if (!c.finishedAt) return '';
+		const m = Math.max(0, Math.round((Date.parse(c.finishedAt.replace(' ', 'T') + 'Z') - Date.parse(c.createdAt.replace(' ', 'T') + 'Z')) / 60000));
+		return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
 	};
 
-	const MASTER: Record<string, { label: string; tone: string; hint: string }> = {
-		green: { label: 'green', tone: 'bg-green-100 text-green-800', hint: 'Batches build on it' },
-		verifying: { label: 'CI running after the last landing', tone: 'bg-amber-100 text-amber-800', hint: 'The tree already passed in its batch; this run refreshes caches and releases' },
-		checking: { label: 'checking a commit pushed outside the queue', tone: 'bg-amber-100 text-amber-800', hint: 'Batches wait for this check' },
-		red: { label: 'red', tone: 'bg-red-100 text-red-800', hint: 'Only PRs that pass on it can land' }
+	const MASTER: Record<string, { label: string; tone: string; dot: string; hint: string }> = {
+		green: { label: 'green', tone: 'text-green-700', dot: 'bg-green-500', hint: 'Batches build on it' },
+		verifying: { label: 'CI after the last landing', tone: 'text-sky-700', dot: 'bg-sky-500', hint: 'The tree already passed in its batch; this run refreshes caches and releases' },
+		checking: { label: 'checking a commit pushed outside the queue', tone: 'text-amber-700', dot: 'bg-amber-500', hint: 'Batches wait for this check' },
+		red: { label: 'red', tone: 'text-red-700', dot: 'bg-red-500', hint: 'Only PRs that pass on it can land' }
 	};
 
 	async function refresh() {
@@ -148,73 +180,61 @@
 	<title>{data.repo.owner}/{data.repo.name} - Merge Queue</title>
 </svelte:head>
 
-<div class="space-y-5">
-	<!-- Header -->
-	<div class="flex flex-wrap items-center justify-between gap-3">
-		<div class="flex min-w-0 items-center gap-3">
-			{#if !data.anonymous}
-				<a href="/" class="shrink-0 text-gray-400 transition-colors hover:text-gray-600" aria-label="Back to dashboard">
-					<svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-						<path stroke-linecap="round" stroke-linejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+<div class="space-y-4">
+	<!-- Header: the repository, its default branch, how it merges, and what batching saved. -->
+	<div class="flex items-start gap-3">
+		{#if !data.anonymous}
+			<a href="/" class="mt-1.5 shrink-0 text-gray-400 transition-colors hover:text-gray-600" aria-label="Back to dashboard">
+				<svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+					<path stroke-linecap="round" stroke-linejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+				</svg>
+			</a>
+		{/if}
+		<div class="min-w-0 flex-1">
+			<h1 class="truncate text-xl font-bold text-gray-900 sm:text-2xl">
+				<a href="https://github.com/{data.repo.owner}/{data.repo.name}" target="_blank" rel="noopener" class="hover:text-indigo-600">
+					{data.repo.owner}<span class="text-gray-400">/</span>{data.repo.name}
+				</a>
+			</h1>
+			<p class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-gray-500">
+				<span>into <span class="font-mono text-gray-700">{data.repo.default_branch}</span></span>
+				{#if pipe?.master}
+					{@const m = MASTER[pipe.master.state] ?? { label: pipe.master.state, tone: 'text-gray-700', dot: 'bg-gray-400', hint: '' }}
+					<span class="inline-flex items-center gap-1 {m.tone}" title={m.hint}><span class="h-1.5 w-1.5 rounded-full {m.dot}" aria-hidden="true"></span>{m.label} <span class="font-mono">{pipe.master.sha.slice(0, 7)}</span></span>
+				{/if}
+				<span class="text-gray-300" aria-hidden="true">·</span>
+				{#if data.readonly}
+					<span>{batchMode ? `batches of up to ${data.limits.maxBatch}` : 'one by one'}</span>
+				{:else}
+					<a href="/repos/{data.repo.owner}/{data.repo.name}/settings#strategy" class="hover:text-indigo-600" title="How the queue merges PRs; change it in the queue settings">{batchMode ? `batches of up to ${data.limits.maxBatch}` : 'one by one'}</a>
+				{/if}
+				<span class="text-gray-300" aria-hidden="true">·</span>
+				<SavingsCard savings={data.savings} />
+			</p>
+		</div>
+		<div class="flex shrink-0 items-center gap-1.5">
+			{#if !data.readonly}
+				<a href="/repos/{data.repo.owner}/{data.repo.name}/settings" class="rounded-lg p-2 text-gray-500 transition-colors hover:bg-surface-sunken hover:text-gray-800" aria-label="Queue settings" title="Queue settings: merge strategy, batches, CI">
+					<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+						<path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
 					</svg>
 				</a>
 			{/if}
-			<div class="min-w-0">
-				<h1 class="truncate text-xl font-bold text-gray-900 sm:text-2xl">
-					<a href="https://github.com/{data.repo.owner}/{data.repo.name}" target="_blank" rel="noopener" class="hover:text-indigo-600">
-						{data.repo.owner}<span class="text-gray-400">/</span>{data.repo.name}
-					</a>
-				</h1>
-				<p class="text-sm text-gray-500">
-					Into <code class="rounded bg-gray-100 px-1.5 py-0.5 text-xs">{data.repo.default_branch}</code>
-					{#if pipe?.master}
-						{@const m = MASTER[pipe.master.state] ?? { label: pipe.master.state, tone: 'bg-gray-100 text-gray-700', hint: '' }}
-						<span class="ml-1 rounded px-1.5 py-0.5 text-xs {m.tone}" title={m.hint}>{m.label} at <span class="whitespace-nowrap">{pipe.master.sha.slice(0, 7)}</span></span>
-					{/if}
-					{#if data.readonly}
-						<span class="ml-1 whitespace-nowrap text-xs text-gray-500">{batchMode ? `Batches of up to ${data.limits.maxBatch}` : 'One by one'}</span>
-					{:else}
-					<a href="/repos/{data.repo.owner}/{data.repo.name}/settings#strategy" class="ml-1 whitespace-nowrap text-xs text-gray-500 underline decoration-dotted underline-offset-2 hover:text-indigo-600" title="How the queue merges PRs; change it in the queue settings"
-						>{batchMode ? `Batches of up to ${data.limits.maxBatch}` : 'One by one'}</a
-					>
-					{/if}
-				</p>
-			</div>
-		</div>
-		<div class="flex flex-wrap items-center gap-2">
-			<SavingsCard savings={data.savings} />
-			{#if !data.readonly}
-			<a
-				href="/repos/{data.repo.owner}/{data.repo.name}/settings"
-				class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-2 text-sm text-gray-700 transition-colors hover:bg-surface-sunken sm:py-1.5"
-				aria-label="Queue settings"
-				title="Queue settings: merge strategy, batches, CI"
-			>
-				<svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
-					<path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-					<path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-				</svg>
-				<span class="hidden sm:inline">Queue settings</span>
-			</a>
-			{/if}
-			<button
-				onclick={refresh}
-				disabled={refreshing}
-				class="rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-2 text-sm text-gray-600 transition-colors hover:bg-surface-sunken disabled:opacity-50"
-				aria-label="Refresh queue"
-			>
+			<button onclick={refresh} disabled={refreshing} class="rounded-lg p-2 text-gray-500 transition-colors hover:bg-surface-sunken hover:text-gray-800 disabled:opacity-50" aria-label="Refresh queue">
 				<svg class="h-4 w-4 {refreshing ? 'animate-spin' : ''}" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
 					<path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
 				</svg>
 			</button>
 			{#if !readonly}
-			<button
-				onclick={() => (showAddDialog = true)}
-				class="whitespace-nowrap rounded-lg bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-indigo-700"
-				title={data.openPrs.length === 0 ? 'Every open PR is already queued' : `${data.openPrs.length} open PRs not queued`}
-			>
-				+ Add PR
-			</button>
+				<button
+					onclick={() => (showAddDialog = true)}
+					class="ml-1 inline-flex items-center gap-1 whitespace-nowrap rounded-lg bg-indigo-600 px-2.5 py-1.5 text-sm font-medium text-white transition-colors hover:bg-indigo-700"
+					title={data.openPrs.length === 0 ? 'Every open PR is already queued' : `${data.openPrs.length} open PRs not queued`}
+					aria-label="Add a PR"
+				>
+					<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.25 3h1.5v4.25H13v1.5H8.75V13h-1.5V8.75H3v-1.5h4.25z" /></svg><span class="hidden sm:inline">Add PR</span>
+				</button>
 			{/if}
 		</div>
 	</div>
@@ -241,35 +261,44 @@
 	{/if}
 
 	<!-- Views: what runs now and the line; what needs someone; what already happened. -->
-	<nav class="flex gap-1 border-b border-border-subtle text-sm" aria-label="Queue views">
+	<nav class="sticky top-0 z-20 -mx-4 flex gap-1 border-b border-border-subtle bg-surface/95 px-4 text-sm backdrop-blur sm:static sm:mx-0 sm:px-0" aria-label="Queue views">
 		{#each [{ key: 'now', label: 'Now' }, { key: 'attention', label: 'Needs attention' }, { key: 'history', label: 'History' }] as v (v.key)}
 			<a
 				href={v.key === 'now' ? `/repos/${data.repo.owner}/${data.repo.name}` : `?view=${v.key}`}
 				data-sveltekit-noscroll
 				data-sveltekit-replacestate
 				aria-current={view === v.key ? 'page' : undefined}
-				class="-mb-px inline-flex items-center gap-1.5 border-b-2 px-3 py-2 {view === v.key ? 'border-indigo-600 font-medium text-gray-900' : 'border-transparent text-gray-500 hover:text-gray-800'}"
+				class="-mb-px inline-flex h-10 items-center gap-1.5 border-b-2 px-3 {view === v.key ? 'border-gray-900 font-medium text-gray-900' : 'border-transparent text-gray-500 hover:text-gray-800'}"
 			>
 				{v.label}
-				{#if v.key === 'now' && work.length > 0}
-					<span class="rounded-full bg-amber-100 px-1.5 text-xs tabular-nums text-amber-800">{work.length}</span>
-				{:else if v.key === 'attention' && attention.length > 0}
-					<span class="inline-flex items-center gap-0.5 rounded-full bg-red-600 px-1.5 text-xs font-semibold tabular-nums text-white" aria-label="{attention.length} need attention"><span aria-hidden="true">!</span>{attention.length}</span>
+				{#if v.key === 'attention' && attention.length > 0}
+					<span class="inline-flex h-5 min-w-5 items-center justify-center gap-1 rounded-full bg-red-600 px-1.5 text-[11px] font-semibold tabular-nums text-white" aria-label="{attention.length} need attention"
+						><svg class="h-3 w-3" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.1 2.6a1 1 0 011.8 0l5.8 10.6a1 1 0 01-.9 1.5H2.2a1 1 0 01-.9-1.5zM7.25 6v3.5h1.5V6zm0 4.75v1.5h1.5v-1.5z" /></svg>{attention.length}</span
+					>
 				{/if}
 			</a>
 		{/each}
 	</nav>
 
 	{#if view === 'now'}
-		<!-- Running work first: the queue's preparation, then the runs in the order they hold the runners. -->
-		<section aria-labelledby="running" class="space-y-3">
-			<h2 id="running" class="text-base font-semibold text-gray-900">Running</h2>
-			{#if !pipe}
-				<p class="text-sm text-gray-500">Loading…</p>
-			{:else if work.length === 0}
-				<p class="text-sm text-gray-500">{batchMode && inLine ? 'Nothing is running; the next batch starts when the collect window ends or it is full.' : 'Nothing is running.'}</p>
-			{:else}
-				<div class="grid grid-cols-1 items-start gap-3 xl:grid-cols-2">
+		<!-- One line over everything: what runs, what prepares, how much CI waits. -->
+		{#if pipe}
+			<p class="flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-600" aria-label="Summary">
+				{#each summary as part (part.label)}
+					<span><span class="font-semibold tabular-nums {part.label === 'step failed' ? 'text-red-700' : 'text-gray-900'}">{part.value}</span> {part.label}</span>
+				{/each}
+			</p>
+		{/if}
+
+		<div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+			<!-- Running work in run order: preparation first, then the runs; cards keep their place. -->
+			<section aria-labelledby="running" class="min-w-0 space-y-3">
+				<h2 id="running" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Running</h2>
+				{#if !pipe}
+					<p class="text-sm text-gray-500">Loading…</p>
+				{:else if work.length === 0}
+					<p class="rounded-xl border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">{batchMode && inLine ? 'Nothing is running. The next batch starts when the collect window ends or it is full.' : 'Nothing is running.'}</p>
+				{:else}
 					{#each work as w (w.key)}
 						{#if w.kind === 'run'}
 							<BatchCard batch={w.card} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} stopsEarly={data.stopsEarly} prep={w.prep} now={clock + skew} />
@@ -277,34 +306,20 @@
 							<PrepCard slot={w.slot} />
 						{/if}
 					{/each}
-				</div>
-			{/if}
-		</section>
+				{/if}
+			</section>
 
-		<section class="space-y-3" aria-label="In line">
-			{#if data.queueItems.length === 0}
-				<div class="rounded-xl border border-dashed border-gray-300 bg-surface-raised p-8 text-center">
-					<h3 class="text-sm font-medium text-gray-900">Queue is empty</h3>
-					{#if !readonly}<p class="mt-1 text-sm text-gray-500">Add a pull request to start the merge queue.</p>{/if}
-				</div>
-			{:else}
+			<section class="min-w-0 space-y-3 lg:sticky lg:top-4" aria-labelledby="in-line">
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-					<h2 class="text-base font-semibold text-gray-900">In line · {inLine}</h2>
-					<span class="text-xs text-gray-500">
-						{batchMode ? 'urgent first, then in line order; a stack goes as one' : data.can.reorder ? 'drag to reorder; a stack goes as one' : 'in line order; a stack goes as one'}
-					</span>
-					<input
-						type="search"
-						bind:value={search}
-						placeholder="Find #, title or author"
-						class="ml-auto w-full rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm sm:w-56"
-						aria-label="Find a PR in the queue"
-					/>
+					<h2 id="in-line" class="text-xs font-semibold uppercase tracking-wide text-gray-500">In line <span class="tabular-nums text-gray-400">{inLine}</span></h2>
+					{#if data.queueItems.length > 0}
+						<input type="search" bind:value={search} placeholder="Find #, title or author" class="ml-auto w-full rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm sm:w-48" aria-label="Find a PR in the queue" />
+					{/if}
 				</div>
-
 				{#if board?.error}<p class="text-sm text-red-600">{board.error}</p>{/if}
-
-				{#if shownStacks.length > 0}
+				{#if data.queueItems.length === 0}
+					<p class="rounded-xl border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">Queue is empty.{#if !readonly} Add a pull request to start.{/if}</p>
+				{:else if shownStacks.length > 0}
 					<div class="overflow-hidden rounded-xl border border-border-subtle bg-surface-raised" role="list">
 						{#each shownStacks as st, index (st.root)}
 							{@const drag = !batchMode && !needle && data.can.reorder && !readonly}
@@ -336,48 +351,76 @@
 							</div>
 						{/each}
 					</div>
+					<p class="text-xs text-gray-400">{batchMode ? 'Urgent first, then in line order; a stack goes as one.' : data.can.reorder ? 'Drag to reorder; a stack goes as one.' : 'In line order; a stack goes as one.'}</p>
 				{:else if needle}
 					<p class="text-sm text-gray-500">No queued PR matches “{search}”.</p>
-				{:else if board && inLine === 0}
+				{:else if board}
 					<p class="text-sm text-gray-500">Nothing is waiting in line.</p>
 				{/if}
-			{/if}
-		</section>
+			</section>
+		</div>
 	{:else if view === 'attention'}
-		<section aria-label="Needs attention">
+		<section aria-label="Needs attention" class="space-y-3">
 			{#if attention.length === 0}
-				<p class="text-sm text-gray-500">{board ? 'Nothing needs attention.' : 'Loading…'}</p>
+				<p class="rounded-xl border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">{board ? 'Nothing needs attention.' : 'Loading…'}</p>
 			{:else}
-				<p class="mb-2 text-xs text-gray-500">Held back until someone acts; each says what to do.</p>
-				<div class="overflow-hidden rounded-xl border border-red-200 bg-surface-raised" role="list">
+				<p class="text-sm text-gray-600">These PRs are held until someone acts. Each one says what to do; the queue takes them again once it is done.</p>
+				<div class="divide-y divide-border-subtle overflow-hidden rounded-xl border border-border-subtle bg-surface-raised">
 					{#each attention as h (h.pr)}
-						<div role="listitem">
-							<QueueItem {readonly} canUrgent={data.can.urgent} item={items.get(h.pr)!} repoOwner={data.repo.owner} repoName={data.repo.name} {batchMode} why={h.reason} needsSomeone warnings={board?.warnings[h.pr] ?? []} />
-						</div>
+						<AttentionRow item={items.get(h.pr)!} why={h.reason} repoOwner={data.repo.owner} repoName={data.repo.name} {readonly} />
 					{/each}
 				</div>
 			{/if}
 		</section>
 	{:else}
-		<section aria-label="History" class="space-y-2">
-			{#if timeline.length === 0}
-				<p class="text-sm text-gray-500">{pipe ? 'Nothing has finished yet.' : 'Loading…'}</p>
+		<section aria-label="History" class="space-y-3">
+			<div class="flex flex-wrap items-center gap-2">
+				{#each [{ k: 'all', l: 'All' }, { k: 'landed', l: 'Landed' }, { k: 'failed', l: 'Failed' }] as f (f.k)}
+					<button type="button" onclick={() => (outcome = f.k)} aria-pressed={outcome === f.k} class="rounded-full px-3 py-1 text-xs font-medium ring-1 ring-inset {outcome === f.k ? 'bg-gray-900 text-white ring-gray-900' : 'text-gray-600 ring-border-subtle hover:bg-surface-sunken'}">{f.l}</button>
+				{/each}
+				<input type="search" bind:value={historySearch} placeholder="PR #" class="ml-auto w-28 rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm" aria-label="Find a PR in the history" />
+			</div>
+			{#if shownHistory.length === 0}
+				<p class="rounded-xl border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">{pipe ? 'Nothing here yet.' : 'Loading…'}</p>
 			{/if}
-			{#each timeline as e (e.key)}
-				<div class="flex gap-3">
-					<time class="w-20 shrink-0 pt-3 text-right text-xs tabular-nums text-gray-400" datetime={new Date(e.at).toISOString()} title={new Date(e.at).toLocaleString()}>{when(e.at)}</time>
-					<div class="min-w-0 flex-1">
-						{#if e.kind === 'batch'}
-							<BatchCard batch={e.card} owner={data.repo.owner} name={data.repo.name} stopsEarly={data.stopsEarly} now={clock + skew} />
-						{:else}
-							<div class="flex min-w-0 flex-wrap items-center gap-2 rounded-xl border border-border-subtle bg-surface-raised px-4 py-2.5 text-sm">
-								<a href={e.row.pr_url} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{e.row.pr_number}</a>
-								<span class="min-w-0 flex-1 truncate text-gray-600">{e.row.pr_title}</span>
-								<span class="hidden text-xs text-gray-500 sm:inline">{e.row.author_login}</span>
-								<StatusBadge status={e.row.status} />
-							</div>
-						{/if}
-					</div>
+			{#each historyDays as day (day.label)}
+				<div>
+					<h3 class="mb-1.5 text-xs font-semibold uppercase tracking-wide text-gray-500">{day.label}</h3>
+					<ul class="divide-y divide-border-subtle overflow-hidden rounded-xl border border-border-subtle bg-surface-raised text-sm">
+						{#each day.entries as e (e.key)}
+							{@const ok = outcomeOf(e) === 'landed'}
+							<li>
+								{#if e.kind === 'batch'}
+									<details class="group">
+										<summary class="flex min-w-0 cursor-pointer list-none items-center gap-3 px-4 py-2.5 hover:bg-surface-sunken/60 [&::-webkit-details-marker]:hidden">
+											<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] {ok ? 'bg-green-50 text-green-700' : outcomeOf(e) === 'failed' ? 'bg-red-50 text-red-700' : 'bg-gray-100 text-gray-500'}" aria-hidden="true">{ok ? '✓' : outcomeOf(e) === 'failed' ? '✕' : '–'}</span>
+											<span class="shrink-0 font-medium text-gray-900">{e.card.express ? 'Urgent batch' : 'Batch'} #{e.card.number}</span>
+											<span class="min-w-0 truncate text-gray-500">{e.card.prs.length} PR{e.card.prs.length === 1 ? '' : 's'} · {e.card.status === 'superseded' ? 'rebuilt' : e.card.status}{e.card.bisection.length ? ` · ${e.card.bisection.length} bisection step${e.card.bisection.length === 1 ? '' : 's'}` : ''}</span>
+											<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-400">{took(e.card)} · {clockTime(e.at)}</span>
+										</summary>
+										<ul class="space-y-0.5 border-t border-border-subtle bg-surface-sunken/40 px-4 py-2 text-[13px]">
+											{#each e.card.prs as pr (pr.pr)}
+												{@const row = e.rows.find((r) => r.pr_number === pr.pr)}
+												<li class="flex min-w-0 items-center gap-2 pl-8">
+													<a href={row?.pr_url || pr.url || `https://github.com/${data.repo.owner}/${data.repo.name}/pull/${pr.pr}`} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{pr.pr}</a>
+													<span class="min-w-0 truncate text-gray-800">{pr.title}</span>
+													{#if row}<span class="ml-auto shrink-0 text-xs {row.status === 'merged' ? 'text-green-700' : 'text-red-700'}">{row.status}</span>{/if}
+												</li>
+											{/each}
+										</ul>
+									</details>
+								{:else}
+									<div class="flex min-w-0 items-center gap-3 px-4 py-2.5">
+										<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] {ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}" aria-hidden="true">{ok ? '✓' : '✕'}</span>
+										<a href={e.row.pr_url} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{e.row.pr_number}</a>
+										<span class="min-w-0 truncate text-gray-900">{e.row.pr_title}</span>
+										<span class="hidden shrink-0 text-xs text-gray-500 sm:inline">{e.row.author_login}</span>
+										<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-400"><span class={ok ? 'text-green-700' : 'text-red-700'}>{e.row.status}</span> · {clockTime(e.at)}</span>
+									</div>
+								{/if}
+							</li>
+						{/each}
+					</ul>
 				</div>
 			{/each}
 		</section>

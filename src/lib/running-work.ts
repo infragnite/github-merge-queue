@@ -1,7 +1,8 @@
 // What the queue page shows on top: everything running now, in the order it holds the runners.
 // The queue's own preparation (forming a batch, a failed step) goes first; preparing a bisection
-// step or landing goes inside the batch it is for, and that batch goes first too. Then the check
-// of the default branch, urgent batches, batches by number, and try runs.
+// step or landing goes inside the batch it is for. Then the check
+// of the default branch, urgent batches, batches by number, and try runs. That order never changes
+// while they run: preparation for a batch shows on top inside it, not by moving the batch.
 
 import { runOrder, type MasterRun, type RunSlot } from './run-order';
 import type { BatchCard } from './server/batch-view';
@@ -52,8 +53,7 @@ export function runningWork(input: { active: BatchCard[]; master?: MasterRun | n
 		else own.push({ kind: 'prep', key: slot.key, slot });
 	}
 
+	// The batch's own preparation goes on top inside it; the batch keeps its place, so cards never jump.
 	const runs = [...input.active].sort((x, y) => rank(x) - rank(y) || x.number - y.number).map((card): WorkItem => ({ kind: 'run', key: `run${card.id}`, card, prep: prepOf.get(card.id) ?? [] }));
-	const preparing = runs.filter((r) => r.kind === 'run' && r.prep.length > 0);
-	const rest = runs.filter((r) => r.kind === 'run' && r.prep.length === 0);
-	return [...own, ...preparing, ...(master ? [master] : []), ...rest];
+	return [...own, ...(master ? [master] : []), ...runs];
 }

@@ -1,11 +1,11 @@
 <script lang="ts">
 	import type { SavingsView } from '$lib/server/ci-savings';
 
-	// CI time saved by batching over the last 30 days, in one line; how it is counted on hover.
+	// CI time saved by batching over the last 30 days, as a few words in the page subtitle; how
+	// it is counted on hover.
 	let { savings }: { savings: SavingsView } = $props();
 
 	const w = $derived(savings.windows.find((x) => x.key === '30d') ?? null);
-
 	const fmt = (ms: number) => {
 		const min = Math.abs(ms) / 60_000;
 		if (min < 60) return `${Math.round(min)} min`;
@@ -22,17 +22,16 @@
 				].join('\n')
 			: 'No finished queue run has been timed yet.'
 	);
-	const less = $derived(w && w.aloneMs > 0 ? Math.round((1 - w.spentMs / w.aloneMs) * 100) : null);
 </script>
 
-<p class="inline-flex items-baseline gap-1.5 whitespace-nowrap rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-xs text-gray-500" title={how}>
-	<span>CI saved, 30 days</span>
+<span class="whitespace-nowrap text-xs text-gray-500" title={how}>
 	{#if !perRun || !w}
-		<span class="text-gray-400">measuring</span>
+		CI savings: measuring
 	{:else if w.landed === 0}
-		<span class="text-gray-400">nothing landed</span>
+		CI savings: nothing landed in 30 days
+	{:else if w.savedMs >= 0}
+		saved <span class="font-medium tabular-nums text-green-700">{fmt(w.savedMs)}</span> of CI in 30 days
 	{:else}
-		<span class="text-sm font-semibold tabular-nums {w.savedMs >= 0 ? 'text-green-700' : 'text-amber-700'}">{w.savedMs >= 0 ? fmt(w.savedMs) : `−${fmt(w.savedMs)}`}</span>
-		{#if less !== null}<span class="tabular-nums">{less}% less</span>{/if}
+		<span class="font-medium tabular-nums text-amber-700">{fmt(w.savedMs)}</span> more CI than one by one, 30 days
 	{/if}
-</p>
+</span>

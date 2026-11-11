@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { historyTimeline, type HistoryRow } from './history-timeline';
+import { historyOutcome, historyTimeline, type HistoryRow } from './history-timeline';
 import type { BatchCard, BatchPR } from './server/batch-view';
 
 const pr = (n: number): BatchPR => ({ pr: n, title: '', url: '', depth: 0, parent: null, link: null });
@@ -62,5 +62,20 @@ describe('history: finished batches and merged PRs in one list', () => {
 	test('a PR completed before a batch carrying it was created is not that batch\'s', () => {
 		const recent = [batch(5, [7], '2026-11-11 10:00:00', '2026-11-11 10:30:00', 'failed')];
 		expect(historyTimeline(recent, [row(1, 7, '2026-11-11 09:00:00')]).map((e) => e.key)).toEqual(['b5', 'h1']);
+	});
+});
+
+describe('what a history entry ended as, for the filter', () => {
+	test('a batch that landed, or a merged PR, landed; a failed batch or PR failed; a rebuilt or cancelled batch neither', () => {
+		const [landed, failed, rebuilt, merged, prFailed] = historyTimeline(
+			[batch(3, [], '2026-11-11 12:00:00', '2026-11-11 12:10:00'), batch(2, [], '2026-11-11 11:00:00', '2026-11-11 11:10:00', 'failed'), batch(1, [], '2026-11-11 10:00:00', '2026-11-11 10:10:00', 'superseded')],
+			[row(2, 9, '2026-11-11 09:00:00'), row(1, 8, '2026-11-11 08:00:00', 'failed')]
+		);
+		expect([landed, failed, rebuilt, merged, prFailed].map(historyOutcome)).toEqual(['landed', 'failed', 'other', 'landed', 'failed']);
+	});
+
+	test('a bisected batch that landed part of its PRs counts as landed', () => {
+		const b = { ...batch(4, [1, 2], '2026-11-11 12:00:00', '2026-11-11 12:10:00', 'failed'), landed: [1] };
+		expect(historyTimeline([b], []).map(historyOutcome)).toEqual(['landed']);
 	});
 });

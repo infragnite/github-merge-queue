@@ -42,3 +42,10 @@ export function historyTimeline<R extends HistoryRow>(recent: BatchCard[], histo
 	);
 	return out.sort((x, y) => y.at - x.at || (x.kind === 'pr' ? -1 : 1));
 }
+
+/** What an entry ended as, for the history filter. A bisected batch that landed some PRs landed. */
+export function historyOutcome(e: HistoryEntry): 'landed' | 'failed' | 'other' {
+	if (e.kind === 'pr') return e.row.status === 'merged' ? 'landed' : 'failed';
+	if (e.card.status === 'landed' || e.card.landed.length > 0) return 'landed';
+	return e.card.status === 'failed' ? 'failed' : 'other';
+}
