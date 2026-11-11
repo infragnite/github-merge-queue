@@ -550,6 +550,8 @@ export interface Hold {
 	head?: string;
 	/** Its check was posted but the comment setting kept it from a comment: it is commented on once the setting allows. */
 	quiet?: boolean;
+	/** A conflict with the default branch: that branch's head when it conflicted. It is checked again once the branch moves. */
+	base?: string;
 }
 
 export function setHold(itemId: number, hold: Hold | null) {

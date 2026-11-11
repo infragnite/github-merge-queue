@@ -411,6 +411,8 @@ class Tick {
 		if (it) {
 			db.updateQueueItemHeadSha(it.id, p.headSha);
 			db.updateQueueItemStatus(it.id, 'conflict', reason);
+			// What it conflicts with may change without a push (the default branch moves): checked again then.
+			if (code === 'conflict') store.setHold(it.id, { code, reason, head: p.headSha, told: true, base: await this.d.github.defaultBranchSha() });
 		}
 		const hold = { pr: n, head: p.headSha, code, reason, files, ...(fix ? { fix } : {}) };
 		await this.d.github.setPRCheck(p.headSha, { state: 'action_required', ...holdCheck(hold) }).catch(this.bestEffort('github.setPRCheck'));
@@ -1551,6 +1553,7 @@ class Tick {
 		// A PR is `checking` only while a batch carries it; any other (a mode switch, a crash
 		// between steps) goes back in line rather than waiting forever.
 		const carried = new Set(store.getActiveBatches(this.repoId).flatMap((b) => b.members));
+		let master: string | undefined;
 		for (const it of this.items()) {
 			if ((it.status === 'checking' || it.status === 'updating' || it.status === 'merging') && !carried.has(it.pr_number)) {
 				db.updateQueueItemStatus(it.id, 'queued');
@@ -1572,8 +1575,26 @@ class Tick {
 				db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
 				await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
 				this.event(it.pr_number, 'requeued', { reason: 'pushed after a conflict', headSha: p.headSha });
+			} else if (it.status === 'conflict') {
+				master ??= await this.d.github.defaultBranchSha();
+				await this.recheckConflict(it, p, master);
 			}
 		}
+	}
+
+	/** A conflict with the default branch, its head unchanged: back in line once the branch moved and it merges cleanly. */
+	async recheckConflict(it: QueueItem, p: LivePR, master: string) {
+		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
+		if (hold?.code !== 'conflict' || !hold.base || hold.base === master) return;
+		await this.d.git.fetch([master, p.headSha]);
+		const r = await this.d.git.build(master, [{ pr: it.pr_number, headSha: p.headSha, title: p.title, parentHeadSha: null }]);
+		if (!r.ok) {
+			store.setHold(it.id, { ...hold, base: master });
+			return;
+		}
+		db.updateQueueItemStatus(it.id, 'queued', null as unknown as string);
+		await this.d.github.label(it.pr_number, CONFLICT_LABEL, false).catch(this.bestEffort('github.label'));
+		this.event(it.pr_number, 'requeued', { reason: `no longer conflicts with ${this.d.repo.default_branch}`, headSha: p.headSha });
 	}
 
 	/**
