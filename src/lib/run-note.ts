@@ -1,5 +1,6 @@
-// Why a run is still going when it could have stopped. Runs of several PRs stop at their first
-// failed job; a run of one PR is that PR's verdict and runs to the end, so its author gets every error.
+// Why a run is still going after a job failed. Runs of several PRs stop at their first failed
+// job; a run of one PR is that PR's verdict and runs to the end, so its author gets every error.
+// Before anything fails there is nothing to explain.
 
 interface RunLike {
 	prs: { pr: number }[];
@@ -14,11 +15,9 @@ export function runNote(run: RunLike, stopsEarly = true): string | null {
 	// Decided at its first failed job: the rest of its CI goes on for the author, holding nothing.
 	if (run.ci === 'failure' && run.prs.length === 1 && p && p.done < p.total)
 		return `Failed at its first failed job. Its other ${p.total - p.done} jobs go on only for #${run.prs[0].pr}'s full log; nothing waits for them.`;
-	if (run.ci !== 'pending' || run.finishedAt) return null;
-	if (!stopsEarly) return 'Runs to the end: stop on first failure is off in the settings.';
+	if (run.ci !== 'pending' || run.finishedAt || !p || p.failed === 0) return null;
+	if (!stopsEarly) return 'A job failed. It runs to the end: stop on first failure is off in the settings.';
 	if (run.prs.length !== 1) return null;
-	const n = `#${run.prs[0].pr}`;
 	// A failed job isn't the queue's verdict yet (another workflow, a re-run, a red default branch).
-	if (p && p.failed > 0) return `A job failed. ${n} runs to the end so its author gets every error: ${p.total - p.done} jobs left.`;
-	return `Runs to the end: ${n} is tested alone, so its author gets every error. Runs of several PRs stop at their first failure.`;
+	return `A job failed. #${run.prs[0].pr} runs to the end so its author gets every error: ${p.total - p.done} jobs left.`;
 }
