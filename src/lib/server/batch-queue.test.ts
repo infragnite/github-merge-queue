@@ -990,6 +990,42 @@ describe('batch queue runtime', () => {
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 	});
 
+	test("a stacked child whose own commits don't replay onto master (it merged its parent in) still lands its tested tree, through a merge of master, no pause", async () => {
+		// #1 writes shared.txt; #2 rewrites it, then #1 rewrites it again and #2 merges that in, resolving
+		// both. Replaying #2's first commit onto #1's squash conflicts; the tree CI tested does not.
+		const w = (text: string, msg: string) => {
+			writeFileSync(`${git.dir}/shared.txt`, text);
+			git.git('commit', '-qam', msg);
+		};
+		git.branch('pr1', 'main');
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'one\n');
+		git.git('add', 'shared.txt');
+		git.git('commit', '-qm', 'p1a');
+		git.branch('pr2', 'pr1');
+		git.git('checkout', '-q', 'pr2');
+		w('child\n', 'c1');
+		git.git('checkout', '-q', 'pr1');
+		w('two\n', 'p1b');
+		git.git('checkout', '-q', 'pr2');
+		git.git('merge', '-q', 'pr1', '-m', 'merge pr1', '-s', 'ours');
+		w('child two\n', 'resolve');
+		git.openPR(1, 'pr1', 'main');
+		git.openPR(2, 'pr2', 'pr1');
+		world.approved.add(1);
+		world.approved.add(2);
+		db.addToQueue(repo.id, 1, 'PR 1', 'u', 'dev', '', 'dev');
+		db.addToQueue(repo.id, 2, 'PR 2', 'u', 'dev', '', 'dev');
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([1, 2]);
+		expect(git.git('show', 'main:shared.txt')).toBe('child two');
+		expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+		// The head it pushed merges master into #2's own history, which it keeps.
+		const pushed = world.pushedHeads.find((h) => h.branch === 'pr2')!;
+		expect(git.git('rev-list', '--parents', '-n', '1', pushed.sha).split(' ')).toHaveLength(3);
+	});
+
 	/** A stacked child #2 that edits its parent #1's lines: it lands only once the queue restacks it onto master. */
 	function childEditingParent() {
 		pr(1, { file: 'shared.txt' });
