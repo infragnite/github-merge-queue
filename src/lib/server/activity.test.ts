@@ -60,7 +60,7 @@ function fakeDeps(over: { git?: Partial<QueueDeps['git']>; github?: Partial<Queu
 			comment: async () => {},
 			...over.github
 		},
-		ci: { start: async () => {}, refreshCaches: async () => {}, result: async () => 'pending' as const, cancel: async () => {}, rerunFailed: async () => 'none' as const, runUrl: async () => null, ...over.ci }
+		ci: { start: async () => {}, refreshCaches: async () => {}, result: async () => 'pending' as const, cancel: async () => {}, stalled: async () => null, rerunFailed: async () => 'none' as const, runUrl: async () => null, ...over.ci }
 	};
 	return { deps: deps as QueueDeps, clock };
 }

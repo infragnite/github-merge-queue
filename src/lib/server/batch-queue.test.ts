@@ -35,6 +35,13 @@ class World {
 	flaky = new Set<string>();
 	started: { branch: string; head: string; prs: number[] }[] = [];
 	reruns = new Map<string, number>();
+	/** Heads whose run has a job that hangs (pending) until the queue cancels it. */
+	hanging = new Set<string>();
+	/** Heads whose run hangs again after its re-run. */
+	hangsAgain = new Set<string>();
+	/** Heads whose run was cancelled (or a job timed out) with no job failed: failure until re-run. */
+	interrupted = new Set<string>();
+	stalledReads: { head: string; notBefore: number | null; hangMs: number }[] = [];
 	statuses: { sha: string; state: string }[] = [];
 	comments: { pr: number; body: string }[] = [];
 	merged: number[] = [];
@@ -145,6 +152,8 @@ class World {
 				},
 				result: async (head, _notBefore, opts) => {
 					this.resultReads.push({ head, failFast: !!opts?.failFast });
+					if (this.hanging.has(head)) return 'pending';
+					if (this.interrupted.has(head)) return 'failure';
 					if (this.ciPendingOnce.delete(head) || this.stillRunning.has(head)) return 'pending';
 					if (this.slowFailures && this.ciFails(head) && !this.cancelled.includes(head) && !opts?.failFast) {
 						// The rest of a failing run takes a few more reads to finish.
@@ -161,6 +170,13 @@ class World {
 				cancel: async (head) => {
 					this.cancelled.push(head);
 					this.ciOps.push(`cancel ${head}`);
+					if (this.hanging.delete(head)) this.interrupted.add(head);
+				},
+				stalled: async (head, notBefore, hangMs) => {
+					this.stalledReads.push({ head, notBefore: notBefore ?? null, hangMs });
+					if (this.hanging.has(head)) return 'hung';
+					if (this.interrupted.has(head)) return 'interrupted';
+					return null;
 				},
 				refreshCaches: async () => {
 					this.cacheRefreshes++;
@@ -174,6 +190,7 @@ class World {
 					this.reruns.set(head, (this.reruns.get(head) ?? 0) + 1);
 					this.ciOps.push(`rerun ${head}`);
 					this.ciPendingOnce.add(head);
+					if (this.interrupted.delete(head) && this.hangsAgain.has(head)) this.hanging.add(head);
 					return 'rerun';
 				}
 			},
@@ -2297,6 +2314,86 @@ describe('batch queue runtime', () => {
 		await run();
 		expect(world.reruns.size).toBe(0);
 		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the queue/) }]);
+	});
+
+	describe('a stalled CI run', () => {
+		const MIN = 60_000;
+		beforeEach(() => store.updateQueueSettings(repo.id, { config: { retryFailed: false } }));
+
+		test('a job that hangs is cancelled and its jobs run again, even with flake retries off; the PR lands', async () => {
+			pr(1);
+			await tickBatchQueue(world.deps());
+			const head = world.started[0].head;
+			world.hanging.add(head);
+			await run();
+			expect(world.merged).toEqual([1]);
+			// Cancelled once it hung, then run again (the last cancel only retires the landed batch's run).
+			expect(world.ciOps.filter((o) => o.endsWith(head))).toEqual([`cancel ${head}`, `rerun ${head}`, `cancel ${head}`]);
+			expect(world.comments).toEqual([]);
+			expect(world.started).toHaveLength(1);
+		});
+
+		test('a run cancelled outside the queue, with no job failed, runs again and lands', async () => {
+			pr(1);
+			pr(2);
+			await tickBatchQueue(world.deps());
+			const head = world.started[0].head;
+			world.interrupted.add(head);
+			await run();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.ciOps.filter((o) => o.endsWith(head))).toEqual([`rerun ${head}`, `cancel ${head}`]);
+			// Not bisected: one run, and nobody was told anything.
+			expect(world.started).toHaveLength(1);
+			expect(world.comments).toEqual([]);
+		});
+
+		test('a job that hangs again after the re-run fails the batch: the lone PR leaves, told why', async () => {
+			pr(1);
+			await tickBatchQueue(world.deps());
+			const head = world.started[0].head;
+			world.hanging.add(head);
+			world.hangsAgain.add(head);
+			await run();
+			expect(world.merged).toEqual([]);
+			expect(world.ciOps.filter((o) => o.endsWith(head))).toEqual([`cancel ${head}`, `rerun ${head}`, `cancel ${head}`, `cancel ${head}`]);
+			expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: CI failed/) }]);
+		});
+
+		test('a real failure is still not re-run with flake retries off', async () => {
+			pr(1, { file: 'x-breaks-master.txt' });
+			world.breakingFiles.add('x-breaks-master.txt');
+			await run();
+			expect(world.reruns.size).toBe(0);
+			// Only the retirement of its run after it left.
+			expect(world.ciOps).toEqual([`cancel ${world.started[0].head}`]);
+			expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the queue/) }]);
+		});
+
+		test('a bisection step whose job hangs runs again, and blames nobody for the hang', async () => {
+			pr(1);
+			pr(2, { file: 'x-breaks-master.txt' });
+			pr(3);
+			world.breakingFiles.add('x-breaks-master.txt');
+			for (let i = 0; i < 20 && world.started.length < 2; i++) await tickBatchQueue(world.deps());
+			const step = world.started[1].head;
+			world.hanging.add(step);
+			await run(60);
+			expect(world.merged).toEqual([1, 3]);
+			expect(world.ciOps.filter((o) => o.endsWith(step)).slice(0, 2)).toEqual([`cancel ${step}`, `rerun ${step}`]);
+			expect(world.reruns.get(step)).toBe(1);
+			expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/Removed from the queue/) }]);
+		});
+
+		test('a job counts as hung after the repo setting, an hour by default', async () => {
+			pr(1);
+			await tickBatchQueue(world.deps());
+			world.stillRunning.add(world.started[0].head);
+			await tickBatchQueue(world.deps());
+			expect(world.stalledReads.at(-1)?.hangMs).toBe(60 * MIN);
+			store.updateQueueSettings(repo.id, { config: { jobHangMs: 30 * MIN } });
+			await tickBatchQueue(world.deps());
+			expect(world.stalledReads.at(-1)?.hangMs).toBe(30 * MIN);
+		});
 	});
 
 	test('a failed check whose workflow still runs other jobs is re-run once it finishes, not bisected', async () => {
