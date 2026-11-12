@@ -156,10 +156,10 @@ test('actionsJobsFor: every attempt of every workflow run on the commit, page by
 		if (path.includes('/runs/1/jobs')) return { jobs: [job(100)] };
 		return { jobs: [job(200)] };
 	};
-	const jobs = await actionsJobsFor(get, 'o', 'r', 'abc');
+	const jobs = await actionsJobsFor(get, 'o', 'r', 'abc', 'mq/batch-1');
 	expect(jobs.map((j) => j.id)).toEqual([...Array.from({ length: 101 }, (_, i) => i), 200]);
 	expect(asked).toEqual([
-		'/repos/o/r/actions/runs?head_sha=abc&per_page=100',
+		'/repos/o/r/actions/runs?head_sha=abc&branch=mq%2Fbatch-1&per_page=100',
 		'/repos/o/r/actions/runs/1/jobs?filter=all&per_page=100&page=1',
 		'/repos/o/r/actions/runs/1/jobs?filter=all&per_page=100&page=2',
 		'/repos/o/r/actions/runs/2/jobs?filter=all&per_page=100&page=1'
@@ -175,6 +175,65 @@ test('a run over long ago with no jobs is recorded empty, so it cannot hold up t
 	db.getDb().prepare(`UPDATE batches SET status = 'passed', created_at = datetime('now', '-2 hours') WHERE id = ?`).run(old.id);
 	expect(await recordRunCosts({ id }, async () => [])).toBe(1);
 	expect(db.getDb().prepare('SELECT job_ms FROM ci_runs WHERE batch_id = ?').get(old.id)).toEqual({ job_ms: 0 });
+});
+
+test('the call budget counts GitHub calls, not runs: a commit with several workflow runs spends more of it', async () => {
+	const user = db.upsertUser(5, 'dev5', null, null);
+	db.addRepo('acme', 'budget', 'main', user);
+	const id = db.getRepoByOwnerName('acme', 'budget')!.id;
+	for (const h of ['b1', 'b2', 'b3', 'b4']) {
+		const b = store.insertBatch({ repoId: id, kind: 'batch', branch: `mq/${h}`, baseSha: 'b', headSha: h, treeSha: 't', baseTree: 'bt', members: [1], heads: {} });
+		store.setBatchCI(b.id, 'success');
+		store.setBatchStatus(b.id, 'landed');
+	}
+	const asked: string[] = [];
+	// One call for the commit's runs, then one per run: three calls a commit.
+	const jobsFor = async (sha: string, spend: () => void) => {
+		asked.push(sha);
+		spend();
+		spend();
+		spend();
+		return [{ name: 'ci', status: 'completed', started_at: t(0), completed_at: t(5) }];
+	};
+	expect(await recordRunCosts({ id }, jobsFor, Date.now(), 4)).toBe(2);
+	expect(asked).toEqual(['b1', 'b2']);
+});
+
+test('only the runs on the batch\'s own branch count: a push of the same commit to master runs CI that the batch did not cause', async () => {
+	const user = db.upsertUser(7, 'dev7', null, null);
+	db.addRepo('acme', 'branch', 'main', user);
+	const id = db.getRepoByOwnerName('acme', 'branch')!.id;
+	const b = store.insertBatch({ repoId: id, kind: 'batch', branch: 'mq/batch-77', baseSha: 'b', headSha: 'ff', treeSha: 't', baseTree: 'bt', members: [1], heads: {} });
+	store.setBatchCI(b.id, 'success');
+	store.setBatchStatus(b.id, 'landed');
+	const asked: Array<[string, string]> = [];
+	await recordRunCosts({ id }, async (sha, _spend, branch) => {
+		asked.push([sha, branch]);
+		return [];
+	});
+	expect(asked).toEqual([['ff', 'mq/batch-77']]);
+});
+
+test('a run another batch row already owns (a landing on a passed try, same commit) is not counted twice', async () => {
+	const user = db.upsertUser(6, 'dev6', null, null);
+	db.addRepo('acme', 'reuse', 'main', user);
+	const id = db.getRepoByOwnerName('acme', 'reuse')!.id;
+	const tryRun = store.insertBatch({ repoId: id, kind: 'try', branch: 'mq/try-9', baseSha: 'b', headSha: 'same', treeSha: 't', baseTree: 'bt', members: [9], heads: {} });
+	store.setBatchCI(tryRun.id, 'success');
+	store.setBatchStatus(tryRun.id, 'landed');
+	const landing = store.insertBatch({ repoId: id, kind: 'batch', branch: 'mq/try-9', baseSha: 'b', headSha: 'same', treeSha: 't', baseTree: 'bt', members: [9], heads: {}, passed: true });
+	store.setBatchStatus(landing.id, 'landed');
+	const asked: string[] = [];
+	const jobs = async (sha: string) => {
+		asked.push(sha);
+		return [{ id: 31, run_id: 3, run_attempt: 1, name: 'ci', status: 'completed', conclusion: 'success', created_at: t(0), started_at: t(1), completed_at: t(11) }];
+	};
+	expect(await recordRunCosts({ id }, jobs)).toBe(2);
+	expect(asked).toEqual(['same']);
+	const run = (b: number) => db.getDb().prepare('SELECT job_ms, jobs FROM ci_runs WHERE batch_id = ?').get(b);
+	expect(run(tryRun.id)).toEqual({ job_ms: 10 * MIN, jobs: 1 });
+	expect(run(landing.id)).toEqual({ job_ms: 0, jobs: 0 });
+	expect(db.getDb().prepare('SELECT batch_id FROM ci_jobs WHERE job_id = 31').get()).toEqual({ batch_id: tryRun.id });
 });
 
 describe('public view setting', () => {

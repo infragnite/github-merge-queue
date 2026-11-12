@@ -80,11 +80,13 @@ export function jobCost(jobs: Job[]): JobCost {
 }
 
 /**
- * Every job attempt of every workflow run on a commit, through `get` (a GitHub API GET returning
- * parsed JSON). The workflow-jobs API, unlike check runs, says when each job was queued.
+ * Every job attempt of every workflow run on a commit pushed to `branch`, through `get` (a GitHub
+ * API GET returning parsed JSON). The workflow-jobs API, unlike check runs, says when each job was
+ * queued. Only the batch's own branch: the same commit pushed to the default branch (a landing)
+ * runs CI that the batch did not cause.
  */
-export async function actionsJobsFor(get: (path: string) => Promise<any>, owner: string, repo: string, sha: string): Promise<Job[]> {
-	const runs = ((await get(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=100`)).workflow_runs ?? []) as Array<{ id: number }>;
+export async function actionsJobsFor(get: (path: string) => Promise<any>, owner: string, repo: string, sha: string, branch: string): Promise<Job[]> {
+	const runs = ((await get(`/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&branch=${encodeURIComponent(branch)}&per_page=100`)).workflow_runs ?? []) as Array<{ id: number }>;
 	const out: Job[] = [];
 	for (const run of runs) {
 		for (let page = 1; page <= 5; page++) {
@@ -121,13 +123,23 @@ function unrecorded(repoId: number, limit: number): BatchRow[] {
 	).map((r) => ({ ...r, members: JSON.parse(r.members as unknown as string) }));
 }
 
+/** An earlier row of the same commit on the same branch (a landing on a passed try): it owns that run. */
+function runOwnedElsewhere(b: BatchRow): boolean {
+	return !!getDb()
+		.prepare('SELECT 1 FROM batches WHERE repo_id = ? AND head_sha = ? AND branch = ? AND id < ? LIMIT 1')
+		.get(b.repo_id, b.head_sha, b.branch, b.id);
+}
+
 /**
- * Records what finished runs cost, at most `maxCalls` GitHub calls per call (it is called every
- * processor cycle, so a backlog drains over a few minutes without spending the rate limit).
+ * Records what finished runs cost, spending about `maxCalls` GitHub calls per call (it is called
+ * every processor cycle, so a backlog drains over a few minutes without spending the rate limit).
+ * `jobsFor` calls `spend` once per GitHub call it makes (one for the commit's runs, then one per
+ * run and page); one that doesn't say is counted as one call. A commit may overshoot the budget by
+ * its own calls, then nothing more is asked this time.
  */
 export async function recordRunCosts(
 	repo: { id: number },
-	jobsFor: (sha: string) => Promise<Job[]>,
+	jobsFor: (sha: string, spend: () => void, branch: string) => Promise<Job[]>,
 	now = Date.now(),
 	maxCalls = 4
 ): Promise<number> {
@@ -135,14 +147,20 @@ export async function recordRunCosts(
 	let recorded = 0;
 	for (const b of unrecorded(repo.id, 50)) {
 		if (calls >= maxCalls) break;
-		calls++;
-		const jobs = await jobsFor(b.head_sha);
+		// Owned by an earlier row: recorded at once as costing nothing, it ran nothing of its own.
+		const owned = runOwnedElsewhere(b);
+		let jobs: Job[] = [];
+		if (!owned) {
+			let spent = 0;
+			jobs = await jobsFor(b.head_sha, () => spent++, b.branch);
+			calls += Math.max(spent, 1);
+		}
 		const cost = jobCost(jobs);
 		// Over by its status but still showing running jobs, or none at all (a run that never
 		// started, or an old bisection row without a finish time): recorded as it is once it has
 		// been over long enough, so such rows can't hold up the ones behind them.
 		const settled = now - toMs(b.finished_at ?? b.created_at) > SETTLE_MS;
-		if (!cost.done && !settled) continue;
+		if (!cost.done && !settled && !owned) continue;
 		const job = getDb().prepare(
 			`INSERT OR REPLACE INTO ci_jobs (job_id, batch_id, repo_id, run_id, attempt, workflow, name, conclusion, runner, created_ms, started_ms, completed_ms)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`

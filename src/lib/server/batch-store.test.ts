@@ -34,6 +34,13 @@ describe('what a batch keeps for later analysis', () => {
 		expect(store.getBatch(b.id)!.ci_done_at).toBe(first);
 	});
 
+	test('a batch decided when it is recorded (landing on a try that passed) has its CI result time set', () => {
+		const b = store.insertBatch({ repoId, kind: 'batch', branch: 'mq/try-1', baseSha: 'b', headSha: 'h', treeSha: 't', baseTree: 'bt', members: [1], heads: {}, passed: true });
+		expect(b).toMatchObject({ status: 'passed', ci_result: 'success' });
+		expect(b.ci_done_at).not.toBeNull();
+		expect(insert().ci_done_at).toBeNull();
+	});
+
 	test('why it ended, when it ended early; a later status without a reason keeps it', () => {
 		const b = insert();
 		store.setBatchStatus(b.id, 'superseded', 'master-moved');

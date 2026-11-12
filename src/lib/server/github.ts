@@ -538,9 +538,9 @@ export async function actionsJobsForSha(owner: string, repo: string, sha: string
 	}>;
 }
 
-/** Every Actions job ever run on a commit, every attempt, with its times (for what CI cost). */
-export function actionsJobAttemptsForSha(owner: string, repo: string, sha: string) {
-	return actionsJobsFor((path) => ghFetchAsApp(path), owner, repo, sha);
+/** Every Actions job ever run on a commit pushed to `branch`, every attempt, with its times (for what CI cost). */
+export function actionsJobAttemptsForSha(owner: string, repo: string, sha: string, branch: string, spend: () => void = () => {}) {
+	return actionsJobsFor((path) => (spend(), ghFetchAsApp(path)), owner, repo, sha, branch);
 }
 
 export async function workflowRunsForSha(owner: string, repo: string, sha: string) {

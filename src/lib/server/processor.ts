@@ -108,7 +108,7 @@ async function recordCosts(repo: RepoRef) {
 	lastRunCost.set(repo.id, Date.now());
 	if ((await github.rateLimitOf(repo.owner).catch(() => null))?.low) return;
 	try {
-		await recordRunCosts(repo, (sha) => github.actionsJobAttemptsForSha(repo.owner, repo.name, sha));
+		await recordRunCosts(repo, (sha, spend, branch) => github.actionsJobAttemptsForSha(repo.owner, repo.name, sha, branch, spend));
 	} catch (err) {
 		console.warn(`[merge-queue] Recording CI run times for ${repo.owner}/${repo.name} failed:`, err instanceof Error ? err.message : err);
 	}

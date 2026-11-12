@@ -422,8 +422,8 @@ export function insertBatch(b: {
 }): BatchRow {
 	const r = getDb()
 		.prepare(
-			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number, status, ci_result, settings)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number, status, ci_result, settings, ci_done_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? THEN datetime('now') END)`
 		)
 		.run(
 			b.repoId,
@@ -444,7 +444,8 @@ export function insertBatch(b: {
 				: null,
 			b.passed ? 'passed' : 'testing',
 			b.passed ? 'success' : 'pending',
-			snapshot(b.repoId)
+			snapshot(b.repoId),
+			b.passed ? 1 : 0
 		);
 	return getBatch(Number(r.lastInsertRowid))!;
 }
