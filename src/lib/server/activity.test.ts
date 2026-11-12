@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { activityOf, clearActivity, trackActivity, withActivity } from './activity';
 import { RateLimitedError } from './rate-limit';
+import { HeadMovedError } from './head-moved';
+import { GitHubError } from './github-retry';
 import type { LivePR, QueueDeps } from './batch-queue';
 import type { BuildResult } from './batch-builder';
 
@@ -214,12 +216,15 @@ describe('activity of a queue step', () => {
 		await p;
 	});
 
-	test('a failed step is kept with its batch, PRs and error after the tick, until the same step next succeeds', async () => {
+	const WORKFLOWS = "! [remote rejected] x -> mq/batch-5 (refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission)";
+	const GRANT_WORKFLOWS = "Grant the GitHub App the Workflows (read and write) permission, then approve it on this account's installation";
+
+	test('a failed step someone can fix is kept with its batch, PRs and what to do, until the same step next succeeds', async () => {
 		let fail = true;
 		const { deps, clock } = fakeDeps({
 			github: {
 				pushBranch: async () => {
-					if (fail) throw new Error('refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml`');
+					if (fail) throw new Error(WORKFLOWS);
 				}
 			}
 		});
@@ -231,13 +236,7 @@ describe('activity of a queue step', () => {
 			since: null,
 			phase: null,
 			step: null,
-			failure: {
-				phase: 'Forming a batch',
-				step: 'pushing mq/batch-5',
-				prs: [1, 2],
-				message: 'refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml`',
-				at: clock.t
-			}
+			failure: { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1, 2], action: GRANT_WORKFLOWS, at: clock.t }
 		});
 		// Other steps succeeding don't clear it; the same step does.
 		await withActivity(deps, async (d) => {
@@ -252,12 +251,64 @@ describe('activity of a queue step', () => {
 		expect(activityOf(REPO.id).failure).toBeNull();
 	});
 
-	test('the error still reaches the caller', async () => {
-		const { deps } = fakeDeps({ git: { fetch: async () => Promise.reject(new Error('timeout')) } });
+	test('a missing App permission names the permission the call needs', async () => {
+		const notAccessible = (path: string) => async () => Promise.reject(new GitHubError(403, `Resource not accessible by integration: ${path}`));
+		const cases: [string, (d: QueueDeps) => Promise<unknown>, Partial<QueueDeps['github']> | Partial<QueueDeps['ci']>, 'github' | 'ci', string][] = [
+			['retargetBase', (d) => d.github.retargetBase(4, 'main'), { retargetBase: notAccessible('PATCH /repos/o/r/pulls/4') }, 'github', 'Pull requests (read and write)'],
+			['squashMerge', (d) => d.github.squashMerge(4, 't', 'h'), { squashMerge: notAccessible('PUT /repos/o/r/pulls/4/merge') }, 'github', 'Contents (read and write)'],
+			['ci.start', (d) => d.ci.start('mq/batch-1', 'b', 'h', [1]), { start: notAccessible('POST /repos/o/r/actions/workflows/ci.yml/dispatches') }, 'ci', 'Actions (read and write)']
+		];
+		for (const [, call, over, where, permission] of cases) {
+			clearActivity(REPO.id);
+			const { deps } = fakeDeps({ [where]: over });
+			await call(trackActivity(deps)).catch(() => {});
+			expect(activityOf(REPO.id).failure?.action).toBe(`Grant the GitHub App the ${permission} permission, then approve it on this account's installation`);
+		}
+	});
+
+	test("git refusing the App's push for lack of access names the Contents permission", async () => {
+		const denied = 'git push failed: remote: Permission to o/r.git denied to merge-queue[bot].\nfatal: unable to access \'https://github.com/o/r.git/\': The requested URL returned error: 403';
+		const { deps } = fakeDeps({ github: { pushHead: async () => Promise.reject(new Error(denied)) } });
+		await trackActivity(deps).github.pushHead('feature-4', 'new4', 'head4').catch(() => {});
+		expect(activityOf(REPO.id).failure?.action).toBe("Grant the GitHub App the Contents (read and write) permission, then approve it on this account's installation");
+	});
+
+	test('a failure nobody can act on (a timeout, a server error) goes to the log only; the error still reaches the caller', async () => {
+		const { deps } = fakeDeps({ git: { fetch: async () => Promise.reject(new Error('timeout')) }, github: { pushBranch: async () => Promise.reject(new GitHubError(502, 'Server Error')) } });
 		const d = trackActivity(deps);
 		await expect(d.git.fetch(['x'])).rejects.toThrow('timeout');
-		expect(activityOf(REPO.id).failure).toMatchObject({ phase: null, step: 'fetching commits from GitHub', message: 'timeout' });
+		await expect(d.github.pushBranch('mq/batch-1', 'x')).rejects.toThrow('Server Error');
+		expect(activityOf(REPO.id).failure).toBeNull();
 		expect(activityOf(REPO.id).step).toBeNull();
+	});
+
+	test('a push that lost its lease is not a failure: the author pushed first, and the next tick reads the new head', async () => {
+		const { deps } = fakeDeps({ github: { pushHead: async (branch, _sha, expected) => Promise.reject(new HeadMovedError(branch, expected)) } });
+		const d = trackActivity(deps);
+		await d.github.pr(4);
+		await expect(d.github.pushHead('feature-4', 'new4', 'head4')).rejects.toBeInstanceOf(HeadMovedError);
+		expect(activityOf(REPO.id).failure).toBeNull();
+	});
+
+	test('a tick that ends without the failure again clears it; an action (a try run) or a tick that throws does not', async () => {
+		let fail = true;
+		const { deps } = fakeDeps({ github: { pushBranch: async () => (fail ? Promise.reject(new Error(WORKFLOWS)) : undefined) } });
+		const tick = { tick: true };
+		await withActivity(deps, (d) => d.github.pushBranch('mq/batch-1', 'x').catch(() => {}), tick);
+		expect(activityOf(REPO.id).failure).not.toBeNull();
+		// The same failure again in the next tick keeps it.
+		await withActivity(deps, (d) => d.github.pushBranch('mq/batch-2', 'x').catch(() => {}), tick);
+		expect(activityOf(REPO.id).failure).not.toBeNull();
+		fail = false;
+		// An action that never pushes says nothing about it.
+		await withActivity(deps, async () => {});
+		expect(activityOf(REPO.id).failure).not.toBeNull();
+		// Nor does a tick that stopped part way.
+		await expect(withActivity(deps, async () => Promise.reject(new Error('later step failed')), tick)).rejects.toThrow();
+		expect(activityOf(REPO.id).failure).not.toBeNull();
+		// A whole tick without it: it is over, even though nothing pushed a batch.
+		await withActivity(deps, async () => {}, tick);
+		expect(activityOf(REPO.id).failure).toBeNull();
 	});
 
 	test("a rate limit is not a failed step: the page has its own notice for it", async () => {
