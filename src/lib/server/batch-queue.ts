@@ -44,7 +44,7 @@ import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
 import { HeadMovedError } from './head-moved';
 import { failureAction } from './activity';
-import { emitEvent, heldPRs, type QueueEventKind } from './events';
+import { emitEvent, heldPRs, lastRepoEvent, type QueueEventKind } from './events';
 
 /** The error, and what to do about it: a pause reason always says what to do. */
 function withAction(call: string, e: unknown): string {
@@ -384,9 +384,12 @@ class Tick {
 		return (await this.d.ci.runUrl(run.head_sha).catch(() => null)) ?? this.branchRuns(run.branch);
 	}
 
+	/** The batch being landed: a pause while it lands is that batch's, and cancelling it ends the pause. */
+	landing: number | null = null;
+
 	pause(reason: string) {
 		store.updateQueueSettings(this.repoId, { pausedReason: reason });
-		this.event(null, 'paused', { reason });
+		this.event(null, 'paused', { reason, ...(this.landing !== null ? { batch: this.landing } : {}) });
 		this.log(reason);
 	}
 
@@ -873,7 +876,14 @@ class Tick {
 		// Recorded before the first merge: a crash before it is cleared is finished by `recoverLanding`.
 		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs: part, group: prs });
 		const merged: number[] = [];
-		const ok = (await this.landNow(batch, part, src, merged)) && this.skipped.size === 0;
+		this.landing = batch.id;
+		let landed: boolean;
+		try {
+			landed = await this.landNow(batch, part, src, merged);
+		} finally {
+			this.landing = null;
+		}
+		const ok = landed && this.skipped.size === 0;
 		// What landed is recorded together with clearing the intent, so a crash can't split them.
 		// A landing of part of the group (one stopped, or left PRs out) puts on master a tree no run
 		// tested on its own (only the whole group was), so it is not marked green; the next tick
@@ -2548,6 +2558,13 @@ export async function cancelBatch(deps: QueueDeps, id: number, by: string): Prom
 	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled', reason);
 	await t.supersede(above, 'below-cancelled', `batch ${b.number} below it was cancelled`);
 	t.event(null, 'cancelled', { batch: id, number: b.number, by, requeued, rebuilt: above.map((x) => x.id) });
+	// A pause its landing caused: nothing of it is left to resume.
+	const paused = store.getQueueSettings(deps.repo.id).pausedReason;
+	const cause = paused ? lastRepoEvent(deps.repo.id, 'paused') : null;
+	if (cause && cause.data.batch === id && cause.data.reason === paused) {
+		store.updateQueueSettings(deps.repo.id, { pausedReason: null });
+		t.event(null, 'resumed', { by, reason: `batch ${b.number}, whose landing paused the queue, was cancelled` });
+	}
 	t.log(`batch ${b.number} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
 	return { requeued, rebuilt: above.map((x) => x.id) };
 }
