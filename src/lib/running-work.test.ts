@@ -9,6 +9,7 @@ const card = (id: number, over: Partial<BatchCard>): BatchCard => ({
 	number: id,
 	kind: 'batch',
 	branch: `mq/${id}`,
+	runUrl: null,
 	status: 'testing',
 	express: false,
 	ci: 'pending',

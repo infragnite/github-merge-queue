@@ -91,6 +91,8 @@ export interface BatchCard {
 	number: number;
 	kind: BatchRow['kind'];
 	branch: string;
+	/** Its CI run, once GitHub listed it. */
+	runUrl: string | null;
 	status: BatchRow['status'];
 	express: boolean;
 	ci: BatchRow['ci_result'];
@@ -187,6 +189,7 @@ export function batchCard(
 		number: b.number,
 		kind: b.kind,
 		branch: b.branch,
+		runUrl: b.run_url ?? null,
 		status: b.status,
 		express: b.express,
 		ci: b.ci_result,

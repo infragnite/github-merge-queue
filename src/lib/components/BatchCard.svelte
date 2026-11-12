@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
-	import { actionsUrl } from '$lib/actions-link';
+	import { runHref } from '$lib/actions-link';
 	import { runNote } from '$lib/run-note';
 	import { runStatus } from '$lib/run-status';
 	import { batchStats } from '$lib/batch-stats';
@@ -126,7 +126,7 @@
 				<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>
 			</summary>
 			<div class="absolute right-0 z-10 mt-1 w-52 overflow-hidden rounded-lg border border-border-subtle bg-surface-raised py-1 text-sm shadow-lg">
-				<a href={actionsUrl(owner, name, batch.branch)} target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">GitHub Actions runs</a>
+				<a href={runHref(owner, name, batch)} target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">{batch.runUrl ? 'Open the CI run' : 'GitHub Actions runs'}</a>
 				{#if p?.url}<a href={p.url} target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">{p.failed ? 'Open the failed job' : 'Open a running job'}</a>{/if}
 				<a href="https://github.com/{owner}/{name}/commit/{batch.headSha}" target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">Commit <span class="font-mono text-xs text-gray-500">{batch.headSha.slice(0, 7)}</span></a>
 				{#if cancellable}
@@ -187,7 +187,7 @@
 				{@const rs = runStatus(run)}
 				<div class="flex min-w-0 items-center gap-2 px-3 py-2 text-sm">
 					<span class="h-1.5 w-1.5 shrink-0 rounded-full {rs === 'failing' ? 'bg-red-500' : 'bg-sky-500'}" aria-hidden="true"></span>
-					<a href={actionsUrl(owner, name, run.branch)} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600" title="GitHub Actions runs of {run.branch}">Step {stepNo(run)}</a>
+					<a href={runHref(owner, name, run)} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600" title={run.runUrl ? `CI run of ${run.branch}` : `GitHub Actions runs of ${run.branch}`}>Step {stepNo(run)}</a>
 					<span class="min-w-0 truncate font-mono text-xs text-gray-500" title={run.prs.map((x) => `#${x.pr}`).join(' ')}>{run.prs.length === 1 ? `#${run.prs[0].pr} alone` : run.prs.map((x) => `#${x.pr}`).join(' ')}</span>
 					{#if rs === 'failing'}<StatusChip status="failing" />{/if}
 					<span class="ml-auto flex shrink-0 items-center gap-2">

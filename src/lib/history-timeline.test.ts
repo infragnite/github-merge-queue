@@ -8,6 +8,7 @@ const batch = (id: number, prs: number[], createdAt: string, finishedAt: string 
 	number: id,
 	kind: 'batch',
 	branch: `mq/${id}`,
+	runUrl: null,
 	status,
 	express: false,
 	ci: status === 'landed' ? 'success' : 'failure',

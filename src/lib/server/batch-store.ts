@@ -59,6 +59,8 @@ export interface BatchRow {
 	status: BatchStatus;
 	express: boolean;
 	ci_result: 'pending' | 'success' | 'failure';
+	/** The CI run that tests `head_sha`, once GitHub listed it; until then links go to the branch's runs. */
+	run_url: string | null;
 	created_at: string;
 	finished_at: string | null;
 	/** When its latest CI result came in (null while none has, and in rows from before it was recorded). */
@@ -230,6 +232,14 @@ export function migrateBatches(database: Database.Database) {
 			sha TEXT NOT NULL,
 			PRIMARY KEY (repo_id, branch)
 		);
+		CREATE TABLE IF NOT EXISTS run_link_waits (
+			repo_id INTEGER NOT NULL,
+			sha TEXT NOT NULL,
+			suffix TEXT NOT NULL,
+			branch TEXT NOT NULL,
+			title TEXT NOT NULL,
+			PRIMARY KEY (repo_id, sha, suffix)
+		);
 		CREATE TABLE IF NOT EXISTS master_health (
 			repo_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
 			sha TEXT NOT NULL,
@@ -255,7 +265,8 @@ export function migrateBatches(database: Database.Database) {
 		['ci_done_at', 'TEXT'],
 		['retries', 'INTEGER NOT NULL DEFAULT 0'],
 		['end_reason', 'TEXT'],
-		['settings', 'TEXT']
+		['settings', 'TEXT'],
+		['run_url', 'TEXT']
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
@@ -588,6 +599,36 @@ export function setBatchCI(id: number, result: BatchRow['ci_result']) {
 	getDb()
 		.prepare(`UPDATE batches SET ci_result = ?, ci_done_at = CASE WHEN ? = 'pending' THEN ci_done_at ELSE datetime('now') END WHERE id = ?`)
 		.run(result, result, id);
+}
+
+export function setBatchRunUrl(id: number, url: string) {
+	getDb().prepare('UPDATE batches SET run_url = ? WHERE id = ?').run(url, id);
+}
+
+/**
+ * A PR's open check that links `branch`'s runs because CI had not created its run yet. Once the run
+ * is listed the check is sent again, with `title`, linking it. `suffix` tells the PR's checks apart.
+ */
+export interface RunLinkWait {
+	sha: string;
+	suffix: string;
+	branch: string;
+	title: string;
+}
+
+/** Replaces whatever `sha`'s check with `suffix` waited for: a check sent later stands. */
+export function setRunLinkWait(repoId: number, w: RunLinkWait | { sha: string; suffix: string; branch?: undefined }) {
+	const db = getDb();
+	db.prepare('DELETE FROM run_link_waits WHERE repo_id = ? AND sha = ? AND suffix = ?').run(repoId, w.sha, w.suffix);
+	if (w.branch !== undefined) db.prepare('INSERT INTO run_link_waits (repo_id, sha, suffix, branch, title) VALUES (?, ?, ?, ?, ?)').run(repoId, w.sha, w.suffix, w.branch, w.title);
+}
+
+export function runLinkWaits(repoId: number): RunLinkWait[] {
+	return getDb().prepare('SELECT sha, suffix, branch, title FROM run_link_waits WHERE repo_id = ? ORDER BY rowid').all(repoId) as RunLinkWait[];
+}
+
+export function clearRunLinkWaits(repoId: number, branch: string) {
+	getDb().prepare('DELETE FROM run_link_waits WHERE repo_id = ? AND branch = ?').run(repoId, branch);
 }
 
 // --- queue item extras ---

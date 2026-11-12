@@ -7,7 +7,7 @@ import { runOrder } from '$lib/run-order';
 const row = (o: Partial<BatchRow>): BatchRow => ({
 	id: 1, repo_id: 1, kind: 'batch', parent_batch_id: null, branch: 'mq/1', base_sha: 'b', head_sha: 'h1', tree_sha: 't',
 	base_tree: 'bt', heads: {}, steps: {}, retried_at: null, members: [], context: [], landed: [], left_prs: [], ejected: [], number: 1, status: 'testing', express: false,
-	ci_result: 'pending', created_at: '2026-11-09 21:00:00', finished_at: null, ci_done_at: null, retries: 0, end_reason: null, settings: null, ...o
+	ci_result: 'pending', run_url: null, created_at: '2026-11-09 21:00:00', finished_at: null, ci_done_at: null, retries: 0, end_reason: null, settings: null, ...o
 });
 
 const info = (number: number, parent: number | null): PRStackInfo => ({
@@ -161,4 +161,12 @@ test('a PR that failed alone on a tree not known green is tried alone again, not
 	// On the tree a run of this bisection landed, it is known green.
 	runs[2] = { ...runs[2], base_tree: 'after-3364' };
 	expect(batchCard(b8, runs, null, new Map(), new Map()).prs.filter((p) => p.awaitingEject).map((p) => p.pr)).toEqual([3241]);
+});
+
+test('carries the CI run each card and bisection step links to', () => {
+	const analysis: StackAnalysis = { prs: new Map(), stacks: [], issues: [] };
+	const step = row({ id: 2, kind: 'bisect', branch: 'mq/1-bisect', run_url: null });
+	const card = batchCard(row({ run_url: 'https://github.com/o/r/runs/7' }), [step], analysis, new Map(), new Map());
+	expect(card.runUrl).toBe('https://github.com/o/r/runs/7');
+	expect(card.bisection.map((b) => b.runUrl)).toEqual([null]);
 });

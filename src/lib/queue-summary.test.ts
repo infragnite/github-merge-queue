@@ -5,7 +5,7 @@ import type { BatchCard } from './server/batch-view';
 
 const progress = (done: number, running: number, total = 40) => ({ total, done, failed: 0, running, url: null, failedJobs: [] });
 const card = (id: number, over: Partial<BatchCard>): BatchCard => ({
-	id, number: id, kind: 'batch', branch: `mq/${id}`, status: 'testing', express: false, ci: 'pending', headSha: `h${id}`,
+	id, number: id, kind: 'batch', branch: `mq/${id}`, runUrl: null, status: 'testing', express: false, ci: 'pending', headSha: `h${id}`,
 	createdAt: '2026-11-11 10:00:00', finishedAt: null, context: [], landed: [], prs: [], bisection: [], progress: null, ...over
 });
 const run = (c: BatchCard): WorkItem => ({ kind: 'run', key: `run${c.id}`, card: c, prep: [] });
