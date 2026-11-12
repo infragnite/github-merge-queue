@@ -40,7 +40,8 @@ export interface QueueEvent {
 const bus = new EventEmitter();
 bus.setMaxListeners(0);
 
-const KEEP_DAYS = 7;
+// Kept long enough to analyse the queue's history later (wait times, holds, ejections, pauses).
+const KEEP_DAYS = 400;
 let inserts = 0;
 
 export function emitEvent(repoId: number, pr: number | null, kind: QueueEventKind, data: Record<string, unknown> = {}) {
@@ -99,7 +100,7 @@ export function heldPRs(repoId: number): number[] {
 	return rows.filter((r) => r.kind === 'held').map((r) => r.pr_number);
 }
 
-/** The kind of the PR's newest event among `kinds`; null when it has none (events are kept 7 days). */
+/** The kind of the PR's newest event among `kinds`; null when it has none (events are kept about a year). */
 export function lastEventOf(repoId: number, pr: number, kinds: QueueEventKind[]): { kind: QueueEventKind; data: Record<string, unknown> } | null {
 	const r = getDb()
 		.prepare(`SELECT kind, data FROM queue_events WHERE repo_id = ? AND pr_number = ? AND kind IN (${kinds.map(() => '?').join(', ')}) ORDER BY id DESC LIMIT 1`)

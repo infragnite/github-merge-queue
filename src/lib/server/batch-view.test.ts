@@ -7,7 +7,7 @@ import { runOrder } from '$lib/run-order';
 const row = (o: Partial<BatchRow>): BatchRow => ({
 	id: 1, repo_id: 1, kind: 'batch', parent_batch_id: null, branch: 'mq/1', base_sha: 'b', head_sha: 'h1', tree_sha: 't',
 	base_tree: 'bt', heads: {}, steps: {}, retried_at: null, members: [], context: [], landed: [], left_prs: [], ejected: [], number: 1, status: 'testing', express: false,
-	ci_result: 'pending', created_at: '2026-11-09 21:00:00', finished_at: null, ...o
+	ci_result: 'pending', created_at: '2026-11-09 21:00:00', finished_at: null, ci_done_at: null, retries: 0, end_reason: null, settings: null, ...o
 });
 
 const info = (number: number, parent: number | null): PRStackInfo => ({
