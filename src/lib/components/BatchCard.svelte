@@ -2,200 +2,239 @@
 	import { enhance } from '$app/forms';
 	import { actionsUrl } from '$lib/actions-link';
 	import { runNote } from '$lib/run-note';
-	import BatchCard from './BatchCard.svelte';
+	import { runStatus } from '$lib/run-status';
+	import { batchStats } from '$lib/batch-stats';
+	import type { RunSlot } from '$lib/run-order';
+	import PrepCard from './PrepCard.svelte';
+	import StatusChip from './StatusChip.svelte';
 	import type { BatchCard as Card } from '$lib/server/batch-view';
 
+	// A running batch or run of its own (a try, the check of the default branch). Colour lives in
+	// the status chip and the bars only; what runs inside a batch is a row in its well.
 	let {
 		batch,
 		owner,
 		name,
-		nested = false,
-		step = null,
 		canCancel = false,
 		progressErrors = {},
-		stopsEarly = true
+		stopsEarly = true,
+		prep = [],
+		now = Date.now()
 	}: {
 		batch: Card;
 		owner: string;
 		name: string;
-		nested?: boolean;
-		step?: number | null;
 		canCancel?: boolean;
 		/** Why CI progress could not be read, by head commit. */
 		progressErrors?: Record<string, string>;
 		/** The repo's stop-on-first-failure setting, for why a run goes on. */
 		stopsEarly?: boolean;
+		/** The queue's own work on this batch now: preparing a bisection step, landing. */
+		prep?: RunSlot[];
+		now?: number;
 	} = $props();
+
 	const progressError = $derived(progressErrors[batch.headSha] ?? null);
 	const cancellable = $derived(canCancel && batch.kind === 'batch' && ['testing', 'retrying', 'bisecting', 'passed'].includes(batch.status));
-
-	const KIND: Record<Card['kind'], string> = { batch: 'Batch', bisect: 'Bisection run', try: 'Tried alone', baseline: 'Master check' };
-	const STATUS: Record<string, string> = {
-		testing: 'bg-amber-100 text-amber-800',
-		retrying: 'bg-amber-100 text-amber-800',
-		bisecting: 'bg-orange-100 text-orange-800',
-		passed: 'bg-green-100 text-green-800',
-		landed: 'bg-green-100 text-green-800',
-		failed: 'bg-red-100 text-red-800',
-		superseded: 'bg-gray-100 text-gray-600',
-		cancelled: 'bg-gray-100 text-gray-600',
-		failing: 'bg-red-100 text-red-800'
-	};
-	const LABEL: Record<string, string> = {
-		testing: 'testing',
-		retrying: 're-running failed jobs',
-		bisecting: 'bisecting',
-		passed: 'passed, waiting to land',
-		landed: 'landed',
-		failed: 'failed',
-		superseded: 'rebuilt: the batch below it failed',
-		cancelled: 'cancelled',
-		failing: 'failing'
-	};
-
-	function since(sqlTime: string, end: string | null): string {
-		const start = Date.parse(sqlTime.replace(' ', 'T') + 'Z');
-		const ms = (end ? Date.parse(end.replace(' ', 'T') + 'Z') : Date.now()) - start;
-		const m = Math.max(0, Math.round(ms / 60000));
-		return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
-	}
-
-	// A bisection or try run that passed is stored as landed; it landed nothing itself.
 	const p = $derived(batch.progress);
-	// Why a run of one PR goes on after a failure.
+	const status = $derived(runStatus(batch));
+	const stats = $derived(batchStats(batch, now));
 	const note = $derived(runNote(batch, stopsEarly));
-	// A run with a failed job will fail: say so before the remaining jobs finish.
-	const status = $derived(
-		(batch.kind === 'try' || batch.kind === 'baseline') && batch.status === 'landed'
-			? 'passed'
-			: batch.status === 'testing' && p && p.failed > 0
-				? 'failing'
-				: batch.status
+	const waiting = $derived(!batch.finishedAt && ['testing', 'retrying'].includes(batch.status));
+	// Close the actions menu on a click outside it or on Escape.
+	function dismiss(el: HTMLDetailsElement) {
+		const close = (e: Event) => {
+			if (!el.open) return;
+			if (e instanceof KeyboardEvent ? e.key === 'Escape' : !el.contains(e.target as Node)) el.open = false;
+		};
+		document.addEventListener('click', close);
+		document.addEventListener('keydown', close);
+		return {
+			destroy: () => {
+				document.removeEventListener('click', close);
+				document.removeEventListener('keydown', close);
+			}
+		};
+	}
+	// A big batch lists its first PRs; the rest fold away.
+	const MAX_PRS = 8;
+	const live = $derived(!batch.finishedAt || status === 'failing');
+
+	const fmt = (ms: number) => {
+		const m = Math.max(0, Math.floor(ms / 60000));
+		return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+	};
+	const title = $derived(
+		batch.kind === 'batch'
+			? `${batch.express ? 'Urgent batch' : 'Batch'} #${batch.number}`
+			: batch.kind === 'try'
+				? `Try #${batch.prs[0]?.pr ?? ''}`
+				: batch.kind === 'baseline'
+					? 'Check of master'
+					: 'Bisection step'
 	);
-	const prList = (ns: number[]) => ns.map((n) => `#${n}`).join(', ');
-	// What the runs showed about a PR, as an icon; what is happening to it, as a mark on that icon.
-	const VERDICT: Record<string, { label: string; icon: string; cls: string }> = {
-		passing: { label: 'passing', icon: '✓', cls: 'bg-green-100 text-green-700' },
-		unknown: { label: 'unknown', icon: '?', cls: 'bg-gray-100 text-gray-500' },
-		failing: { label: 'failing', icon: '✕', cls: 'bg-red-100 text-red-700' }
+	const DOT: Record<string, string> = { testing: 'bg-sky-500', retrying: 'bg-sky-500', bisecting: 'bg-violet-500', failing: 'bg-red-500', passed: 'bg-green-500' };
+	const pct = (n: number, total: number) => (total > 0 ? (n / total) * 100 : 0);
+
+	// A bisection, PR by PR: cleared, still suspect, in a step running now, or pinned down.
+	const SEG: Record<string, { cls: string; label: string }> = {
+		cleared: { cls: 'bg-green-500', label: 'cleared' },
+		checking: { cls: 'bg-sky-400', label: 'in a step' },
+		suspect: { cls: 'bg-gray-300', label: 'suspect' },
+		failing: { cls: 'bg-red-500', label: 'failing' }
 	};
-	const ACTIVITY: Record<string, { label: string; cls: string }> = {
-		checking: { label: 'checking', cls: 'ring-2 ring-amber-400 motion-safe:animate-pulse' },
-		landed: { label: 'landed', cls: '!bg-green-600 !text-white' },
-		left: { label: 'back in line', cls: 'opacity-50' }
-	};
-	const count = <T,>(values: T[], order: string[]) =>
-		order.map((k) => [k, values.filter((v) => v === k).length] as const).filter(([, c]) => c > 0);
-	const verdictCounts = $derived(count(batch.prs.map((p) => p.verdict), ['passing', 'unknown', 'failing']));
-	const activityCounts = $derived(count(batch.prs.map((p) => p.activity), ['checking', 'landed', 'left']));
-	const runningRuns = $derived(batch.bisection.filter((r) => r.ci === 'pending' && !['cancelled', 'superseded'].includes(r.status)).length);
-	const pct = (n: number) => (p && p.total > 0 ? (n / p.total) * 100 : 0);
+	const segOf = (pr: Card['prs'][number]) =>
+		pr.verdict === 'failing' ? 'failing' : pr.verdict === 'passing' || pr.activity === 'landed' ? 'cleared' : pr.activity === 'checking' ? 'checking' : 'suspect';
+	const bisecting = $derived(stats.runs !== null);
+	const segs = $derived(batch.prs.map((x) => ({ pr: x.pr, seg: segOf(x) })));
+	const segCount = (k: string) => segs.filter((s) => s.seg === k).length;
+	// In a bisection only the PRs still to settle are listed; the rest fold away.
+	const open = $derived(bisecting ? batch.prs.filter((x) => !x.settled && x.verdict !== 'passing') : batch.prs);
+	const folded = $derived(bisecting ? batch.prs.filter((x) => !open.includes(x)) : []);
+	const finished = $derived(batch.bisection.filter((r) => !stats.running.includes(r)));
+	const stepNo = (r: Card) => batch.bisection.indexOf(r) + 1;
+	const prLink = (n: number, url = '') => url || `https://github.com/${owner}/${name}/pull/${n}`;
 </script>
 
-<div id={nested ? undefined : `batch-${batch.id}`} class="scroll-mt-4 rounded-xl border border-border-subtle bg-surface-raised {nested ? 'p-3' : 'p-4'}">
-	<div class="flex flex-wrap items-center gap-2 text-sm">
-		<span class="font-semibold text-gray-900">{KIND[batch.kind]} {batch.kind === 'batch' ? `#${batch.number}` : step !== null ? step : ''}</span>
-		<span class="rounded px-1.5 py-0.5 text-xs {STATUS[status] ?? 'bg-gray-100 text-gray-600'}">{batch.kind !== 'batch' && status === 'passed' ? 'passed' : (LABEL[status] ?? status)}</span>
-		{#if batch.express}<span class="rounded bg-indigo-100 px-1.5 py-0.5 text-xs text-indigo-700" title="A small batch of urgent PRs, ahead of the rest">urgent</span>{/if}
-		<a href="https://github.com/{owner}/{name}/commit/{batch.headSha}" target="_blank" rel="noopener" class="hidden max-w-[12rem] truncate font-mono text-[11px] text-gray-400 hover:text-indigo-600 sm:inline" title={batch.branch}>{batch.branch}</a>
-		<a href={actionsUrl(owner, name, batch.branch)} target="_blank" rel="noopener" class="text-xs text-gray-500 hover:text-indigo-600" title="GitHub Actions runs of {batch.branch}">Actions</a>
-		<span class="ml-auto text-xs text-gray-400">{batch.finishedAt ? `took ${since(batch.createdAt, batch.finishedAt)}` : `running ${since(batch.createdAt, null)}`}</span>
-		{#if cancellable}
-			<form
-				method="POST"
-				action="/repos/{owner}/{name}?/cancelBatch"
-				use:enhance={({ cancel }) => {
-					if (!confirm(`Cancel batch ${batch.number}? Its CI stops and its PRs go back in line, blamed for nothing. Batches built on it are rebuilt.`)) cancel();
-				}}
-			>
-				<input type="hidden" name="batch_id" value={batch.id} />
-				<button type="submit" class="rounded px-1.5 py-0.5 text-xs text-gray-500 hover:bg-red-50 hover:text-red-700" aria-label="Cancel batch {batch.number}">Cancel</button>
-			</form>
-		{/if}
+{#snippet prRow(pr: Card['prs'][number])}
+	<li class="flex min-w-0 items-center gap-2" style="padding-left: {pr.depth}rem">
+					{#if pr.depth > 0}<span class="text-gray-300" aria-hidden="true">└</span>{/if}
+					{#if bisecting}<span class="h-1.5 w-1.5 shrink-0 rounded-full {SEG[segOf(pr)].cls}" title={SEG[segOf(pr)].label} aria-label={SEG[segOf(pr)].label}></span>{/if}
+					<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{pr.pr}</a>
+					<span class="min-w-0 truncate text-gray-800" title={pr.trail || pr.title}>{pr.title}</span>
+					{#if pr.link && pr.link !== 'healthy'}<span class="shrink-0 rounded bg-amber-50 px-1.5 text-[11px] text-amber-800">{pr.link}</span>{/if}
+				</li>
+{/snippet}
+
+{#snippet jobsBar(pr: NonNullable<Card['progress']>, small: boolean)}
+	<div class="flex overflow-hidden rounded-full bg-gray-100 {small ? 'h-1 w-16 shrink-0' : 'h-1.5'}" role="progressbar" aria-valuenow={pr.done} aria-valuemax={pr.total} aria-label="CI jobs finished">
+		<div class="bg-green-500" style="width: {pct(pr.done - pr.failed, pr.total)}%"></div>
+		<div class="bg-red-500" style="width: {pct(pr.failed, pr.total)}%"></div>
+		<div class="bg-sky-300" style="width: {pct(pr.running, pr.total)}%"></div>
 	</div>
+{/snippet}
 
-
-	{#if note}<p class="mt-1 text-xs text-gray-500">{note}</p>{/if}
-	{#if p}
-		<div class="mt-2">
-			<div class="flex h-2 overflow-hidden rounded-full bg-gray-100" role="progressbar" aria-valuenow={p.done} aria-valuemax={p.total} aria-label="CI jobs finished">
-				<div class="bg-green-500" style="width: {pct(p.done - p.failed)}%"></div>
-				<div class="bg-red-500" style="width: {pct(p.failed)}%"></div>
-				<div class="animate-pulse bg-amber-400" style="width: {pct(p.running)}%"></div>
-			</div>
-			<div class="mt-1 flex flex-wrap gap-x-3 text-xs text-gray-500">
-				<span>{p.done}/{p.total} jobs done</span>
-				{#if p.running > 0}<span>{p.running} running</span>{/if}
-				{#if p.total - p.done - p.running > 0}<span>{p.total - p.done - p.running} waiting for a runner</span>{/if}
-				{#if p.failed > 0}<span class="text-red-600">failed: {p.failedJobs.join(', ')}</span>{/if}
-				{#if p.url}<a href={p.url} target="_blank" rel="noopener" class="hover:text-indigo-600">open CI</a>{/if}
-			</div>
-		</div>
-		{#if progressError}<p class="mt-1 text-xs text-red-600">Last known progress; reading it now failed: {progressError}</p>{/if}
-	{:else if batch.status === 'testing' && !batch.finishedAt}
-		<p class="mt-2 text-xs {progressError ? 'text-red-600' : 'text-gray-500'}">{progressError ? `Could not read CI progress: ${progressError}` : 'No CI run found for it yet.'}</p>
-	{/if}
-
-	{#if batch.context.length > 0}
-		<p class="mt-2 text-xs text-gray-500">On top of {prList(batch.context)}, which passed</p>
-	{/if}
-
-	{#if verdictCounts.length}
-		<p class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-600">
-			{#each verdictCounts as [v, c] (v)}
-				<span class="inline-flex items-center gap-1"
-					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full text-[10px] leading-none {VERDICT[v].cls}" aria-hidden="true">{VERDICT[v].icon}</span
-					><span class="font-semibold">{c}</span> {VERDICT[v].label}</span
-				>
-			{/each}
-			{#if activityCounts.length}<span class="text-gray-300" aria-hidden="true">|</span>{/if}
-			{#each activityCounts as [a, c] (a)}
-				<span class="inline-flex items-center gap-1"
-					><span class="inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-100 text-[10px] leading-none text-gray-500 {ACTIVITY[a].cls}" aria-hidden="true"></span
-					><span class="font-semibold">{c}</span> {ACTIVITY[a].label}</span
-				>
-			{/each}
-		</p>
-	{/if}
-
-	<ul class="mt-2 space-y-1 text-sm">
-		{#each batch.prs as pr, i (pr.pr)}
-			{#if pr.settled && !batch.prs[i - 1]?.settled && i > 0}
-				<li class="pt-1 text-xs font-medium text-gray-400" aria-hidden="true">Settled: landed, ejected or back in line</li>
-			{/if}
-			<li class="flex min-w-0 items-center gap-2 {pr.settled ? 'opacity-60' : ''}" style="padding-left: {pr.depth * 1.25}rem">
-				{#if pr.depth > 0}<span class="text-gray-400" aria-hidden="true">└</span>{/if}
-				{#if pr.verdict}
-					{@const label = [VERDICT[pr.verdict].label, pr.activity ? ACTIVITY[pr.activity].label : null].filter(Boolean).join(', ')}
-					<span
-						class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] leading-none {VERDICT[pr.verdict].cls} {pr.activity ? ACTIVITY[pr.activity].cls : ''}"
-						title="{label}{pr.trail ? `\n${pr.trail}` : ': not in any run yet'}"
-						role="img"
-						aria-label={label}>{VERDICT[pr.verdict].icon}</span
-					>
-				{/if}
-				<a href={pr.url || `https://github.com/${owner}/${name}/pull/${pr.pr}`} target="_blank" rel="noopener" class="font-medium hover:text-indigo-600">#{pr.pr}</a>
-				<span class="min-w-0 truncate text-gray-600">{pr.title}</span>
-				{#if pr.parent !== null && pr.depth === 0}
-					<span class="shrink-0 text-xs text-gray-400">stacked on #{pr.parent}</span>
-				{/if}
-				{#if pr.link && pr.link !== 'healthy'}
-					<span class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">{pr.link}</span>
-				{/if}
-			</li>
-		{/each}
-	</ul>
-
-	{#if batch.bisection.length > 0}
-		<details class="mt-3">
-			<summary class="cursor-pointer text-xs text-gray-500 hover:text-gray-700">
-				{batch.bisection.length} bisection run{batch.bisection.length === 1 ? '' : 's'}{runningRuns ? `, ${runningRuns} going` : ''}
+<article id="batch-{batch.id}" class="scroll-mt-4 rounded-xl border border-border-subtle bg-surface-raised p-3 shadow-sm sm:p-4">
+	<header class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+		<span class="h-2 w-2 shrink-0 rounded-full {DOT[status] ?? 'bg-gray-300'} {live ? 'motion-safe:animate-pulse' : ''}" aria-hidden="true"></span>
+		<h3 class="shrink-0 text-sm font-semibold text-gray-900">{title}</h3>
+		{#if batch.kind === 'batch'}<span class="hidden shrink-0 text-xs text-gray-500 sm:inline">{batch.prs.length} PR{batch.prs.length === 1 ? '' : 's'}</span>{/if}
+		<span class="min-w-0 truncate"><StatusChip {status} label={status === 'passed' && batch.kind === 'batch' ? 'passed, landing' : null} /></span>
+		<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-500" title="Started {batch.createdAt} UTC">{fmt(stats.elapsedMs)}</span>
+		<details class="relative shrink-0" use:dismiss>
+			<summary class="flex h-9 w-9 cursor-pointer list-none items-center justify-center rounded-md text-gray-500 hover:bg-surface-sunken hover:text-gray-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 sm:h-7 sm:w-7 [&::-webkit-details-marker]:hidden" aria-label="Actions for {title}">
+				<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>
 			</summary>
-			<div class="mt-2 space-y-2 border-l-2 border-orange-200 pl-3">
-				{#each batch.bisection as run, i (run.id)}
-					<BatchCard batch={run} {owner} {name} nested step={i + 1} {progressErrors} {stopsEarly} />
-				{/each}
+			<div class="absolute right-0 z-10 mt-1 w-52 overflow-hidden rounded-lg border border-border-subtle bg-surface-raised py-1 text-sm shadow-lg">
+				<a href={actionsUrl(owner, name, batch.branch)} target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">GitHub Actions runs</a>
+				{#if p?.url}<a href={p.url} target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">{p.failed ? 'Open the failed job' : 'Open a running job'}</a>{/if}
+				<a href="https://github.com/{owner}/{name}/commit/{batch.headSha}" target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">Commit <span class="font-mono text-xs text-gray-500">{batch.headSha.slice(0, 7)}</span></a>
+				{#if cancellable}
+					<form
+						method="POST"
+						action="/repos/{owner}/{name}?/cancelBatch"
+						use:enhance={({ cancel }) => {
+							if (!confirm(`Cancel batch ${batch.number}? Its CI stops and its PRs go back in line, blamed for nothing. Batches built on it are rebuilt.`)) cancel();
+						}}
+						class="border-t border-border-subtle"
+					>
+						<input type="hidden" name="batch_id" value={batch.id} />
+						<button type="submit" class="block w-full px-3 py-1.5 text-left text-red-700 hover:bg-red-50">Cancel batch</button>
+					</form>
+				{/if}
 			</div>
 		</details>
+	</header>
+
+	<!-- Statistics: the jobs of its CI, or how far its bisection has got. -->
+	{#if bisecting}
+		<div class="mt-2.5">
+			<div class="flex h-1.5 gap-px overflow-hidden rounded-full" role="img" aria-label="{segCount('cleared')} cleared, {segCount('checking')} in a step, {segCount('suspect')} suspect, {segCount('failing')} failing">
+				{#each segs as s (s.pr)}<div class="flex-1 {SEG[s.seg].cls}" title="#{s.pr}: {SEG[s.seg].label}"></div>{/each}
+			</div>
+			<p class="mt-1 flex flex-wrap gap-x-3 text-xs text-gray-500">
+				{#each ['cleared', 'checking', 'suspect', 'failing'] as k (k)}
+					{#if segCount(k)}<span class="inline-flex items-center gap-1"><span class="h-1.5 w-1.5 rounded-full {SEG[k].cls}" aria-hidden="true"></span><span class="font-medium tabular-nums text-gray-800">{segCount(k)}</span> {SEG[k].label}</span>{/if}
+				{/each}
+				<span><span class="font-medium tabular-nums text-gray-800">{stats.runs?.total}</span> step{stats.runs?.total === 1 ? '' : 's'}</span>
+			</p>
+		</div>
+	{:else if p && stats.jobs}
+		<div class="mt-2.5">
+			{@render jobsBar(p, false)}
+			<p class="mt-1 flex flex-wrap gap-x-3 text-xs text-gray-500">
+				<span><span class="font-medium tabular-nums text-gray-800">{stats.jobs.done}/{stats.jobs.total}</span> jobs</span>
+				{#if stats.jobs.running}<span><span class="font-medium tabular-nums text-gray-800">{stats.jobs.running}</span> running</span>{/if}
+				{#if stats.jobs.waiting}<span><span class="font-medium tabular-nums text-gray-800">{stats.jobs.waiting}</span> waiting for a runner</span>{/if}
+				{#if stats.jobs.failed}<span class="text-red-700"><span class="font-medium tabular-nums">{stats.jobs.failed}</span> failed{batch.kind !== 'batch' ? `: ${p.failedJobs.join(', ')}` : ''}</span>{/if}
+			</p>
+		</div>
+		{#if progressError}<p class="mt-1 text-xs text-gray-500" title={progressError}>Last known progress; reading it now failed: {progressError}</p>{/if}
+	{:else if progressError}
+		<p class="mt-2 text-xs text-gray-500" title={progressError}>Could not read CI progress: {progressError}</p>
+	{:else if waiting}
+		<p class="mt-2 text-xs text-gray-500">Waiting for its CI to start.</p>
 	{/if}
-</div>
+	{#if note}<p class="mt-1.5 text-xs text-gray-600">{note}</p>{/if}
+
+	<!-- What runs inside the batch now: preparation first, then each step still going, one row each. -->
+	{#if prep.length > 0 || stats.running.length > 0}
+		<div class="mt-3 divide-y divide-border-subtle overflow-hidden rounded-lg bg-surface-sunken/60">
+			{#each prep as slot (slot.key)}
+				<PrepCard {slot} inWell />
+			{/each}
+			{#each stats.running as run (run.id)}
+				{@const rs = runStatus(run)}
+				<div class="flex min-w-0 items-center gap-2 px-3 py-2 text-sm">
+					<span class="h-1.5 w-1.5 shrink-0 rounded-full {rs === 'failing' ? 'bg-red-500' : 'bg-sky-500'}" aria-hidden="true"></span>
+					<a href={actionsUrl(owner, name, run.branch)} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600" title="GitHub Actions runs of {run.branch}">Step {stepNo(run)}</a>
+					<span class="min-w-0 truncate font-mono text-xs text-gray-500" title={run.prs.map((x) => `#${x.pr}`).join(' ')}>{run.prs.length === 1 ? `#${run.prs[0].pr} alone` : run.prs.map((x) => `#${x.pr}`).join(' ')}</span>
+					{#if rs === 'failing'}<StatusChip status="failing" />{/if}
+					<span class="ml-auto flex shrink-0 items-center gap-2">
+						{#if run.progress}<span class="hidden sm:flex">{@render jobsBar(run.progress, true)}</span><span class="w-11 text-right text-xs tabular-nums text-gray-500">{run.progress.done}/{run.progress.total}</span>{/if}
+						<span class="hidden w-12 text-right text-xs tabular-nums text-gray-500 sm:inline">{fmt(batchStats(run, now).elapsedMs)}</span>
+					</span>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
+	{#if batch.kind === 'batch'}
+		{#if batch.context.length > 0}<p class="mt-2 text-xs text-gray-500">On top of {batch.context.map((n) => `#${n}`).join(' ')}, which passed</p>{/if}
+		<ul class="mt-2.5 space-y-0.5 text-[13px]">
+			{#each open.slice(0, MAX_PRS) as pr (pr.pr)}{@render prRow(pr)}{/each}
+		</ul>
+		{#if open.length > MAX_PRS}
+			<details class="mt-1">
+				<summary class="cursor-pointer select-none text-xs text-gray-500 hover:text-gray-800">+{open.length - MAX_PRS} more</summary>
+				<ul class="mt-0.5 space-y-0.5 text-[13px]">
+					{#each open.slice(MAX_PRS) as pr (pr.pr)}{@render prRow(pr)}{/each}
+				</ul>
+			</details>
+		{/if}
+		{#if folded.length > 0 || finished.length > 0}
+			<details class="mt-2 text-xs text-gray-500">
+				<summary class="cursor-pointer select-none hover:text-gray-800">
+					{[folded.length ? `${folded.length} settled` : '', finished.length ? `${finished.length} finished step${finished.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')}
+				</summary>
+				<ul class="mt-1.5 space-y-0.5">
+					{#each folded as pr (pr.pr)}
+						<li class="flex min-w-0 items-center gap-2">
+							<span class="h-1.5 w-1.5 shrink-0 rounded-full {SEG[segOf(pr)].cls}" aria-hidden="true"></span>
+							<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="shrink-0 font-mono hover:text-indigo-600">#{pr.pr}</a>
+							<span class="min-w-0 truncate">{pr.title}</span>
+							<span class="ml-auto shrink-0">{pr.activity === 'landed' ? 'landed' : pr.activity === 'left' ? 'back in line' : pr.verdict === 'failing' ? 'failing' : 'cleared'}</span>
+						</li>
+					{/each}
+					{#each finished as run (run.id)}
+						<li class="flex min-w-0 items-center gap-2">
+							<span class="shrink-0">Step {stepNo(run)}</span>
+							<span class="min-w-0 truncate font-mono">{run.prs.map((x) => `#${x.pr}`).join(' ')}</span>
+							<span class="ml-auto shrink-0"><StatusChip status={runStatus(run) === 'landed' ? 'passed' : runStatus(run)} /></span>
+						</li>
+					{/each}
+				</ul>
+			</details>
+		{/if}
+	{/if}
+</article>

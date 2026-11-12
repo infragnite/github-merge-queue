@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
 import { RateLimitedError } from './rate-limit';
+import { HeadMovedError, leaseLost } from './head-moved';
 import { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } from './batch-builder';
 import { replay } from './rebase';
 import { gitConfigEnv, mergeDriverEnv, requireGitVersion } from './merge-drivers';
@@ -97,6 +98,36 @@ export function earlyFailure(
 			(!feeds || (j.name !== undefined && feeds(j.name))) &&
 			(!notBefore || !j.completed_at || Date.parse(j.completed_at) >= notBefore)
 	);
+}
+
+/**
+ * Whether a CI run is stuck rather than failing (see `QueueCI.stalled`). `hung`: a job has been
+ * running (on a runner, not waiting for one) longer than `hangMs`. `interrupted`: every job ended,
+ * some cancelled or timed out, none failed. Only jobs of the CI workflow's runs (`suites`, when
+ * known) that the gate waits for (`feeds`, when known) count, and none that finished before
+ * `notBefore` (a re-run's start) or started before it.
+ */
+export function stalledRun(
+	jobs: Array<{ name?: string; status: string; conclusion: string | null; started_at?: string | null; completed_at?: string | null; check_suite?: { id: number } }>,
+	opts: { now: number; hangMs: number; notBefore?: number | null; suites?: ReadonlySet<number>; feeds?: (name: string) => boolean }
+): 'hung' | 'interrupted' | null {
+	const since = (t: string | null | undefined) => (t ? Date.parse(t) : null);
+	const current = jobs.filter((j) => {
+		if (opts.suites && !(j.check_suite && opts.suites.has(j.check_suite.id))) return false;
+		if (opts.feeds && !(j.name !== undefined && opts.feeds(j.name))) return false;
+		if (!opts.notBefore) return true;
+		const end = since(j.completed_at);
+		const start = since(j.started_at);
+		return j.status === 'completed' ? end === null || end >= opts.notBefore : start === null || start >= opts.notBefore;
+	});
+	const hung = current.some((j) => {
+		const start = since(j.started_at);
+		return j.status === 'in_progress' && start !== null && opts.now - start > opts.hangMs;
+	});
+	if (hung) return 'hung';
+	if (current.length === 0 || current.some((j) => j.status !== 'completed')) return null;
+	if (current.some((j) => j.conclusion === 'failure')) return null;
+	return current.some((j) => j.conclusion === 'cancelled' || j.conclusion === 'timed_out') ? 'interrupted' : null;
 }
 
 /**
@@ -211,22 +242,36 @@ export class Mirror {
 		]);
 	}
 
-	/** Force-pushes `sha` to `branch` only if the branch is still at `expected`. */
+	/**
+	 * Force-pushes `sha` to `branch` only if the branch is still at `expected`; a
+	 * `HeadMovedError` when it is not (the author pushed first).
+	 */
 	async pushLease(branch: string, sha: string, expected: string) {
-		await this.network(`push ${sha.slice(0, 8)} to ${branch} (lease ${expected.slice(0, 8)})`, [
-			'push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`
-		]);
+		await this.network(
+			`push ${sha.slice(0, 8)} to ${branch} (lease ${expected.slice(0, 8)})`,
+			['push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`],
+			(message) => (leaseLost(message) ? new HeadMovedError(branch, expected) : null)
+		);
 	}
 
-	/** Runs a fetch or push off the event loop, logging what it did and how long it took. */
-	private async network(what: string, args: string[]) {
+	/**
+	 * Runs a fetch or push off the event loop, logging what it did and how long it took. `expected`
+	 * turns a failure that is an outcome, not an error, into its own error, logged as information.
+	 */
+	private async network(what: string, args: string[], expected: (message: string) => Error | null = () => null) {
 		const name = `${this.repo.owner}/${this.repo.name}`;
 		const started = Date.now();
 		try {
 			await this.plain.runAsync(args, { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
 			console.log(`[git] ${name}: ${what} took ${Date.now() - started} ms`);
 		} catch (err) {
-			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${err instanceof Error ? err.message : err}`);
+			const message = err instanceof Error ? err.message : String(err);
+			const outcome = expected(message);
+			if (outcome) {
+				console.log(`[git] ${name}: ${what} refused after ${Date.now() - started} ms: ${outcome.message}`);
+				throw outcome;
+			}
+			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${message}`);
 			throw err;
 		}
 	}
@@ -377,6 +422,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					: new Set((await github.workflowRunsForSha(owner, name, headSha)).filter((w) => w.path?.split('@')[0] === file).map((w) => w.check_suite_id));
 				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore, feeds, ciSuites) ? 'failure' : 'pending';
 			},
+			stalled: async (headSha, notBefore, hangMs) => {
+				const file = `.github/workflows/${ci().workflow}`;
+				const suites = new Set((await github.workflowRunsForSha(owner, name, headSha)).filter((w) => w.path?.split('@')[0] === file).map((w) => w.check_suite_id));
+				const jobs = await github.actionsJobsForSha(owner, name, headSha);
+				return stalledRun(jobs, { now: Date.now(), hangMs, notBefore, suites: suites.size ? suites : undefined, feeds: gateAt(headSha) ?? undefined });
+			},
 			cancel: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);
 				for (const r of runs.filter((r) => r.status !== 'completed')) await github.cancelWorkflowRun(owner, name, r.id);
@@ -420,7 +471,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					authorLogin: p.user?.login ?? '',
 					baseRef: p.base.ref,
 					state: 'open' as const,
-					merged: false
+					merged: false,
+					body: p.body ?? null
 				})),
 			pr: async (n): Promise<LivePR> => {
 				const p = await github.getPR(owner, name, n);
@@ -435,7 +487,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					authorLogin: p.user?.login ?? '',
 					baseRef: p.base.ref,
 					state: p.state,
-					merged: !!p.merged
+					merged: !!p.merged,
+					body: p.body ?? null
 				};
 			},
 			readiness: async (n, headSha, author, opts): Promise<Readiness> => {

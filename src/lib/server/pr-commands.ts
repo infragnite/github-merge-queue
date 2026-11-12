@@ -207,7 +207,7 @@ async function perform(repo: Repo, deps: CommandDeps, n: number, caller: Caller,
 				if (e instanceof Error && /is not open|does not apply|comes from a fork/.test(e.message)) throw new Refused(e.message);
 				throw e;
 			}
-			return `Started a try run on top of \`${repo.default_branch}\`, on branch \`${run.branch}\`. Its CI shows on that branch; nothing is merged.`;
+			return `Started a try run on top of \`${repo.default_branch}\`, on branch \`${run.branch}\`. Its CI shows on that branch; nothing is merged. If it passes and neither this PR nor \`${repo.default_branch}\` changes, \`/mq queue\` lands it without another run.`;
 		}
 	}
 }
@@ -288,7 +288,10 @@ function actionLine(a: api.NextAction): string {
 		case 'wait-for':
 			return head(`Wait for #${a.pr}. ${a.why}`);
 		case 'queue':
+		case 'queue-dependency':
 			return head(`Queue #${a.pr} (comment \`/mq queue\` on it). ${a.why}`);
+		case 'edit-dependencies':
+			return head(`Fix or remove that \`Depends-On:\` line in the description. ${a.why}`);
 		case 'mark-ready':
 			return head(`Mark it ready for review. ${a.why}`);
 		case 'fix':
@@ -304,7 +307,7 @@ const HELP = [
 	'| `/mq queue [--priority low\\|normal\\|urgent]` | Queue this PR. Its parents are not queued with it. | write (urgent: maintain) |',
 	'| `/mq dequeue` | Take it out of the queue, unless a batch is testing it | write |',
 	'| `/mq retry` | Queue it again after the queue removed it on a failure | write |',
-	'| `/mq try` | One CI run of it on top of the default branch; nothing is merged | write |',
+	'| `/mq try` | One CI run of it on top of the default branch; nothing is merged, and a pass lets `/mq queue` land it without another run while neither changes | write |',
 	'| `/mq status` | Where it stands, what holds it, and what to do | read |',
 	'| `/mq help` | This list | read |'
 ].join('\n');

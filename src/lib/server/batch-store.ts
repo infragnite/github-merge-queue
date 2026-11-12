@@ -79,6 +79,8 @@ export interface BatchStep {
 	parent?: number | null;
 	/** The default branch commit whose attributes picked the merge drivers for this step (unset in older rows). */
 	attrs?: string;
+	/** The PRs it declared it depends on (`Depends-On:`) when it was batched, if any. */
+	deps?: number[];
 }
 
 export const PR_REPORTS = ['check-run', 'status', 'both'] as const;
@@ -152,6 +154,7 @@ export function migrateBatches(database: Database.Database) {
 			finished_at TEXT
 		);
 		CREATE INDEX IF NOT EXISTS batches_repo_status ON batches(repo_id, status);
+		CREATE INDEX IF NOT EXISTS batches_repo_kind_base ON batches(repo_id, kind, base_tree);
 
 		-- What each queue-started CI run cost, read from its Actions jobs once it is over:
 		-- job_ms is the jobs' summed run time (every attempt), wall_ms first start to last finish.
@@ -304,6 +307,7 @@ export function migrateBatches(database: Database.Database) {
 	add('priority', `TEXT NOT NULL DEFAULT 'normal'`);
 	// PRs this one conflicts with in a batch; it waits until they have left the queue.
 	add('deferred_for', `TEXT`);
+	add('depends_on', `TEXT`);
 	// Batches this PR failed in without being found the culprit (flaky or unclear failures).
 	add('batch_failures', `INTEGER NOT NULL DEFAULT 0`);
 	// Why the planner holds this queued PR back: { code, wait, reason } (see setHold).
@@ -413,11 +417,13 @@ export function insertBatch(b: {
 	steps?: Record<number, BatchStep>;
 	context?: number[];
 	express?: boolean;
+	/** Recorded already decided (a batch landing on a try's pass): its CI is that try's. */
+	passed?: boolean;
 }): BatchRow {
 	const r = getDb()
 		.prepare(
-			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number, settings)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number, status, ci_result, settings)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 		.run(
 			b.repoId,
@@ -436,6 +442,8 @@ export function insertBatch(b: {
 			b.kind === 'batch'
 				? (getDb().prepare(`SELECT COALESCE(MAX(number), 0) + 1 AS n FROM batches WHERE repo_id = ? AND kind = 'batch'`).get(b.repoId) as { n: number }).n
 				: null,
+			b.passed ? 'passed' : 'testing',
+			b.passed ? 'success' : 'pending',
 			snapshot(b.repoId)
 		);
 	return getBatch(Number(r.lastInsertRowid))!;
@@ -589,6 +597,21 @@ export function setDeferredFor(itemId: number, prs: number[] | null) {
 		.run(prs && prs.length ? JSON.stringify(prs) : null, itemId);
 }
 
+/** The open PRs a queued PR declares it depends on, as the planner last read its description. */
+export function setDependsOn(itemId: number, prs: number[] | null) {
+	getDb()
+		.prepare('UPDATE queue_items SET depends_on = ? WHERE id = ?')
+		.run(prs && prs.length ? JSON.stringify(prs) : null, itemId);
+}
+
+export function dependsOn(item: { depends_on?: string | null }): number[] {
+	try {
+		return item.depends_on ? (JSON.parse(item.depends_on) as number[]) : [];
+	} catch {
+		return [];
+	}
+}
+
 export function deferredFor(item: { deferred_for?: string | null }): number[] {
 	try {
 		return item.deferred_for ? (JSON.parse(item.deferred_for) as number[]) : [];
@@ -691,6 +714,19 @@ export function getRunningTries(repoId: number): BatchRow[] {
 			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status = 'testing' ORDER BY id`)
 			.all(repoId) as RawBatch[]
 	).map(parse);
+}
+
+/**
+ * The latest finished `try` run of `pr` at `headSha` on a default branch with tree `baseTree`, if
+ * any: whether its pass may stand in for a run of the queue's own (see `Tick.reusableTry`).
+ */
+export function latestTry(repoId: number, pr: number, headSha: string, baseTree: string): BatchRow | null {
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND base_tree = ? AND ci_result != 'pending' ORDER BY id DESC`)
+			.all(repoId, baseTree) as RawBatch[]
+	).map(parse);
+	return rows.find((r) => r.members.length === 1 && r.members[0] === pr && r.heads[pr] === headSha) ?? null;
 }
 
 // --- default-branch health ---

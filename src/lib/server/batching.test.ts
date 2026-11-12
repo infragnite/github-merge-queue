@@ -7,6 +7,7 @@ import {
 	DEFAULT_BATCH_CONFIG,
 	descendants,
 	splitPoint,
+	triedPrefix,
 	forkSplit,
 	type BatchConfig,
 	type PRState,
@@ -802,5 +803,70 @@ describe('never worse than one run per PR', () => {
 		const runs: BisectRun[] = [{ context: [], members: [1, 2, 3], baseTree: 'm0', result: 'failure' }];
 		const step = planBisection({ runs, remaining: [1, 2, 3], masterTree: 'm0', parentOf: (n) => (n > 1 ? n - 1 : null), slots: 1 });
 		expect(step.kind === 'step' && step.start).toEqual([[1]]);
+	});
+});
+
+describe('triedPrefix: the part of a batch a passed try already tested', () => {
+	const parents = (m: Record<number, number>) => (n: number) => m[n] ?? null;
+	const passedOnly = (...prs: number[]) => (n: number) => prs.includes(n);
+
+	test('a lone PR at the head of the batch, tried and passed', () => {
+		expect(triedPrefix([1, 2, 3], parents({}), passedOnly(1))).toEqual([1]);
+	});
+
+	test('the whole batch when it is that PR alone', () => {
+		expect(triedPrefix([1], parents({}), passedOnly(1))).toEqual([1]);
+	});
+
+	test('nothing when no PR in it passed a try', () => {
+		expect(triedPrefix([1, 2], parents({}), passedOnly())).toBeNull();
+	});
+
+	test('nothing for a tried PR behind another one: its try was not on top of it', () => {
+		expect(triedPrefix([1, 2, 3], parents({}), passedOnly(2))).toBeNull();
+		expect(triedPrefix([1, 2, 3], parents({}), passedOnly(3))).toBeNull();
+	});
+
+	test('a stack whose tip passed a try: the tip carries its parents, so the try tested them all', () => {
+		expect(triedPrefix([1, 2, 3, 4], parents({ 2: 1, 3: 2 }), passedOnly(3))).toEqual([1, 2, 3]);
+	});
+
+	test('never part of a stack: a tried parent with its child behind it in the batch', () => {
+		expect(triedPrefix([1, 2, 3], parents({ 2: 1 }), passedOnly(1))).toBeNull();
+		// deeper: the grandchild still sits on the prefix
+		expect(triedPrefix([1, 2, 3, 4], parents({ 2: 1, 3: 2 }), passedOnly(2))).toBeNull();
+	});
+
+	test('never a fork of a stack: a try of one branch did not test the other', () => {
+		// 1 <- 2 and 1 <- 3: the try of 2 left 3 out, the try of 3 left 2 out
+		expect(triedPrefix([1, 2, 3], parents({ 2: 1, 3: 1 }), passedOnly(2))).toBeNull();
+		expect(triedPrefix([1, 2, 3], parents({ 2: 1, 3: 1 }), passedOnly(3))).toBeNull();
+	});
+
+	test('never a prefix with a PR that is not the tried PR or its ancestor', () => {
+		// 1 and 2 unrelated, 2 tried: its try did not have 1 under it
+		expect(triedPrefix([1, 2], parents({}), passedOnly(2))).toBeNull();
+		// 1 <- 3 with 2 unrelated between them
+		expect(triedPrefix([1, 2, 3], parents({ 3: 1 }), passedOnly(3))).toBeNull();
+	});
+
+	test('never part of a unit joined by a declared dependency: a PR behind it in the batch depends on it', () => {
+		// 2 declares Depends-On: #1 (no shared commits): the try of 1 did not test 2, and the unit stays whole
+		const deps = (m: Record<number, number[]>) => (n: number) => m[n] ?? [];
+		expect(triedPrefix([1, 2], parents({}), passedOnly(1), deps({ 2: [1] }))).toBeNull();
+		// through a git child: 3 sits on 2, which declares 1
+		expect(triedPrefix([1, 2, 3], parents({ 3: 2 }), passedOnly(1), deps({ 2: [1], 3: [2] }))).toBeNull();
+		// a declaration on something before the prefix is fine: nothing behind depends on the prefix
+		expect(triedPrefix([1, 2], parents({}), passedOnly(1), deps({ 1: [9] }))).toEqual([1]);
+	});
+
+	test('a declared dependency is no git ancestor: the try of a PR that declares one did not test it', () => {
+		const deps = (m: Record<number, number[]>) => (n: number) => m[n] ?? [];
+		expect(triedPrefix([1, 2], parents({}), passedOnly(2), deps({ 2: [1] }))).toBeNull();
+	});
+
+	test('the first prefix that a try covers wins', () => {
+		expect(triedPrefix([1, 2], parents({}), passedOnly(1, 2))).toEqual([1]);
+		expect(triedPrefix([1, 2, 3], parents({ 2: 1 }), passedOnly(1, 2, 3))).toEqual([1, 2]);
 	});
 });

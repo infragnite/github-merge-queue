@@ -480,6 +480,12 @@ describe('/mq try', () => {
 		expect(deps.replies[0][1]).toMatch(/^Started a try run on top of `main`, on branch `mq\/try-4-1700000000000`/m);
 	});
 
+	test('the reply says a pass carries over to the queue while the default branch stays as it is', async () => {
+		batchMode();
+		await run('/mq try', 'dev', 4);
+		expect(deps.replies[0][1]).toMatch(/If it passes and neither this PR nor `main` changes, `\/mq queue` lands it without another run\./);
+	});
+
 	test('needs the queue in batch mode', async () => {
 		store.updateQueueSettings(repo.id, { mode: 'serial' });
 		expect(await run('/mq try', 'dev', 4)).toMatchObject({ ok: false });
@@ -588,6 +594,31 @@ describe('/mq status', () => {
 		expect(hidden(body).steps).toEqual([{ do: 'queue', pr: 1, why: expect.any(String) }]);
 		// The same id a hold notice gives for this hold.
 		expect(hidden(body).nextActions).toEqual(['queue-parent']);
+	});
+
+	test('a PR that declares a dependency nobody queued is told to queue it', async () => {
+		api.enqueue(repo, writer, pull(2), {});
+		store.setDependsOn(item(2)!.id, [1]);
+		const reason = "Depends on #1, which isn't queued";
+		db.updateQueueItemStatus(item(2)!.id, 'queued', reason);
+		store.setHold(item(2)!.id, { code: 'dependency-not-queued', reason });
+		await run('/mq status', 'rae', 2);
+		const body = deps.replies[0][1];
+		expect(body).toMatch(/Held \(`dependency-not-queued`\): Depends on #1, which isn't queued/);
+		expect(body).toMatch(/Queue #1 \(comment `\/mq queue` on it\)/);
+		expect(hidden(body).steps).toEqual([{ do: 'queue-dependency', pr: 1, why: expect.any(String) }]);
+		expect(hidden(body).nextActions).toEqual(['queue-dependency']);
+	});
+
+	test('a PR held for a Depends-On line is told to fix it', async () => {
+		api.enqueue(repo, writer, pull(2), {});
+		const reason = '`Depends-On: the cache PR` names no pull request';
+		db.updateQueueItemStatus(item(2)!.id, 'queued', reason);
+		store.setHold(item(2)!.id, { code: 'dependency-invalid', reason });
+		await run('/mq status', 'rae', 2);
+		const body = deps.replies[0][1];
+		expect(body).toMatch(/- `edit-dependencies`: Fix or remove that `Depends-On:` line in the description\. `Depends-On: the cache PR` names no pull request/);
+		expect(hidden(body).nextActions).toEqual(['edit-dependencies']);
 	});
 
 	test('the head the status was about is in the block, when the queue knows it', async () => {

@@ -26,6 +26,7 @@ import {
 	planBisection,
 	descendants,
 	planRedBatch,
+	triedPrefix,
 	type Hold,
 	type HoldCode,
 	type PRState,
@@ -38,9 +39,19 @@ import { ejectedNotice, holdCheck, holdNotice } from './hold-format';
 import type { BatchMember, BuildResult } from './batch-builder';
 import type { ReplayResult } from './rebase';
 import { restackCommand, type StackAnalysis } from './stacks';
+import { declaredDeps, dependencyGraph, parseDependsOn, type DependencyGraph, type DepRef, type DepTarget } from './deps';
 import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
+import { HeadMovedError } from './head-moved';
+import { failureAction } from './activity';
 import { emitEvent, heldPRs, type QueueEventKind } from './events';
+
+/** The error, and what to do about it when someone can (a pause reason must say what to do). */
+function withAction(call: string, e: unknown): string {
+	const message = e instanceof Error ? e.message : String(e);
+	const action = failureAction(call, e);
+	return action ? `${message}. ${action}` : message;
+}
 
 /** A PR as the queue sees it; `PRState`'s readiness fields come from `QueueGitHub.readiness`. */
 export interface LivePR {
@@ -56,6 +67,8 @@ export interface LivePR {
 	baseRef: string;
 	state: 'open' | 'closed';
 	merged: boolean;
+	/** Its description, where it declares what it depends on (`Depends-On:`). */
+	body?: string | null;
 }
 
 export type Readiness = Pick<PRState, 'ciGreen' | 'approvedShas' | 'changesRequested'>;
@@ -73,7 +86,7 @@ export interface QueueGitHub {
 	readiness(n: number, headSha: string, author: string, opts?: { needApprovals?: boolean; fresh?: boolean }): Promise<Readiness>;
 	/** Creates or force-moves a queue branch to `sha` (the commit must be in the mirror). */
 	pushBranch(branch: string, sha: string): Promise<void>;
-	/** Moves a PR's head branch to `sha`, only if it still points at `expected`. */
+	/** Moves a PR's head branch to `sha`, only if it still points at `expected`; a `HeadMovedError` if not. */
 	pushHead(branch: string, sha: string, expected: string): Promise<void>;
 	/**
 	 * Whether a push to the head of a PR into the default branch keeps it mergeable without a new
@@ -133,6 +146,12 @@ export interface QueueCI {
 	result(headSha: string, notBefore?: number | null, opts?: { failFast?: boolean }): Promise<'pending' | 'success' | 'failure'>;
 	/** Cancels workflow runs still going on `headSha` (a superseded batch). */
 	cancel(headSha: string): Promise<void>;
+	/**
+	 * Whether the CI run on `headSha` is stuck rather than failing: `hung` while a job has run longer
+	 * than `hangMs`; `interrupted` once it ended with jobs cancelled or timed out and none failed.
+	 * Jobs of an attempt before `notBefore` (a re-run's start) don't count.
+	 */
+	stalled(headSha: string, notBefore: number | null | undefined, hangMs: number): Promise<'hung' | 'interrupted' | null>;
 	/** Re-runs only the failed jobs; false when there is nothing to re-run. */
 	rerunFailed(headSha: string): Promise<RerunResult>;
 	/** A link to the required check's run on `headSha` (a failed job first), once it exists. */
@@ -204,13 +223,22 @@ function sqliteMs(ts: string): number {
 	return Date.parse(ts.includes('T') ? ts : `${ts.replace(' ', 'T')}Z`);
 }
 
+/** Dependencies seen merged (`repo#pr`): a merge is final. */
+const MERGED = new Set<string>();
+/** Dependencies seen closed or missing (`repo#pr`), asked again only after a while: a reopen is rare. */
+const SETTLED = new Map<string, { state: 'closed' | 'missing'; at: number }>();
+const SETTLED_TTL_MS = 5 * 60_000;
+
 class Tick {
 	private readonly prs = new Map<number, LivePR>();
 	/** This tick's list of open PRs, read once (null: not read yet, or stale after a landing). */
 	private open: Map<number, LivePR> | null = null;
 	private readonly ready = new Map<string, Readiness>();
 	private analysisCache: StackAnalysis | null = null;
+	private depsCache: DependencyGraph | null = null;
 	private pushable: Promise<boolean> | null = null;
+	/** PRs pushed to while this tick restacked them: what it read of them is out of date, so it tells them nothing. */
+	private readonly movedThisTick = new Set<number>();
 
 	constructor(private readonly d: QueueDeps) {}
 
@@ -239,6 +267,7 @@ class Tick {
 	forgetPRs() {
 		this.prs.clear();
 		this.open = null;
+		this.depsCache = null;
 	}
 
 	/**
@@ -343,6 +372,69 @@ class Tick {
 		store.updateQueueSettings(this.repoId, { pausedReason: reason });
 		this.event(null, 'paused', { reason });
 		this.log(reason);
+	}
+
+	/**
+	 * What each queued PR depends on: its git parent and the open PRs its description declares
+	 * (`Depends-On:`), with the declarations' problems and cycles. Recorded on each queue item, so the
+	 * queue page and the agent API show them without asking GitHub.
+	 */
+	async dependencies(): Promise<DependencyGraph> {
+		if (this.depsCache) return this.depsCache;
+		const analysis = await this.analysis();
+		const refs = new Map<number, DepRef[]>();
+		const items = this.items();
+		for (const it of items) {
+			const p = await this.pr(it.pr_number).catch((e) => {
+				// A queued PR deleted meanwhile has no description; anything else is a real failure.
+				if ((e as { status?: number })?.status === 404) return null;
+				throw e;
+			});
+			const r = parseDependsOn(p?.body, this.d.repo);
+			if (r.length) refs.set(it.pr_number, r);
+		}
+		const targets = new Map<number, DepTarget>();
+		for (const n of new Set([...refs.values()].flat().flatMap((r) => (r.kind === 'pr' ? [r.pr] : [])))) {
+			// A merged PR stays merged: asked once, not on every tick while its dependents wait.
+			const key = `${this.repoId}#${n}`;
+			if (MERGED.has(key)) {
+				targets.set(n, { state: 'merged' });
+				continue;
+			}
+			const settled = SETTLED.get(key);
+			if (settled && this.d.now() - settled.at < SETTLED_TTL_MS) {
+				targets.set(n, { state: settled.state });
+				continue;
+			}
+			const p = await this.pr(n).catch((e) => {
+				if ((e as { status?: number })?.status === 404) return null;
+				throw e;
+			});
+			const state = !p ? 'missing' : p.state === 'open' ? 'open' : p.merged ? 'merged' : 'closed';
+			targets.set(n, { state });
+			if (state === 'closed' || state === 'missing') {
+				if (SETTLED.size >= 5000) SETTLED.clear();
+				SETTLED.set(key, { state, at: this.d.now() });
+			} else SETTLED.delete(key);
+			if (p?.merged) {
+				if (MERGED.size >= 5000) MERGED.clear();
+				MERGED.add(key);
+			}
+		}
+		const declared = declaredDeps(refs, (n) => targets.get(n) ?? { state: 'missing' });
+		const gitParent = (n: number) => analysis.prs.get(n)?.parent ?? null;
+		for (const it of items) {
+			// What the description adds to the stack: the git parent is shown as a stack already.
+			const now = (declared.on.get(it.pr_number) ?? []).filter((p) => p !== gitParent(it.pr_number));
+			if (JSON.stringify(now) !== JSON.stringify(store.dependsOn(it as QueueItem & { depends_on?: string | null }))) store.setDependsOn(it.id, now);
+		}
+		this.depsCache = dependencyGraph(analysis, declared);
+		return this.depsCache;
+	}
+
+	/** Everything each PR must land after: its git parent, then what it declares. */
+	async depsOf(): Promise<(n: number) => number[]> {
+		return (await this.dependencies()).depsOf;
 	}
 
 	async parentOf(): Promise<(n: number) => number | null> {
@@ -566,8 +658,9 @@ class Tick {
 		prs: number[],
 		below: number[],
 		express: boolean,
-		masterSha: string
-	): Promise<'started' | 'conflict' | 'error'> {
+		masterSha: string,
+		reuse?: BatchRow
+	): Promise<'started' | 'conflict' | 'error' | 'stale'> {
 		const built = await this.build(baseSha, prs, below, masterSha);
 		if (!built) return 'conflict';
 		const { result, members } = built;
@@ -592,6 +685,15 @@ class Tick {
 			for (const n of empty) await this.eject(n, `#${n} has no changes left against ${this.d.repo.default_branch}`);
 			return 'conflict';
 		}
+		if (reuse) {
+			// The queue builds another tree than the try did (its merge drivers apply now, or no longer):
+			// the try's pass says nothing about it.
+			if (result.tree !== reuse.tree_sha) {
+				this.log(`#${prs.at(-1)} builds another tree than its try ${reuse.branch}; testing it again`);
+				return 'stale';
+			}
+			return this.recordBatch(baseSha, prs, express, masterSha, result, members, reuse);
+		}
 		const branch = `mq/batch-${this.d.now()}`;
 		store.intendBranch(this.repoId, branch, result.headSha);
 		try {
@@ -608,12 +710,34 @@ class Tick {
 				const held = await this.holdWorkflowChanges(baseSha, result.commits);
 				if (held) return 'conflict';
 			}
-			this.pause(`Could not start a batch of ${prs.map((n) => `#${n}`).join(' ')}: ${e instanceof Error ? e.message : e}`);
+			this.pause(`Could not start a batch of ${prs.map((n) => `#${n}`).join(' ')}: ${withAction('pushBranch', e)}`);
 			return 'error';
 		}
+		return this.recordBatch(baseSha, prs, express, masterSha, result, members, undefined, branch);
+	}
+
+	/**
+	 * Records a batch built on `baseSha`: pushed to `branch` with its CI started, or, with `reuse`,
+	 * already passed on that try's run (nothing is pushed; it lands next).
+	 */
+	async recordBatch(
+		baseSha: string,
+		prs: number[],
+		express: boolean,
+		masterSha: string,
+		result: Extract<BuildResult, { ok: true }>,
+		members: BatchMember[],
+		reuse?: BatchRow,
+		pushed?: string
+	): Promise<'started'> {
+		const branch = reuse ? reuse.branch : pushed!;
 		const steps: Record<number, BatchStep> = {};
 		const parentAt = await this.parentOf();
-		for (const c of result.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: parentAt(c.pr), attrs: masterSha };
+		const declaredAt = (await this.dependencies()).declaredOf;
+		for (const c of result.commits) {
+			const deps = declaredAt(c.pr);
+			steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: parentAt(c.pr), attrs: masterSha, deps };
+		}
 		const batch = store.insertBatch({
 			repoId: this.repoId,
 			kind: 'batch',
@@ -625,20 +749,23 @@ class Tick {
 			members: prs,
 			heads: Object.fromEntries(members.map((m) => [m.pr, m.headSha])),
 			steps,
-			express
+			express,
+			passed: !!reuse
 		});
-		store.branchPushed(this.repoId, branch);
+		if (!reuse) store.branchPushed(this.repoId, branch);
+		const title = reuse
+			? `Passed in ${branch} on this ${this.d.repo.default_branch}; lands without a new run`
+			: `Testing in ${branch} with ${prs.length - 1} other PR(s)`;
+		const url = reuse ? await this.runLink(reuse) : this.branchRuns(branch);
 		for (const n of prs) {
 			const it = this.item(n);
 			if (it) {
 				db.updateQueueItemStatus(it.id, 'checking');
-				this.event(n, 'batched', { batch: batch.id, branch, prs });
-				await this.d.github
-					.setPRCheck(batch.heads[n], { state: 'in_progress', title: short(`Testing in ${branch} with ${prs.length - 1} other PR(s)`), url: this.branchRuns(branch) })
-					.catch(this.bestEffort('github.setPRCheck'));
+				this.event(n, 'batched', { batch: batch.id, branch, prs, ...(reuse ? { reusedTry: reuse.id } : {}) });
+				await this.d.github.setPRCheck(batch.heads[n], { state: 'in_progress', title: short(title), url }).catch(this.bestEffort('github.setPRCheck'));
 			}
 		}
-		this.log(`batch ${batch.number} started: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
+		this.log(`batch ${batch.number} ${reuse ? `passed on try ${branch}` : 'started'}: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
 		return 'started';
 	}
 
@@ -680,15 +807,22 @@ class Tick {
 
 	/** The parent of each PR of the landing under way, inside or outside the group. */
 	parentAt: (n: number) => number | null = () => null;
+	/** What each PR of the landing under way declared it depends on when it was batched. */
+	declaredAt: (n: number) => number[] = () => [];
 
-	/** Adds `n` to `out`, with every PR of `prs` stacked on it (directly or not). */
+	/** Adds `n` to `out`, with every PR of `prs` stacked on it or depending on it (directly or not). */
 	skip(out: Set<number>, prs: number[], n: number) {
 		out.add(n);
-		for (const m of prs) {
-			for (let p = this.parentAt(m), seen = 0; p !== null && seen < prs.length; p = this.parentAt(p), seen++) {
-				if (out.has(p)) {
+		const needs = (m: number) => {
+			const p = this.parentAt(m);
+			return [...(p === null ? [] : [p]), ...this.declaredAt(m)];
+		};
+		for (let grew = true; grew; ) {
+			grew = false;
+			for (const m of prs) {
+				if (!out.has(m) && needs(m).some((p) => out.has(p))) {
 					out.add(m);
-					break;
+					grew = true;
 				}
 			}
 		}
@@ -713,6 +847,8 @@ class Tick {
 		const known = await this.parentOf();
 		// Older batches recorded no parents; their stacks come from what the queue knows now.
 		this.parentAt = (m) => (src.steps[m] && src.steps[m].parent !== undefined ? src.steps[m].parent! : known(m));
+		const declared = (await this.dependencies()).declaredOf;
+		this.declaredAt = (m) => src.steps[m]?.deps ?? batch.steps[m]?.deps ?? declared(m);
 		this.skipped = await this.notLandable(batch, prs, src);
 		const part = prs.filter((n) => !this.skipped.has(n));
 		if (!part.length) return false;
@@ -811,6 +947,16 @@ class Tick {
 	 * with its new head, with what is stacked on it; the rest still lands, and master is then
 	 * checked alone (it holds a tree no run tested).
 	 */
+	/**
+	 * The push that would land `n` as tested lost its lease: its author pushed after the queue read
+	 * `head`. Their push stands, and `n` goes back in line with it, as any PR changed while landing.
+	 */
+	async headMovedWhileLanding(batch: BatchRow, n: number, head: string, prs: number[], src: BatchRow) {
+		const now = await this.pr(n, true);
+		await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Changed while batch ${batch.number} was landing; back in line`) }).catch(this.bestEffort('github.setPRCheck'));
+		this.changedWhileLanding(batch, n, now, prs, src);
+	}
+
 	changedWhileLanding(batch: BatchRow, n: number, now: LivePR, prs: number[], src: BatchRow) {
 		this.skip(this.skipped, prs, n);
 		this.log(`#${n} ${now.state !== 'open' ? 'was closed' : 'was pushed to'} while batch ${batch.number} was landing; the rest lands without it`);
@@ -895,7 +1041,11 @@ class Tick {
 					await this.d.github.pushHead(p.headRef, r.head, head);
 				} catch (e) {
 					if (e instanceof RateLimitedError) throw e;
-					this.pause(`Could not push the restacked #${n}: ${e instanceof Error ? e.message : e}`);
+					if (e instanceof HeadMovedError) {
+						await this.headMovedWhileLanding(batch, n, head, prs, src);
+						continue;
+					}
+					this.pause(`Could not push the restacked #${n}: ${withAction('pushHead', e)}`);
 					return false;
 				}
 				store.recordRebasedHead(this.repoId, n, head, r.head, true);
@@ -923,7 +1073,11 @@ class Tick {
 					await this.d.github.pushHead(p.headRef, merge, head);
 				} catch (e) {
 					if (e instanceof RateLimitedError) throw e;
-					this.pause(`Could not push the merge of ${def} into #${n}: ${e instanceof Error ? e.message : e}`);
+					if (e instanceof HeadMovedError) {
+						await this.headMovedWhileLanding(batch, n, head, prs, src);
+						continue;
+					}
+					this.pause(`Could not push the merge of ${def} into #${n}: ${withAction('pushHead', e)}`);
 					return false;
 				}
 				store.recordRebasedHead(this.repoId, n, head, merge, true);
@@ -1027,12 +1181,41 @@ class Tick {
 	 */
 	async ciResult(b: BatchRow): Promise<'pending' | 'success' | 'failure'> {
 		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast: this.settings().config.stopOnFirstFailure });
+		if (r !== 'success' && (await this.stalled(b, r))) return 'pending';
 		if (r === 'failure' && this.failFast(b))
 			await this.d.ci.cancel(b.head_sha).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				this.bestEffort('ci.cancel')(e);
 			});
 		return r;
+	}
+
+	/**
+	 * A run that is stuck, not failing, is the runner's problem, not the PRs': a hung job's run is
+	 * cancelled, and a run that ended cancelled or timed out with no job failed runs its jobs again,
+	 * once per run, whatever `retryFailed` says. True while that keeps the run going (it is pending);
+	 * a run that already ran again is judged as it is, so a job that always hangs fails in the end.
+	 */
+	async stalled(b: BatchRow, r: 'pending' | 'failure'): Promise<boolean> {
+		const state = await this.d.ci.stalled(b.head_sha, b.retried_at, this.settings().config.jobHangMs);
+		if (state === 'hung' && r === 'pending') {
+			this.event(null, 'hung', { batch: b.id, number: b.number, branch: b.branch, again: b.retried_at !== null });
+			this.log(`${b.branch}: a job has run longer than ${Math.round(this.settings().config.jobHangMs / 60_000)} min; cancelling it${b.retried_at === null ? ' to run it again' : ''}`);
+			await this.d.ci.cancel(b.head_sha).catch((e) => {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('ci.cancel')(e);
+			});
+			return true;
+		}
+		if (state !== 'interrupted' || r !== 'failure' || b.retried_at !== null) return false;
+		const rerun = await this.d.ci.rerunFailed(b.head_sha);
+		if (rerun === 'none') return false;
+		if (rerun === 'rerun') {
+			store.setBatchStatus(b.id, 'retrying');
+			store.setBatchRetried(b.id, this.d.now());
+			this.log(`${b.branch} was cancelled or timed out with no job failed; running its jobs again`);
+		}
+		return true;
 	}
 
 	/** Re-runs a failed check's jobs once, unless the repo turned flake retries off. */
@@ -1211,13 +1394,22 @@ class Tick {
 		const keys = batch.members.map((n) => `${n}@${batch.heads[n]}`);
 		const seen = new Set(h.tried);
 		// A batch that is one PR with only its queued ancestors is that PR's try alone too.
-		const parentOf = await this.parentOf();
-		const onlyAncestors = (n: number) =>
-			batch.members.every((m) => {
-				if (m === n) return true;
-				for (let p = parentOf(n); p !== null; p = parentOf(p)) if (p === m) return true;
-				return false;
-			});
+		const depsOf = await this.depsOf();
+		const ancestors = (n: number) => {
+			const out = new Set<number>();
+			const todo = [...depsOf(n)];
+			while (todo.length) {
+				const p = todo.pop()!;
+				if (out.has(p)) continue;
+				out.add(p);
+				todo.push(...depsOf(p));
+			}
+			return out;
+		};
+		const onlyAncestors = (n: number) => {
+			const up = ancestors(n);
+			return batch.members.every((m) => m === n || up.has(m));
+		};
 		const tip = batch.members.find(onlyAncestors);
 		const again = batch.members.length === 1 || keys.every((k) => seen.has(k));
 		const alone = again ? keys : tip !== undefined ? [`${tip}@${batch.heads[tip]}`] : [];
@@ -1241,7 +1433,8 @@ class Tick {
 		const tree = active[0].base_tree;
 		if (this.masterState(tree) !== 'red' || active.some((b) => b.base_tree !== tree || b.status === 'bisecting')) return false;
 		for (const b of active) {
-			let r = await this.d.ci.result(b.head_sha, b.retried_at);
+			// A batch landing on a try's pass has no run of its own to read.
+			let r = b.status === 'passed' ? 'success' : await this.d.ci.result(b.head_sha, b.retried_at);
 			if (r === 'pending') {
 				if (!this.timedOut(b)) continue;
 				await this.d.ci.cancel(b.head_sha).catch(this.bestEffort('ci.cancel'));
@@ -1284,7 +1477,8 @@ class Tick {
 		return this.d.now() - store.batchCreatedMs(b) > this.settings().config.ciTimeoutMs;
 	}
 
-	async advanceHead(head: BatchRow, rest: BatchRow[], interleave = false) {
+	/** `startRuns`: a bisection may start its next step (not while an urgent batch runs beside it). */
+	async advanceHead(head: BatchRow, rest: BatchRow[], interleave = false, startRuns = true) {
 		if (head.status === 'testing' || head.status === 'retrying') {
 			const r = await this.ciResult(head);
 			if (r === 'pending') {
@@ -1347,7 +1541,7 @@ class Tick {
 			}
 			return;
 		}
-		if (head.status === 'bisecting') await this.bisect(head, interleave);
+		if (head.status === 'bisecting') await this.bisect(head, interleave, startRuns);
 	}
 
 	/**
@@ -1355,7 +1549,7 @@ class Tick {
 	 * branch lands at once, failing groups are split and run again on top of it. Everything is
 	 * planned from the recorded runs, so a restart picks it up where it was.
 	 */
-	async bisect(batch: BatchRow, interleave = false) {
+	async bisect(batch: BatchRow, interleave = false, startRuns = true) {
 		const runs = store.getBisectRuns(batch.id);
 		for (const run of runs) {
 			if (run.ci_result !== 'pending') continue;
@@ -1408,6 +1602,9 @@ class Tick {
 		}
 		// A run that never started (its push failed, or its PRs did not build on the new branch) shows nothing.
 		const all = [batch, ...runs.filter((r) => r.status !== 'cancelled')];
+		// What each PR was batched with, and anything declared since: never tested without either.
+		const depsNow = await this.depsOf();
+		const needsOf = (n: number) => [...new Set([...depsNow(n), ...(batch.steps[n]?.deps ?? [])])];
 		const plan = planBisection({
 			runs: all.map((r) => ({
 				context: r.context.filter((n) => !landed.has(n)),
@@ -1417,7 +1614,7 @@ class Tick {
 			})),
 			remaining,
 			masterTree,
-			parentOf: await this.parentOf(),
+			parentOf: needsOf,
 			// Known green: the base the batch failed on (its failure was only acted on once that was
 			// settled), every tree this bisection landed, and the current branch (ejecting waits for it to settle).
 			trusted: (t) => t === masterTree || t === (runs[0]?.base_tree ?? batch.base_tree) || runs.some((r) => r.status === 'landed' && r.tree_sha === t),
@@ -1456,6 +1653,16 @@ class Tick {
 			const out = await this.ejectWithStack(culprits);
 			// Children in the batch went with their parent: ejected too, not back in line.
 			store.leaveBatch(batch.id, out.filter((n) => batch.members.includes(n)), { ejected: true });
+			// PRs that only declared a dependency on one are not to blame: they go back in line,
+			// and wait there for it to be queued again.
+			const gone = new Set(out);
+			const needsGone = (n: number, seen = new Set<number>()): boolean =>
+				needsOf(n).some((p) => gone.has(p) || (!seen.has(p) && (seen.add(p), needsGone(p, seen))));
+			const dependents = remaining.filter((n) => !gone.has(n) && needsGone(n));
+			if (dependents.length) {
+				const ejectedList = [...gone].map((n) => `#${n}`).join(', ');
+				await this.leaveBisection(batch, dependents, `depends on ${ejectedList}, which failed in batch ${batch.number}`);
+			}
 		}
 		if (plan.requeue.length) {
 			store.leaveBatch(batch.id, plan.requeue);
@@ -1472,6 +1679,8 @@ class Tick {
 			this.log(`batch ${batch.number}: bisection waits for an urgent batch`);
 			return;
 		}
+		// An urgent batch runs beside it: the next step starts on whatever branch it leaves.
+		if (!startRuns && plan.start.length) return;
 		for (const g of plan.start) await this.startBisectRun(batch, { context: [], members: g }, runs.length, masterSha, masterTree);
 	}
 
@@ -1488,13 +1697,17 @@ class Tick {
 			const recorded = now.steps[n]?.parent;
 			return recorded !== undefined ? recorded : parentOf(n);
 		};
+		const declared = (await this.dependencies()).declaredOf;
+		const needs = (n: number) => {
+			const p = parent(n);
+			return [...(p === null ? [] : [p]), ...(now.steps[n]?.deps ?? declared(n))];
+		};
 		const open = now.members.filter((n) => !now.landed.includes(n) && !now.left_prs.includes(n));
 		const out = new Set(prs);
 		for (let grew = true; grew; ) {
 			grew = false;
 			for (const n of open) {
-				const p = parent(n);
-				if (!out.has(n) && p !== null && out.has(p)) {
+				if (!out.has(n) && needs(n).some((p) => out.has(p))) {
 					out.add(n);
 					grew = true;
 				}
@@ -1508,7 +1721,11 @@ class Tick {
 		for (const n of back) {
 			// A child went with the PR it is stacked on, which left for its own reason.
 			let root = n;
-			while (!prs.includes(root) && parent(root) !== null) root = parent(root)!;
+			for (let k = 0; !prs.includes(root) && k < open.length; k++) {
+				const next = needs(root).find((p) => out.has(p));
+				if (next === undefined) break;
+				root = next;
+			}
 			const reason = prs.includes(n) ? why : `went with #${root}, which left batch ${batch.number}`;
 			// A PR closed or deleted meanwhile isn't back in line: the queue drops it.
 			const p = await this.pr(n).catch((e) => {
@@ -1550,7 +1767,10 @@ class Tick {
 		}
 		const branch = `${batch.branch}-bisect-${seq + 1}-${this.d.now()}`;
 		const steps: Record<number, BatchStep> = {};
-		for (const c of r.commits) steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: batch.steps[c.pr]?.parent ?? parentOf(c.pr), attrs: baseSha };
+		for (const c of r.commits) {
+			const deps = batch.steps[c.pr]?.deps;
+			steps[c.pr] = { sha: c.sha, tree: c.tree, fork: c.fork, parent: batch.steps[c.pr]?.parent ?? parentOf(c.pr), attrs: baseSha, ...(deps ? { deps } : {}) };
+		}
 		const run = store.insertBatch({
 			repoId: this.repoId,
 			kind: 'bisect',
@@ -1648,7 +1868,13 @@ class Tick {
 			store.setBatchStatus(t.id, r === 'success' ? 'landed' : 'failed');
 			const n = t.members[0];
 			const desc = r === 'success' ? `Passed on ${this.d.repo.default_branch} in ${t.branch}` : `Failed on ${this.d.repo.default_branch} in ${t.branch}`;
-			await this.d.github.setPRCheck(t.heads[n], { state: r, title: short(desc), suffix: '/try', url: await this.runLink(t) }).catch(this.bestEffort('github.setPRCheck'));
+			const def = this.d.repo.default_branch;
+			// A pass stands in for the queue's own run while neither the PR nor the default branch changes (see `reusableTry`).
+			const summary =
+				r === 'success' ? `${desc}. \`/mq queue\` lands it ahead of every PR but urgent ones, without another run, while neither it nor \`${def}\` changes.` : undefined;
+			await this.d.github
+				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: await this.runLink(t) })
+				.catch(this.bestEffort('github.setPRCheck'));
 			await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
 			this.event(n, 'tried', { status: r, branch: t.branch, run: t.id, headSha: t.heads[n] });
 		}
@@ -1836,7 +2062,16 @@ class Tick {
 			try {
 				await this.d.github.pushHead(p.headRef, r.head, p.headSha);
 			} catch (e) {
-				this.log(`could not push restacked #${n}: ${e instanceof Error ? e.message : e}`);
+				// Pushed to since this tick read it (often the author restacking it too): their push
+				// stands, and the next tick restacks from the new head if it still needs it. The rest
+				// of the tick reads the stacks and PRs again, and tells this one nothing (a hold to
+				// restack itself would be about the head it no longer has).
+				if (e instanceof HeadMovedError) {
+					this.log(`#${n} was pushed to while the queue restacked it; the next tick reads its new head`);
+					this.movedThisTick.add(n);
+					this.analysisCache = null;
+					this.forgetPRs();
+				} else this.log(`could not push restacked #${n}: ${e instanceof Error ? e.message : e}`);
 				continue;
 			}
 			store.recordRebasedHead(this.repoId, n, p.headSha, r.head, before.ciGreen);
@@ -1918,6 +2153,7 @@ class Tick {
 		for (const it of this.items()) {
 			// A PR in conflict keeps its status and message: it is held for that, and was told.
 			if (it.status !== 'queued') continue;
+			if (this.movedThisTick.has(it.pr_number)) continue;
 			const was = store.currentHold(it);
 			// What it was last told, even if its message changed since (fewer PRs ahead of a deferral).
 			const stored = store.storedHold(it as QueueItem & { hold?: string | null });
@@ -2038,23 +2274,50 @@ class Tick {
 		if (red && opts.urgentOnly) return 'idle';
 		const analysis = await this.analysis();
 		let plan: Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express' | 'held'>;
+		/** Plans again without the try of `n`, when building its stack did not give the tree it tested. */
+		let without: (n: number) => Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express'> = () => plan;
 		if (red) {
 			// Siblings go only beside siblings: a stacked pipeline still in flight (built before the
 			// branch turned red) is decided first.
 			// (With `holdsOnly` nothing starts anyway; the plan still says what holds the PRs.)
 			if (!opts.holdsOnly && (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha))) return 'idle';
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
+			const dependencies = await this.dependencies();
 			plan = planRedBatch({
 				queue: queue.filter((e) => !deferred.has(e.pr) && !conflicted.has(e.pr)),
 				states,
 				analysis,
+				dependencies,
 				config: settings.config,
 				tried: (n, alone) => tried.has(`${n}@${states.get(n)!.headSha}${alone ? '!' : ''}`),
 				live: new Set(this.items().map((i) => i.pr_number))
 			});
 		} else {
 			if (opts.urgentOnly && settings.mode === 'serial') return 'idle';
-			plan = planNextBatch({ now: this.d.now(), queue, states, analysis, inflight: opts.urgentOnly ? [] : active.map((b) => b.members), config: settings.config, strategy: settings.mode, held: deferred, conflicts: conflicted });
+			// Built on the default branch, a stack a passed try tested whole lands without a run: it goes first.
+			const masterTree = await this.d.git.tree(masterSha);
+			const landable = new Set(
+				opts.urgentOnly || !active.length
+					? [...states.values()].filter((st) => store.latestTry(this.repoId, st.pr, st.headSha, masterTree)?.ci_result === 'success').map((st) => st.pr)
+					: []
+			);
+			const dependencies = await this.dependencies();
+			const planWith = (landable: Set<number>) =>
+				planNextBatch({
+					now: this.d.now(),
+					queue,
+					states,
+					analysis,
+					inflight: opts.urgentOnly ? [] : active.map((b) => b.members),
+					config: settings.config,
+					strategy: settings.mode,
+					held: deferred,
+					conflicts: conflicted,
+					dependencies,
+					landable
+				});
+			plan = planWith(landable);
+			without = (n) => planWith(new Set([...landable].filter((m) => m !== n)));
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
 			if (opts.urgentOnly && !plan.express) return 'idle';
@@ -2064,7 +2327,36 @@ class Tick {
 		if (!plan.batch || opts.holdsOnly) return 'idle';
 		const below = red || opts.urgentOnly ? [] : active.flatMap((b) => b.members);
 		const base = red || opts.urgentOnly || !active.length ? masterSha : active[active.length - 1].head_sha;
-		return this.startBatch(base, plan.batch, below, plan.express, masterSha);
+		// Built on the default branch, the head of the batch may be what a try already passed on it.
+		// On a red branch the queue looks for a fix with its own runs, and keeps count of them.
+		const reuse = !red && base === masterSha ? await this.reusableTry(plan.batch, masterSha) : null;
+		let next: Pick<typeof plan, 'batch' | 'express'> = plan;
+		if (reuse) {
+			const r = await this.startBatch(base, reuse.prefix, below, plan.express, masterSha, reuse.run);
+			if (r !== 'stale') return r;
+			// Not what the try tested: it goes back to its place in line, and the batch is planned without it.
+			next = without(reuse.prefix[reuse.prefix.length - 1]);
+			if (!next.batch) return 'idle';
+		}
+		const r = await this.startBatch(base, next.batch!, below, next.express, masterSha);
+		return r === 'stale' ? 'conflict' : r;
+	}
+
+	/**
+	 * The head of `batch` that a `try` run passed on this default branch (same tree, same PR heads),
+	 * with that run, or null. Only the latest finished try of a head counts: a failure after a pass
+	 * leaves it to the queue's own run. A failed try is no verdict either way (it may be a flake).
+	 */
+	async reusableTry(batch: number[], masterSha: string): Promise<{ prefix: number[]; run: BatchRow } | null> {
+		const tree = await this.d.git.tree(masterSha);
+		const passed = new Map<number, BatchRow>();
+		for (const n of batch) {
+			const t = store.latestTry(this.repoId, n, (await this.pr(n)).headSha, tree);
+			if (t?.ci_result === 'success') passed.set(n, t);
+		}
+		if (!passed.size) return null;
+		const prefix = triedPrefix(batch, await this.parentOf(), (n) => passed.has(n), await this.depsOf());
+		return prefix && { prefix, run: passed.get(prefix[prefix.length - 1])! };
 	}
 }
 
@@ -2114,19 +2406,39 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		// pipeline: keep the head, rebuild the rest on top of it.
 		// An urgent batch run between two steps of a bisection is built on master beside it, not on
 		// top of it: it goes first, and the bisection waits for it.
-		const between = active[0].status === 'bisecting' ? active.find((b, i) => i > 0 && b.express && b.base_sha !== active[0].head_sha) : undefined;
+		let between = active[0].status === 'bisecting' ? active.find((b, i) => i > 0 && b.express && b.base_sha !== active[0].head_sha) : undefined;
+		// An urgent batch beside a bisection whose step landed meanwhile tests a branch that is gone: it runs again.
+		if (between && between.status !== 'bisecting' && between.base_sha !== masterSha) {
+			await t.supersede([between], 'the bisection beside it landed first');
+			active = active.filter((b) => b !== between);
+			between = undefined;
+		}
 		const loose = active.findIndex((b, i) => i > 0 && b !== between && b.base_sha !== active[i - 1].head_sha);
 		if (loose > 0) {
 			await t.supersede(active.slice(loose), 'off-pipeline');
 			active = active.slice(0, loose);
 		}
-		if (between && active.includes(between)) await t.advanceHead(between, []);
-		else await t.advanceHead(active[0], active.slice(1), true);
+		if (between && active.includes(between)) {
+			await t.advanceHead(between, []);
+			if (store.getQueueSettings(deps.repo.id).pausedReason) return;
+			// The bisection's step goes on beside it, unless the urgent batch is bisecting itself (it goes
+			// first) or just landed (the bisection follows the new branch next tick).
+			const now = store.getBatch(between.id)!;
+			if (now.status !== 'bisecting' && (await deps.github.defaultBranchSha()) === masterSha) {
+				const head = store.getBatch(active[0].id)!;
+				if (head.status === 'bisecting') await t.advanceHead(head, active.filter((b) => b.id !== head.id && b.id !== between!.id), false, false);
+			}
+		} else await t.advanceHead(active[0], active.slice(1), true);
 		if (store.getQueueSettings(deps.repo.id).pausedReason) return;
 		active = store.getActiveBatches(deps.repo.id);
 	}
 	// Don't plan new work on top of a bisection: its base is about to change. Holds are still said.
 	if (active.some((b) => b.status === 'bisecting')) {
+		// Urgent PRs don't wait for a running step: one urgent batch runs beside the bisection, on the
+		// default branch. Whichever lands second runs again on the branch the first one left.
+		if (!active.some((b, i) => i > 0 && b.express) && (await deps.github.defaultBranchSha()) === masterSha) {
+			if ((await t.plan(active, masterSha, { urgentOnly: true })) === 'started') active = store.getActiveBatches(deps.repo.id);
+		}
 		await t.plan(active, masterSha, { holdsOnly: true });
 		return;
 	}
