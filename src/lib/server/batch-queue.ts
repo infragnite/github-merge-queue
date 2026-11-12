@@ -205,6 +205,16 @@ const deferredReason = (ahead: number[]) => `Conflicts with ${ahead.map((a) => `
 /** A refused merge's hold reason: GitHub's own words. */
 const refusedReason = (message: string) => `GitHub refused the merge: ${message}`;
 
+/**
+ * GitHub's refusal of one PR's merge, which its author fixes: a rule, a review, a required check, its
+ * stack. Anything else (an outage, a merge still running, a base that moved) pauses for a resume.
+ */
+const PR_REFUSAL =
+	/rule violations|required status check|status checks? (?:are|is) (?:expected|required)|approving review|review is required|reviews? (?:are|is) required|code owner|changes must be made through|signed commits|is (?:still )?a draft|is closed|in its GitHub stack|which stack|does not list #/i;
+
+/** `why`, ending in what to do: resume, unless it already says so. */
+const resumable = (why: string) => `${why}${/[.!?]$/.test(why) ? '' : '.'}${/\bresume\b/i.test(why) ? '' : ' Resume to try again.'}`;
+
 /** Holds whose notice a recheck may post later, when it failed or was kept quiet. */
 const TOLD_LATER: ReadonlySet<string> = new Set<HoldCode>(['conflict', 'workflow-permission', 'merge-refused']);
 
@@ -1129,15 +1139,26 @@ class Tick {
 					continue;
 				}
 				const why = m.message ?? 'merge refused';
-				// The same refusal already holds another PR: it is the repository's, not this PR's.
-				const other = this.items().find((i) => {
+				if (!PR_REFUSAL.test(why)) {
+					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
+					this.pause(`Landing batch ${batch.number} stopped at #${n}: ${resumable(why)}`);
+					return false;
+				}
+				// The same refusal already holds another PR: it is the repository's, not this PR's. Once
+				// the repository is fixed, resuming retries both.
+				const others = this.items().filter((i) => {
 					const h = i.pr_number !== n ? store.storedHold(i as QueueItem & { hold?: string | null }) : null;
 					return h?.code === 'merge-refused' && h.reason === refusedReason(why);
 				});
-				if (other) {
+				if (others.length) {
 					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
+					for (const o of others) {
+						db.updateQueueItemStatus(o.id, 'queued', null as unknown as string);
+						store.setHold(o.id, null);
+						this.event(o.pr_number, 'requeued', { reason: `the same refusal as #${n}: the repository's, not the PR's` });
+					}
 					this.pause(
-						`GitHub refused to merge #${n} with the same reason as #${other.pr_number} (${why}), so the cause is likely in the repository's settings, not in the PRs. Fix that, then resume.`
+						`GitHub refused to merge #${n} with the same reason as #${others[0].pr_number} (${why}), so the cause is likely in the repository's settings, not in the PRs. Fix that, then resume.`
 					);
 					return false;
 				}

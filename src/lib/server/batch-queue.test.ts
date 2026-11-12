@@ -2875,7 +2875,7 @@ describe('batch queue runtime', () => {
 			expect(world.started.slice(before).map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['master', '2']);
 		});
 
-		test('the same refusal for a second PR is the repository\'s, not the PR\'s: the queue pauses saying what to fix, and that PR stays in its batch', async () => {
+		test('the same refusal for a second PR is the repository\'s, not the PR\'s: the queue pauses saying what to fix, frees the PR it held, and that PR stays in its batch', async () => {
 			pr(1);
 			world.refuseMerge.add(1);
 			await run();
@@ -2887,9 +2887,9 @@ describe('batch queue runtime', () => {
 			expect(store.getQueueSettings(repo.id).pausedReason).toBe(
 				'GitHub refused to merge #2 with the same reason as #1 (Repository rule violations found), so the cause is likely in the repository\'s settings, not in the PRs. Fix that, then resume.'
 			);
-			// #2 stays in its batch, whose landing resuming tries again.
+			// #2 stays in its batch, whose landing resuming tries again; #1's hold was the repository's, so it is back in line.
 			expect(queued()).toEqual([
-				{ pr: 1, status: 'conflict' },
+				{ pr: 1, status: 'queued' },
 				{ pr: 2, status: 'checking' }
 			]);
 		});

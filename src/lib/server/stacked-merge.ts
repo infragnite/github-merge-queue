@@ -47,6 +47,8 @@ export async function mergeInStack(
 	// The PR's position still counts the PRs below it that merged: only the stack says which are open.
 	const number = req.pr.stack?.number;
 	let below: number[] = [];
+	const unchecked = (why: string): MergeResult => ({ merged: false, sha: null, message: `${why}, so the PRs below it can't be checked; GitHub's merge would merge them with it` });
+	if ((req.pr.stack?.position ?? 1) > 1 && number === undefined) return unchecked(`GitHub did not say which stack #${req.n} is in`);
 	if (number !== undefined && (req.pr.stack?.position ?? 1) > 1) {
 		let stack: Stack;
 		try {
@@ -56,7 +58,8 @@ export async function mergeInStack(
 		}
 		const prs = stack.pull_requests ?? [];
 		const at = prs.findIndex((p) => p.number === req.n);
-		below = prs.slice(0, at < 0 ? 0 : at).filter((p) => p.state === 'open').map((p) => p.number);
+		if (at < 0) return unchecked(`GitHub's stack ${number} does not list #${req.n}`);
+		below = prs.slice(0, at).filter((p) => p.state === 'open').map((p) => p.number);
 	}
 	if (below.length) {
 		const k = below.length;
