@@ -2693,6 +2693,19 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([]);
 	});
 
+	test("on a red default branch a failed batch's PRs show that they wait, not that they are tested", async () => {
+		redMain();
+		pr(1);
+		pr(2);
+		await run(40);
+		expect(world.started.length).toBeGreaterThan(0);
+		for (const ref of ['pr1', 'pr2'])
+			expect(world.prChecks.filter((x) => x.sha === git.sha(ref) && x.name === 'merge-queue').at(-1)).toMatchObject({
+				state: 'queued',
+				title: 'Waiting: main is red, and this PR does not fix it'
+			});
+	});
+
 	test('on a red default branch with the pipeline full, a PR held meanwhile is told', async () => {
 		store.updateQueueSettings(repo.id, { config: { depth: 1 } });
 		redMain();
