@@ -399,6 +399,17 @@
 		</form>
 	{/if}
 
+	{#if pipe?.red}
+		<div class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800" role="status" data-testid="red-master">
+			<p class="font-medium">
+				{data.repo.default_branch} is red since {new Date(pipe.red.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}:
+				<a href="https://github.com/{data.repo.owner}/{data.repo.name}/commit/{pipe.red.sha}" target="_blank" rel="noopener" class="font-mono underline">{pipe.red.sha.slice(0, 7)}</a>
+				{pipe.red.phase === 'alone' ? '· batches are one PR each' : pipe.red.phase === 'waiting' ? '· nothing left to try' : '· batches run side by side on it'}
+			</p>
+			<p class="mt-0.5 text-xs text-red-700">{pipe.red.text}</p>
+		</div>
+	{/if}
+
 	<!-- Views: what runs now and the line; what needs someone; what already happened. -->
 	<nav class="sticky top-0 z-20 -mx-4 flex gap-1 border-b border-border-subtle bg-surface/95 px-4 text-sm backdrop-blur sm:static sm:mx-0 sm:px-0" aria-label="Queue views">
 		{#each [{ key: 'now', label: 'Now' }, { key: 'attention', label: 'Needs attention' }, { key: 'history', label: 'History' }] as v (v.key)}
