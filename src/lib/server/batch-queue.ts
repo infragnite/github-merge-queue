@@ -1037,6 +1037,32 @@ class Tick {
 				);
 				continue;
 			}
+			// Pushes the head the PR lands as, in place of its tested head: whether it landed there, or
+			// the author pushed first (back in line), or the queue stopped.
+			const replace = async (to: string, what: string, reason: string): Promise<'pushed' | 'moved' | 'stopped'> => {
+				try {
+					await this.d.github.pushHead(p.headRef, to, head);
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					if (e instanceof HeadMovedError) {
+						await this.headMovedWhileLanding(batch, n, head, prs, src);
+						return 'moved';
+					}
+					this.pause(`Could not push the ${what} #${n}: ${withAction('pushHead', e)}`);
+					return 'stopped';
+				}
+				store.recordRebasedHead(this.repoId, n, head, to, true);
+				this.event(n, 'rebased', { from: head, to, onto: def, reason });
+				head = to;
+				// GitHub takes a moment to see the new head; merging before that is refused.
+				if (!(await this.waitForHead(n, head))) {
+					this.pause(`GitHub did not pick up the new head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
+					return 'stopped';
+				}
+				return 'pushed';
+			};
+			/** Master merged into the PR with `tree`: GitHub's squash of that head onto master is `tree`. */
+			const mergeIn = (tree: string) => this.d.git.mergeCommit(tree, [head, master], `Merge ${def} into ${p.headRef}`);
 			if (asIs) {
 				// Nothing to change.
 			} else if (step.fork) {
@@ -1049,29 +1075,14 @@ class Tick {
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
-				if (!r.ok || (!this.skipped.size && r.tree !== step.tree)) {
-					this.pause(`Could not restack #${n} onto master to land it: ${r.ok ? 'the result differs from the tested tree' : r.reason}. Restack #${n} onto ${def} by hand and push, then resume.`);
-					return false;
-				}
-				try {
-					await this.d.github.pushHead(p.headRef, r.head, head);
-				} catch (e) {
-					if (e instanceof RateLimitedError) throw e;
-					if (e instanceof HeadMovedError) {
-						await this.headMovedWhileLanding(batch, n, head, prs, src);
-						continue;
-					}
-					this.pause(`Could not push the restacked #${n}: ${withAction('pushHead', e)}`);
-					return false;
-				}
-				store.recordRebasedHead(this.repoId, n, head, r.head, true);
-				this.event(n, 'rebased', { from: head, to: r.head, onto: def, reason: 'landing after its parent' });
-				head = r.head;
-				// GitHub takes a moment to see the new head; merging before that is refused.
-				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the restacked head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
-					return false;
-				}
+				const done =
+					r.ok && (this.skipped.size || r.tree === step.tree)
+						? await replace(r.head, 'restacked', 'landing after its parent')
+						: // Its own commits don't replay onto master one by one (it merged its parent in, say),
+							// though the tree it was tested with does: master merged in with that tree lands it.
+							await replace(await mergeIn(step.tree), 'merge of master into', `merged ${def} with the tested tree to land after its parent`);
+				if (done === 'moved') continue;
+				if (done === 'stopped') return false;
 			} else {
 				// A file the queue's merge drivers merged where GitHub's line merge conflicts or differs:
 				// merge master into the PR with the tree the queue merged; GitHub's squash of that head is then this tree.
@@ -1084,25 +1095,9 @@ class Tick {
 					this.pause(`Could not merge ${def} into #${n} to land it: the result differs from the tested tree. Merge ${def} into #${n} by hand and push, then resume.`);
 					return false;
 				}
-				const merge = await this.d.git.mergeCommit(t.queue, [head, master], `Merge ${def} into ${p.headRef}`);
-				try {
-					await this.d.github.pushHead(p.headRef, merge, head);
-				} catch (e) {
-					if (e instanceof RateLimitedError) throw e;
-					if (e instanceof HeadMovedError) {
-						await this.headMovedWhileLanding(batch, n, head, prs, src);
-						continue;
-					}
-					this.pause(`Could not push the merge of ${def} into #${n}: ${withAction('pushHead', e)}`);
-					return false;
-				}
-				store.recordRebasedHead(this.repoId, n, head, merge, true);
-				this.event(n, 'rebased', { from: head, to: merge, onto: def, reason: `merged ${def} with the queue's merge drivers to land` });
-				head = merge;
-				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the new head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
-					return false;
-				}
+				const done = await replace(await mergeIn(t.queue), 'merge of master into', `merged ${def} with the queue's merge drivers to land`);
+				if (done === 'moved') continue;
+				if (done === 'stopped') return false;
 			}
 			if (p.baseRef !== def) await this.d.github.retargetBase(n, def);
 			// The default branch requires this status, so only the queue can merge, and only what it
