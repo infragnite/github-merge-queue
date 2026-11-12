@@ -3712,6 +3712,82 @@ describe('a passed try stands in for a run on the same default branch', () => {
 		expect(world.merged).toEqual([1]);
 	});
 
+	test('two PRs that each passed a try on the same default branch: only the first lands on its try', async () => {
+		// Each try says nothing about the two together: once one lands, the other's try is stale.
+		open(1);
+		open(2);
+		await tried(1);
+		await tried(2);
+		queue(1);
+		queue(2);
+		await run();
+		expect(runs()).toEqual([[2]]);
+		expect(world.merged).toEqual([1, 2]);
+		const reused = batchRows().filter((b) => b.branch.startsWith('mq/try-'));
+		expect(reused.map((b) => b.members)).toEqual([[1]]);
+	});
+
+	test('one by one, two tried PRs: only the first lands on its try', async () => {
+		store.updateQueueSettings(repo.id, { mode: 'serial' });
+		open(1);
+		open(2);
+		await tried(1);
+		await tried(2);
+		queue(1);
+		queue(2);
+		await run();
+		expect(runs()).toEqual([[2]]);
+		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('with a deeper pipeline, the second tried PR is tested on top of the first, not landed on its own try', async () => {
+		store.updateQueueSettings(repo.id, { config: { depth: 3 } });
+		open(1);
+		open(2);
+		open(3);
+		await tried(1);
+		await tried(2);
+		await tried(3);
+		queue(1);
+		queue(2);
+		queue(3);
+		await tickBatchQueue(world.deps());
+		const active = store.getActiveBatches(repo.id);
+		expect(active.map((b) => [b.members, b.status])).toEqual([
+			[[1], 'passed'],
+			[[2, 3], 'testing']
+		]);
+		expect(active[1].base_sha).toBe(active[0].head_sha);
+		await run();
+		expect(runs()).toEqual([[2, 3]]);
+		expect(world.merged).toEqual([1, 2, 3]);
+	});
+
+	test('an urgent tried PR beside a bisection step, and a second tried PR: only the urgent one lands on its try', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		open(5);
+		open(6);
+		await tried(5);
+		await tried(6);
+		queue(5);
+		queue(6);
+		store.setQueuePriority(repo.id, 5, 'urgent');
+		store.setQueuePriority(repo.id, 6, 'urgent');
+		await run(80);
+		const reused = batchRows().filter((b) => b.branch.startsWith('mq/try-'));
+		expect(reused.length).toBeLessThanOrEqual(1);
+		expect(world.merged.filter((n) => n === 5 || n === 6).sort()).toEqual([5, 6]);
+		// at most one PR ever lands on a try per default branch: every other one had a run of its own
+		const onTry = new Set(reused.flatMap((b) => b.members));
+		const ran = new Set(world.started.filter((s) => s.branch.startsWith('mq/batch-')).flatMap((s) => s.prs));
+		for (const n of [5, 6]) expect(onTry.has(n) || ran.has(n)).toBe(true);
+		expect(onTry.size).toBeLessThanOrEqual(1);
+	});
+
 	test('in batches, the head PR’s pass lands it alone, and the rest is batched behind it', async () => {
 		open(1);
 		open(2);
