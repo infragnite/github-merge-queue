@@ -3,6 +3,8 @@
 
 import * as github from './github';
 import * as store from './batch-store';
+import { getQueueItems } from './db';
+import { redMasterView, type RedMasterView } from './red-master-view';
 import { dashboardStackAnalysis } from './stack-runtime';
 import { tickError, type TickError } from './tick-errors';
 import { activityOf, type ActivityView } from './activity';
@@ -15,6 +17,8 @@ export interface PipelineView {
 	mode: string;
 	paused: string | null;
 	master: { sha: string; state: string; since: number } | null;
+	/** While the default branch is red: what the queue does about it, and what gets it back to normal. */
+	red: RedMasterView | null;
 	active: BatchCard[];
 	recent: BatchCard[];
 	error: string | null;
@@ -95,6 +99,7 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 		mode: settings.mode,
 		paused: settings.pausedReason,
 		master: master ? { sha: master.sha, state: master.state, since: master.since } : null,
+		red: redMasterView(master, getQueueItems(repo.id), repo.default_branch),
 		active: [...sideRuns, ...active].map(card),
 		recent: recent.map(card),
 		error: null,
@@ -121,6 +126,7 @@ export function publicPipeline(p: PipelineView): PipelineView {
 		mode: p.mode,
 		paused: p.paused ? 'The queue is paused' : null,
 		master: p.master ? { sha: p.master.sha, state: p.master.state, since: p.master.since } : null,
+		red: p.red,
 		active: p.active,
 		recent: p.recent,
 		error: p.error ? 'Batches could not be loaded' : null,

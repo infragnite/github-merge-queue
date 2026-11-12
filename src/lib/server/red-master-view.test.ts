@@ -16,7 +16,7 @@ describe('what the queue page says about a red default branch', () => {
 			since: 1000,
 			phase: 'batches',
 			left: 2,
-			text: 'master fails CI on its own, so no batch can be blamed. Batches of PRs not tried on it yet run side by side until one passes and lands; 2 PRs left. To get back to normal batches, land a fix with /mq urgent.'
+			text: 'master fails CI on its own, so no batch can be blamed. Batches of PRs not tried on it yet run side by side until one passes and lands; 2 PRs left. To get back to normal batches, queue a fix with `/mq queue --priority urgent`.'
 		});
 	});
 
@@ -24,7 +24,7 @@ describe('what the queue page says about a red default branch', () => {
 		expect(redMasterView(health(['1@h1', '2@h2', '2@h2!']), [item(1), item(2)], 'master')).toMatchObject({
 			phase: 'alone',
 			left: 1,
-			text: 'master fails CI on its own, so no batch can be blamed. Every PR was tried in a batch on it, so each now gets one try alone, in case another PR in its batch broke it; 1 PR left. To get back to normal batches, land a fix with /mq urgent.'
+			text: 'master fails CI on its own, so no batch can be blamed. Every PR was tried in a batch on it, so each now gets one try alone, in case another PR in its batch broke it; 1 PR left. To get back to normal batches, queue a fix with `/mq queue --priority urgent`.'
 		});
 	});
 
@@ -32,7 +32,7 @@ describe('what the queue page says about a red default branch', () => {
 		expect(redMasterView(health(['1@h1', '1@h1!']), [item(1)], 'main')).toMatchObject({
 			phase: 'waiting',
 			left: 0,
-			text: 'main fails CI on its own, and every PR in the queue failed on it. The queue waits for a push to a PR or a fix: land one with /mq urgent.'
+			text: 'main fails CI on its own, and every PR in the queue failed on it. The queue waits for a push to a PR or a fix: queue one with `/mq queue --priority urgent`.'
 		});
 	});
 
