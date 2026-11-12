@@ -8,6 +8,7 @@
 // build is the conflict check of one PR) and the branch it pushes (mq/batch-*, *-bisect-*, mq/try-*).
 
 import { RateLimitedError } from './rate-limit';
+import { GitHubError } from './github-retry';
 import type { QueueDeps } from './batch-queue';
 
 export type PhaseKind = 'forming' | 'bisect' | 'try' | 'master' | 'restack' | 'landing';
@@ -34,8 +35,8 @@ export interface ActivityFailure {
 	phase: string | null;
 	step: string;
 	prs: number[];
-	/** Null where the viewer may not see it (the public page). */
-	message: string | null;
+	/** What to do about it. Null where the viewer may not see it (the public page). */
+	action: string | null;
 	at: number;
 }
 
@@ -44,20 +45,26 @@ export interface ActivityView {
 	since: number | null;
 	phase: ActivityPhase | null;
 	step: ActivityStep | null;
-	/** The last step that failed, until the same step next succeeds. */
+	/**
+	 * The last step that failed in a way someone can fix, with what to do, until the same step next
+	 * succeeds or a whole tick runs without it. Failures nobody can act on (a timeout, a server
+	 * error) go to the log only: the next tick tries again.
+	 */
 	failure: ActivityFailure | null;
 }
 
 interface RepoActivity extends ActivityView {
 	/** The kind of call that failed, so the same call succeeding clears it. */
 	failedCall: string | null;
+	/** Whether a failure was shown since the running tick started. */
+	failedThisTick: boolean;
 }
 
 const repos = new Map<number, RepoActivity>();
 
 function of(repoId: number): RepoActivity {
 	let a = repos.get(repoId);
-	if (!a) repos.set(repoId, (a = { since: null, phase: null, step: null, failure: null, failedCall: null }));
+	if (!a) repos.set(repoId, (a = { since: null, phase: null, step: null, failure: null, failedCall: null, failedThisTick: false }));
 	return a;
 }
 
@@ -108,9 +115,42 @@ function phaseLabel(kind: PhaseKind, prs: number[], def: string): string {
 /** Calls whose failure the queue shrugs off (cleanup, notices): a failure of theirs isn't shown. */
 const IGNORED = new Set(['deleteBranch', 'cancel', 'label', 'comment', 'setPRCheck', 'setStatus']);
 
+/** The App permission each call needs, as GitHub's settings name it. */
+const PERMISSION: Record<string, string> = {
+	pushBranch: 'Contents (read and write)',
+	pushHead: 'Contents (read and write)',
+	squashMerge: 'Contents (read and write)',
+	retargetBase: 'Pull requests (read and write)',
+	ciStart: 'Actions (read and write)',
+	refreshCaches: 'Actions (read and write)',
+	rerunFailed: 'Actions (read and write)'
+};
+
+const grant = (permission: string) => `Grant the GitHub App the ${permission} permission, then approve it on this account's installation`;
+
+/**
+ * What someone can do about `call` failing with `e`, or null when nothing (it goes to the log, and
+ * the next tick tries again). Only a missing App permission has a fix outside the queue.
+ */
+export function failureAction(call: string, e: unknown): string | null {
+	const message = e instanceof Error ? e.message : String(e);
+	if (/without `workflows` permission/.test(message)) return grant('Workflows (read and write)');
+	const refused =
+		(e instanceof GitHubError && e.status === 403 && /not accessible by integration/i.test(message)) ||
+		// git's words for a push the installation token may not make
+		/Permission to \S+ denied to|The requested URL returned error: 403/.test(message);
+	if (!refused) return null;
+	const permission = PERMISSION[call];
+	if (permission) return grant(permission);
+	const endpoint = /not accessible by integration: (.+)$/i.exec(message)?.[1];
+	return endpoint ? `Grant the GitHub App the permission ${endpoint} needs, then approve it on this account's installation` : null;
+}
+
 export interface TrackOptions {
 	/** What a build is for, when the calls can't tell: a bisection step while a batch bisects, a try run. A batch by default. */
 	buildKind?: () => 'forming' | 'bisect' | 'try';
+	/** A tick of the queue: one that runs to its end without showing a failure clears the one shown. */
+	tick?: boolean;
 }
 
 /** `deps`, with each call recorded as the repository's running step while it runs. */
@@ -145,9 +185,11 @@ export function trackActivity(deps: QueueDeps, opts: TrackOptions = {}): QueueDe
 			}
 			return r;
 		} catch (e) {
-			if (!(e instanceof RateLimitedError) && !IGNORED.has(call)) {
-				a.failure = { phase: a.phase?.label ?? null, step: label, prs, message: e instanceof Error ? e.message : String(e), at: now() };
+			const action = IGNORED.has(call) ? null : failureAction(call, e);
+			if (action) {
+				a.failure = { phase: a.phase?.label ?? null, step: label, prs, action, at: now() };
 				a.failedCall = call;
+				a.failedThisTick = true;
 			}
 			throw e;
 		} finally {
@@ -255,8 +297,14 @@ export function trackActivity(deps: QueueDeps, opts: TrackOptions = {}): QueueDe
 export async function withActivity<T>(deps: QueueDeps, fn: (d: QueueDeps) => Promise<T>, opts: TrackOptions = {}): Promise<T> {
 	const a = of(deps.repo.id);
 	a.since = deps.now();
+	a.failedThisTick = false;
 	try {
-		return await fn(trackActivity(deps, opts));
+		const r = await fn(trackActivity(deps, opts));
+		if (opts.tick && !a.failedThisTick) {
+			a.failure = null;
+			a.failedCall = null;
+		}
+		return r;
 	} finally {
 		a.since = null;
 		a.phase = null;

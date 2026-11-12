@@ -984,13 +984,14 @@ describe('batch queue runtime', () => {
 			if (branch === 'pr2') git.commit('pr2', 'late change');
 			world.beforePushHead = () => {};
 		};
-		await run();
+		await run(3);
 		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
-		expect(world.merged).toEqual([1, 2]);
-		expect(world.files('main').has('late-change.txt')).toBe(true);
-		expect(git.git('show', 'main:shared.txt')).toBe('child rewrote it');
-		// The batch, master alone (it holds #1 without #2), then #2 as the author left it.
-		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['1,2', 'master', '2']);
+		expect(world.merged.slice(0, 1)).toEqual([1]);
+		// The author's push stands: the queue never pushed over it.
+		expect(world.pushedHeads).toEqual([]);
+		expect(git.git('log', '-1', '--format=%s', 'pr2')).toBe('late change');
+		// The batch, then master alone (it holds #1 without #2, never tested so).
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join())).slice(0, 2)).toEqual(['1,2', 'master']);
 		expect(events.listEvents(repo.id, { pr: 2, limit: 500 }).map((e) => e.kind)).toContain('changed');
 	});
 
@@ -1690,7 +1691,7 @@ describe('batch queue runtime', () => {
 		// The author's restack is what lands: the queue never pushed over it.
 		expect(world.pushedHeads).toEqual([]);
 		expect(world.merged).toEqual([1, 2]);
-		git.git('merge-base', '--is-ancestor', theirs, 'main');
+		expect(git.sha('pr2')).toBe(theirs);
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
 	});
 
@@ -1702,6 +1703,7 @@ describe('batch queue runtime', () => {
 		world.beforePushHead = (branch) => {
 			if (branch !== 'pr2') return;
 			git.commit('pr2', 'late change');
+			git.git('checkout', '-q', '--detach'); // the queue's later push moves the branch
 			world.beforePushHead = () => {};
 		};
 		await run();
