@@ -26,7 +26,8 @@ export type QueueEventKind =
 	| 'mode'
 	| 'priority'
 	| 'settings'
-	| 'cancelled';
+	| 'cancelled'
+	| 'hung';
 
 export interface QueueEvent {
 	id: number;

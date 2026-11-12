@@ -27,6 +27,7 @@ export const BATCH_FIELDS: SettingField[] = [
 	{ name: 'config.bisectRuns', label: 'Bisection runs at once', help: 'Runs of a failed batch tested at the same time; the rest wait their turn. 2 runs both halves of a split side by side (one lands, the other keeps narrowing): about half the time for a few more runs, given runners to spare.', kind: 'number', min: 1 },
 	{ name: 'config.collectWindowMs', label: 'Wait for a fuller batch', help: 'How long a partial batch waits for more PRs before it is tested.', kind: 'duration', unitMs: MIN, unit: 'min' },
 	{ name: 'config.ciTimeoutMs', label: 'CI timeout', help: 'A batch with no CI result after this long pauses the queue.', kind: 'duration', unitMs: HOUR, unit: 'h' },
+	{ name: 'config.jobHangMs', label: 'Hung job limit', help: "A CI job still running after this long is stuck, not failing: its run is cancelled and its jobs run again once, even with failed jobs not re-run. A job that hangs again fails the batch.", kind: 'duration', unitMs: MIN, unit: 'min' },
 	{ name: 'config.retryFailed', label: 'Re-run failed jobs once', help: 'Before a failure counts, its failed jobs run again (for flaky tests).', kind: 'boolean' },
 	{ name: 'config.stopOnFirstFailure', label: 'Stop a red run early', help: 'A run of several PRs counts as failed at its first failed job, and the rest of it is cancelled. A PR tested alone still runs to the end, so its author sees every failure.', kind: 'boolean' },
 	{ name: 'config.requireApproval', label: 'Require approval', help: 'Only approved PRs enter a batch.', kind: 'boolean' },
@@ -122,7 +123,7 @@ export const SETTING_GROUPS: { id: string; title: string; help: string; fields: 
 	{ id: 'batching', title: 'Batches', help: 'How PRs are grouped and tested together.', fields: pick('config.maxBatch', 'config.depth', 'config.collectWindowMs') },
 	{ id: 'failures', title: 'Urgent PRs and failures', help: 'Urgent PRs skip ahead; a failed batch is narrowed down to the PR that breaks it.', fields: pick('config.bisectRuns', 'config.retryFailed', 'config.stopOnFirstFailure') },
 	{ id: 'rules', title: 'Who can enter a batch', help: 'What a PR needs before the queue tests it.', fields: pick('config.requireApproval', 'config.approvalOnHead', 'config.requirePRChecks', 'config.autoRebase') },
-	{ id: 'ci', title: 'CI', help: 'How the queue starts and reads CI.', fields: [...pick('config.ciTimeoutMs', 'config.masterRun', 'config.masterRunMinGapMs'), ...CI_FIELDS] },
+	{ id: 'ci', title: 'CI', help: 'How the queue starts and reads CI.', fields: [...pick('config.ciTimeoutMs', 'config.jobHangMs', 'config.masterRun', 'config.masterRunMinGapMs'), ...CI_FIELDS] },
 	{ id: 'notices', title: 'PR comments', help: 'How much the queue says on PRs.', fields: pick('config.comments') },
 	{ id: 'visibility', title: 'Visibility', help: 'Who can see the queue page.', fields: VIEW_FIELDS }
 ];
