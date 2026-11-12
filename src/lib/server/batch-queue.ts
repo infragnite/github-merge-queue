@@ -42,7 +42,15 @@ import { declaredDeps, dependencyGraph, parseDependsOn, type DependencyGraph, ty
 import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
 import { HeadMovedError } from './head-moved';
+import { failureAction } from './activity';
 import { emitEvent, heldPRs, type QueueEventKind } from './events';
+
+/** The error, and what to do about it when someone can (a pause reason must say what to do). */
+function withAction(call: string, e: unknown): string {
+	const message = e instanceof Error ? e.message : String(e);
+	const action = failureAction(call, e);
+	return action ? `${message}. ${action}` : message;
+}
 
 /** A PR as the queue sees it; `PRState`'s readiness fields come from `QueueGitHub.readiness`. */
 export interface LivePR {
@@ -222,6 +230,8 @@ class Tick {
 	private analysisCache: StackAnalysis | null = null;
 	private depsCache: DependencyGraph | null = null;
 	private pushable: Promise<boolean> | null = null;
+	/** PRs pushed to while this tick restacked them: what it read of them is out of date, so it tells them nothing. */
+	private readonly movedThisTick = new Set<number>();
 
 	constructor(private readonly d: QueueDeps) {}
 
@@ -680,7 +690,7 @@ class Tick {
 				const held = await this.holdWorkflowChanges(baseSha, result.commits);
 				if (held) return 'conflict';
 			}
-			this.pause(`Could not start a batch of ${prs.map((n) => `#${n}`).join(' ')}: ${e instanceof Error ? e.message : e}`);
+			this.pause(`Could not start a batch of ${prs.map((n) => `#${n}`).join(' ')}: ${withAction('pushBranch', e)}`);
 			return 'error';
 		}
 		const steps: Record<number, BatchStep> = {};
@@ -994,7 +1004,7 @@ class Tick {
 						await this.headMovedWhileLanding(batch, n, head, prs, src);
 						continue;
 					}
-					this.pause(`Could not push the restacked #${n}: ${e instanceof Error ? e.message : e}`);
+					this.pause(`Could not push the restacked #${n}: ${withAction('pushHead', e)}`);
 					return false;
 				}
 				store.recordRebasedHead(this.repoId, n, head, r.head, true);
@@ -1026,7 +1036,7 @@ class Tick {
 						await this.headMovedWhileLanding(batch, n, head, prs, src);
 						continue;
 					}
-					this.pause(`Could not push the merge of ${def} into #${n}: ${e instanceof Error ? e.message : e}`);
+					this.pause(`Could not push the merge of ${def} into #${n}: ${withAction('pushHead', e)}`);
 					return false;
 				}
 				store.recordRebasedHead(this.repoId, n, head, merge, true);
@@ -1920,9 +1930,8 @@ class Tick {
 
 	/**
 	 * Restacks queued PRs whose parent was rebased or merged under them, when
-	 * that needs no conflict resolution. Returns true when it pushed anything, or
-	 * found a PR pushed to since this tick read it (the stack analysis is then
-	 * stale until the next tick).
+	 * that needs no conflict resolution. Returns true when it pushed anything
+	 * (the stack analysis is then stale until the next tick).
 	 */
 	async restack(): Promise<boolean> {
 		const def = this.d.repo.default_branch;
@@ -1977,12 +1986,14 @@ class Tick {
 				await this.d.github.pushHead(p.headRef, r.head, p.headSha);
 			} catch (e) {
 				// Pushed to since this tick read it (often the author restacking it too): their push
-				// stands, and the next tick restacks from the new head if it still needs it.
-				// What this tick read of the stacks is then out of date: it ends here, before anything
-				// (a hold telling the author to restack) acts on it.
+				// stands, and the next tick restacks from the new head if it still needs it. The rest
+				// of the tick reads the stacks and PRs again, and tells this one nothing (a hold to
+				// restack itself would be about the head it no longer has).
 				if (e instanceof HeadMovedError) {
 					this.log(`#${n} was pushed to while the queue restacked it; the next tick reads its new head`);
-					pushed = true;
+					this.movedThisTick.add(n);
+					this.analysisCache = null;
+					this.forgetPRs();
 				} else this.log(`could not push restacked #${n}: ${e instanceof Error ? e.message : e}`);
 				continue;
 			}
@@ -2065,6 +2076,7 @@ class Tick {
 		for (const it of this.items()) {
 			// A PR in conflict keeps its status and message: it is held for that, and was told.
 			if (it.status !== 'queued') continue;
+			if (this.movedThisTick.has(it.pr_number)) continue;
 			const was = store.currentHold(it);
 			// What it was last told, even if its message changed since (fewer PRs ahead of a deferral).
 			const stored = store.storedHold(it as QueueItem & { hold?: string | null });

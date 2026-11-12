@@ -56,6 +56,11 @@ describe('a push that lost its lease', () => {
 		expect(leaseLost(msg)).toBe(true);
 	});
 
+	test("GitHub's own refusal when the branch moves between its advertisement and the update is a lost lease too", () => {
+		expect(leaseLost('git push failed: To https://github.com/o/r.git\n ! [remote rejected] abc -> feature (incorrect old value provided)\nerror: failed to push some refs')).toBe(true);
+		expect(leaseLost("git push failed: To https://github.com/o/r.git\n ! [remote rejected] abc -> feature (cannot lock ref 'refs/heads/feature': is at 123 but expected 456)")).toBe(true);
+	});
+
 	test('other failures are not a lost lease', () => {
 		expect(leaseLost("fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com")).toBe(false);
 		expect(leaseLost('remote: Permission to o/r.git denied to app[bot].\nfatal: unable to access: The requested URL returned error: 403')).toBe(false);

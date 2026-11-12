@@ -14,7 +14,10 @@ export class HeadMovedError extends Error {
 	}
 }
 
-/** Whether a failed `git push --force-with-lease` was refused for its lease, by git's own words. */
+/**
+ * Whether a failed `git push --force-with-lease` was refused for its lease, by git's own words: git
+ * itself (`stale info`), or GitHub when the branch moved between what it advertised and the update.
+ */
 export function leaseLost(message: string): boolean {
-	return /\[rejected\][^\n]*\(stale info\)/.test(message);
+	return /\[rejected\][^\n]*\(stale info\)|\[remote rejected\][^\n]*\((?:incorrect old value|cannot lock ref)/.test(message);
 }

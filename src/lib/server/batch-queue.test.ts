@@ -995,6 +995,19 @@ describe('batch queue runtime', () => {
 		expect(events.listEvents(repo.id, { pr: 2, limit: 500 }).map((e) => e.kind)).toContain('changed');
 	});
 
+	test('a push to land a child refused for lack of access pauses with what to grant, not only the git error', async () => {
+		childEditingParent();
+		const denied = "git push failed: remote: Permission to acme/repo.git denied to merge-queue[bot].\nfatal: unable to access 'https://github.com/acme/repo.git/': The requested URL returned error: 403";
+		world.beforePushHead = () => {
+			throw new Error(denied);
+		};
+		await run(3);
+		expect(world.merged).toEqual([1]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBe(
+			`Could not push the restacked #2: ${denied}. Grant the GitHub App the Contents (read and write) permission, then approve it on this account's installation`
+		);
+	});
+
 	describe('count baselines', () => {
 		const BASELINE = 'clippy-baseline.tsv';
 		const rows = (...r: [number, string][]) => r.map(([n, finding]) => `${n}\tsrc/a.rs\t${finding}\n`).join('');
@@ -1714,6 +1727,29 @@ describe('batch queue runtime', () => {
 		expect(world.merged).toEqual([1, 2]);
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
 		expect(world.files('main').has('late-change.txt')).toBe(true);
+	});
+
+	test('a lease lost on every tick holds up only that PR: the rest of the queue still plans and lands', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		pr(3);
+		git.commit('main', 'm1', 'x-main.txt');
+		git.rebase('pr1', 'main');
+		// The author keeps pushing to #2, each time just before the queue's restack of it.
+		let lost = 0;
+		world.beforePushHead = (branch) => {
+			if (branch !== 'pr2') return;
+			lost++;
+			git.commit('pr2', `late change ${lost}`);
+			git.git('checkout', '-q', '--detach');
+		};
+		await run(5);
+		expect(lost).toBeGreaterThan(1);
+		expect(world.merged).toContain(3);
+		expect(world.pushedHeads).toEqual([]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		// Nobody tells #2 to restack itself while the queue is still trying to.
+		expect(world.comments.filter((c) => c.pr === 2 && c.body.includes('"code":"stack-broken"'))).toEqual([]);
 	});
 
 	test('a PR whose parent was rebased, with restacking off, is told the exact restack command', async () => {
