@@ -62,6 +62,8 @@ class World {
 	rerunWaits = 0;
 	/** PRs whose merge GitHub refuses (e.g. a ruleset the queue doesn't satisfy). */
 	refuseMerge = new Set<number>();
+	/** What GitHub says when it refuses a PR's merge; the default is a ruleset's refusal. */
+	refusal = new Map<number, string>();
 	/** GitHub answers merges with a rate-limit refusal. */
 	rateLimited = false;
 	commentsFail = false;
@@ -261,7 +263,7 @@ class World {
 				retargetBase: async (n, base) => git.retarget(n, base),
 				squashMerge: async (n, _title, expected) => {
 					this.beforeMerge(n);
-					if (this.refuseMerge.has(n)) return { merged: false, message: 'Repository rule violations found' };
+					if (this.refuseMerge.has(n)) return { merged: false, message: this.refusal.get(n) ?? 'Repository rule violations found' };
 					if (this.rateLimited) throw new RateLimitedError(Date.now() + 60_000, 'API rate limit exceeded');
 					if (git.sha(git.pr(n).headRef) !== expected) return { merged: false, message: 'Head branch was modified' };
 					try {
@@ -1998,6 +2000,26 @@ describe('batch queue runtime', () => {
 		expect(world.files('main').has('late-change.txt')).toBe(true);
 	});
 
+	test('a merge outside the queue while a batch lands pauses saying what happened and what resuming does; resuming lands the rest', async () => {
+		pr(1);
+		pr(2);
+		await tickBatchQueue(world.deps());
+		world.beforeMerge = (n) => {
+			if (n === 1) {
+				world.beforeMerge = () => {};
+				git.commit('main', 'outside', 'x-outside.txt');
+			}
+		};
+		await run(3);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBe(
+			'Master changed while batch 1 was landing (before #2): something was merged outside the queue. Resume to test the rest on top of it.'
+		);
+		store.updateQueueSettings(repo.id, { pausedReason: null });
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([1, 2]);
+	});
+
 	test('batches are numbered per repository, apart from bisection steps and master checks', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
@@ -2797,28 +2819,79 @@ describe('batch queue runtime', () => {
 		await run();
 		const head = git.sha('pr1');
 		const last = world.prChecks.filter((s) => s.sha === head).at(-1);
-		expect(last?.state).toBe('queued');
-		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #1: Repository rule violations found/);
+		expect(last?.state).toBe('action_required');
 		expect(world.merged).toEqual([]);
 	});
 
-	test('a landing that stops part way does not trust what it merged: master is checked alone before anyone is blamed on it', async () => {
-		pr(1);
-		pr(2);
-		world.refuseMerge.add(2);
-		await run();
-		expect(world.merged).toEqual([1]);
-		expect(store.getQueueSettings(repo.id).pausedReason).toMatch(/stopped at #2/);
-		// Master holds #1 without #2: no run tested that tree, so it is not marked green.
-		const h = store.getMasterHealth(repo.id);
-		expect(h?.sha === git.sha('main') && h.state === 'green').toBe(false);
-		world.refuseMerge.delete(2);
-		store.updateQueueSettings(repo.id, { pausedReason: null });
-		const before = world.started.length;
-		await run();
-		expect(world.merged).toEqual([1, 2]);
-		// a check of the default branch alone, and #2 on top of it
-		expect(world.started.slice(before).map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['master', '2']);
+	describe('a merge GitHub refuses', () => {
+		const STACKED = "#2 sits above 1 open PR in its GitHub stack, and GitHub's merge would merge them with it; merge or unstack the PRs below it first";
+
+		test('holds only that PR, with GitHub\'s reason and what to do; the rest of the batch lands, no pause', async () => {
+			pr(1);
+			pr(2);
+			pr(3);
+			world.refuseMerge.add(2);
+			world.refusal.set(2, STACKED);
+			await run();
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(world.merged).toEqual([1, 3]);
+			const reason = `GitHub refused the merge: ${STACKED}`;
+			expect(db.getQueueItems(repo.id).map((i) => ({ pr: i.pr_number, status: i.status, message: i.error_message }))).toEqual([{ pr: 2, status: 'conflict', message: reason }]);
+			const notice = holdNotice({ pr: 2, head: git.sha('pr2'), code: 'merge-refused', reason, files: [] });
+			expect(world.comments).toEqual([{ pr: 2, body: notice }]);
+			expect(world.prChecks.filter((c) => c.sha === git.sha('pr2')).at(-1)).toMatchObject({ state: 'action_required', title: reason });
+			expect(world.labels.get(2)?.has('needs-rebase') ?? false).toBe(false);
+		});
+
+		test('a held refusal is not retried by itself when master moves; a push retries it', async () => {
+			pr(1);
+			world.refuseMerge.add(1);
+			await run();
+			world.refuseMerge.delete(1);
+			git.commit('main', 'm1', 'x-main.txt');
+			await run(5);
+			expect(world.merged).toEqual([]);
+			expect(queued()).toEqual([{ pr: 1, status: 'conflict' }]);
+			git.commit('pr1', 'pr1 again', 'pr1.txt');
+			await run();
+			expect(world.merged).toEqual([1]);
+			expect(queued()).toEqual([]);
+		});
+
+		test('a landing a refusal cut short does not trust what it merged: master is checked alone before the PR lands again', async () => {
+			pr(1);
+			pr(2);
+			world.refuseMerge.add(2);
+			await run();
+			expect(world.merged).toEqual([1]);
+			// Master holds #1 without #2: no run tested that tree, so it is not marked green.
+			const h = store.getMasterHealth(repo.id);
+			expect(h?.sha === git.sha('main') && h.state === 'green').toBe(false);
+			world.refuseMerge.delete(2);
+			const before = world.started.length;
+			git.commit('pr2', 'pr2 again', 'pr2.txt');
+			await run();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.started.slice(before).map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join()))).toEqual(['master', '2']);
+		});
+
+		test('the same refusal for a second PR is the repository\'s, not the PR\'s: the queue pauses saying what to fix, and that PR stays in line', async () => {
+			pr(1);
+			world.refuseMerge.add(1);
+			await run();
+			expect(queued()).toEqual([{ pr: 1, status: 'conflict' }]);
+			pr(2);
+			world.refuseMerge.add(2);
+			await run();
+			expect(world.merged).toEqual([]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBe(
+				'GitHub refused to merge #2 with the same reason as #1 (Repository rule violations found), so the cause is likely in the repository\'s settings, not in the PRs. Fix that, then resume.'
+			);
+			expect(queued()).toEqual([
+				{ pr: 1, status: 'conflict' },
+				{ pr: 2, status: 'queued' }
+			]);
+		});
 	});
 
 	test('an interrupted landing that merged only part of its PRs does not mark master green', async () => {
