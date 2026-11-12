@@ -1950,6 +1950,39 @@ describe('batch queue runtime', () => {
 		expect(store.getActiveBatches(repo.id)[0].express).toBe(true);
 	});
 
+	test('each new plan is logged with what it saw (queue order, priorities, holds) and what it chose; an unchanged plan is not', async () => {
+		const { setLogSink } = await import('./log');
+		const plans: Array<Record<string, unknown>> = [];
+		setLogSink((_, line) => {
+			const rec = JSON.parse(line);
+			if (rec.msg === 'plan') plans.push(rec);
+		});
+		try {
+			store.updateQueueSettings(repo.id, { config: { collectWindowMs: 60 * 60 * 1000 } });
+			pr(1);
+			pr(2);
+			store.setQueuePriority(repo.id, 2, 'urgent');
+			world.hold = () => true;
+			await tickBatchQueue(world.deps());
+			expect(plans).toHaveLength(1);
+			expect(plans[0]).toMatchObject({
+				level: 'info',
+				batch: [2],
+				express: true,
+				red: false,
+				queue: [
+					{ pr: 1, priority: 'normal' },
+					{ pr: 2, priority: 'urgent' }
+				]
+			});
+			await tickBatchQueue(world.deps());
+			await tickBatchQueue(world.deps());
+			expect(plans.filter((p) => Array.isArray(p.batch) && (p.batch as number[]).includes(2))).toHaveLength(1);
+		} finally {
+			setLogSink(null);
+		}
+	});
+
 	test('master moving outside the queue rebuilds the pipeline on the new master', async () => {
 		pr(1);
 		pr(2);
