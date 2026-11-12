@@ -1082,7 +1082,7 @@ describe('batch queue runtime', () => {
 			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
 		};
 
-		test('two PRs that lower the same count land together, with the counts summed', async () => {
+		test('two PRs that lower the same count conflict: the queue has no count-baseline driver', async () => {
 			git.git('checkout', '-q', 'main');
 			writeFileSync(`${git.dir}/.gitattributes`, `${BASELINE} merge=count-baseline\n`);
 			writeFileSync(`${git.dir}/${BASELINE}`, rows([3, 'needless borrow'], [5, 'single match']));
@@ -1092,12 +1092,9 @@ describe('batch queue runtime', () => {
 			lowering(1, rows([3, 'needless borrow'], [4, 'single match']));
 			lowering(2, rows([2, 'needless borrow'], [3, 'single match']));
 			await run();
-			expect(world.started[0].prs).toEqual([1, 2]);
-			expect(world.merged).toEqual([1, 2]);
-			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
-			expect(git.git('show', `main:${BASELINE}`)).toBe(rows([2, 'needless borrow'], [2, 'single match']).trimEnd());
-			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
-			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+			expect(world.merged).toEqual([1]);
+			expect(git.git('show', `main:${BASELINE}`)).toBe(rows([3, 'needless borrow'], [4, 'single match']).trimEnd());
+			expect(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)?.status).toBe('conflict');
 		});
 	});
 
