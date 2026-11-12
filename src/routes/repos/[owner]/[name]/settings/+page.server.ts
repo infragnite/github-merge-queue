@@ -12,6 +12,7 @@ import { retireBatches } from '$lib/server/batch-queue';
 import { liveDeps } from '$lib/server/batch-live';
 import { markDirty } from '$lib/server/wake';
 import type { PageServerLoad, Actions } from './$types';
+import { log } from '$lib/server/log';
 
 export const load: PageServerLoad = async ({ params, locals, url }) => {
 	if (!locals.user) redirect(302, `/login?next=${encodeURIComponent(url.pathname)}`);
@@ -61,7 +62,7 @@ export const actions: Actions = {
 			patchConfig(repo, me, { mode });
 			await retireBatches(liveDeps(repo));
 			markDirty(repo.id);
-			console.log(`[merge-queue] ${repo.owner}/${repo.name} switched to ${mode} mode by ${me.login}`);
+			log.info('queue mode changed', { repo: `${repo.owner}/${repo.name}`, mode, by: me.login });
 		});
 		return { modeSaved: true };
 	},
@@ -95,7 +96,7 @@ export const actions: Actions = {
 		}
 		// Under the repo lock, so no step of the queue is halfway through it.
 		await withRepoLock(repo.id, async () => removeRepo(repo.id));
-		console.log(`[merge-queue] ${repo.owner}/${repo.name} removed by ${locals.user.login}`);
+		log.info('repository removed', { repo: `${repo.owner}/${repo.name}`, by: locals.user.login });
 		redirect(303, '/');
 	}
 };

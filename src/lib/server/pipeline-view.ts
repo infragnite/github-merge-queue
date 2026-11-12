@@ -8,6 +8,7 @@ import { tickError, type TickError } from './tick-errors';
 import { activityOf, type ActivityView } from './activity';
 import { batchCard, ciMayStillRun, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
 import type { StackAnalysis } from './stacks';
+import { log } from './log';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -51,7 +52,7 @@ async function progressFor(repo: RepoRef, sha: string, low: boolean): Promise<CI
 		return value;
 	} catch (e) {
 		const why = e instanceof Error ? e.message : String(e);
-		console.warn(`[batches] ${repo.owner}/${repo.name}: CI progress for ${sha.slice(0, 8)} failed: ${why}`);
+		log.warn('reading CI progress failed', { repo: `${repo.owner}/${repo.name}`, sha, err: why });
 		progressErrors.set(key, why);
 		return hit?.value ?? null;
 	}
