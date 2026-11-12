@@ -1467,9 +1467,12 @@ class Tick {
 		store.setBatchStatus(batch.id, 'failed');
 		await this.retire(batch);
 		this.requeue(batch.members);
+		const why = `Waiting: ${this.d.repo.default_branch} is red, and this PR does not fix it`;
 		for (const n of batch.members) {
 			const it = this.item(n);
-			if (it) db.updateQueueItemStatus(it.id, 'queued', `Waiting: ${this.d.repo.default_branch} is red, and this PR does not fix it`);
+			if (!it) continue;
+			db.updateQueueItemStatus(it.id, 'queued', why);
+			await this.d.github.setPRCheck(batch.heads[n], { state: 'queued', title: short(why) }).catch(this.bestEffort('github.setPRCheck'));
 		}
 	}
 
