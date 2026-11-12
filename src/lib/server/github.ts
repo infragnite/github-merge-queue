@@ -1,6 +1,7 @@
 import { actionsJobsFor } from './ci-savings';
 import { env } from '$env/dynamic/private';
 import { createSign } from 'crypto';
+import { mergeInStack, needsAsyncMerge } from './stacked-merge';
 import {
 	mergeResultFromData,
 	mergeResultFromError,
@@ -433,6 +434,17 @@ export async function setPRBase(owner: string, repo: string, n: number, base: st
 export async function squashMergeAt(owner: string, repo: string, n: number, title: string, sha: string) {
 	try {
 		const pr = await ghFetchAsApp(`/repos/${owner}/${repo}/pulls/${n}`);
+		// A PR in one of GitHub's stacks only merges through the async merge API (see stacked-merge.ts).
+		const inStack = () =>
+			mergeInStack(
+				{
+					put: (path, body) => ghFetchAsApp(path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, owner),
+					get: (path) => ghFetchAsApp(path, undefined, owner),
+					sleep: (ms) => new Promise((r) => setTimeout(r, ms))
+				},
+				{ pulls: `/repos/${owner}/${repo}/pulls`, n, title, sha, pr }
+			);
+		if (needsAsyncMerge(pr, null)) return await inStack();
 		const data = await ghFetchAsApp(
 			'/graphql',
 			{
@@ -455,7 +467,12 @@ export async function squashMergeAt(owner: string, repo: string, n: number, titl
 			},
 			owner
 		);
-		if (data.errors?.length) return { merged: false, sha: null, message: data.errors.map((e: { message: string }) => e.message).join('; ') };
+		if (data.errors?.length) {
+			const message = data.errors.map((e: { message: string }) => e.message).join('; ');
+			// A PR GitHub stacked without saying so in the PR it returned.
+			if (needsAsyncMerge({}, message)) return await inStack();
+			return { merged: false, sha: null, message };
+		}
 		const r = data.data?.mergePullRequest?.pullRequest;
 		return mergeResultFromData({ merged: !!r?.merged, sha: r?.mergeCommit?.oid });
 	} catch (e) {
