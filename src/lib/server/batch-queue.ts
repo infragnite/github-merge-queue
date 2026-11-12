@@ -1080,7 +1080,8 @@ class Tick {
 						? await replace(r.head, 'restacked', 'landing after its parent')
 						: // Its own commits don't replay onto master one by one (it merged its parent in, say),
 							// though the tree it was tested with does: master merged in with that tree lands it.
-							await replace(await mergeIn(step.tree), 'merge of master into', `merged ${def} with the tested tree to land after its parent`);
+							// The batch's commit carries that tree into the mirror, however long ago it was built.
+							(await this.d.git.fetch([src.head_sha]), await replace(await mergeIn(step.tree), 'merge of master into', `merged ${def} with the tested tree to land after its parent`));
 				if (done === 'moved') continue;
 				if (done === 'stopped') return false;
 			} else {
