@@ -60,7 +60,7 @@ function ownWork(a: ActivityView, now: number): RunSlot[] {
 	if (a.failure) {
 		const f = a.failure;
 		const ago = now - f.at < 60_000 ? 'just now' : `${minutes(now - f.at)} ago`;
-		const what = [f.phase ? f.step : null, f.message].filter(Boolean).join(': ');
+		const what = [f.phase ? f.step : null, f.action].filter(Boolean).join(': ');
 		out.push({
 			key: 'failure',
 			state: 'failed',

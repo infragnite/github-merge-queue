@@ -141,8 +141,10 @@ describe('runOrder: what the queue is doing now', () => {
 		]);
 	});
 
-	test('a failed step is shown first, with its PRs, the step, the error and when', () => {
-		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1, 2], message: 'refusing to allow a GitHub App to create or update workflow', at };
+	const GRANT = "Grant the GitHub App the Workflows (read and write) permission, then approve it on this account's installation";
+
+	test('a failed step is shown first, with its PRs, the step, what to do and when', () => {
+		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1, 2], action: GRANT, at };
 		const rows = runOrder({ active: [card(4, { prs: [pr(9)] })], upNext: [], express: false, activity: { ...idle, failure }, now: at + 5 * 60_000 });
 		expect(rows[0]).toEqual({
 			key: 'failure',
@@ -150,7 +152,7 @@ describe('runOrder: what the queue is doing now', () => {
 			batch: null,
 			label: 'Forming a batch failed',
 			branch: null,
-			detail: 'pushing mq/batch-5: refusing to allow a GitHub App to create or update workflow (5 min ago)',
+			detail: `pushing mq/batch-5: ${GRANT} (5 min ago)`,
 			prs: [1, 2],
 			urgent: false
 		});
@@ -158,12 +160,12 @@ describe('runOrder: what the queue is doing now', () => {
 	});
 
 	test('a failed step outside a batch is named by the step', () => {
-		const failure = { phase: null, step: 'fetching #3 from GitHub', prs: [3], message: 'timeout', at };
-		expect(runOrder({ active: [], upNext: [], express: false, activity: { ...idle, failure }, now: at + 20_000 })[0]).toMatchObject({ label: 'Fetching #3 from GitHub failed', detail: 'timeout (just now)' });
+		const failure = { phase: null, step: 'pointing #3 at main', prs: [3], action: GRANT, at };
+		expect(runOrder({ active: [], upNext: [], express: false, activity: { ...idle, failure }, now: at + 20_000 })[0]).toMatchObject({ label: 'Pointing #3 at main failed', detail: `${GRANT} (just now)` });
 	});
 
 	test('a failure and the retry of it both show while the retry runs', () => {
-		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], message: 'boom', at };
+		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], action: GRANT, at };
 		const activity = { since: at + 60_000, phase: { kind: 'forming' as const, label: 'Forming a batch', prs: [1], branch: null, since: at + 60_000 }, step: { label: 'merging #1', prs: [1], since: at + 60_000 }, failure };
 		expect(runOrder({ active: [], upNext: [], express: false, activity, now: at + 61_000 }).map((r) => [r.key, r.state])).toEqual([
 			['failure', 'failed'],
@@ -171,8 +173,8 @@ describe('runOrder: what the queue is doing now', () => {
 		]);
 	});
 
-	test('without its error (the public page), a failed step says only what failed and when', () => {
-		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], message: null, at };
+	test('without what to do (the public page), a failed step says only what failed and when', () => {
+		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], action: null, at };
 		expect(runOrder({ active: [], upNext: [], express: false, activity: { ...idle, failure }, now: at + 120_000 })[0]).toMatchObject({ label: 'Forming a batch failed', detail: 'pushing mq/batch-5 (2 min ago)' });
 	});
 

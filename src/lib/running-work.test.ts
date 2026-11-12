@@ -50,7 +50,7 @@ describe('running work, in the order it holds the runners', () => {
 	});
 
 	test('a failed preparation step goes on top too, before the retry of it', () => {
-		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], message: 'boom', at };
+		const failure = { phase: 'Forming a batch', step: 'pushing mq/batch-5', prs: [1], action: 'Grant it', at };
 		const activity: ActivityView = { since: at, phase: { kind: 'forming', label: 'Forming a batch', prs: [1], branch: null, since: at }, step: null, failure };
 		expect(keys(runningWork({ active: [card(4, { prs: [pr(2)] })], activity, now: at + 1000 }))).toEqual(['failure', 'activity', 'run4']);
 	});
@@ -72,7 +72,7 @@ describe('running work, in the order it holds the runners', () => {
 
 	test('a failed bisection step preparation shows inside its batch too', () => {
 		const b13 = card(13, { status: 'bisecting', ci: 'failure', prs: [pr(1, { verdict: 'unknown' }), pr(2, { verdict: 'unknown' })] });
-		const failure = { phase: 'Preparing a bisection step', step: 'merging #2', prs: [2], message: 'conflict', at };
+		const failure = { phase: 'Preparing a bisection step', step: 'merging #2', prs: [2], action: 'Grant it', at };
 		const w = runningWork({ active: [card(12, { prs: [pr(5)] }), b13], activity: { ...idle, failure }, now: at + 1000 });
 		expect(keys(w)).toEqual(['run12', 'run13']);
 		expect(w[1]).toMatchObject({ prep: [{ key: 'failure', state: 'failed', label: 'Preparing a bisection step failed' }] });

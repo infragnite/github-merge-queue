@@ -167,7 +167,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	try {
 		// Tracked, so the queue page shows the step running (forming a batch, a restack) and a failed one.
 		const buildKind = () => (getActiveBatches(repo.id).some((b) => b.status === 'bisecting') ? ('bisect' as const) : ('forming' as const));
-		await withRepoLock(repo.id, () => withActivity(liveDeps(repo), tickBatchQueue, { buildKind }));
+		await withRepoLock(repo.id, () => withActivity(liveDeps(repo), tickBatchQueue, { buildKind, tick: true }));
 		clearTickError(repo.id);
 	} catch (err) {
 		noteTickError(repo.id, err);

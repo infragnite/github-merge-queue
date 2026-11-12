@@ -134,5 +134,5 @@ export function publicPipeline(p: PipelineView): PipelineView {
 
 /** Which step runs and on which PRs is what the page already shows; why one failed is not (App internals). */
 export function publicActivity(a: ActivityView): ActivityView {
-	return { since: a.since, phase: a.phase, step: a.step, failure: a.failure ? { ...a.failure, message: null } : null };
+	return { since: a.since, phase: a.phase, step: a.step, failure: a.failure ? { ...a.failure, action: null } : null };
 }

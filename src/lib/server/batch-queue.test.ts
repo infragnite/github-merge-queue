@@ -15,6 +15,8 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import type { LivePR, PRCheckState, QueueDeps } from './batch-queue';
 import { ejectedNotice, holdCheck, holdNotice, readNotice } from './hold-format';
 import { RateLimitedError } from './rate-limit';
+import { HeadMovedError } from './head-moved';
+import { activityOf, clearActivity, withActivity } from './activity';
 import { DEFAULT_BATCH_CONFIG, type BatchConfig } from './batching';
 
 let git: GitSandbox;
@@ -99,6 +101,8 @@ class World {
 	ciOps: string[] = [];
 	/** Called as each PR is about to be merged (before GitHub checks its head). */
 	beforeMerge: (n: number) => void = () => {};
+	/** Called as the queue pushes to a PR's branch, before GitHub checks the lease: the author pushing first. */
+	beforePushHead: (branch: string) => void = () => {};
 
 	ciFails(sha: string) {
 		if (this.everythingFails) return true;
@@ -230,7 +234,8 @@ class World {
 					return this.pushKeepsApproval;
 				},
 				pushHead: async (branch, sha, expected) => {
-					if (git.sha(branch) !== expected) throw new Error('stale info');
+					this.beforePushHead(branch);
+					if (git.sha(branch) !== expected) throw new HeadMovedError(branch, expected);
 					git.git('branch', '-f', branch, sha);
 					this.pushedHeads.push({ branch, sha });
 				},
@@ -978,6 +983,48 @@ describe('batch queue runtime', () => {
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 	});
 
+	/** A stacked child #2 that edits its parent #1's lines: it lands only once the queue restacks it onto master. */
+	function childEditingParent() {
+		pr(1, { file: 'shared.txt' });
+		git.branch('pr2', 'pr1');
+		git.git('checkout', '-q', 'pr2');
+		writeFileSync(`${git.dir}/shared.txt`, 'child rewrote it\n');
+		git.git('commit', '-qam', 'pr2');
+		git.openPR(2, 'pr2', 'pr1');
+		world.approved.add(2);
+		db.addToQueue(repo.id, 2, 'PR 2', 'u', 'dev', '', 'dev');
+	}
+
+	test('the author pushing to a child just before the queue restacks it to land: no pause, the rest lands, the child goes back in line', async () => {
+		childEditingParent();
+		world.beforePushHead = (branch) => {
+			if (branch === 'pr2') git.commit('pr2', 'late change');
+			world.beforePushHead = () => {};
+		};
+		await run(3);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged.slice(0, 1)).toEqual([1]);
+		// The author's push stands: the queue never pushed over it.
+		expect(world.pushedHeads).toEqual([]);
+		expect(git.git('log', '-1', '--format=%s', 'pr2')).toBe('late change');
+		// The batch, then master alone (it holds #1 without #2, never tested so).
+		expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join())).slice(0, 2)).toEqual(['1,2', 'master']);
+		expect(events.listEvents(repo.id, { pr: 2, limit: 500 }).map((e) => e.kind)).toContain('changed');
+	});
+
+	test('a push to land a child refused for lack of access pauses with what to grant, not only the git error', async () => {
+		childEditingParent();
+		const denied = "git push failed: remote: Permission to acme/repo.git denied to merge-queue[bot].\nfatal: unable to access 'https://github.com/acme/repo.git/': The requested URL returned error: 403";
+		world.beforePushHead = () => {
+			throw new Error(denied);
+		};
+		await run(3);
+		expect(world.merged).toEqual([1]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBe(
+			`Could not push the restacked #2: ${denied}. Grant the GitHub App the Contents (read and write) permission, then approve it on this account's installation`
+		);
+	});
+
 	describe('count baselines', () => {
 		const BASELINE = 'clippy-baseline.tsv';
 		const rows = (...r: [number, string][]) => r.map(([n, finding]) => `${n}\tsrc/a.rs\t${finding}\n`).join('');
@@ -1066,6 +1113,22 @@ describe('batch queue runtime', () => {
 			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 			const pushed = world.pushedHeads[0].sha;
 			expect(git.git('rev-list', '--parents', '-n', '1', pushed).split(' ').slice(1)).toEqual([head2, git.sha('main~1')]);
+		});
+
+		test('the author pushing just before the queue merges main into their PR to land it: no pause, #1 lands, #2 goes back in line', async () => {
+			lists();
+			removing(1, ['a.kt', 'c.kt', 'd.kt']);
+			removing(2, ['a.kt', 'b.kt', 'd.kt']);
+			world.beforePushHead = (branch) => {
+				if (branch === 'pr2') git.commit('pr2', 'late change');
+				world.beforePushHead = () => {};
+			};
+			await run(3);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(world.merged.slice(0, 1)).toEqual([1]);
+			expect(world.pushedHeads).toEqual([]);
+			expect(world.started.map((x) => (x.branch.includes('/base-') ? 'master' : x.prs.join())).slice(0, 2)).toEqual(['1,2', 'master']);
+			expect(events.listEvents(repo.id, { pr: 2, limit: 500 }).map((e) => e.kind)).toContain('changed');
 		});
 
 		test('without the attributes on main, neighbouring removals are a conflict as before', async () => {
@@ -1630,6 +1693,80 @@ describe('batch queue runtime', () => {
 		git.git('merge-base', '--is-ancestor', 'pr1', world.pushedHeads[0].sha);
 		expect(world.merged).toEqual([1, 2]);
 		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
+	});
+
+	test('the author restacking a child just before the queue does: the queue leaves it, says nothing, shows nothing, and both land', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		git.commit('main', 'm1', 'x-main.txt');
+		git.rebase('pr1', 'main');
+		const oldHead = git.sha('pr2');
+		// The author restacks #2 onto its rebased parent while the queue is doing the same.
+		world.beforePushHead = (branch) => {
+			if (branch !== 'pr2') return;
+			git.git('branch', '-f', 'pr2', git.git('rev-parse', 'pr1'));
+			git.commit('pr2', 'pr2', 'pr2.txt');
+			world.beforePushHead = () => {};
+		};
+		clearActivity(repo.id);
+		await withActivity(world.deps(), tickBatchQueue, { tick: true });
+		expect(git.sha('pr2')).not.toBe(oldHead);
+		const theirs = git.sha('pr2');
+		expect(world.pushedHeads).toEqual([]);
+		expect(activityOf(repo.id).failure).toBeNull();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.comments.filter((c) => c.pr === 2)).toEqual([]);
+		expect(events.listEvents(repo.id, { pr: 2, limit: 500 }).filter((e) => e.kind === 'rebased')).toEqual([]);
+		await run();
+		// The author's restack is what lands: the queue never pushed over it.
+		expect(world.pushedHeads).toEqual([]);
+		expect(world.merged).toEqual([1, 2]);
+		expect(git.sha('pr2')).toBe(theirs);
+		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
+	});
+
+	test('the author pushing a commit to a child with stale commits as the queue restacks it: the next tick restacks the new head', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		git.commit('main', 'm1', 'x-main.txt');
+		git.rebase('pr1', 'main');
+		world.beforePushHead = (branch) => {
+			if (branch !== 'pr2') return;
+			git.commit('pr2', 'late change');
+			git.git('checkout', '-q', '--detach'); // the queue's later push moves the branch
+			world.beforePushHead = () => {};
+		};
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		// One push, of the head the author left, restacked.
+		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+		git.git('merge-base', '--is-ancestor', 'pr1', world.pushedHeads[0].sha);
+		expect(world.merged).toEqual([1, 2]);
+		expect(mainFiles()).toEqual(['pr1.txt', 'pr2.txt', 'x-main.txt']);
+		expect(world.files('main').has('late-change.txt')).toBe(true);
+	});
+
+	test('a lease lost on every tick holds up only that PR: the rest of the queue still plans and lands', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		pr(3);
+		git.commit('main', 'm1', 'x-main.txt');
+		git.rebase('pr1', 'main');
+		// The author keeps pushing to #2, each time just before the queue's restack of it.
+		let lost = 0;
+		world.beforePushHead = (branch) => {
+			if (branch !== 'pr2') return;
+			lost++;
+			git.commit('pr2', `late change ${lost}`);
+			git.git('checkout', '-q', '--detach');
+		};
+		await run(5);
+		expect(lost).toBeGreaterThan(1);
+		expect(world.merged).toContain(3);
+		expect(world.pushedHeads).toEqual([]);
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		// Nobody tells #2 to restack itself while the queue is still trying to.
+		expect(world.comments.filter((c) => c.pr === 2 && c.body.includes('"code":"stack-broken"'))).toEqual([]);
 	});
 
 	test('a PR whose parent was rebased, with restacking off, is told the exact restack command', async () => {

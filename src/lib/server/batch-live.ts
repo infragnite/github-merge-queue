@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
 import { RateLimitedError } from './rate-limit';
+import { HeadMovedError, leaseLost } from './head-moved';
 import { baselineCommit, buildBatch, GitRunner, mergeTrees, queueMergeCommit } from './batch-builder';
 import { replay } from './rebase';
 import { gitConfigEnv, mergeDriverEnv, requireGitVersion } from './merge-drivers';
@@ -241,22 +242,36 @@ export class Mirror {
 		]);
 	}
 
-	/** Force-pushes `sha` to `branch` only if the branch is still at `expected`. */
+	/**
+	 * Force-pushes `sha` to `branch` only if the branch is still at `expected`; a
+	 * `HeadMovedError` when it is not (the author pushed first).
+	 */
 	async pushLease(branch: string, sha: string, expected: string) {
-		await this.network(`push ${sha.slice(0, 8)} to ${branch} (lease ${expected.slice(0, 8)})`, [
-			'push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`
-		]);
+		await this.network(
+			`push ${sha.slice(0, 8)} to ${branch} (lease ${expected.slice(0, 8)})`,
+			['push', '-q', `--force-with-lease=refs/heads/${branch}:${expected}`, this.url, `${sha}:refs/heads/${branch}`],
+			(message) => (leaseLost(message) ? new HeadMovedError(branch, expected) : null)
+		);
 	}
 
-	/** Runs a fetch or push off the event loop, logging what it did and how long it took. */
-	private async network(what: string, args: string[]) {
+	/**
+	 * Runs a fetch or push off the event loop, logging what it did and how long it took. `expected`
+	 * turns a failure that is an outcome, not an error, into its own error, logged as information.
+	 */
+	private async network(what: string, args: string[], expected: (message: string) => Error | null = () => null) {
 		const name = `${this.repo.owner}/${this.repo.name}`;
 		const started = Date.now();
 		try {
 			await this.plain.runAsync(args, { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
 			console.log(`[git] ${name}: ${what} took ${Date.now() - started} ms`);
 		} catch (err) {
-			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${err instanceof Error ? err.message : err}`);
+			const message = err instanceof Error ? err.message : String(err);
+			const outcome = expected(message);
+			if (outcome) {
+				console.log(`[git] ${name}: ${what} refused after ${Date.now() - started} ms: ${outcome.message}`);
+				throw outcome;
+			}
+			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${message}`);
 			throw err;
 		}
 	}
