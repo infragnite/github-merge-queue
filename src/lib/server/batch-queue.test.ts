@@ -2919,6 +2919,34 @@ describe('batch queue runtime', () => {
 			);
 		});
 
+		for (const [why, held] of [
+			['Commits must have verified signatures.', true],
+			['A conversation must be resolved before this pull request can be merged.', true],
+			['Pull request is in draft state', true],
+			['Required status check "merge-queue" is expected.', false],
+			['Changes must be made through the merge queue', false],
+			["GitHub did not say which stack #1 is in, so the PRs below it can't be checked; GitHub's merge would merge them with it", false]
+		] as const) {
+			test(`"${why}" ${held ? 'holds the PR for its author' : 'pauses for a resume: no push of the PR fixes it'}`, async () => {
+				pr(1);
+				world.refuseMerge.add(1);
+				world.refusal.set(1, why);
+				await run();
+				expect(queued()).toEqual([{ pr: 1, status: held ? 'conflict' : 'checking' }]);
+				expect(store.getQueueSettings(repo.id).pausedReason !== null).toBe(!held);
+			});
+		}
+
+		test('a PR freed by a repository-wide refusal shows as waiting again, not as needing its author', async () => {
+			pr(1);
+			world.refuseMerge.add(1);
+			await run();
+			pr(2);
+			world.refuseMerge.add(2);
+			await run();
+			expect(world.prChecks.filter((c) => c.sha === git.sha('pr1')).at(-1)?.state).toBe('queued');
+		});
+
 		test('resuming after the repository-wide refusal puts the PR it held back in line too', async () => {
 			pr(1);
 			world.refuseMerge.add(1);
