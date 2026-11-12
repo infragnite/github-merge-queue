@@ -25,6 +25,7 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	deferred: [],
 	conflict: ['resolve-conflict'],
 	'workflow-permission': ['grant-workflows-permission'],
+	'merge-refused': ['fix-merge-refusal'],
 	failed: ['fix-failure']
 };
 

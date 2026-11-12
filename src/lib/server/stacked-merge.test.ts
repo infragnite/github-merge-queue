@@ -78,14 +78,51 @@ describe("merging a PR in one of GitHub's stacks", () => {
 		expect(slept.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(120_000);
 	});
 
+	const stackOf = (...prs: Array<[number, 'open' | 'merged' | 'closed']>) => ({
+		number: 3390,
+		open: true,
+		pull_requests: prs.map(([number, st]) => ({ number, state: st === 'open' ? 'open' : 'closed', merged_at: st === 'merged' ? '2026-11-12T11:17:18Z' : null }))
+	});
+	const SECOND = { stack: { number: 3390, position: 2, size: 2 } };
+
 	test('a PR above unmerged PRs in its stack is not merged: GitHub would merge those too, untested', async () => {
+		const { fake, calls } = api([], [stackOf([3255, 'open'], [3294, 'open'])]);
+		expect(await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: SECOND })).toEqual({
+			merged: false,
+			sha: null,
+			message: "#3294 sits above 1 open PR in its GitHub stack (#3255), and GitHub's merge would merge them with it; merge or unstack the PRs below it first"
+		});
+		expect(calls).toEqual(['GET /repos/o/r/stacks/3390']);
+	});
+
+	test('a PR whose lower PRs in the stack already merged merges: GitHub keeps counting them in its position', async () => {
+		const { fake, calls } = api([{ status: 'merged', details: { message: 'Merged', sha: MERGED } }], [stackOf([3255, 'merged'], [3294, 'open'])]);
+		expect(await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: SECOND })).toEqual({ merged: true, sha: MERGED, message: undefined });
+		expect(calls).toEqual(['GET /repos/o/r/stacks/3390', 'PUT /repos/o/r/pulls/3294/merge-async']);
+	});
+
+	test('a closed, unmerged PR below it does not count: GitHub merges only open ones with it', async () => {
+		const { fake } = api([{ status: 'merged', details: { message: 'Merged', sha: MERGED } }], [stackOf([1, 'closed'], [3294, 'open'])]);
+		expect((await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: SECOND })).merged).toBe(true);
+	});
+
+	test('a PR above others in a stack GitHub does not name is not merged: the PRs below cannot be checked', async () => {
 		const { fake, calls } = api([]);
 		expect(await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: { stack: { position: 2, size: 2 } } })).toEqual({
 			merged: false,
 			sha: null,
-			message: "#3294 sits above 1 open PR in its GitHub stack, and GitHub's merge would merge them with it; merge or unstack the PRs below it first"
+			message: "GitHub did not say which stack #3294 is in, so the PRs below it can't be checked; GitHub's merge would merge them with it"
 		});
 		expect(calls).toEqual([]);
+	});
+
+	test('a PR its stack does not list is not merged', async () => {
+		const { fake } = api([], [stackOf([3255, 'open'])]);
+		expect(await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: SECOND })).toEqual({
+			merged: false,
+			sha: null,
+			message: "GitHub's stack 3390 does not list #3294, so the PRs below it can't be checked; GitHub's merge would merge them with it"
+		});
 	});
 
 	test('a rate limit is not a refusal: it is thrown for the queue to wait', async () => {

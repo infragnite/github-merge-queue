@@ -68,6 +68,18 @@ describe('the hold comment', () => {
 		);
 	});
 
+	test('a merge GitHub refused says to fix what GitHub named and push', () => {
+		const reason = "GitHub refused the merge: #2 sits above 1 open PR in its GitHub stack, and GitHub's merge would merge them with it; merge or unstack the PRs below it first";
+		const body = holdNotice({ pr: 2, head: 'h2', code: 'merge-refused', reason, files: [] });
+		expect(body).toBe(
+			[
+				`**Merge queue:** ${reason}. Fix what GitHub named, then push to retry.`,
+				'',
+				`<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"h2","code":"merge-refused","reason":${JSON.stringify(reason)},"nextActions":["fix-merge-refusal"]} -->`
+			].join('\n')
+		);
+	});
+
 	test('a conflict lists its files and the commands that fix it, in the same format', () => {
 		const body = holdNotice({
 			pr: 3,
