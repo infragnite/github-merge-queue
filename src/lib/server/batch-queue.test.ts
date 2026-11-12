@@ -3260,7 +3260,7 @@ describe('a passed try stands in for a run on the same default branch', () => {
 		await tried(1);
 		expect(world.prChecks.filter((x) => x.name === 'merge-queue/try').at(-1)).toMatchObject({
 			state: 'success',
-			summary: expect.stringMatching(/`\/mq queue` lands it without another run while neither it nor `main` changes\./)
+			summary: expect.stringMatching(/`\/mq queue` lands it ahead of every PR but urgent ones, without another run, while neither it nor `main` changes\./)
 		});
 	});
 
@@ -3456,6 +3456,30 @@ describe('a passed try stands in for a run on the same default branch', () => {
 		world.hold = () => false;
 		await run();
 		expect(world.merged).toEqual([1, 2, 3]);
+	});
+
+	test('a PR another queued PR declares a dependency on goes with it, not alone on its try', async () => {
+		open(1);
+		open(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		await tried(1);
+		queue(1);
+		queue(2);
+		await run();
+		expect(runs()).toEqual([[1, 2]]);
+		expect(world.merged).toEqual([1, 2]);
+	});
+
+	test('a try of a PR that declares a dependency did not test that dependency', async () => {
+		open(1);
+		open(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		await tried(2);
+		queue(1);
+		queue(2);
+		await run();
+		expect(runs()).toEqual([[1, 2]]);
+		expect(world.merged).toEqual([1, 2]);
 	});
 
 	test('a stack whose tip passed a try lands whole without a new run', async () => {
