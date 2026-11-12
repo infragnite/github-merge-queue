@@ -146,6 +146,7 @@ export function migrateBatches(database: Database.Database) {
 			finished_at TEXT
 		);
 		CREATE INDEX IF NOT EXISTS batches_repo_status ON batches(repo_id, status);
+		CREATE INDEX IF NOT EXISTS batches_repo_kind_base ON batches(repo_id, kind, base_tree);
 
 		-- What each queue-started CI run cost, read from its Actions jobs once it is over:
 		-- job_ms is the jobs' summed run time (every attempt), wall_ms first start to last finish.
@@ -368,11 +369,13 @@ export function insertBatch(b: {
 	steps?: Record<number, BatchStep>;
 	context?: number[];
 	express?: boolean;
+	/** Recorded already decided (a batch landing on a try's pass): its CI is that try's. */
+	passed?: boolean;
 }): BatchRow {
 	const r = getDb()
 		.prepare(
-			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT INTO batches (repo_id, kind, parent_batch_id, branch, base_sha, head_sha, tree_sha, base_tree, members, heads, steps, context, express, number, status, ci_result)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 		.run(
 			b.repoId,
@@ -390,7 +393,9 @@ export function insertBatch(b: {
 			b.express ? 1 : 0,
 			b.kind === 'batch'
 				? (getDb().prepare(`SELECT COALESCE(MAX(number), 0) + 1 AS n FROM batches WHERE repo_id = ? AND kind = 'batch'`).get(b.repoId) as { n: number }).n
-				: null
+				: null,
+			b.passed ? 'passed' : 'testing',
+			b.passed ? 'success' : 'pending'
 		);
 	return getBatch(Number(r.lastInsertRowid))!;
 }
@@ -656,6 +661,19 @@ export function getRunningTries(repoId: number): BatchRow[] {
 			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status = 'testing' ORDER BY id`)
 			.all(repoId) as RawBatch[]
 	).map(parse);
+}
+
+/**
+ * The latest finished `try` run of `pr` at `headSha` on a default branch with tree `baseTree`, if
+ * any: whether its pass may stand in for a run of the queue's own (see `Tick.reusableTry`).
+ */
+export function latestTry(repoId: number, pr: number, headSha: string, baseTree: string): BatchRow | null {
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND base_tree = ? AND ci_result != 'pending' ORDER BY id DESC`)
+			.all(repoId, baseTree) as RawBatch[]
+	).map(parse);
+	return rows.find((r) => r.members.length === 1 && r.members[0] === pr && r.heads[pr] === headSha) ?? null;
 }
 
 // --- default-branch health ---

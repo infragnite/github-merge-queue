@@ -8,7 +8,7 @@
 //
 // Pure: the runtime gathers the queue, PR states, the stack analysis and known conflicts.
 
-import { admit, type Admission, type BatchConfig, type Hold, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
+import { admit, triedPrefix, type Admission, type BatchConfig, type Hold, type HoldCode, type Plan, type PlanInput, type Priority, type QueueEntry } from './batching';
 import type { DependencyGraph } from './deps';
 import type { StackAnalysis } from './stacks';
 
@@ -30,6 +30,11 @@ export interface QueueModelInput {
 	 * already cut. By default only the git parent.
 	 */
 	deps?: Pick<DependencyGraph, 'depsOf' | 'declaredOf'>;
+	/**
+	 * PRs whose latest `try` passed at their current head on the default branch as it is now. A stack
+	 * such a try tested whole lands without a run of its own, so it goes first, after urgent stacks.
+	 */
+	landable?: Set<number>;
 }
 
 export interface QueueStack {
@@ -59,6 +64,8 @@ export interface QueueStack {
 	priority: Priority;
 	/** When its earliest member was queued. */
 	enqueuedAt: number;
+	/** A passed try tested the whole stack on the default branch: it lands without a run (see `landable`). */
+	landable: boolean;
 }
 
 export interface Held {
@@ -195,20 +202,36 @@ export function queueModel(input: QueueModelInput): QueueModel {
 		};
 		for (const r of group.filter((n) => needs.get(n)!.length === 0).sort(byOrder)) visit(r, null);
 		const outside = members.flatMap((m) => depsOf(m).filter((p) => !set.has(p)));
+		const on = outside.find((p) => inflight.has(p)) ?? null;
+		const after = [...new Set(outside.filter((p) => freeSet.has(p)))];
 		const es = members.map((m) => entries.get(m)!);
 		return {
 			root: members[0],
 			members,
 			parentOf: within,
 			needs,
-			on: outside.find((p) => inflight.has(p)) ?? null,
-			after: [...new Set(outside.filter((p) => freeSet.has(p)))],
+			on,
+			after,
 			priority: PRIORITIES[Math.min(...members.map((m) => eff.get(m)!))],
-			enqueuedAt: Math.min(...es.map((e) => e.enqueuedAt))
+			enqueuedAt: Math.min(...es.map((e) => e.enqueuedAt)),
+			// A try tests one PR's head alone on the default branch, which carries its git parents' commits
+			// but not what it declares: only a stack of one PR and its git parents, on the default branch
+			// itself and after nothing else in line, is what the try tested.
+			landable:
+				on === null &&
+				after.length === 0 &&
+				!!input.landable &&
+				triedPrefix(members, gitParent, (m) => input.landable!.has(m), depsOf)?.length === members.length
 		};
 	});
 	const place = (s: QueueStack) => Math.min(...s.members.map((m) => entries.get(m)!.position ?? 0));
-	stacks.sort((a, b) => RANK[a.priority] - RANK[b.priority] || place(a) - place(b) || a.enqueuedAt - b.enqueuedAt || a.root - b.root);
+	// Urgent stacks first (an urgent PR may break what a try tested), then stacks that land on a
+	// passed try without a run of their own, then the rest by priority.
+	const tier = (s: QueueStack) => (s.priority === 'urgent' ? 0 : s.landable ? 1 : 1 + RANK[s.priority]);
+	stacks.sort(
+		(a, b) =>
+			tier(a) - tier(b) || Number(b.landable) - Number(a.landable) || place(a) - place(b) || a.enqueuedAt - b.enqueuedAt || a.root - b.root
+	);
 	return { stacks, attention };
 }
 
@@ -231,6 +254,8 @@ export function fillBatch(model: QueueModel, opts: { config: BatchConfig; inflig
 	const none: FillResult = { batch: null, express: false, waitUntil: null };
 	if (opts.inflightBatches >= config.depth || model.stacks.length === 0) return none;
 	const express = model.stacks[0].priority === 'urgent';
+	// It lands on its try, without a run: at once, alone; the rest is batched after it.
+	if (!express && model.stacks[0].landable) return { batch: [...model.stacks[0].members], express: false, waitUntil: null };
 	const candidates = express ? model.stacks.filter((s) => s.priority === 'urgent') : model.stacks;
 	const batch: number[] = [];
 	const taken = new Set<number>();
@@ -263,7 +288,7 @@ export function serialPick(model: QueueModel, opts: { inflight: number }): numbe
  * head stack whole.
  */
 export function planNextBatch(
-	input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial'; held?: Map<number, Hold>; dependencies?: DependencyGraph }
+	input: PlanInput & { conflicts?: Map<number, string>; strategy?: 'batch' | 'serial'; held?: Map<number, Hold>; dependencies?: DependencyGraph; landable?: Set<number> }
 ): Plan {
 	const inflight = new Set(input.inflight.flat());
 	const conflicts = [...(input.conflicts ?? [])].map(([pr, reason]) => [pr, { code: 'conflict' as const, reason }] as const);
@@ -271,7 +296,7 @@ export function planNextBatch(
 	const admission = (n: number) => input.held?.get(n) ?? admitted(n);
 	// A known conflict is said before a problem with the PR's declarations.
 	const problems = new Map([...(input.dependencies?.problems ?? []), ...conflicts]);
-	const model = queueModel({ queue: input.queue, admission, analysis: input.analysis, inflight, problems, deps: input.dependencies });
+	const model = queueModel({ queue: input.queue, admission, analysis: input.analysis, inflight, problems, deps: input.dependencies, landable: input.landable });
 	const fill: FillResult =
 		input.strategy === 'serial'
 			? { batch: serialPick(model, { inflight: input.inflight.length }), express: false, waitUntil: null }

@@ -244,7 +244,8 @@ describe('filling never takes a unit before what it depends on', () => {
 			on: null,
 			after,
 			priority,
-			enqueuedAt: NOW
+			enqueuedAt: NOW,
+			landable: false
 		});
 		const m: QueueModel = { stacks: [unit([5], [9]), unit([6], [5]), unit([7])], attention: [] };
 		expect(fillBatch(m, { config, inflightBatches: 0, now: NOW }).batch).toEqual([7]);
