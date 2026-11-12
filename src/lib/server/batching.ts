@@ -144,6 +144,7 @@ export type HoldCode =
 	| AdmissionCode
 	| 'conflict'
 	| 'workflow-permission'
+	| 'merge-refused'
 	| 'failed'
 	| 'deferred'
 	| 'parent-not-queued'
@@ -165,6 +166,7 @@ const EVERY_HOLD: Record<HoldCode, true> = {
 	'wrong-base': true,
 	conflict: true,
 	'workflow-permission': true,
+	'merge-refused': true,
 	failed: true,
 	deferred: true,
 	'parent-not-queued': true,
@@ -209,6 +211,8 @@ export function holdAdvice(code: HoldCode): string {
 			return 'Rebase it and push:';
 		case 'workflow-permission':
 			return 'A repository admin grants the app the Workflows: Read and write permission; then push to retry.';
+		case 'merge-refused':
+			return 'Fix what GitHub named, then push to retry.';
 		case 'failed':
 			return 'Fix the failure and push.';
 		// Nothing the author can do: it waits for other PRs, or for the queue itself.

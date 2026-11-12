@@ -46,11 +46,11 @@ import { HeadMovedError } from './head-moved';
 import { failureAction } from './activity';
 import { emitEvent, heldPRs, type QueueEventKind } from './events';
 
-/** The error, and what to do about it when someone can (a pause reason must say what to do). */
+/** The error, and what to do about it: a pause reason always says what to do. */
 function withAction(call: string, e: unknown): string {
 	const message = e instanceof Error ? e.message : String(e);
 	const action = failureAction(call, e);
-	return action ? `${message}. ${action}` : message;
+	return `${message}. ${action ?? 'Resume to try again'}`;
 }
 
 /** A PR as the queue sees it; `PRState`'s readiness fields come from `QueueGitHub.readiness`. */
@@ -201,6 +201,12 @@ export interface QueueDeps {
 
 /** Why a PR deferred behind `ahead` waits. */
 const deferredReason = (ahead: number[]) => `Conflicts with ${ahead.map((a) => `#${a}`).join(' ')} ahead of it; waits for them to land`;
+
+/** A refused merge's hold reason: GitHub's own words. */
+const refusedReason = (message: string) => `GitHub refused the merge: ${message}`;
+
+/** Holds whose notice a recheck may post later, when it failed or was kept quiet. */
+const TOLD_LATER: ReadonlySet<string> = new Set<HoldCode>(['conflict', 'workflow-permission', 'merge-refused']);
 
 const LIVE = ['queued', 'checking', 'updating', 'merging', 'conflict'];
 export const CONFLICT_LABEL = 'needs-rebase';
@@ -549,7 +555,7 @@ class Tick {
 	 * told on the PR. A push clears it and the PR is picked up again.
 	 */
 	/** `base`: the default branch head it conflicted with alone; the conflict is checked again once the branch moves. Without one, only a push retries it. */
-	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict', base?: string, parent?: number) {
+	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' | 'merge-refused' = 'conflict', base?: string, parent?: number) {
 		const it = this.item(n);
 		const p = await this.pr(n);
 		// Told this conflict on this head already (it was tried again and still conflicts): the check says it again, no new comment.
@@ -558,7 +564,7 @@ class Tick {
 		const same = !!was && was.code === code && was.head === p.headSha && was.reason === reason;
 		const toldBefore = same && (!!was?.told || (!!was?.quiet && !this.speaks('attention')));
 		// A conflict with the default branch may go away when the branch moves: it is checked again then. A
-		// restack's conflict (old parent commits) and a workflow change wait for a push.
+		// restack's conflict (old parent commits), a workflow change and a refused merge wait for a push.
 		const save = (told: boolean) =>
 			it && store.setHold(it.id, { code, reason, head: p.headSha, told, ...(told ? {} : { quiet: true }), ...(base ? { base } : {}), ...(parent !== undefined ? { parent } : {}), ...(files.length ? { files } : {}), ...(fix ? { fix } : {}) });
 		if (it) {
@@ -982,7 +988,7 @@ class Tick {
 			// Each merge lands exactly the tree tested for its step; once a PR is left out, only the
 			// first merge still has one (the group's base): something merged around the queue is a pause.
 			if ((!this.skipped.size || !merged.length) && (await this.d.git.tree(master)) !== expected) {
-				this.pause(`Master changed while batch ${batch.number} was landing (before #${n}); was something merged outside the queue?`);
+				this.pause(`Master changed while batch ${batch.number} was landing (before #${n}): something was merged outside the queue. Resume to test the rest on top of it.`);
 				return false;
 			}
 			const step = src.steps[n];
@@ -1034,7 +1040,7 @@ class Tick {
 					continue;
 				}
 				if (!r.ok || (!this.skipped.size && r.tree !== step.tree)) {
-					this.pause(`Could not restack #${n} onto master to land it: ${r.ok ? 'the result differs from the tested tree' : r.reason}`);
+					this.pause(`Could not restack #${n} onto master to land it: ${r.ok ? 'the result differs from the tested tree' : r.reason}. Restack #${n} onto ${def} by hand and push, then resume.`);
 					return false;
 				}
 				try {
@@ -1053,7 +1059,7 @@ class Tick {
 				head = r.head;
 				// GitHub takes a moment to see the new head; merging before that is refused.
 				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the restacked head of #${n} in time`);
+					this.pause(`GitHub did not pick up the restacked head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
 					return false;
 				}
 			} else {
@@ -1065,7 +1071,7 @@ class Tick {
 						this.skip(this.skipped, prs, n);
 						continue;
 					}
-					this.pause(`Could not merge ${def} into #${n} to land it: the result differs from the tested tree`);
+					this.pause(`Could not merge ${def} into #${n} to land it: the result differs from the tested tree. Merge ${def} into #${n} by hand and push, then resume.`);
 					return false;
 				}
 				const merge = await this.d.git.mergeCommit(t.queue, [head, master], `Merge ${def} into ${p.headRef}`);
@@ -1084,7 +1090,7 @@ class Tick {
 				this.event(n, 'rebased', { from: head, to: merge, onto: def, reason: `merged ${def} with the queue's merge drivers to land` });
 				head = merge;
 				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the new head of #${n} in time`);
+					this.pause(`GitHub did not pick up the new head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
 					return false;
 				}
 			}
@@ -1122,9 +1128,23 @@ class Tick {
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
-				await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
-				this.pause(`Landing batch ${batch.number} stopped at #${n}: ${m.message ?? 'merge refused'}`);
-				return false;
+				const why = m.message ?? 'merge refused';
+				// The same refusal already holds another PR: it is the repository's, not this PR's.
+				const other = this.items().find((i) => {
+					const h = i.pr_number !== n ? store.storedHold(i as QueueItem & { hold?: string | null }) : null;
+					return h?.code === 'merge-refused' && h.reason === refusedReason(why);
+				});
+				if (other) {
+					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
+					this.pause(
+						`GitHub refused to merge #${n} with the same reason as #${other.pr_number} (${why}), so the cause is likely in the repository's settings, not in the PRs. Fix that, then resume.`
+					);
+					return false;
+				}
+				// Only this PR: it waits for its author's push; the rest lands without it.
+				this.skip(this.skipped, prs, n);
+				await this.conflict(n, refusedReason(why), [], '', 'merge-refused');
+				continue;
 			}
 			merged.push(n);
 			master = m.sha ?? (await this.d.github.defaultBranchSha());
@@ -1146,7 +1166,7 @@ class Tick {
 			return merged.length > 0;
 		}
 		if ((await this.d.git.tree(master)) !== expected) {
-			this.pause(`Master after batch ${batch.number} does not match the tested tree; was something merged outside the queue?`);
+			this.pause(`Master after batch ${batch.number} does not match the tested tree: something was merged outside the queue. Resume to check ${def} alone and go on from there.`);
 			return false;
 		}
 		await this.d.github.setStatus(master, 'success', `Tree tested in ${src.branch} (${src.head_sha.slice(0, 7)})`);
@@ -1298,7 +1318,7 @@ class Tick {
 				await this.retire(run);
 				store.setBatchStatus(run.id, 'failed');
 				store.clearMasterHealth(this.repoId);
-				this.pause(`The check of ${this.d.repo.default_branch} alone (${run.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
+				this.pause(`The check of ${this.d.repo.default_branch} alone (${run.branch}) got no CI result in time. Make the CI workflow run on pushes to mq/** branches, then resume.`);
 				return;
 			}
 			// Its tree passed in a batch; a default-branch run that never reports must not hold anything.
@@ -1349,7 +1369,7 @@ class Tick {
 		} catch (e) {
 			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
-			this.pause(`Could not start a check of ${this.d.repo.default_branch} alone: ${e instanceof Error ? e.message : e}`);
+			this.pause(`Could not start a check of ${this.d.repo.default_branch} alone: ${e instanceof Error ? e.message : e}. Resume to try again.`);
 			return;
 		}
 		store.insertBatch({
@@ -1484,7 +1504,7 @@ class Tick {
 			if (r === 'pending') {
 				if (this.timedOut(head)) {
 					await this.supersede([head, ...rest], 'ci-timeout');
-					this.pause(`Batch ${head.number} (${head.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
+					this.pause(`Batch ${head.number} (${head.branch}) got no CI result in time. Make the CI workflow run on pushes to mq/** branches, then resume.`);
 				}
 				return;
 			}
@@ -1570,7 +1590,7 @@ class Tick {
 				await this.retire(batch);
 				store.setBatchStatus(batch.id, 'failed');
 				this.requeue(batch.members);
-				this.pause(`Bisection run ${run.branch} got no CI result in time`);
+				this.pause(`Bisection run ${run.branch} got no CI result in time. Make the CI workflow run on pushes to mq/** branches, then resume.`);
 				return;
 			}
 		}
@@ -1797,7 +1817,7 @@ class Tick {
 			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			store.branchPushed(this.repoId, branch);
-			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}`);
+			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}. Resume to try again.`);
 			return;
 		}
 		const link = this.branchRuns(branch);
@@ -1954,8 +1974,8 @@ class Tick {
 		// Still held, and its comment failed or the setting kept it quiet and now allows it: posted now.
 		const now = this.item(it.pr_number);
 		const hold = now ? store.storedHold(now as QueueItem & { hold?: string | null }) : null;
-		if (!hold || hold.told || hold.head !== p.headSha || (hold.code !== 'conflict' && hold.code !== 'workflow-permission')) return;
-		const notice = { pr: it.pr_number, head: p.headSha, code: hold.code as 'conflict' | 'workflow-permission', reason: hold.reason, files: hold.files ?? [], ...(hold.fix ? { fix: hold.fix } : {}) };
+		if (!hold || hold.told || hold.head !== p.headSha || !TOLD_LATER.has(hold.code)) return;
+		const notice = { pr: it.pr_number, head: p.headSha, code: hold.code as HoldCode, reason: hold.reason, files: hold.files ?? [], ...(hold.fix ? { fix: hold.fix } : {}) };
 		if (!(await this.say(it.pr_number, holdNotice(notice), 'attention'))) return;
 		const { quiet: _, ...rest } = hold;
 		store.setHold(it.id, { ...rest, told: true });
@@ -1964,7 +1984,8 @@ class Tick {
 	/** Puts a held conflict back in line when what it conflicted with moved and it may apply now; whether it did. */
 	private async releaseConflict(it: QueueItem, p: LivePR, master: string): Promise<boolean> {
 		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
-		if (hold?.code === 'workflow-permission') return false;
+		// Only the author's push retries these: moving master changes nothing about them.
+		if (hold?.code === 'workflow-permission' || hold?.code === 'merge-refused') return false;
 		// A restack's conflict with its rebased parent: back in line once the parent moved; the restack tries again.
 		if (hold?.code === 'conflict' && hold.parent !== undefined) {
 			const parent = await this.pr(hold.parent).catch((e) => {
