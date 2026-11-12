@@ -136,6 +136,12 @@ export interface QueueCI {
 	result(headSha: string, notBefore?: number | null, opts?: { failFast?: boolean }): Promise<'pending' | 'success' | 'failure'>;
 	/** Cancels workflow runs still going on `headSha` (a superseded batch). */
 	cancel(headSha: string): Promise<void>;
+	/**
+	 * Whether the CI run on `headSha` is stuck rather than failing: `hung` while a job has run longer
+	 * than `hangMs`; `interrupted` once it ended with jobs cancelled or timed out and none failed.
+	 * Jobs of an attempt before `notBefore` (a re-run's start) don't count.
+	 */
+	stalled(headSha: string, notBefore: number | null | undefined, hangMs: number): Promise<'hung' | 'interrupted' | null>;
 	/** Re-runs only the failed jobs; false when there is nothing to re-run. */
 	rerunFailed(headSha: string): Promise<RerunResult>;
 	/** A link to the required check's run on `headSha` (a failed job first), once it exists. */
@@ -1111,12 +1117,41 @@ class Tick {
 	 */
 	async ciResult(b: BatchRow): Promise<'pending' | 'success' | 'failure'> {
 		const r = await this.d.ci.result(b.head_sha, b.retried_at, { failFast: this.settings().config.stopOnFirstFailure });
+		if (r !== 'success' && (await this.stalled(b, r))) return 'pending';
 		if (r === 'failure' && this.failFast(b))
 			await this.d.ci.cancel(b.head_sha).catch((e) => {
 				if (e instanceof RateLimitedError) throw e;
 				this.bestEffort('ci.cancel')(e);
 			});
 		return r;
+	}
+
+	/**
+	 * A run that is stuck, not failing, is the runner's problem, not the PRs': a hung job's run is
+	 * cancelled, and a run that ended cancelled or timed out with no job failed runs its jobs again,
+	 * once per run, whatever `retryFailed` says. True while that keeps the run going (it is pending);
+	 * a run that already ran again is judged as it is, so a job that always hangs fails in the end.
+	 */
+	async stalled(b: BatchRow, r: 'pending' | 'failure'): Promise<boolean> {
+		const state = await this.d.ci.stalled(b.head_sha, b.retried_at, this.settings().config.jobHangMs);
+		if (state === 'hung' && r === 'pending') {
+			this.event(null, 'hung', { batch: b.id, number: b.number, branch: b.branch, again: b.retried_at !== null });
+			this.log(`${b.branch}: a job has run longer than ${Math.round(this.settings().config.jobHangMs / 60_000)} min; cancelling it${b.retried_at === null ? ' to run it again' : ''}`);
+			await this.d.ci.cancel(b.head_sha).catch((e) => {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('ci.cancel')(e);
+			});
+			return true;
+		}
+		if (state !== 'interrupted' || r !== 'failure' || b.retried_at !== null) return false;
+		const rerun = await this.d.ci.rerunFailed(b.head_sha);
+		if (rerun === 'none') return false;
+		if (rerun === 'rerun') {
+			store.setBatchStatus(b.id, 'retrying');
+			store.setBatchRetried(b.id, this.d.now());
+			this.log(`${b.branch} was cancelled or timed out with no job failed; running its jobs again`);
+		}
+		return true;
 	}
 
 	/** Re-runs a failed check's jobs once, unless the repo turned flake retries off. */

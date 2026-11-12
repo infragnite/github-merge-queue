@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { approvalsFrom, checkResult, checkRunRequest, earlyFailure, gateFeeds, postPRReport, prReportCalls, queuePage, statusFromCheck } from './batch-live';
+import { approvalsFrom, checkResult, checkRunRequest, earlyFailure, gateFeeds, postPRReport, prReportCalls, queuePage, stalledRun, statusFromCheck } from './batch-live';
 import { RateLimitedError } from './rate-limit';
 import type { GhReview } from './github';
 
@@ -97,6 +97,58 @@ describe('stopping at the first failed job', () => {
 		const notBefore = Date.parse('2026-11-10T11:00:00Z');
 		expect(earlyFailure(required, [job('tests', 'completed', 'failure', 7, '2026-11-10T10:00:00Z')], notBefore)).toBe(false);
 		expect(earlyFailure(required, [job('tests', 'completed', 'failure', 7, '2026-11-10T11:05:00Z')], notBefore)).toBe(true);
+	});
+});
+
+describe('a stalled CI run', () => {
+	const MIN = 60_000;
+	const now = Date.parse('2026-11-12T08:00:00Z');
+	const at = (minutesAgo: number) => new Date(now - minutesAgo * MIN).toISOString();
+	const job = (status: string, conclusion: string | null, o: { started?: number; completed?: number; suite?: number } = {}) => ({
+		status,
+		conclusion,
+		started_at: o.started === undefined ? null : at(o.started),
+		completed_at: o.completed === undefined ? null : at(o.completed),
+		check_suite: { id: o.suite ?? 7 }
+	});
+	const opts = { now, hangMs: 60 * MIN, notBefore: null, suites: new Set([7]) };
+
+	test('a job running longer than the limit is hung', () => {
+		expect(stalledRun([job('completed', 'success', { started: 120, completed: 110 }), job('in_progress', null, { started: 61 })], opts)).toBe('hung');
+	});
+
+	test('a job running within the limit, or one waiting for a runner however long, is not hung', () => {
+		expect(stalledRun([job('in_progress', null, { started: 59 })], opts)).toBeNull();
+		expect(stalledRun([job('queued', null)], opts)).toBeNull();
+		expect(stalledRun([job('queued', null, { started: 300 })], opts)).toBeNull();
+	});
+
+	test('a hung job of another workflow does not count', () => {
+		expect(stalledRun([job('in_progress', null, { started: 200, suite: 9 })], opts)).toBeNull();
+	});
+
+	test('a finished run whose jobs were cancelled or timed out, with none failed, was interrupted', () => {
+		expect(stalledRun([job('completed', 'success', { started: 50, completed: 40 }), job('completed', 'cancelled', { started: 50, completed: 1 })], opts)).toBe('interrupted');
+		expect(stalledRun([job('completed', 'timed_out', { started: 400, completed: 40 }), job('completed', 'skipped', { completed: 40 })], opts)).toBe('interrupted');
+	});
+
+	test('a run with a failed job failed, even if other jobs were cancelled', () => {
+		expect(stalledRun([job('completed', 'failure', { started: 50, completed: 40 }), job('completed', 'cancelled', { started: 50, completed: 39 })], opts)).toBeNull();
+	});
+
+	test('a run that passed, or still runs, was not interrupted', () => {
+		expect(stalledRun([job('completed', 'success', { started: 50, completed: 40 })], opts)).toBeNull();
+		expect(stalledRun([job('completed', 'cancelled', { started: 50, completed: 40 }), job('in_progress', null, { started: 10 })], opts)).toBeNull();
+	});
+
+	test('jobs of an attempt before the re-run do not count', () => {
+		const notBefore = now - 30 * MIN;
+		expect(stalledRun([job('completed', 'cancelled', { started: 200, completed: 40 })], { ...opts, notBefore })).toBeNull();
+		expect(stalledRun([job('completed', 'cancelled', { started: 25, completed: 5 })], { ...opts, notBefore })).toBe('interrupted');
+	});
+
+	test('without the workflow known, every job on the commit counts', () => {
+		expect(stalledRun([job('in_progress', null, { started: 61, suite: 9 })], { ...opts, suites: undefined })).toBe('hung');
 	});
 });
 

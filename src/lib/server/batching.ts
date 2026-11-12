@@ -71,6 +71,11 @@ export interface BatchConfig {
 	/** A batch whose CI has not finished after this long pauses the queue. */
 	ciTimeoutMs: number;
 	/**
+	 * A CI job still running after this long is hung (a stuck runner, not the PR): its run is
+	 * cancelled and its jobs run again once, whatever `retryFailed` says.
+	 */
+	jobHangMs: number;
+	/**
 	 * A PR whose own `requiredCheck` failed on its head is held; one still running is not. Off by default: the batch run is the
 	 * gate, and a repo whose CI runs only on queue branches has no PR checks at all.
 	 */
@@ -113,6 +118,7 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	approvalOnHead: true,
 	autoRebase: true,
 	ciTimeoutMs: 12 * 60 * 60 * 1000,
+	jobHangMs: 60 * 60 * 1000,
 	requirePRChecks: false,
 	masterRun: true,
 	retryFailed: true,

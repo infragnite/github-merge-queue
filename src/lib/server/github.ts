@@ -531,6 +531,7 @@ export async function actionsJobsForSha(owner: string, repo: string, sha: string
 		status: string;
 		conclusion: string | null;
 		html_url: string;
+		started_at: string | null;
 		completed_at: string | null;
 		check_suite?: { id: number };
 	}>;
