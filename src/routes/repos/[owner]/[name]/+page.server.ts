@@ -109,7 +109,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		.catch((e) => {
 		const why = e instanceof Error ? e.message : String(e);
 		log.error('batch view failed', { repo: `${repo.owner}/${repo.name}`, err: why });
-		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {}, activity: readonly ? publicActivity(activityOf(repo.id)) : activityOf(repo.id), serverTime: Date.now() };
+		return { mode: 'serial', paused: null, master: null, red: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {}, activity: readonly ? publicActivity(activityOf(repo.id)) : activityOf(repo.id), serverTime: Date.now() };
 	});
 
 	// Built by the planners' own queue model; PRs being tested are in the batches, not in line.

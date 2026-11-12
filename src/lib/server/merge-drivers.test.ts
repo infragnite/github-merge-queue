@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { linkSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { GitRunner, mergeTrees } from './batch-builder';
-import { COUNT_BASELINE_SOURCE, gitConfigEnv, gitVersionProblem, mergeDriverEnv, MIN_GIT_VERSION, requireGitVersion, SORTED_SET_SOURCE } from './merge-drivers';
+import { gitConfigEnv, gitVersionProblem, mergeDriverEnv, MIN_GIT_VERSION, requireGitVersion, SORTED_SET_SOURCE } from './merge-drivers';
 import { GitSandbox } from './testing/git-sandbox';
 
 let git: GitSandbox;
@@ -93,14 +93,10 @@ describe('the sorted-set merge driver', () => {
 	});
 });
 
-describe('the count-baseline merge driver', () => {
-	// The shape of krusty's clippy-baseline.tsv: `count<TAB>file<TAB>finding`, one line per file
-	// and finding, in byte order of the whole line.
+describe('a list of counts has no queue driver', () => {
+	// The shape of krusty's clippy-baseline.tsv: `count<TAB>file<TAB>finding`. Counts two branches
+	// lowered can't be merged correctly, so the queue gives them git's line merge.
 	const BASELINE = 'clippy-baseline.tsv';
-	const COUNTS = 'clippy-baseline.tsv merge=count-baseline\n';
-	const row = (count: number, file: string, finding: string) => `${count}\t${file}\t${finding}`;
-	const tsv = (...rows: string[]) => rows.map((r) => `${r}\n`).join('');
-	/** Commits `text` as the baseline on `branch` (and `.gitattributes` when given). */
 	const put = (branch: string, text: string, attributes?: string) => {
 		git.git('checkout', '-q', branch);
 		if (attributes !== undefined) writeFileSync(join(git.dir, '.gitattributes'), attributes);
@@ -108,114 +104,20 @@ describe('the count-baseline merge driver', () => {
 		git.git('add', '-A');
 		git.git('commit', '-q', '-m', `${branch}: baseline`);
 	};
-	/** Branches `ours` and `theirs` off main, writes their baselines, and merges them as the queue does. */
-	const mergeCounts = (ours: string, theirs: string, r: GitRunner = runner) => {
+
+	test('a file that asks for count-baseline gets the line merge: two lowered counts conflict', () => {
+		put('main', '3\tsrc/a.rs\tneedless borrow\n5\tsrc/a.rs\tsingle match\n', 'clippy-baseline.tsv merge=count-baseline\n');
 		git.branch('ours', 'main');
 		git.branch('theirs', 'main');
-		put('ours', ours);
-		put('theirs', theirs);
-		const out = r.run([`--attr-source=${git.sha('main')}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages', git.sha('ours'), git.sha('theirs')], { allowFail: true });
-		const lines = out.out.split('\n').filter(Boolean);
-		if (out.code !== 0) return { clean: false, conflicts: out.code === 1 ? lines.slice(1) : [], text: null };
-		return { clean: true, conflicts: [], text: execFileSync('git', ['cat-file', 'blob', `${lines[0]}:${BASELINE}`], { cwd: git.dir, encoding: 'latin1' }) };
-	};
-	const A = 'src/a.rs';
-	const B = 'src/b.rs';
-	const MATCH = 'you seem to be trying to use `match` for destructuring a single pattern';
-	const DEREF = 'this expression creates a reference which is immediately dereferenced by the compiler';
-	const BASE_ROWS = tsv(row(1, B, DEREF), row(3, A, DEREF), row(5, A, MATCH));
-
-	test('two PRs that lower the same count merge into the sum of what each fixed', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)), tsv(row(1, B, DEREF), row(3, A, DEREF), row(3, A, MATCH)));
-		expect(r).toEqual({ clean: true, conflicts: [], text: tsv(row(1, B, DEREF), row(2, A, MATCH), row(3, A, DEREF)) });
+		put('ours', '3\tsrc/a.rs\tneedless borrow\n4\tsrc/a.rs\tsingle match\n');
+		put('theirs', '3\tsrc/a.rs\tneedless borrow\n3\tsrc/a.rs\tsingle match\n');
+		const r = runner.run([`--attr-source=${git.sha('main')}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages', git.sha('ours'), git.sha('theirs')], { allowFail: true });
+		expect(r.code).toBe(1);
+		expect(r.out.split('\n').filter(Boolean).slice(1)).toEqual([BASELINE]);
 	});
 
-	test('a count raised on one side and lowered on the other adds both changes', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(4, A, DEREF), row(5, A, MATCH)), tsv(row(1, A, DEREF), row(1, B, DEREF), row(5, A, MATCH)));
-		expect(r).toEqual({ clean: true, conflicts: [], text: tsv(row(1, B, DEREF), row(2, A, DEREF), row(5, A, MATCH)) });
-	});
-
-	test('a finding fixed on both sides down to nothing is dropped, and so is one removed on one side and lowered on the other', () => {
-		put('main', tsv(row(2, A, DEREF), row(2, A, MATCH), row(3, B, DEREF)), COUNTS);
-		const r = mergeCounts(tsv(row(1, A, DEREF), row(3, B, DEREF)), tsv(row(1, A, DEREF), row(1, A, MATCH), row(3, B, DEREF)));
-		expect(r).toEqual({ clean: true, conflicts: [], text: tsv(row(3, B, DEREF)) });
-	});
-
-	test('a finding added on one side and another removed on the other keeps both changes, in byte order', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(1, B, MATCH), row(3, A, DEREF), row(5, A, MATCH)), tsv(row(3, A, DEREF), row(5, A, MATCH)));
-		expect(r).toEqual({ clean: true, conflicts: [], text: tsv(row(1, B, MATCH), row(3, A, DEREF), row(5, A, MATCH)) });
-	});
-
-	test('the same new finding added on both sides counts both', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(1, B, MATCH), row(3, A, DEREF), row(5, A, MATCH)), tsv(row(1, B, DEREF), row(1, B, MATCH), row(3, A, DEREF), row(4, A, MATCH)));
-		expect(r).toEqual({ clean: true, conflicts: [], text: tsv(row(1, B, DEREF), row(2, B, MATCH), row(3, A, DEREF), row(4, A, MATCH)) });
-	});
-
-	test('a count that is not a whole number falls back to the line merge, which conflicts', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)), tsv(row(1, B, DEREF), row(3, A, DEREF), `x\t${A}\t${MATCH}`));
-		expect(r).toEqual({ clean: false, conflicts: [BASELINE], text: null });
-	});
-
-	test('a line without a key falls back to the line merge', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)), tsv(row(1, B, DEREF), row(3, A, DEREF), '3'));
-		expect(r).toEqual({ clean: false, conflicts: [BASELINE], text: null });
-	});
-
-	test('a finding listed twice falls back to the line merge', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)), tsv(row(1, B, DEREF), row(2, A, MATCH), row(3, A, DEREF), row(3, A, MATCH)));
-		expect(r).toEqual({ clean: false, conflicts: [BASELINE], text: null });
-	});
-
-	test('lines out of byte order fall back to the line merge', () => {
-		put('main', tsv(row(5, A, MATCH), row(3, A, DEREF), row(1, B, DEREF)), COUNTS);
-		const r = mergeCounts(tsv(row(4, A, MATCH), row(3, A, DEREF), row(1, B, DEREF)), tsv(row(3, A, MATCH), row(3, A, DEREF), row(1, B, DEREF)));
-		expect(r).toEqual({ clean: false, conflicts: [BASELINE], text: null });
-	});
-
-	test('a baseline both sides add, with no version before, merges as an empty one', () => {
-		git.git('checkout', '-q', 'main');
-		writeFileSync(join(git.dir, '.gitattributes'), COUNTS);
-		git.git('add', '-A');
-		git.git('commit', '-q', '-m', 'attributes');
-		const r = mergeCounts(tsv(row(1, A, DEREF), row(2, A, MATCH)), tsv(row(1, A, MATCH), row(1, B, DEREF)));
-		expect(r).toEqual({ clean: true, conflicts: [], text: tsv(row(1, A, DEREF), row(1, B, DEREF), row(3, A, MATCH)) });
-	});
-
-	test('CRLF lines keep their line ends', () => {
-		const crlf = (...rows: string[]) => rows.map((x) => `${x}\r\n`).join('');
-		put('main', crlf(row(1, B, DEREF), row(3, A, DEREF), row(5, A, MATCH)), COUNTS);
-		const r = mergeCounts(crlf(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)), crlf(row(1, B, DEREF), row(3, A, DEREF), row(3, A, MATCH)));
-		expect(r).toEqual({ clean: true, conflicts: [], text: crlf(row(1, B, DEREF), row(2, A, MATCH), row(3, A, DEREF)) });
-	});
-
-	test('without the attributes the same merge conflicts', () => {
-		put('main', BASE_ROWS, '');
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)), tsv(row(1, B, DEREF), row(3, A, DEREF), row(3, A, MATCH)));
-		expect(r).toEqual({ clean: false, conflicts: [BASELINE], text: null });
-	});
-
-	test('without the driver environment the same merge conflicts', () => {
-		put('main', BASE_ROWS, COUNTS);
-		const r = mergeCounts(tsv(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)), tsv(row(1, B, DEREF), row(3, A, DEREF), row(3, A, MATCH)), new GitRunner(git.dir));
-		expect(r).toEqual({ clean: false, conflicts: [BASELINE], text: null });
-	});
-
-	test("GitHub's line merge conflicts where the queue's merge sums the counts", () => {
-		put('main', BASE_ROWS, COUNTS);
-		git.branch('ours', 'main');
-		git.branch('theirs', 'main');
-		put('ours', tsv(row(1, B, DEREF), row(3, A, DEREF), row(4, A, MATCH)));
-		put('theirs', tsv(row(1, B, DEREF), row(3, A, DEREF), row(3, A, MATCH)));
-		const t = mergeTrees(runner, git.sha('ours'), git.sha('theirs'), git.sha('main'));
-		expect(t.line).toBeNull();
-		expect(git.git('show', `${t.queue}:${BASELINE}`)).toBe(tsv(row(1, B, DEREF), row(2, A, MATCH), row(3, A, DEREF)).trimEnd());
+	test('the driver environment registers no count-baseline driver', () => {
+		expect(runner.run(['config', '--get', 'merge.count-baseline.driver'], { allowFail: true }).code).toBe(1);
 	});
 });
 
@@ -291,7 +193,6 @@ describe('the driver environment', () => {
 		const withServer = new GitRunner(git.dir, mergeDriverEnv(join(git.dir, '.git')));
 		expect(withServer.run(['config', '--get', 'queue.server']).out).toBe('kept');
 		expect(withServer.run(['config', '--get', 'merge.sorted-set.driver']).out).toMatch(/sorted-set\.cjs' %O %A %B$/);
-		expect(withServer.run(['config', '--get', 'merge.count-baseline.driver']).out).toMatch(/count-baseline\.cjs' %O %A %B$/);
 		write('main', BASE, SET);
 		const r = merge([...HEADER, 'a.kt', 'c.kt', 'd.kt', 'e.kt'], [...HEADER, 'a.kt', 'b.kt', 'd.kt', 'e.kt'], { runner: withServer });
 		expect(r).toEqual({ clean: true, conflicts: [], text: list('a.kt', 'd.kt', 'e.kt') });
@@ -308,11 +209,11 @@ describe('the driver environment', () => {
 		mergeDriverEnv(join(git.dir, '.git'));
 		expect(readFileSync(file, 'utf8')).toBe(SORTED_SET_SOURCE);
 		expect(readFileSync(other, 'utf8')).toBe('// an older driver\n');
-		expect(readdirSync(folder).sort()).toEqual(['count-baseline.cjs', 'sorted-set.cjs']);
+		expect(readdirSync(folder).sort()).toEqual(['sorted-set.cjs']);
 	});
 
 	test('an up-to-date driver file is left as it is', () => {
-		for (const name of ['sorted-set.cjs', 'count-baseline.cjs']) {
+		for (const name of ['sorted-set.cjs']) {
 			const file = join(git.dir, '.git', 'merge-drivers', name);
 			const before = statSync(file).ino;
 			mergeDriverEnv(join(git.dir, '.git'));
@@ -320,10 +221,16 @@ describe('the driver environment', () => {
 		}
 	});
 
-	test('each driver file holds its own program', () => {
+	test('the driver file holds its program', () => {
 		const folder = join(git.dir, '.git', 'merge-drivers');
 		expect(readFileSync(join(folder, 'sorted-set.cjs'), 'utf8')).toBe(SORTED_SET_SOURCE);
-		expect(readFileSync(join(folder, 'count-baseline.cjs'), 'utf8')).toBe(COUNT_BASELINE_SOURCE);
+	});
+
+	test('a count-baseline driver an older version wrote is deleted', () => {
+		const folder = join(git.dir, '.git', 'merge-drivers');
+		writeFileSync(join(folder, 'count-baseline.cjs'), '// an older driver\n');
+		mergeDriverEnv(join(git.dir, '.git'));
+		expect(readdirSync(folder).sort()).toEqual(['sorted-set.cjs']);
 	});
 });
 
