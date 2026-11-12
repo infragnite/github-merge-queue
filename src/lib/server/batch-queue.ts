@@ -210,7 +210,7 @@ const refusedReason = (message: string) => `GitHub refused the merge: ${message}
  * stack. Anything else (an outage, a merge still running, a base that moved) pauses for a resume.
  */
 const PR_REFUSAL =
-	/rule violations|required status check|status checks? (?:are|is) (?:expected|required)|approving review|review is required|reviews? (?:are|is) required|code owner|changes must be made through|signed commits|is (?:still )?a draft|is closed|in its GitHub stack|which stack|does not list #/i;
+	/rule violations|approving review|reviews? (?:are|is) required|review is required|code owner|verified signatures|signed commits|conversations? must be resolved|comments must be resolved|must be (?:successfully )?deployed|draft|is closed|open PRs? in its GitHub stack/i;
 
 /** `why`, ending in what to do: resume, unless it already says so. */
 const resumable = (why: string) => `${why}${/[.!?]$/.test(why) ? '' : '.'}${/\bresume\b/i.test(why) ? '' : ' Resume to try again.'}`;
@@ -1155,6 +1155,7 @@ class Tick {
 					for (const o of others) {
 						db.updateQueueItemStatus(o.id, 'queued', null as unknown as string);
 						store.setHold(o.id, null);
+						if (o.head_sha) await this.d.github.setPRCheck(o.head_sha, { state: 'queued', title: short('Waiting for the merge queue') }).catch(this.bestEffort('github.setPRCheck'));
 						this.event(o.pr_number, 'requeued', { reason: `the same refusal as #${n}: the repository's, not the PR's` });
 					}
 					this.pause(
@@ -1282,7 +1283,8 @@ class Tick {
 		let m: { merged: boolean; sha?: string | null; message?: string } = { merged: false };
 		for (let i = 0; i < 4; i++) {
 			m = await this.d.github.squashMerge(n, `${title} (#${n})`, head);
-			if (m.merged || !/modified|not mergeable|try again|base branch was modified|405|409/i.test(m.message ?? '')) return m;
+			// A required status GitHub has not registered yet (the queue's own, set just before) is retried too.
+			if (m.merged || !/modified|not mergeable|try again|base branch was modified|405|409|status check .* is expected/i.test(m.message ?? '')) return m;
 			await this.sleep(2000 * (i + 1));
 		}
 		return m;
