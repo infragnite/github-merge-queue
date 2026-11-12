@@ -3055,6 +3055,31 @@ describe('batch queue runtime', () => {
 		expect(store.getLandingIntent(repo.id)).toBeNull();
 	});
 
+	test('cancelling the batch whose landing paused the queue ends that pause: nothing is left to resume', async () => {
+		pr(1);
+		pr(2);
+		world.refuseMerge.add(2);
+		world.refusal.set(2, 'Server Error');
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBe('Landing batch 1 stopped at #2: Server Error. Resume to try again.');
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		await cancelBatch(world.deps(), b.id, 'anton');
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+	});
+
+	test('cancelling a batch keeps a pause it did not cause', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		store.updateQueueSettings(repo.id, { pausedReason: 'release freeze' });
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		await cancelBatch(world.deps(), b.id, 'anton');
+		expect(store.getQueueSettings(repo.id).pausedReason).toBe('release freeze');
+	});
+
 	test('cancelling a bisecting batch stops its runs and puts its PRs back in line, blaming nobody', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
