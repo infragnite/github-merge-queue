@@ -221,7 +221,7 @@ export function queueModel(input: QueueModelInput): QueueModel {
 				on === null &&
 				after.length === 0 &&
 				!!input.landable &&
-				triedPrefix(members, gitParent, (m) => input.landable!.has(m))?.length === members.length
+				triedPrefix(members, gitParent, (m) => input.landable!.has(m), depsOf)?.length === members.length
 		};
 	});
 	const place = (s: QueueStack) => Math.min(...s.members.map((m) => entries.get(m)!.position ?? 0));

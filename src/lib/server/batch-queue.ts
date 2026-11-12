@@ -1838,7 +1838,8 @@ class Tick {
 			const desc = r === 'success' ? `Passed on ${this.d.repo.default_branch} in ${t.branch}` : `Failed on ${this.d.repo.default_branch} in ${t.branch}`;
 			const def = this.d.repo.default_branch;
 			// A pass stands in for the queue's own run while neither the PR nor the default branch changes (see `reusableTry`).
-			const summary = r === 'success' ? `${desc}. \`/mq queue\` lands it without another run while neither it nor \`${def}\` changes.` : undefined;
+			const summary =
+				r === 'success' ? `${desc}. \`/mq queue\` lands it ahead of every PR but urgent ones, without another run, while neither it nor \`${def}\` changes.` : undefined;
 			await this.d.github
 				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: await this.runLink(t) })
 				.catch(this.bestEffort('github.setPRCheck'));
@@ -2312,7 +2313,7 @@ class Tick {
 			if (t?.ci_result === 'success') passed.set(n, t);
 		}
 		if (!passed.size) return null;
-		const prefix = triedPrefix(batch, await this.parentOf(), (n) => passed.has(n));
+		const prefix = triedPrefix(batch, await this.parentOf(), (n) => passed.has(n), await this.depsOf());
 		return prefix && { prefix, run: passed.get(prefix[prefix.length - 1])! };
 	}
 }

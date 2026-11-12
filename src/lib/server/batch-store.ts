@@ -146,6 +146,7 @@ export function migrateBatches(database: Database.Database) {
 			finished_at TEXT
 		);
 		CREATE INDEX IF NOT EXISTS batches_repo_status ON batches(repo_id, status);
+		CREATE INDEX IF NOT EXISTS batches_repo_kind_base ON batches(repo_id, kind, base_tree);
 
 		-- What each queue-started CI run cost, read from its Actions jobs once it is over:
 		-- job_ms is the jobs' summed run time (every attempt), wall_ms first start to last finish.

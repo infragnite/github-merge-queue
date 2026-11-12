@@ -396,7 +396,6 @@ function ancestry(below: Below): (n: number) => number[] {
 	};
 }
 
-/** A commit to test: `context` (known good on the base) plus `members`, in order. */
 /**
  * The head of `batch` that a passed `try` run already tested on this default branch, or null. A
  * try tests one PR's head alone on the default branch, and a stacked PR's head carries its
@@ -404,8 +403,20 @@ function ancestry(below: Below): (n: number) => number[] {
  * those, at the start of the batch (nothing else under it), and keep its stack whole (no PR behind
  * it in the batch sits on it). The first such prefix wins; the caller still checks that building it
  * gives the tree the try tested.
+ *
+ * `depsOf` is everything a PR lands after (its git parent and what it declares, see deps.ts): a
+ * declared dependency shares no commits, so the try did not test it, and a PR behind the prefix
+ * that depends on it keeps the unit whole.
  */
-export function triedPrefix(batch: number[], parentOf: (n: number) => number | null, passed: (n: number) => boolean): number[] | null {
+export function triedPrefix(
+	batch: number[],
+	parentOf: (n: number) => number | null,
+	passed: (n: number) => boolean,
+	depsOf: (n: number) => number[] = (n) => {
+		const p = parentOf(n);
+		return p === null ? [] : [p];
+	}
+): number[] | null {
 	for (let k = 1; k <= batch.length; k++) {
 		const n = batch[k - 1];
 		if (!passed(n)) continue;
@@ -414,15 +425,25 @@ export function triedPrefix(batch: number[], parentOf: (n: number) => number | n
 		for (let p = parentOf(n), i = 0; p !== null && i < batch.length; p = parentOf(p), i++) ancestors.add(p);
 		if (!prefix.every((m) => m === n || ancestors.has(m))) continue;
 		const inPrefix = new Set(prefix);
-		const splits = batch.slice(k).some((m) => {
-			for (let p = parentOf(m), i = 0; p !== null && i < batch.length; p = parentOf(p), i++) if (inPrefix.has(p)) return true;
+		const rest = new Set(batch.slice(k));
+		const reaches = (m: number): boolean => {
+			const seen = new Set<number>();
+			const todo = [...depsOf(m)];
+			while (todo.length) {
+				const p = todo.pop()!;
+				if (inPrefix.has(p)) return true;
+				if (seen.has(p) || !rest.has(p)) continue;
+				seen.add(p);
+				todo.push(...depsOf(p));
+			}
 			return false;
-		});
-		if (!splits) return prefix;
+		};
+		if (![...rest].some(reaches)) return prefix;
 	}
 	return null;
 }
 
+/** A commit to test: `context` (known good on the base) plus `members`, in order. */
 export interface TestGroup {
 	context: number[];
 	members: number[];
