@@ -2893,6 +2893,44 @@ describe('batch queue runtime', () => {
 				{ pr: 2, status: 'checking' }
 			]);
 		});
+
+		test('a failure that is not a refusal (a GitHub outage) still pauses, and resuming tries it again: nobody needs to push', async () => {
+			pr(1);
+			world.refuseMerge.add(1);
+			world.refusal.set(1, 'Server Error');
+			await run();
+			expect(store.getQueueSettings(repo.id).pausedReason).toBe('Landing batch 1 stopped at #1: Server Error. Resume to try again.');
+			expect(queued()).toEqual([{ pr: 1, status: 'checking' }]);
+			world.refuseMerge.delete(1);
+			store.updateQueueSettings(repo.id, { pausedReason: null });
+			await run();
+			expect(world.merged).toEqual([1]);
+		});
+
+		test('a merge GitHub is still running in the background pauses: landing the rest would land on a master nobody tested', async () => {
+			pr(1);
+			pr(2);
+			world.refuseMerge.add(1);
+			world.refusal.set(1, 'GitHub is still merging #1 in the background; resume the queue once it has merged');
+			await run();
+			expect(world.merged).toEqual([]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBe(
+				'Landing batch 1 stopped at #1: GitHub is still merging #1 in the background; resume the queue once it has merged.'
+			);
+		});
+
+		test('resuming after the repository-wide refusal puts the PR it held back in line too', async () => {
+			pr(1);
+			world.refuseMerge.add(1);
+			await run();
+			pr(2);
+			world.refuseMerge.add(2);
+			await run();
+			world.refuseMerge.clear();
+			store.updateQueueSettings(repo.id, { pausedReason: null });
+			await run();
+			expect(world.merged.sort()).toEqual([1, 2]);
+		});
 	});
 
 	test('an interrupted landing that merged only part of its PRs does not mark master green', async () => {

@@ -106,6 +106,25 @@ describe("merging a PR in one of GitHub's stacks", () => {
 		expect((await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: SECOND })).merged).toBe(true);
 	});
 
+	test('a PR above others in a stack GitHub does not name is not merged: the PRs below cannot be checked', async () => {
+		const { fake, calls } = api([]);
+		expect(await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: { stack: { position: 2, size: 2 } } })).toEqual({
+			merged: false,
+			sha: null,
+			message: "GitHub did not say which stack #3294 is in, so the PRs below it can't be checked; GitHub's merge would merge them with it"
+		});
+		expect(calls).toEqual([]);
+	});
+
+	test('a PR its stack does not list is not merged', async () => {
+		const { fake } = api([], [stackOf([3255, 'open'])]);
+		expect(await mergeInStack(fake, { pulls: '/repos/o/r/pulls', n: 3294, title: 't', sha: HEAD, pr: SECOND })).toEqual({
+			merged: false,
+			sha: null,
+			message: "GitHub's stack 3390 does not list #3294, so the PRs below it can't be checked; GitHub's merge would merge them with it"
+		});
+	});
+
 	test('a rate limit is not a refusal: it is thrown for the queue to wait', async () => {
 		const limited = Object.assign(new GitHubError(403, 'API rate limit exceeded'), { until: Date.now() + 1000 });
 		const { fake } = api([limited]);
