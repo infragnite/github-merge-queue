@@ -241,6 +241,7 @@ export function trackActivity(deps: QueueDeps, opts: TrackOptions = {}): QueueDe
 			refreshCaches: () => step('refreshCaches', `starting CI on ${def} to refresh caches`, [], () => ci.refreshCaches()),
 			result: (sha, notBefore, o) => step('result', 'reading CI results', [], () => ci.result(sha, notBefore, o)),
 			cancel: (sha) => step('cancel', 'cancelling CI of a run no longer needed', [], () => ci.cancel(sha)),
+			stalled: (sha, notBefore, hangMs) => step('stalled', 'checking for hung CI jobs', [], () => ci.stalled(sha, notBefore, hangMs)),
 			rerunFailed: (sha) => step('rerunFailed', 're-running failed jobs', [], () => ci.rerunFailed(sha)),
 			runUrl: (sha) => step('runUrl', 'reading CI results', [], () => ci.runUrl(sha))
 		}

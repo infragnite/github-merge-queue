@@ -35,6 +35,13 @@ class World {
 	flaky = new Set<string>();
 	started: { branch: string; head: string; prs: number[] }[] = [];
 	reruns = new Map<string, number>();
+	/** Heads whose run has a job that hangs (pending) until the queue cancels it. */
+	hanging = new Set<string>();
+	/** Heads whose run hangs again after its re-run. */
+	hangsAgain = new Set<string>();
+	/** Heads whose run was cancelled (or a job timed out) with no job failed: failure until re-run. */
+	interrupted = new Set<string>();
+	stalledReads: { head: string; notBefore: number | null; hangMs: number }[] = [];
 	statuses: { sha: string; state: string }[] = [];
 	comments: { pr: number; body: string }[] = [];
 	merged: number[] = [];
@@ -69,6 +76,8 @@ class World {
 	pushPolicyCalls = 0;
 	/** False: the default branch's rules dismiss an approval on a push to the PR. */
 	pushKeepsApproval = true;
+	/** PR descriptions (`Depends-On:` lines), by PR. */
+	bodies = new Map<number, string>();
 
 	files(sha: string) {
 		return new Set(git.git('ls-tree', '-r', '--name-only', sha).split('\n'));
@@ -113,7 +122,8 @@ class World {
 			authorLogin: 'dev',
 			baseRef: p.baseRef,
 			state: p.state,
-			merged: p.merged
+			merged: p.merged,
+			body: this.bodies.get(n) ?? null
 		};
 	}
 
@@ -142,6 +152,8 @@ class World {
 				},
 				result: async (head, _notBefore, opts) => {
 					this.resultReads.push({ head, failFast: !!opts?.failFast });
+					if (this.hanging.has(head)) return 'pending';
+					if (this.interrupted.has(head)) return 'failure';
 					if (this.ciPendingOnce.delete(head) || this.stillRunning.has(head)) return 'pending';
 					if (this.slowFailures && this.ciFails(head) && !this.cancelled.includes(head) && !opts?.failFast) {
 						// The rest of a failing run takes a few more reads to finish.
@@ -158,6 +170,13 @@ class World {
 				cancel: async (head) => {
 					this.cancelled.push(head);
 					this.ciOps.push(`cancel ${head}`);
+					if (this.hanging.delete(head)) this.interrupted.add(head);
+				},
+				stalled: async (head, notBefore, hangMs) => {
+					this.stalledReads.push({ head, notBefore: notBefore ?? null, hangMs });
+					if (this.hanging.has(head)) return 'hung';
+					if (this.interrupted.has(head)) return 'interrupted';
+					return null;
 				},
 				refreshCaches: async () => {
 					this.cacheRefreshes++;
@@ -171,6 +190,7 @@ class World {
 					this.reruns.set(head, (this.reruns.get(head) ?? 0) + 1);
 					this.ciOps.push(`rerun ${head}`);
 					this.ciPendingOnce.add(head);
+					if (this.interrupted.delete(head) && this.hangsAgain.has(head)) this.hanging.add(head);
 					return 'rerun';
 				}
 			},
@@ -378,23 +398,29 @@ describe('batch queue runtime', () => {
 		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')).toMatchObject({ landed: [1, 2, 3], ejected: [4] });
 	});
 
-	test('an urgent PR runs between two bisection steps, and the bisection then goes on from where it was', async () => {
+	test('an urgent PR starts beside a running bisection step and lands first; the step that passed on the old branch runs again', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
 		pr(2);
 		pr(3);
 		pr(4, { file: 'x-breaks-master.txt' });
 		world.breakingFiles.add('x-breaks-master.txt');
+		// The bisection's first step takes long.
+		world.hold = (prs) => prs.join() === '1,2';
 		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
 		pr(5);
 		store.setQueuePriority(repo.id, 5, 'urgent');
+		// #5 doesn't wait for the step: it starts beside it, on the default branch, and lands.
+		for (let i = 0; i < 10 && !world.merged.includes(5); i++) await tickBatchQueue(world.deps());
+		expect(world.merged).toEqual([5]);
+		world.hold = () => false;
 		await run(60);
-		// #5 lands after the step that was running, before the next one; nothing is tested twice.
-		expect(world.merged).toEqual([1, 2, 5, 3]);
+		expect(world.merged).toEqual([5, 1, 2, 3]);
 		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
 			'batch 1,2,3,4',
 			'step 1,2',
 			'batch 5',
+			'step 1,2',
 			'step 3',
 			'step 4'
 		]);
@@ -403,7 +429,61 @@ describe('batch queue runtime', () => {
 		expect(batches.find((b) => b.members.length === 4)).toMatchObject({ status: 'landed', landed: [1, 2, 3], ejected: [4] });
 	});
 
-	test('an urgent batch that fails between two bisection steps is bisected first, and the first bisection then goes on', async () => {
+	test('a bisection step that lands before the urgent batch beside it sends that batch to run again on the new branch', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.join() === '1,2';
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		pr(5);
+		store.setQueuePriority(repo.id, 5, 'urgent');
+		for (let i = 0; i < 10 && !world.started.some((x) => x.prs.join() === '5'); i++) await tickBatchQueue(world.deps());
+		// Now #5 takes long, and the step finishes first.
+		world.hold = (prs) => prs.join() === '5';
+		for (let i = 0; i < 10 && !world.merged.includes(2); i++) await tickBatchQueue(world.deps());
+		expect(world.merged).toEqual([1, 2]);
+		world.hold = () => false;
+		await run(60);
+		expect(world.merged).toEqual([1, 2, 5, 3]);
+		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
+			'batch 1,2,3,4',
+			'step 1,2',
+			'batch 5',
+			'batch 5',
+			'step 3',
+			'step 4'
+		]);
+	});
+
+	test('urgent PRs queued while an urgent batch runs beside a bisection wait for it, then go together', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2);
+		pr(3);
+		pr(4, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.join() === '1,2' || prs.join() === '5';
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		pr(5);
+		store.setQueuePriority(repo.id, 5, 'urgent');
+		for (let i = 0; i < 10 && !world.started.some((x) => x.prs.join() === '5'); i++) await tickBatchQueue(world.deps());
+		pr(6);
+		pr(7);
+		store.setQueuePriority(repo.id, 6, 'urgent');
+		store.setQueuePriority(repo.id, 7, 'urgent');
+		for (let i = 0; i < 3; i++) await tickBatchQueue(world.deps());
+		// One urgent batch beside a bisection at a time.
+		expect(world.started.filter((x) => !x.branch.includes('-bisect-')).map((x) => x.prs.join())).toEqual(['1,2,3,4', '5']);
+		world.hold = (prs) => prs.join() === '1,2';
+		for (let i = 0; i < 10 && !world.started.some((x) => x.prs.join() === '6,7'); i++) await tickBatchQueue(world.deps());
+		expect(world.started.filter((x) => !x.branch.includes('-bisect-')).map((x) => x.prs.join())).toEqual(['1,2,3,4', '5', '6,7']);
+		expect(world.merged).toEqual([5]);
+	});
+
+	test('an urgent batch that fails beside a bisection is bisected first, and the first bisection then goes on', async () => {
 		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
 		pr(1);
 		pr(2);
@@ -421,6 +501,8 @@ describe('batch queue runtime', () => {
 		expect(world.started.map((x) => (x.branch.includes('-bisect-') ? 'step ' : 'batch ') + x.prs.join())).toEqual([
 			'batch 1,2,3,4',
 			'step 1,2',
+			// It starts beside the running step, which lands first: it runs again on the new branch.
+			'batch 5,6',
 			'batch 5,6',
 			'step 5',
 			'step 6',
@@ -894,6 +976,39 @@ describe('batch queue runtime', () => {
 		expect(git.git('show', 'main:shared.txt')).toBe('child rewrote it');
 		expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+	});
+
+	describe('count baselines', () => {
+		const BASELINE = 'clippy-baseline.tsv';
+		const rows = (...r: [number, string][]) => r.map(([n, finding]) => `${n}\tsrc/a.rs\t${finding}\n`).join('');
+		/** A queued, approved PR #n off main whose baseline is `text`. */
+		const lowering = (n: number, text: string) => {
+			git.branch(`pr${n}`, 'main');
+			git.git('checkout', '-q', `pr${n}`);
+			writeFileSync(`${git.dir}/${BASELINE}`, text);
+			git.git('commit', '-qam', `pr${n}`);
+			git.openPR(n, `pr${n}`, 'main');
+			world.approved.add(n);
+			db.addToQueue(repo.id, n, `PR ${n}`, `https://example.test/pull/${n}`, 'dev', '', 'dev');
+		};
+
+		test('two PRs that lower the same count land together, with the counts summed', async () => {
+			git.git('checkout', '-q', 'main');
+			writeFileSync(`${git.dir}/.gitattributes`, `${BASELINE} merge=count-baseline\n`);
+			writeFileSync(`${git.dir}/${BASELINE}`, rows([3, 'needless borrow'], [5, 'single match']));
+			git.git('add', '-A');
+			git.git('commit', '-qm', 'baseline');
+			store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+			lowering(1, rows([3, 'needless borrow'], [4, 'single match']));
+			lowering(2, rows([2, 'needless borrow'], [3, 'single match']));
+			await run();
+			expect(world.started[0].prs).toEqual([1, 2]);
+			expect(world.merged).toEqual([1, 2]);
+			expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+			expect(git.git('show', `main:${BASELINE}`)).toBe(rows([2, 'needless borrow'], [2, 'single match']).trimEnd());
+			expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+			expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
+		});
 	});
 
 	describe('sorted-set lists', () => {
@@ -2201,6 +2316,86 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the queue/) }]);
 	});
 
+	describe('a stalled CI run', () => {
+		const MIN = 60_000;
+		beforeEach(() => store.updateQueueSettings(repo.id, { config: { retryFailed: false } }));
+
+		test('a job that hangs is cancelled and its jobs run again, even with flake retries off; the PR lands', async () => {
+			pr(1);
+			await tickBatchQueue(world.deps());
+			const head = world.started[0].head;
+			world.hanging.add(head);
+			await run();
+			expect(world.merged).toEqual([1]);
+			// Cancelled once it hung, then run again (the last cancel only retires the landed batch's run).
+			expect(world.ciOps.filter((o) => o.endsWith(head))).toEqual([`cancel ${head}`, `rerun ${head}`, `cancel ${head}`]);
+			expect(world.comments).toEqual([]);
+			expect(world.started).toHaveLength(1);
+		});
+
+		test('a run cancelled outside the queue, with no job failed, runs again and lands', async () => {
+			pr(1);
+			pr(2);
+			await tickBatchQueue(world.deps());
+			const head = world.started[0].head;
+			world.interrupted.add(head);
+			await run();
+			expect(world.merged).toEqual([1, 2]);
+			expect(world.ciOps.filter((o) => o.endsWith(head))).toEqual([`rerun ${head}`, `cancel ${head}`]);
+			// Not bisected: one run, and nobody was told anything.
+			expect(world.started).toHaveLength(1);
+			expect(world.comments).toEqual([]);
+		});
+
+		test('a job that hangs again after the re-run fails the batch: the lone PR leaves, told why', async () => {
+			pr(1);
+			await tickBatchQueue(world.deps());
+			const head = world.started[0].head;
+			world.hanging.add(head);
+			world.hangsAgain.add(head);
+			await run();
+			expect(world.merged).toEqual([]);
+			expect(world.ciOps.filter((o) => o.endsWith(head))).toEqual([`cancel ${head}`, `rerun ${head}`, `cancel ${head}`, `cancel ${head}`]);
+			expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/^\*\*Merge queue:\*\* Removed from the queue: CI failed/) }]);
+		});
+
+		test('a real failure is still not re-run with flake retries off', async () => {
+			pr(1, { file: 'x-breaks-master.txt' });
+			world.breakingFiles.add('x-breaks-master.txt');
+			await run();
+			expect(world.reruns.size).toBe(0);
+			// Only the retirement of its run after it left.
+			expect(world.ciOps).toEqual([`cancel ${world.started[0].head}`]);
+			expect(world.comments).toEqual([{ pr: 1, body: expect.stringMatching(/Removed from the queue/) }]);
+		});
+
+		test('a bisection step whose job hangs runs again, and blames nobody for the hang', async () => {
+			pr(1);
+			pr(2, { file: 'x-breaks-master.txt' });
+			pr(3);
+			world.breakingFiles.add('x-breaks-master.txt');
+			for (let i = 0; i < 20 && world.started.length < 2; i++) await tickBatchQueue(world.deps());
+			const step = world.started[1].head;
+			world.hanging.add(step);
+			await run(60);
+			expect(world.merged).toEqual([1, 3]);
+			expect(world.ciOps.filter((o) => o.endsWith(step)).slice(0, 2)).toEqual([`cancel ${step}`, `rerun ${step}`]);
+			expect(world.reruns.get(step)).toBe(1);
+			expect(world.comments).toEqual([{ pr: 2, body: expect.stringMatching(/Removed from the queue/) }]);
+		});
+
+		test('a job counts as hung after the repo setting, an hour by default', async () => {
+			pr(1);
+			await tickBatchQueue(world.deps());
+			world.stillRunning.add(world.started[0].head);
+			await tickBatchQueue(world.deps());
+			expect(world.stalledReads.at(-1)?.hangMs).toBe(60 * MIN);
+			store.updateQueueSettings(repo.id, { config: { jobHangMs: 30 * MIN } });
+			await tickBatchQueue(world.deps());
+			expect(world.stalledReads.at(-1)?.hangMs).toBe(30 * MIN);
+		});
+	});
+
 	test('a failed check whose workflow still runs other jobs is re-run once it finishes, not bisected', async () => {
 		pr(1);
 		pr(2);
@@ -3379,5 +3574,148 @@ describe('a passed try stands in for a run on the same default branch', () => {
 		expect(runs()).toEqual([[1]]);
 		expect(world.merged).toEqual([1]);
 		expect(mainFiles()).toEqual(['pr1-fix.txt', 'pr1.txt']);
+	});
+});
+
+describe('declared dependencies (Depends-On) at runtime', () => {
+	test('a PR lands after the PR it depends on, though it was queued first', async () => {
+		pr(2);
+		world.bodies.set(2, 'Uses the reader.\n\nDepends-On: #1');
+		pr(1);
+		pr(3);
+		await run();
+		expect(world.started[0].prs).toEqual([1, 2, 3]);
+		expect(world.merged).toEqual([1, 2, 3]);
+		expect(queued()).toEqual([]);
+	});
+
+	test("a PR whose dependency isn't queued is told to queue it, and the rest goes", async () => {
+		pr(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		await run();
+		expect(world.merged).toEqual([3]);
+		expect(world.comments).toEqual([
+			{ pr: 2, body: holdNotice({ pr: 2, head: git.sha('pr2'), code: 'dependency-not-queued', reason: "Depends on #1, which isn't queued" }) }
+		]);
+		expect(world.comments[0].body).toMatch(/^\*\*Merge queue:\*\* Depends on #1, which isn't queued\. Queue the PR it depends on, or remove that Depends-On line\./);
+		expect(queued()).toEqual([{ pr: 2, status: 'queued' }]);
+	});
+
+	test('a merged dependency is done: the PR goes as it is', async () => {
+		pr(1);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.merge(1, 'squash');
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		await run();
+		expect(world.merged).toEqual([2]);
+	});
+
+	test('a dependency closed without merging holds the PR until it is reopened or the line removed', async () => {
+		pr(1);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.close(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		await run(3);
+		expect(world.merged).toEqual([]);
+		expect(world.comments.map((c) => readNotice(c.body))).toEqual([expect.objectContaining({ pr: 2, code: 'dependency-closed', reason: 'Depends on #1, which was closed without merging' })]);
+		// The author removes the line: it goes.
+		world.bodies.set(2, 'No dependencies after all.');
+		await run();
+		expect(world.merged).toEqual([2]);
+	});
+
+	test('a cycle of declarations holds every PR in it', async () => {
+		pr(1);
+		pr(2);
+		world.bodies.set(1, 'Depends-On: #2');
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		await run();
+		expect(world.merged).toEqual([3]);
+		expect(world.comments.map((c) => [c.pr, readNotice(c.body)?.code, readNotice(c.body)?.reason])).toEqual([
+			[1, 'dependency-cycle', 'Depends on itself through #2'],
+			[2, 'dependency-cycle', 'Depends on itself through #1']
+		]);
+	});
+
+	test('bisection: a breaker is ejected, and the PR that depends on it goes back in line, not ejected', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'x-breaks-master.txt' });
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		world.breakingFiles.add('x-breaks-master.txt');
+		await run(60);
+		expect(world.merged).toEqual([3]);
+		expect(db.getRepoHistory(repo.id).find((h) => h.pr_number === 1)?.status).toBe('failed');
+		expect(db.getRepoHistory(repo.id).find((h) => h.pr_number === 2)).toBeUndefined();
+		expect(queued()).toEqual([{ pr: 2, status: 'queued' }]);
+		// No run ever held #2 without #1.
+		for (const r of world.started) if (r.prs.includes(2)) expect(r.prs).toContain(1);
+		expect(world.comments.filter((c) => c.pr === 2).map((c) => readNotice(c.body)?.code)).toContain('dependency-not-queued');
+	});
+
+	test('a closed dependency is asked about once, not on every tick', async () => {
+		pr(1);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === 1)!.id);
+		git.close(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1, #77');
+		world.deleted.add(77);
+		await run(1);
+		const calls = world.prCalls;
+		await run(5);
+		expect(world.prCalls).toBe(calls);
+	});
+
+	test('declaring the git parent again records nothing extra', async () => {
+		pr(1);
+		pr(2, { from: 'pr1', base: 'pr1' });
+		world.bodies.set(2, 'Depends-On: #1');
+		world.hold = () => true;
+		await run(1);
+		const it = db.getQueueItems(repo.id).find((i) => i.pr_number === 2)! as { depends_on?: string | null };
+		expect(store.dependsOn(it)).toEqual([]);
+	});
+
+	test('bisection keeps the dependencies a PR was batched with, even if its description changes meanwhile', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1, { file: 'x-breaks-master.txt' });
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		world.breakingFiles.add('x-breaks-master.txt');
+		// The bisection runs take long; meanwhile #2's author drops the line.
+		world.hold = (prs) => prs.length < 3;
+		await run(4);
+		expect(store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')?.status).toBe('bisecting');
+		world.bodies.set(2, 'No dependencies.');
+		world.hold = () => false;
+		await run(40);
+		const batch = store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!;
+		const runs = world.started.filter((r) => r.branch.startsWith(`${batch.branch}-bisect-`));
+		for (const r of runs) if (r.prs.includes(2)) expect(r.prs, JSON.stringify(runs)).toContain(1);
+		expect(batch.landed).not.toContain(2);
+	});
+
+	test('landing: a dependency pushed to after the batch was built stays out, and its dependent with it', async () => {
+		pr(1);
+		pr(2);
+		world.bodies.set(2, 'Depends-On: #1');
+		pr(3);
+		// While the batch is tested, #1's author pushes.
+		world.hold = () => true;
+		await run(2);
+		expect(world.started.map((r) => r.prs)).toEqual([[1, 2, 3]]);
+		git.commit('pr1', 'pr1 again', 'pr1-more.txt');
+		world.hold = () => false;
+		await run(1);
+		expect(world.merged).toEqual([3]);
+		expect(queued().map((q) => q.pr).sort()).toEqual([1, 2]);
 	});
 });

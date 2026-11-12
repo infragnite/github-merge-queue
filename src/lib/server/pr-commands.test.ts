@@ -596,6 +596,31 @@ describe('/mq status', () => {
 		expect(hidden(body).nextActions).toEqual(['queue-parent']);
 	});
 
+	test('a PR that declares a dependency nobody queued is told to queue it', async () => {
+		api.enqueue(repo, writer, pull(2), {});
+		store.setDependsOn(item(2)!.id, [1]);
+		const reason = "Depends on #1, which isn't queued";
+		db.updateQueueItemStatus(item(2)!.id, 'queued', reason);
+		store.setHold(item(2)!.id, { code: 'dependency-not-queued', reason });
+		await run('/mq status', 'rae', 2);
+		const body = deps.replies[0][1];
+		expect(body).toMatch(/Held \(`dependency-not-queued`\): Depends on #1, which isn't queued/);
+		expect(body).toMatch(/Queue #1 \(comment `\/mq queue` on it\)/);
+		expect(hidden(body).steps).toEqual([{ do: 'queue-dependency', pr: 1, why: expect.any(String) }]);
+		expect(hidden(body).nextActions).toEqual(['queue-dependency']);
+	});
+
+	test('a PR held for a Depends-On line is told to fix it', async () => {
+		api.enqueue(repo, writer, pull(2), {});
+		const reason = '`Depends-On: the cache PR` names no pull request';
+		db.updateQueueItemStatus(item(2)!.id, 'queued', reason);
+		store.setHold(item(2)!.id, { code: 'dependency-invalid', reason });
+		await run('/mq status', 'rae', 2);
+		const body = deps.replies[0][1];
+		expect(body).toMatch(/- `edit-dependencies`: Fix or remove that `Depends-On:` line in the description\. `Depends-On: the cache PR` names no pull request/);
+		expect(hidden(body).nextActions).toEqual(['edit-dependencies']);
+	});
+
 	test('the head the status was about is in the block, when the queue knows it', async () => {
 		api.enqueue(repo, writer, pull(1), {});
 		db.updateQueueItemHeadSha(item(1)!.id, 'abc123');

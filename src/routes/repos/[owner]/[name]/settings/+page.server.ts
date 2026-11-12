@@ -1,5 +1,5 @@
 import { redirect, error, fail } from '@sveltejs/kit';
-import { getRepoByOwnerName } from '$lib/server/db';
+import { getRepoByOwnerName, removeRepo } from '$lib/server/db';
 import { atLeast } from '$lib/server/api-auth';
 import { ApiError, patchConfig, repoVisibility } from '$lib/server/api-service';
 import { getRepo } from '$lib/server/github';
@@ -24,6 +24,8 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		repo: { id: repo.id, owner: repo.owner, name: repo.name, default_branch: repo.default_branch },
 		role: me.role,
 		canEdit: atLeast(me.role, 'admin'),
+		// Repository admins, and whoever added it.
+		canRemove: repo.added_by === locals.user.id || atLeast(me.role, 'admin'),
 		mode: settings.mode,
 		settings: {
 			config: settings.config,
@@ -81,5 +83,19 @@ export const actions: Actions = {
 		}
 		markDirty(repo.id);
 		return { settingsSaved: true };
+	},
+
+	/** Stops managing the repository: its queue, batches and settings go with it. */
+	remove: async ({ params, locals }) => {
+		if (!locals.user) return fail(401, { removeError: 'Sign in first' });
+		const repo = getRepoByOwnerName(params.owner, params.name);
+		if (!repo) return fail(404, { removeError: 'Repository not found' });
+		if (repo.added_by !== locals.user.id && !atLeast((await webCaller(repo.owner, repo.name, locals.user.login)).role, 'admin')) {
+			return fail(403, { removeError: `Removing ${repo.owner}/${repo.name} needs admin access to it on GitHub` });
+		}
+		// Under the repo lock, so no step of the queue is halfway through it.
+		await withRepoLock(repo.id, async () => removeRepo(repo.id));
+		console.log(`[merge-queue] ${repo.owner}/${repo.name} removed by ${locals.user.login}`);
+		redirect(303, '/');
 	}
 };

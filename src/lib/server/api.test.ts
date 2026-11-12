@@ -178,6 +178,33 @@ describe('stack state for agents', () => {
 		]);
 	});
 
+	test('a PR shows what it declares it depends on, what depends on it, and what to do about each', () => {
+		const a = analysis([1, 2, 3, 4]);
+		api.enqueue(repo, writer, pull(1), {});
+		api.enqueue(repo, writer, pull(3), {});
+		api.enqueue(repo, writer, pull(4), {});
+		const item = (n: number) => db.getQueueItems(repo.id).find((i) => i.pr_number === n)!;
+		// #3 declares #1 (queued) and #2 (not queued); #4 declares #3.
+		store.setDependsOn(item(3).id, [1, 2]);
+		store.setDependsOn(item(4).id, [3]);
+		const s = api.stackState(repo, 3, a);
+		expect(s).toMatchObject({ dependsOn: [1, 2], neededBy: [4] });
+		expect(s.nextActions).toEqual([
+			{ do: 'wait-for', pr: 1, why: 'Depends on #1; the queue lands #1 first, or in the same batch' },
+			{ do: 'queue-dependency', pr: 2, why: "Depends on #2, which isn't queued; queue #2 so this PR can follow it" }
+		]);
+		expect(api.stackState(repo, 1, a)).toMatchObject({ dependsOn: [], neededBy: [3] });
+	});
+
+	test("a PR held for its declarations is told to fix that line", () => {
+		api.enqueue(repo, writer, pull(5), {});
+		const it = db.getQueueItems(repo.id).find((i) => i.pr_number === 5)!;
+		const reason = 'Depends on #8, which was closed without merging';
+		db.updateQueueItemStatus(it.id, 'queued', reason);
+		store.setHold(it.id, { code: 'dependency-closed', reason });
+		expect(api.stackState(repo, 5, analysis([5])).nextActions).toEqual([{ do: 'edit-dependencies', why: reason }]);
+	});
+
 	test('an unknown PR is a 404', () => {
 		expect(() => api.stackState(repo, 99, analysis([1]))).toThrow(/not an open pull request/);
 	});

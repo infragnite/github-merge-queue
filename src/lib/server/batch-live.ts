@@ -100,6 +100,36 @@ export function earlyFailure(
 }
 
 /**
+ * Whether a CI run is stuck rather than failing (see `QueueCI.stalled`). `hung`: a job has been
+ * running (on a runner, not waiting for one) longer than `hangMs`. `interrupted`: every job ended,
+ * some cancelled or timed out, none failed. Only jobs of the CI workflow's runs (`suites`, when
+ * known) that the gate waits for (`feeds`, when known) count, and none that finished before
+ * `notBefore` (a re-run's start) or started before it.
+ */
+export function stalledRun(
+	jobs: Array<{ name?: string; status: string; conclusion: string | null; started_at?: string | null; completed_at?: string | null; check_suite?: { id: number } }>,
+	opts: { now: number; hangMs: number; notBefore?: number | null; suites?: ReadonlySet<number>; feeds?: (name: string) => boolean }
+): 'hung' | 'interrupted' | null {
+	const since = (t: string | null | undefined) => (t ? Date.parse(t) : null);
+	const current = jobs.filter((j) => {
+		if (opts.suites && !(j.check_suite && opts.suites.has(j.check_suite.id))) return false;
+		if (opts.feeds && !(j.name !== undefined && opts.feeds(j.name))) return false;
+		if (!opts.notBefore) return true;
+		const end = since(j.completed_at);
+		const start = since(j.started_at);
+		return j.status === 'completed' ? end === null || end >= opts.notBefore : start === null || start >= opts.notBefore;
+	});
+	const hung = current.some((j) => {
+		const start = since(j.started_at);
+		return j.status === 'in_progress' && start !== null && opts.now - start > opts.hangMs;
+	});
+	if (hung) return 'hung';
+	if (current.length === 0 || current.some((j) => j.status !== 'completed')) return null;
+	if (current.some((j) => j.conclusion === 'failure')) return null;
+	return current.some((j) => j.conclusion === 'cancelled' || j.conclusion === 'timed_out') ? 'interrupted' : null;
+}
+
+/**
  * The jobs a workflow's gate (the job whose name or id is `gate`) waits for, through `needs`,
  * directly or not, and the gate itself: a predicate on check run names. A job's check runs are
  * named by its `name` (up to any expression in it: matrix jobs add their values) or its id, and a
@@ -377,6 +407,12 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					: new Set((await github.workflowRunsForSha(owner, name, headSha)).filter((w) => w.path?.split('@')[0] === file).map((w) => w.check_suite_id));
 				return earlyFailure(required, await github.actionsJobsForSha(owner, name, headSha), notBefore, feeds, ciSuites) ? 'failure' : 'pending';
 			},
+			stalled: async (headSha, notBefore, hangMs) => {
+				const file = `.github/workflows/${ci().workflow}`;
+				const suites = new Set((await github.workflowRunsForSha(owner, name, headSha)).filter((w) => w.path?.split('@')[0] === file).map((w) => w.check_suite_id));
+				const jobs = await github.actionsJobsForSha(owner, name, headSha);
+				return stalledRun(jobs, { now: Date.now(), hangMs, notBefore, suites: suites.size ? suites : undefined, feeds: gateAt(headSha) ?? undefined });
+			},
 			cancel: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);
 				for (const r of runs.filter((r) => r.status !== 'completed')) await github.cancelWorkflowRun(owner, name, r.id);
@@ -420,7 +456,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					authorLogin: p.user?.login ?? '',
 					baseRef: p.base.ref,
 					state: 'open' as const,
-					merged: false
+					merged: false,
+					body: p.body ?? null
 				})),
 			pr: async (n): Promise<LivePR> => {
 				const p = await github.getPR(owner, name, n);
@@ -435,7 +472,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					authorLogin: p.user?.login ?? '',
 					baseRef: p.base.ref,
 					state: p.state,
-					merged: !!p.merged
+					merged: !!p.merged,
+					body: p.body ?? null
 				};
 			},
 			readiness: async (n, headSha, author, opts): Promise<Readiness> => {

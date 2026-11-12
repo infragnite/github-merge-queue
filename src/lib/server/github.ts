@@ -152,6 +152,20 @@ export async function listInstallationRepos(): Promise<
 	return out.sort((a, b) => a.full_name.localeCompare(b.full_name));
 }
 
+let installUrl: string | null = null;
+
+/** Where an admin installs the App on more repositories (its GitHub page), or null if GitHub can't say. */
+export async function appInstallUrl(): Promise<string | null> {
+	if (installUrl) return installUrl;
+	try {
+		const app = (await ghFetch(createJWT(), '/app')) as { html_url?: string } | null;
+		if (app?.html_url?.startsWith('https://github.com/')) installUrl = `${app.html_url}/installations/new`;
+	} catch {
+		// Shown without the link.
+	}
+	return installUrl;
+}
+
 export async function getRepo(owner: string, repo: string) {
 	return ghFetchAsApp(`/repos/${owner}/${repo}`);
 }
@@ -517,6 +531,7 @@ export async function actionsJobsForSha(owner: string, repo: string, sha: string
 		status: string;
 		conclusion: string | null;
 		html_url: string;
+		started_at: string | null;
 		completed_at: string | null;
 		check_suite?: { id: number };
 	}>;

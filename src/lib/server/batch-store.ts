@@ -71,6 +71,8 @@ export interface BatchStep {
 	parent?: number | null;
 	/** The default branch commit whose attributes picked the merge drivers for this step (unset in older rows). */
 	attrs?: string;
+	/** The PRs it declared it depends on (`Depends-On:`) when it was batched, if any. */
+	deps?: number[];
 }
 
 export const PR_REPORTS = ['check-run', 'status', 'both'] as const;
@@ -263,6 +265,7 @@ export function migrateBatches(database: Database.Database) {
 	add('priority', `TEXT NOT NULL DEFAULT 'normal'`);
 	// PRs this one conflicts with in a batch; it waits until they have left the queue.
 	add('deferred_for', `TEXT`);
+	add('depends_on', `TEXT`);
 	// Batches this PR failed in without being found the culprit (flaky or unclear failures).
 	add('batch_failures', `INTEGER NOT NULL DEFAULT 0`);
 	// Why the planner holds this queued PR back: { code, wait, reason } (see setHold).
@@ -538,6 +541,21 @@ export function setDeferredFor(itemId: number, prs: number[] | null) {
 	getDb()
 		.prepare('UPDATE queue_items SET deferred_for = ? WHERE id = ?')
 		.run(prs && prs.length ? JSON.stringify(prs) : null, itemId);
+}
+
+/** The open PRs a queued PR declares it depends on, as the planner last read its description. */
+export function setDependsOn(itemId: number, prs: number[] | null) {
+	getDb()
+		.prepare('UPDATE queue_items SET depends_on = ? WHERE id = ?')
+		.run(prs && prs.length ? JSON.stringify(prs) : null, itemId);
+}
+
+export function dependsOn(item: { depends_on?: string | null }): number[] {
+	try {
+		return item.depends_on ? (JSON.parse(item.depends_on) as number[]) : [];
+	} catch {
+		return [];
+	}
 }
 
 export function deferredFor(item: { deferred_for?: string | null }): number[] {
