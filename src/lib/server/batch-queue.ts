@@ -44,7 +44,7 @@ import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
 import { HeadMovedError } from './head-moved';
 import { failureAction } from './activity';
-import { emitEvent, heldPRs, type QueueEventKind } from './events';
+import { emitEvent, heldPRs, lastRepoEvent, type QueueEventKind } from './events';
 
 /** The error, and what to do about it: a pause reason always says what to do. */
 function withAction(call: string, e: unknown): string {
@@ -384,9 +384,12 @@ class Tick {
 		return (await this.d.ci.runUrl(run.head_sha).catch(() => null)) ?? this.branchRuns(run.branch);
 	}
 
+	/** The batch being landed: a pause while it lands is that batch's, and cancelling it ends the pause. */
+	landing: number | null = null;
+
 	pause(reason: string) {
 		store.updateQueueSettings(this.repoId, { pausedReason: reason });
-		this.event(null, 'paused', { reason });
+		this.event(null, 'paused', { reason, ...(this.landing !== null ? { batch: this.landing } : {}) });
 		this.log(reason);
 	}
 
@@ -873,7 +876,14 @@ class Tick {
 		// Recorded before the first merge: a crash before it is cleared is finished by `recoverLanding`.
 		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs: part, group: prs });
 		const merged: number[] = [];
-		const ok = (await this.landNow(batch, part, src, merged)) && this.skipped.size === 0;
+		this.landing = batch.id;
+		let landed: boolean;
+		try {
+			landed = await this.landNow(batch, part, src, merged);
+		} finally {
+			this.landing = null;
+		}
+		const ok = landed && this.skipped.size === 0;
 		// What landed is recorded together with clearing the intent, so a crash can't split them.
 		// A landing of part of the group (one stopped, or left PRs out) puts on master a tree no run
 		// tested on its own (only the whole group was), so it is not marked green; the next tick
@@ -1037,6 +1047,32 @@ class Tick {
 				);
 				continue;
 			}
+			// Pushes the head the PR lands as, in place of its tested head: whether it landed there, or
+			// the author pushed first (back in line), or the queue stopped.
+			const replace = async (to: string, what: string, reason: string): Promise<'pushed' | 'moved' | 'stopped'> => {
+				try {
+					await this.d.github.pushHead(p.headRef, to, head);
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					if (e instanceof HeadMovedError) {
+						await this.headMovedWhileLanding(batch, n, head, prs, src);
+						return 'moved';
+					}
+					this.pause(`Could not push the ${what} #${n}: ${withAction('pushHead', e)}`);
+					return 'stopped';
+				}
+				store.recordRebasedHead(this.repoId, n, head, to, true);
+				this.event(n, 'rebased', { from: head, to, onto: def, reason });
+				head = to;
+				// GitHub takes a moment to see the new head; merging before that is refused.
+				if (!(await this.waitForHead(n, head))) {
+					this.pause(`GitHub did not pick up the new head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
+					return 'stopped';
+				}
+				return 'pushed';
+			};
+			/** Master merged into the PR with `tree`: GitHub's squash of that head onto master is `tree`. */
+			const mergeIn = (tree: string) => this.d.git.mergeCommit(tree, [head, master], `Merge ${def} into ${p.headRef}`);
 			if (asIs) {
 				// Nothing to change.
 			} else if (step.fork) {
@@ -1049,29 +1085,15 @@ class Tick {
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
-				if (!r.ok || (!this.skipped.size && r.tree !== step.tree)) {
-					this.pause(`Could not restack #${n} onto master to land it: ${r.ok ? 'the result differs from the tested tree' : r.reason}. Restack #${n} onto ${def} by hand and push, then resume.`);
-					return false;
-				}
-				try {
-					await this.d.github.pushHead(p.headRef, r.head, head);
-				} catch (e) {
-					if (e instanceof RateLimitedError) throw e;
-					if (e instanceof HeadMovedError) {
-						await this.headMovedWhileLanding(batch, n, head, prs, src);
-						continue;
-					}
-					this.pause(`Could not push the restacked #${n}: ${withAction('pushHead', e)}`);
-					return false;
-				}
-				store.recordRebasedHead(this.repoId, n, head, r.head, true);
-				this.event(n, 'rebased', { from: head, to: r.head, onto: def, reason: 'landing after its parent' });
-				head = r.head;
-				// GitHub takes a moment to see the new head; merging before that is refused.
-				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the restacked head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
-					return false;
-				}
+				const done =
+					r.ok && (this.skipped.size || r.tree === step.tree)
+						? await replace(r.head, 'restacked', 'landing after its parent')
+						: // Its own commits don't replay onto master one by one (it merged its parent in, say),
+							// though the tree it was tested with does: master merged in with that tree lands it.
+							// The batch's commit carries that tree into the mirror, however long ago it was built.
+							(await this.d.git.fetch([src.head_sha]), await replace(await mergeIn(step.tree), 'merge of master into', `merged ${def} with the tested tree to land after its parent`));
+				if (done === 'moved') continue;
+				if (done === 'stopped') return false;
 			} else {
 				// A file the queue's merge drivers merged where GitHub's line merge conflicts or differs:
 				// merge master into the PR with the tree the queue merged; GitHub's squash of that head is then this tree.
@@ -1084,25 +1106,9 @@ class Tick {
 					this.pause(`Could not merge ${def} into #${n} to land it: the result differs from the tested tree. Merge ${def} into #${n} by hand and push, then resume.`);
 					return false;
 				}
-				const merge = await this.d.git.mergeCommit(t.queue, [head, master], `Merge ${def} into ${p.headRef}`);
-				try {
-					await this.d.github.pushHead(p.headRef, merge, head);
-				} catch (e) {
-					if (e instanceof RateLimitedError) throw e;
-					if (e instanceof HeadMovedError) {
-						await this.headMovedWhileLanding(batch, n, head, prs, src);
-						continue;
-					}
-					this.pause(`Could not push the merge of ${def} into #${n}: ${withAction('pushHead', e)}`);
-					return false;
-				}
-				store.recordRebasedHead(this.repoId, n, head, merge, true);
-				this.event(n, 'rebased', { from: head, to: merge, onto: def, reason: `merged ${def} with the queue's merge drivers to land` });
-				head = merge;
-				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the new head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
-					return false;
-				}
+				const done = await replace(await mergeIn(t.queue), 'merge of master into', `merged ${def} with the queue's merge drivers to land`);
+				if (done === 'moved') continue;
+				if (done === 'stopped') return false;
 			}
 			if (p.baseRef !== def) await this.d.github.retargetBase(n, def);
 			// The default branch requires this status, so only the queue can merge, and only what it
@@ -1461,9 +1467,12 @@ class Tick {
 		store.setBatchStatus(batch.id, 'failed');
 		await this.retire(batch);
 		this.requeue(batch.members);
+		const why = `Waiting: ${this.d.repo.default_branch} is red, and this PR does not fix it`;
 		for (const n of batch.members) {
 			const it = this.item(n);
-			if (it) db.updateQueueItemStatus(it.id, 'queued', `Waiting: ${this.d.repo.default_branch} is red, and this PR does not fix it`);
+			if (!it) continue;
+			db.updateQueueItemStatus(it.id, 'queued', why);
+			await this.d.github.setPRCheck(batch.heads[n], { state: 'queued', title: short(why) }).catch(this.bestEffort('github.setPRCheck'));
 		}
 	}
 
@@ -2552,6 +2561,13 @@ export async function cancelBatch(deps: QueueDeps, id: number, by: string): Prom
 	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled', reason);
 	await t.supersede(above, 'below-cancelled', `batch ${b.number} below it was cancelled`);
 	t.event(null, 'cancelled', { batch: id, number: b.number, by, requeued, rebuilt: above.map((x) => x.id) });
+	// A pause its landing caused: nothing of it is left to resume.
+	const paused = store.getQueueSettings(deps.repo.id).pausedReason;
+	const cause = paused ? lastRepoEvent(deps.repo.id, 'paused') : null;
+	if (cause && cause.data.batch === id && cause.data.reason === paused) {
+		store.updateQueueSettings(deps.repo.id, { pausedReason: null });
+		t.event(null, 'resumed', { by, reason: `batch ${b.number}, whose landing paused the queue, was cancelled` });
+	}
 	t.log(`batch ${b.number} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
 	return { requeued, rebuilt: above.map((x) => x.id) };
 }

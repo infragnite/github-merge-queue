@@ -990,6 +990,42 @@ describe('batch queue runtime', () => {
 		expect(world.pushedHeads.map((h) => h.branch)).toEqual(['pr2']);
 	});
 
+	test("a stacked child whose own commits don't replay onto master (it merged its parent in) still lands its tested tree, through a merge of master, no pause", async () => {
+		// #1 writes shared.txt; #2 rewrites it, then #1 rewrites it again and #2 merges that in, resolving
+		// both. Replaying #2's first commit onto #1's squash conflicts; the tree CI tested does not.
+		const w = (text: string, msg: string) => {
+			writeFileSync(`${git.dir}/shared.txt`, text);
+			git.git('commit', '-qam', msg);
+		};
+		git.branch('pr1', 'main');
+		git.git('checkout', '-q', 'pr1');
+		writeFileSync(`${git.dir}/shared.txt`, 'one\n');
+		git.git('add', 'shared.txt');
+		git.git('commit', '-qm', 'p1a');
+		git.branch('pr2', 'pr1');
+		git.git('checkout', '-q', 'pr2');
+		w('child\n', 'c1');
+		git.git('checkout', '-q', 'pr1');
+		w('two\n', 'p1b');
+		git.git('checkout', '-q', 'pr2');
+		git.git('merge', '-q', 'pr1', '-m', 'merge pr1', '-s', 'ours');
+		w('child two\n', 'resolve');
+		git.openPR(1, 'pr1', 'main');
+		git.openPR(2, 'pr2', 'pr1');
+		world.approved.add(1);
+		world.approved.add(2);
+		db.addToQueue(repo.id, 1, 'PR 1', 'u', 'dev', '', 'dev');
+		db.addToQueue(repo.id, 2, 'PR 2', 'u', 'dev', '', 'dev');
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+		expect(world.merged).toEqual([1, 2]);
+		expect(git.git('show', 'main:shared.txt')).toBe('child two');
+		expect(git.git('rev-parse', 'main^{tree}')).toBe(git.git('rev-parse', `${world.started[0].head}^{tree}`));
+		// The head it pushed merges master into #2's own history, which it keeps.
+		const pushed = world.pushedHeads.find((h) => h.branch === 'pr2')!;
+		expect(git.git('rev-list', '--parents', '-n', '1', pushed.sha).split(' ')).toHaveLength(3);
+	});
+
 	/** A stacked child #2 that edits its parent #1's lines: it lands only once the queue restacks it onto master. */
 	function childEditingParent() {
 		pr(1, { file: 'shared.txt' });
@@ -2657,6 +2693,19 @@ describe('batch queue runtime', () => {
 		expect(world.comments).toEqual([]);
 	});
 
+	test("on a red default branch a failed batch's PRs show that they wait, not that they are tested", async () => {
+		redMain();
+		pr(1);
+		pr(2);
+		await run(40);
+		expect(world.started.length).toBeGreaterThan(0);
+		for (const ref of ['pr1', 'pr2'])
+			expect(world.prChecks.filter((x) => x.sha === git.sha(ref) && x.name === 'merge-queue').at(-1)).toMatchObject({
+				state: 'queued',
+				title: 'Waiting: main is red, and this PR does not fix it'
+			});
+	});
+
 	test('on a red default branch with the pipeline full, a PR held meanwhile is told', async () => {
 		store.updateQueueSettings(repo.id, { config: { depth: 1 } });
 		redMain();
@@ -3017,6 +3066,31 @@ describe('batch queue runtime', () => {
 		world.deleted.add(1);
 		await recoverInterrupted(world.deps());
 		expect(store.getLandingIntent(repo.id)).toBeNull();
+	});
+
+	test('cancelling the batch whose landing paused the queue ends that pause: nothing is left to resume', async () => {
+		pr(1);
+		pr(2);
+		world.refuseMerge.add(2);
+		world.refusal.set(2, 'Server Error');
+		await run();
+		expect(store.getQueueSettings(repo.id).pausedReason).toBe('Landing batch 1 stopped at #2: Server Error. Resume to try again.');
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		await cancelBatch(world.deps(), b.id, 'anton');
+		expect(store.getQueueSettings(repo.id).pausedReason).toBeNull();
+	});
+
+	test('cancelling a batch keeps a pause it did not cause', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		store.updateQueueSettings(repo.id, { pausedReason: 'release freeze' });
+		const b = store.getRecentBatches(repo.id).find((x) => x.kind === 'batch')!;
+		await cancelBatch(world.deps(), b.id, 'anton');
+		expect(store.getQueueSettings(repo.id).pausedReason).toBe('release freeze');
 	});
 
 	test('cancelling a bisecting batch stops its runs and puts its PRs back in line, blaming nobody', async () => {

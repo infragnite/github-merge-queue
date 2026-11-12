@@ -108,6 +108,12 @@ export function lastEventOf(repoId: number, pr: number, kinds: QueueEventKind[])
 	return r ? { kind: r.kind, data: JSON.parse(r.data) } : null;
 }
 
+/** The repository's newest event of `kind` that is about no one PR (a pause, say). */
+export function lastRepoEvent(repoId: number, kind: QueueEventKind): { data: Record<string, unknown> } | null {
+	const r = getDb().prepare('SELECT data FROM queue_events WHERE repo_id = ? AND pr_number IS NULL AND kind = ? ORDER BY id DESC LIMIT 1').get(repoId, kind) as { data: string } | undefined;
+	return r ? { data: JSON.parse(r.data) } : null;
+}
+
 /** The newest event id for a repo (the cursor to start from when there are no events yet). */
 export function latestEventId(repoId: number): number {
 	const r = getDb().prepare('SELECT MAX(id) AS id FROM queue_events WHERE repo_id = ?').get(repoId) as { id: number | null };
