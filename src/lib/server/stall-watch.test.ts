@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { childProcesses, currentDoing, doing, formatStall, startStallWatch, stopStallWatch, withDoing } from './stall-watch';
 
@@ -106,7 +107,7 @@ describe('the watchdog thread', () => {
 
 	test('while the main thread spins, it logs the stall with the spinning function and what the queue was doing', async () => {
 		const file = join(tmp(), 'stall.log');
-		startStallWatch({ stallMs: 400, checkMs: 100, repeatMs: 60_000, logFile: file });
+		startStallWatch({ stallMs: 400, checkMs: 100, repeatMs: 60_000, logFile: file, stderr: false });
 		await new Promise((r) => setTimeout(r, 300));
 		doing('qnox/krusty: reading the stacks');
 		spinForTheStallTest(2_500);
@@ -119,9 +120,20 @@ describe('the watchdog thread', () => {
 		expect(log).toContain('[stall] main thread free again after');
 	});
 
+	test('while the main thread waits on a synchronous child process, it logs that process', async () => {
+		const file = join(tmp(), 'stall.log');
+		startStallWatch({ stallMs: 400, checkMs: 100, repeatMs: 60_000, logFile: file, stderr: false });
+		await new Promise((r) => setTimeout(r, 300));
+		execFileSync('sleep', ['3.5']);
+		await new Promise((r) => setTimeout(r, 500));
+		const log = readFileSync(file, 'utf8');
+		expect(log).toMatch(/^\[stall\] child \d+: sleep 3\.5$/m);
+		expect(log).toContain('[stall] at: stack not captured');
+	});
+
 	test('a free main thread logs nothing', async () => {
 		const file = join(tmp(), 'stall.log');
-		startStallWatch({ stallMs: 400, checkMs: 100, repeatMs: 60_000, logFile: file });
+		startStallWatch({ stallMs: 400, checkMs: 100, repeatMs: 60_000, logFile: file, stderr: false });
 		await new Promise((r) => setTimeout(r, 1_200));
 		expect(() => readFileSync(file, 'utf8')).toThrow();
 	});
