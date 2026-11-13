@@ -1,5 +1,6 @@
 // Logs whenever the event loop was blocked long enough for requests to stall, so an
 // unresponsive app says why in its own logs instead of just going quiet.
+import { log as logger } from './log';
 
 const CHECK_MS = 1_000;
 /** A stall longer than this is logged. */
@@ -7,7 +8,7 @@ const STALL_MS = 2_000;
 
 let timer: ReturnType<typeof setInterval> | null = null;
 
-export function watchEventLoop(log: (msg: string) => void = console.warn) {
+export function watchEventLoop(log: (msg: string) => void = (msg) => logger.warn(msg)) {
 	if (timer) return;
 	let expected = Date.now() + CHECK_MS;
 	timer = setInterval(() => {

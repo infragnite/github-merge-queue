@@ -25,6 +25,7 @@
 
 import { spawn } from 'node:child_process';
 import { withDoing } from './stall-watch';
+import { log } from './log';
 
 export interface BatchMember {
 	pr: number;
@@ -101,7 +102,7 @@ export class GitRunner {
 	/** Logs `args` when it took at least the slow threshold. */
 	private timed(args: string[], started: number) {
 		const took = Date.now() - started;
-		if (took >= (this.watch.slowMs ?? SLOW_GIT_MS)) (this.watch.log ?? console.log)(redact(`[git] slow: git ${args.join(' ')} took ${took} ms`));
+		if (took >= (this.watch.slowMs ?? SLOW_GIT_MS)) (this.watch.log ?? ((m) => log.info(m)))(redact(`[git] slow: git ${args.join(' ')} took ${took} ms`));
 	}
 
 	/**

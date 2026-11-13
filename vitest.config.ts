@@ -10,6 +10,8 @@ export default defineConfig({
 	},
 	test: {
 		include: ['src/**/*.test.ts'],
-		environment: 'node'
+		environment: 'node',
+		// The queue logs a line per event; tests that check logs capture them with setLogSink.
+		env: { LOG_LEVEL: 'silent' }
 	}
 });

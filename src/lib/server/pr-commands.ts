@@ -23,6 +23,7 @@ import { RequestLimiter } from './request-limit';
 import type { Priority } from './batching';
 import type { StackAnalysis } from './stacks';
 import type { Repo } from '$lib/types';
+import { log } from './log';
 
 export type Command =
 	| { name: 'queue'; priority: Priority }
@@ -126,7 +127,7 @@ export async function runCommand(repo: Repo, deps: CommandDeps, c: PRComment): P
 		role = await deps.role(c.login);
 	} catch (e) {
 		// Nobody acts on a guess about who they are.
-		console.error(`[commands] ${repo.owner}/${repo.name}#${c.pr}: could not look up ${c.login}'s role:`, e instanceof Error ? e.message : e);
+		log.error("/mq command: could not look up the commenter's role", { repo: `${repo.owner}/${repo.name}`, pr: c.pr, by: c.login, err: e });
 		return null;
 	}
 	// A bot reads at most, as an installation token does on the API: its rights can't be checked.
@@ -142,17 +143,17 @@ export async function runCommand(repo: Repo, deps: CommandDeps, c: PRComment): P
 		if (e instanceof AuthError || e instanceof api.ApiError || e instanceof Refused) {
 			text = unname(e.message, c.pr);
 		} else {
-			console.error(`[commands] ${repo.owner}/${repo.name}#${c.pr} ${command.name}:`, e instanceof Error ? e.message : e);
+			log.error('/mq command failed', { repo: `${repo.owner}/${repo.name}`, pr: c.pr, command: command.name, err: e });
 			text = `Could not ${command.name === 'try' ? 'start a try run' : `run \`/mq ${command.name}\``}: something went wrong in the merge queue. Try again shortly.`;
 		}
 	}
 	const reaction: Reaction = ok ? '+1' : 'confused';
-	await deps.react(c.commentId, reaction).catch((e) => console.warn(`[commands] reaction on ${c.commentId}:`, e instanceof Error ? e.message : e));
+	await deps.react(c.commentId, reaction).catch((e) => log.warn('/mq command: reaction not posted', { comment: c.commentId, err: e }));
 	let reply: string | null = null;
 	if (text !== null && replies.take(`${repo.id}:${c.login.toLowerCase()}`) === 0) {
 		reply = `${quote(c.body)}\n\n${text}`;
 		await deps.reply(c.pr, reply).catch((e) => {
-			console.warn(`[commands] reply on #${c.pr}:`, e instanceof Error ? e.message : e);
+			log.warn('/mq command: reply not posted', { pr: c.pr, err: e });
 			reply = null;
 		});
 	}
@@ -248,7 +249,7 @@ async function status(repo: Repo, deps: CommandDeps, n: number): Promise<string>
 	try {
 		analysis = await deps.analysis();
 	} catch (e) {
-		console.warn(`[commands] status of #${n}: no stack analysis:`, e instanceof Error ? e.message : e);
+		log.warn('/mq status: no stack analysis', { pr: n, err: e });
 	}
 	const known = analysis?.prs.has(n) ? api.stackState(repo, n, analysis) : null;
 	const found = known?.queue ?? api.queueEntry(repo.id, n, analysis);

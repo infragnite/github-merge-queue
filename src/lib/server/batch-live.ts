@@ -19,6 +19,7 @@ import { bumpGeneration, memoByGeneration } from './wake';
 import type { LivePR, PRCheck, QueueDeps, Readiness } from './batch-queue';
 import type { CheckRunRequest, GhReview } from './github';
 import type { PRReport } from './batch-store';
+import { log } from './log';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -266,15 +267,15 @@ export class Mirror {
 		const started = Date.now();
 		try {
 			await this.plain.runAsync(args, { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
-			console.log(`[git] ${name}: ${what} took ${Date.now() - started} ms`);
+			log.info('git network call', { repo: name, what, took_ms: Date.now() - started });
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const outcome = expected(message);
 			if (outcome) {
-				console.log(`[git] ${name}: ${what} refused after ${Date.now() - started} ms: ${outcome.message}`);
+				log.info('git network call refused', { repo: name, what, took_ms: Date.now() - started, err: outcome });
 				throw outcome;
 			}
-			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${message}`);
+			log.error('git network call failed', { repo: name, what, took_ms: Date.now() - started, err: message });
 			throw err;
 		}
 	}
@@ -547,7 +548,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					prReport,
 					() => github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page })),
 					() => github.createCommitStatus(owner, name, sha, statusFromCheck(check, prStatus, page)),
-					(e) => console.warn(`[merge-queue] ${owner}/${name}: check run not posted (does the app have the Checks write permission?): ${e instanceof Error ? e.message : e}`)
+					(e) => log.warn('check run not posted (does the app have the Checks write permission?)', { repo: `${owner}/${name}`, err: e })
 				);
 			},
 			label: async (n, label, on) => {
