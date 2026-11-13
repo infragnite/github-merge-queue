@@ -10,7 +10,7 @@ test('a git command slower than the threshold is logged with its arguments and t
 	git = new GitSandbox();
 	const logs: string[] = [];
 	const runner = new GitRunner(git.dir, {}, { slowMs: 0, log: (m) => logs.push(m) });
-	runner.run(['rev-parse', '--git-dir']);
+	await runner.run(['rev-parse', '--git-dir']);
 	await runner.runAsync(['config', 'x.url', 'https://x-access-token:ghs_abcdefghijklmnopqrstuvwxyz@github.com/a'], { allowFail: true });
 	expect(logs.map((l) => l.replace(/\d+ ms/, 'N ms'))).toEqual([
 		'[git] slow: git rev-parse --git-dir took N ms',
@@ -18,11 +18,11 @@ test('a git command slower than the threshold is logged with its arguments and t
 	]);
 });
 
-test('a command under the threshold logs nothing, and the server is doing nothing once it ends', () => {
+test('a command under the threshold logs nothing, and the server is doing nothing once it ends', async () => {
 	git = new GitSandbox();
 	const logs: string[] = [];
 	const runner = new GitRunner(git.dir, {}, { slowMs: 60_000, log: (m) => logs.push(m) });
-	runner.run(['rev-parse', '--git-dir']);
+	await runner.run(['rev-parse', '--git-dir']);
 	expect(logs).toEqual([]);
 	expect(currentDoing()).toBeNull();
 });

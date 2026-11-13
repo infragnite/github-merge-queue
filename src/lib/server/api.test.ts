@@ -317,6 +317,17 @@ describe('queue control', () => {
 		expect(() => api.dequeue(repo, writer, 1)).toThrow(/not queued/);
 	});
 
+	test('a PR the queue cancelled or merged can be queued again', () => {
+		// Closing a queued PR cancels its entry; reopened, it goes back in line (krusty #3474).
+		api.enqueue(repo, writer, pull(1), {});
+		db.updateQueueItemStatus(db.getQueueItems(repo.id)[0].id, 'cancelled', 'PR was closed');
+		expect(api.enqueue(repo, writer, pull(1), {})).toMatchObject({ position: 1, priority: 'normal' });
+		api.enqueue(repo, writer, pull(2), {});
+		db.updateQueueItemStatus(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)!.id, 'merged');
+		expect(api.enqueue(repo, writer, pull(2), {})).toMatchObject({ position: 2 });
+		expect(db.getAllQueueItems(repo.id).map((i) => [i.pr_number, i.status])).toEqual([[1, 'queued'], [2, 'queued']]);
+	});
+
 	test('a PR in a running batch cannot be dequeued', () => {
 		api.enqueue(repo, writer, pull(1), {});
 		store.insertBatch({

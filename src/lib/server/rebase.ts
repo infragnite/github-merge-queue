@@ -31,9 +31,9 @@ export type ReplayResult =
 // Attributes come from the default branch, never from the PR being replayed or its parent.
 const mergeTree = (attrs: string) => [`--attr-source=${attrs}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
 
-export function replay(git: GitRunner, { head, upstream, onto, attrs, date }: ReplayInput): ReplayResult {
+export async function replay(git: GitRunner, { head, upstream, onto, attrs, date }: ReplayInput): Promise<ReplayResult> {
 	const mergeArgs = mergeTree(attrs ?? onto);
-	const whole = git.run([...mergeArgs, `--merge-base=${upstream}`, onto, head], { allowFail: true });
+	const whole = (await git.run([...mergeArgs, `--merge-base=${upstream}`, onto, head], { allowFail: true }));
 	const lines = whole.out.split('\n').filter(Boolean);
 	if (whole.code !== 0) {
 		const conflicts = whole.code === 1 ? lines.slice(1) : [];
@@ -47,15 +47,15 @@ export function replay(git: GitRunner, { head, upstream, onto, attrs, date }: Re
 	}
 	const expected = lines[0];
 
-	const commits = git
-		.run(['rev-list', '--reverse', '--topo-order', '--no-merges', `${upstream}..${head}`])
+	const commits = (await git
+		.run(['rev-list', '--reverse', '--topo-order', '--no-merges', `${upstream}..${head}`]))
 		.out.split('\n')
 		.filter(Boolean);
 	let tip = onto;
-	let tipTree = git.run(['rev-parse', `${onto}^{tree}`]).out;
+	let tipTree = (await git.run(['rev-parse', `${onto}^{tree}`])).out;
 	let replayed = 0;
 	for (const c of commits) {
-		const r = git.run([...mergeArgs, `--merge-base=${c}^`, tip, c], { allowFail: true });
+		const r = (await git.run([...mergeArgs, `--merge-base=${c}^`, tip, c], { allowFail: true }));
 		const out = r.out.split('\n').filter(Boolean);
 		if (r.code !== 0) {
 			const conflicts = r.code === 1 ? out.slice(1) : [];
@@ -67,12 +67,12 @@ export function replay(git: GitRunner, { head, upstream, onto, attrs, date }: Re
 		}
 		const tree = out[0];
 		if (tree === tipTree) continue; // already on `onto` (e.g. commits merged in from the default branch)
-		const [an, ae, ad, cn, ce] = git
-			.run(['log', '-1', '--format=%an%x00%ae%x00%ad%x00%cn%x00%ce', '--date=raw', c])
+		const [an, ae, ad, cn, ce] = (await git
+			.run(['log', '-1', '--format=%an%x00%ae%x00%ad%x00%cn%x00%ce', '--date=raw', c]))
 			.out.split('\0');
-		const message = git.run(['log', '-1', '--format=%B', c]).out;
+		const message = (await git.run(['log', '-1', '--format=%B', c])).out;
 		const when = date !== undefined ? `@${date} +0000` : undefined;
-		tip = git.run(['commit-tree', tree, '-p', tip, '-F', '-'], {
+		tip = (await git.run(['commit-tree', tree, '-p', tip, '-F', '-'], {
 			input: message + '\n',
 			env: {
 				GIT_AUTHOR_NAME: an,
@@ -82,7 +82,7 @@ export function replay(git: GitRunner, { head, upstream, onto, attrs, date }: Re
 				GIT_COMMITTER_EMAIL: ce,
 				...(when ? { GIT_COMMITTER_DATE: when } : {})
 			}
-		}).out;
+		})).out;
 		tipTree = tree;
 		replayed++;
 	}
