@@ -112,6 +112,8 @@ export function queueEntry(repoId: number, n: number, analysis: StackAnalysis | 
 function nextActions(info: PRStackInfo, analysis: StackAnalysis, defaultBranch: string, queued: Set<number>): NextAction[] {
 	const out: NextAction[] = [];
 	const issue = (k: StackIssue['kind']) => info.issues.find((i) => i.kind === k);
+	const cycle = issue('stack-cycle');
+	if (cycle) return [{ do: 'fix', why: cycle.message }];
 	const p = info.parent;
 	const rebased = issue('parent-rebased');
 	const restack = restackCommand(info);
@@ -205,7 +207,10 @@ export function stackState(repo: Repo, n: number, analysis: StackAnalysis) {
 	);
 	// The stack from its root down, parents before children.
 	let root = n;
+	const ancestors = new Set<number>();
 	while (analysis.prs.get(root)?.parent != null && analysis.prs.has(analysis.prs.get(root)!.parent!)) {
+		if (ancestors.has(root)) throw new ApiError(409, `Stack dependency cycle involving #${root}`);
+		ancestors.add(root);
 		root = analysis.prs.get(root)!.parent!;
 	}
 	return {
@@ -233,14 +238,18 @@ export interface StackTree {
 	children: StackTree[];
 }
 
-function tree(analysis: StackAnalysis, n: number): StackTree {
+function tree(analysis: StackAnalysis, n: number, ancestors = new Set<number>()): StackTree {
+	if (ancestors.has(n)) throw new ApiError(409, `Stack dependency cycle involving #${n}`);
+	ancestors.add(n);
 	const info = analysis.prs.get(n)!;
-	return {
+	const result: StackTree = {
 		pr: n,
 		link: info.link,
 		broken: info.broken,
-		children: [...info.children].sort((a, b) => a - b).map((c) => tree(analysis, c))
+		children: [...info.children].sort((a, b) => a - b).map((c) => tree(analysis, c, ancestors))
 	};
+	ancestors.delete(n);
+	return result;
 }
 
 /** Every open stack (two or more PRs) as a tree. */

@@ -120,6 +120,33 @@ beforeEach(() => {
 });
 
 describe('stack state for agents', () => {
+	test.each<{ open: number[]; parents: Record<number, number>; pr: number }>([
+		{ open: [1], parents: { 1: 1 }, pr: 1 },
+		{ open: [1, 2], parents: { 1: 2, 2: 1 }, pr: 1 },
+		{ open: [1, 2, 3], parents: { 1: 2, 2: 1, 3: 2 }, pr: 3 }
+	])('rejects cyclic ancestry without blocking the server: $parents, PR $pr', ({ open, parents, pr }) => {
+		expect(() => api.stackState(repo, pr, analysis(open, parents))).toThrow(
+			expect.objectContaining({ status: 409, message: expect.stringContaining('Stack dependency cycle') })
+		);
+	});
+
+	test('both stack endpoints reject a cycle in child links', () => {
+		const a = analysis([1, 2], { 2: 1 });
+		a.prs.get(2)!.children.push(1);
+		for (const read of [() => api.stackState(repo, 1, a), () => api.stacksState(a)]) {
+			expect(read).toThrow(expect.objectContaining({ status: 409, message: 'Stack dependency cycle involving #1' }));
+		}
+	});
+
+	test('a cut ancestry cycle is reported as a blocking issue with a fix action', () => {
+		const issue: StackIssue = { kind: 'stack-cycle', pr: 1, parent: 2, severity: 'blocking', message: 'Ambiguous stack ancestry cycle' };
+		const a = analysis([1, 2, 3], { 3: 1 }, [issue]);
+		expect(api.stackState(repo, 1, a)).toMatchObject({
+			broken: true, issues: [issue], nextActions: [{ do: 'fix', why: issue.message }],
+			stack: { pr: 1, children: [{ pr: 3, children: [] }] }
+		});
+	});
+
 	test('a stacked child waiting on its queued parent', () => {
 		const a = analysis([1, 2, 3], { 2: 1, 3: 2 });
 		api.enqueue(repo, writer, pull(1), {});

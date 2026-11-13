@@ -47,6 +47,29 @@ function linearStack() {
 }
 
 describe('stack inference from ancestry', () => {
+	test('reciprocal rewritten heads are held and cut instead of forming a cyclic stack', () => {
+		const commit = (sha: string, message = 'same change'): StackCommit => ({
+			sha, message, authorEmail: 'dev@example.test', authoredAt: '2026-11-13T00:00:00Z'
+		});
+		const pr = (number: number, commits: StackCommit[]): PRSnapshot => ({
+			number, state: 'open', merged: false, headRef: `pr${number}`,
+			headSha: commits.at(-1)!.sha, baseRef: 'main', commits
+		});
+		// An amend preserves author, date and message. Each copy looks like the
+		// other's rewritten parent; a child on one copy must be held as well.
+		const a = analyzeStacks({ defaultBranch: 'main', prs: [
+			pr(1, [commit('old')]), pr(2, [commit('new')]),
+			pr(3, [commit('old'), commit('child', 'child change')])
+		] });
+		for (const n of [1, 2]) {
+			expect(info(a, n)).toMatchObject({ parent: null, link: null, broken: true });
+			expect(info(a, n).issues).toContainEqual(expect.objectContaining({ kind: 'stack-cycle', severity: 'blocking' }));
+			expect(mergeBlocker(a, n)).not.toBeNull();
+		}
+		expect(info(a, 3)).toMatchObject({ parent: 1, broken: true });
+		expect(a.stacks).toEqual([[1, 3]]);
+	});
+
 	test('linear stack with correct bases is healthy', () => {
 		linearStack();
 		const a = analyzeStacks(git.input());
