@@ -28,13 +28,13 @@ describe('structured log lines (one JSON object per line, for Loki)', () => {
 		expect(lines[0].level).toBe('warn');
 	});
 
-	test('an error keeps its message, and a GitHub error its HTTP status and request id', () => {
+	test('an error keeps its message, and a GitHub error its HTTP status, call and request id', () => {
 		capture();
-		log.error('tick failed', { err: new GitHubError(502, 'Bad Gateway', {}, 'ABCD:1234') });
+		log.error('tick failed', { err: new GitHubError(502, 'Bad Gateway', {}, 'ABCD:1234', 'GET /repos/o/r/pulls') });
 		log.error('tick failed', { err: new Error('git failed') });
 		log.error('tick failed', { err: 'just text' });
 		const [gh, plain, text] = lines.map((l) => JSON.parse(l.line).err);
-		expect(gh).toEqual({ message: 'Bad Gateway', status: 502, request_id: 'ABCD:1234' });
+		expect(gh).toEqual({ message: 'Bad Gateway', status: 502, call: 'GET /repos/o/r/pulls', request_id: 'ABCD:1234' });
 		expect(plain).toEqual({ message: 'git failed' });
 		expect(text).toEqual({ message: 'just text' });
 	});

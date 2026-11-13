@@ -49,10 +49,11 @@ async function ghFetch(token: string, path: string, init?: RequestInit, budget?:
 	}
 	if (!res.ok) {
 		// A missing App permission names only the symptom; the call says which permission it is.
+		const call = `${init?.method ?? 'GET'} ${path.split('?')[0]}`;
 		const missingPermission = res.status === 403 && /not accessible by integration/i.test(body.message ?? '');
-		const message = missingPermission ? `${body.message}: ${init?.method ?? 'GET'} ${path.split('?')[0]}` : body.message;
+		const message = missingPermission ? `${body.message}: ${call}` : body.message;
 		recordGitHubError(res.status);
-		throw new GitHubError(res.status, message || `GitHub API ${res.status}: ${path}`, body, res.headers.get('x-github-request-id') ?? undefined);
+		throw new GitHubError(res.status, message || `GitHub API ${res.status}: ${call}`, body, res.headers.get('x-github-request-id') ?? undefined, call);
 	}
 	return body;
 }

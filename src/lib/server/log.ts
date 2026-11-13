@@ -26,9 +26,9 @@ export function setLogFormat(f: 'json' | 'text') {
 	format = f;
 }
 
-/** What an error says, for a log line: its message, and for GitHub its HTTP status and request id. */
+/** What an error says, for a log line: its message, and for GitHub its HTTP status, the call and the request id. */
 export function errorFields(err: unknown): Fields {
-	if (err instanceof GitHubError) return { message: err.message, status: err.status, ...(err.requestId ? { request_id: err.requestId } : {}) };
+	if (err instanceof GitHubError) return { message: err.message, status: err.status, ...(err.call ? { call: err.call } : {}), ...(err.requestId ? { request_id: err.requestId } : {}) };
 	if (err instanceof Error) return { message: err.message };
 	return { message: String(err) };
 }
