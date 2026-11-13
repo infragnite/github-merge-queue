@@ -18,6 +18,8 @@ import { dashboardStackAnalysis } from './stack-runtime';
 import { pipelineView } from './pipeline-view';
 import { log } from './log';
 import { recordTick } from './telemetry';
+import { livenessProblem } from './liveness';
+import { withDoing } from './stall-watch';
 
 const label = (repo: { owner: string; name: string }) => `${repo.owner}/${repo.name}`;
 
@@ -38,6 +40,15 @@ type RepoRef = { id: number; owner: string; name: string; default_branch: string
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
 let running = false;
+const startedAt = Date.now();
+let runningSince: number | null = null;
+let lastCycleEnd: number | null = null;
+
+/** Why the processor looks hung (for the health check), or null while its cycles keep finishing. */
+export function processorProblem(now = Date.now()): string | null {
+	if (!intervalId) return null;
+	return livenessProblem({ now, startedAt, lastCycleEnd, runningSince });
+}
 
 export function startProcessor() {
 	if (intervalId) return;
@@ -70,17 +81,20 @@ let stopping = false;
 async function processAll() {
 	if (running || stopping) return;
 	running = true;
+	runningSince = Date.now();
 
 	try {
 		const repos = db.getRepos();
 		for (const repo of repos) {
 			if (stopping) break;
-			await processRepo(repo);
+			await withDoing(`${repo.owner}/${repo.name}`, () => processRepo(repo));
 		}
 	} catch (err) {
 		log.error('processor cycle failed', { err });
 	} finally {
 		running = false;
+		runningSince = null;
+		lastCycleEnd = Date.now();
 	}
 }
 

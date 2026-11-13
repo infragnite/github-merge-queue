@@ -24,6 +24,8 @@
 // Needs git >= 2.41 (`merge-tree --write-tree --merge-base`, `--attr-source`).
 
 import { execFile, execFileSync } from 'node:child_process';
+import { withDoing } from './stall-watch';
+import { log } from './log';
 
 export interface BatchMember {
 	pr: number;
@@ -72,13 +74,32 @@ export function redact(text: string): string {
 		.replace(/\bgh[opsu]_[A-Za-z0-9]{20,}/g, '***');
 }
 
+/** A git command slower than this is logged, with its arguments and time. */
+const SLOW_GIT_MS = 5_000;
+
 export class GitRunner {
 	constructor(
 		readonly dir: string,
-		private readonly env: NodeJS.ProcessEnv = {}
+		private readonly env: NodeJS.ProcessEnv = {},
+		private readonly watch: { slowMs?: number; log?: (msg: string) => void } = {}
 	) {}
 
+	/** Logs `args` when it took at least the slow threshold. */
+	private timed(args: string[], started: number) {
+		const took = Date.now() - started;
+		if (took >= (this.watch.slowMs ?? SLOW_GIT_MS)) (this.watch.log ?? ((m) => log.info(m)))(redact(`[git] slow: git ${args.join(' ')} took ${took} ms`));
+	}
+
 	run(args: string[], opts: { allowFail?: boolean; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}) {
+		const started = Date.now();
+		try {
+			return withDoing(redact(`git ${args.join(' ')}`).slice(0, 300), () => this.runSync(args, opts));
+		} finally {
+			this.timed(args, started);
+		}
+	}
+
+	private runSync(args: string[], opts: { allowFail?: boolean; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }) {
 		try {
 			const out = execFileSync('git', args, {
 				// Local plumbing takes seconds; a hung git must not stall the event loop for long.
@@ -109,7 +130,8 @@ export class GitRunner {
 		args: string[],
 		opts: { allowFail?: boolean; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}
 	): Promise<{ code: number; out: string; err?: string }> {
-		return new Promise((resolve, reject) => {
+		const started = Date.now();
+		return new Promise<{ code: number; out: string; err?: string }>((resolve, reject) => {
 			execFile(
 				'git',
 				args,
@@ -129,7 +151,7 @@ export class GitRunner {
 					resolve({ code, out: stdout.trim(), err: stderr });
 				}
 			);
-		});
+		}).finally(() => this.timed(args, started));
 	}
 }
 
