@@ -283,7 +283,8 @@ const UNFIXABLE: ReadonlySet<string> = new Set([
 	'parent-rebased',
 	'parent-closed',
 	'base-branch-missing',
-	'auto-closed'
+	'auto-closed',
+	'stack-cycle'
 ]);
 
 /** The blocking stack issue on this PR that the queue can't work around, if any. */
