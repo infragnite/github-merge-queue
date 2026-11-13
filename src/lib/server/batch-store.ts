@@ -314,6 +314,22 @@ export function migrateBatches(database: Database.Database) {
 	add('batch_failures', `INTEGER NOT NULL DEFAULT 0`);
 	// Why the planner holds this queued PR back: { code, wait, reason } (see setHold).
 	add('hold', `TEXT`);
+	// Automatic tries: each open PR's current head, when the queue first saw it, and what became of it.
+	database.exec(`
+		CREATE TABLE IF NOT EXISTS auto_tries (
+			repo_id INTEGER NOT NULL,
+			pr_number INTEGER NOT NULL,
+			head_sha TEXT NOT NULL,
+			seen_at INTEGER NOT NULL,
+			outcome TEXT,
+			run_id INTEGER,
+			PRIMARY KEY (repo_id, pr_number, head_sha)
+		);
+		CREATE TABLE IF NOT EXISTS auto_try_primed (
+			repo_id INTEGER PRIMARY KEY,
+			at INTEGER NOT NULL
+		);
+	`);
 }
 
 // --- settings ---
@@ -358,6 +374,8 @@ export function updateQueueSettings(
 			   ci = excluded.ci, paused_reason = excluded.paused_reason, public_view = excluded.public_view`
 		)
 		.run(repoId, next.mode, JSON.stringify(next.config), JSON.stringify(next.ci), next.pausedReason, next.publicView ? 1 : 0);
+	// Automatic tries off (or no batch mode): turned on again, they start from the heads open then.
+	if (!next.config.autoTry || next.mode !== 'batch') unprimeAutoTries(repoId);
 	return next;
 }
 
@@ -754,6 +772,158 @@ export function latestTry(repoId: number, pr: number, headSha: string, baseTree:
 			.all(repoId, baseTree) as RawBatch[]
 	).map(parse);
 	return rows.find((r) => r.members.length === 1 && r.members[0] === pr && r.heads[pr] === headSha) ?? null;
+}
+
+/** Whether a try of `pr` at `headSha` ran or runs, a cancelled one aside: that head needs no automatic one. */
+export function hasTry(repoId: number, pr: number, headSha: string): boolean {
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status != 'cancelled' AND members = ?`)
+			.all(repoId, JSON.stringify([pr])) as RawBatch[]
+	).map(parse);
+	return rows.some((r) => r.members.length === 1 && r.members[0] === pr && r.heads[pr] === headSha);
+}
+
+/**
+ * Where the try runs of `pr` at any of `heads` stand: one passed, one is running, the latest
+ * finished one failed, or none (cancelled ones don't count).
+ */
+export function tryStatus(repoId: number, pr: number, heads: string[]): 'passed' | 'running' | 'failed' | 'none' {
+	const want = new Set(heads);
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status != 'cancelled' AND members = ? ORDER BY id DESC`)
+			.all(repoId, JSON.stringify([pr])) as RawBatch[]
+	)
+		.map(parse)
+		.filter((r) => want.has(r.heads[pr]));
+	if (rows.some((r) => r.ci_result === 'success')) return 'passed';
+	if (rows.some((r) => r.status === 'testing')) return 'running';
+	return rows.length ? 'failed' : 'none';
+}
+
+/** What became of `pr` at `headSha` as an automatic try, if it was seen. */
+export function autoTryOutcome(repoId: number, pr: number, headSha: string): AutoTryOutcome | null {
+	const r = getDb().prepare(`SELECT outcome FROM auto_tries WHERE repo_id = ? AND pr_number = ? AND head_sha = ?`).get(repoId, pr, headSha) as
+		| { outcome: AutoTryOutcome | null }
+		| undefined;
+	return r?.outcome ?? null;
+}
+
+/** A running `try` run of `pr` at `headSha`, if any. */
+export function runningTryOf(repoId: number, pr: number, headSha: string): BatchRow | null {
+	return getRunningTries(repoId).find((t) => t.members.length === 1 && t.members[0] === pr && t.heads[pr] === headSha) ?? null;
+}
+
+// --- automatic tries ---
+
+/**
+ * What became of a head: null while it waits for its delay or a free slot; `started` (its run is
+ * `run_id`); `cancelled` (its run was stopped, and it may start again once nothing keeps it out);
+ * `existing` (open when automatic tries were turned on); `tried` (a `/mq try` covered it);
+ * `conflict` (it does not apply on the default branch).
+ */
+export type AutoTryOutcome = 'started' | 'cancelled' | 'existing' | 'tried' | 'conflict';
+
+export interface AutoTryRow {
+	pr: number;
+	headSha: string;
+	seenAt: number;
+	outcome: AutoTryOutcome | null;
+	runId: number | null;
+}
+
+export function autoTryRows(repoId: number): AutoTryRow[] {
+	return (
+		getDb()
+			.prepare(`SELECT pr_number, head_sha, seen_at, outcome, run_id FROM auto_tries WHERE repo_id = ? ORDER BY seen_at, pr_number`)
+			.all(repoId) as Array<{ pr_number: number; head_sha: string; seen_at: number; outcome: AutoTryOutcome | null; run_id: number | null }>
+	).map((r) => ({ pr: r.pr_number, headSha: r.head_sha, seenAt: r.seen_at, outcome: r.outcome, runId: r.run_id }));
+}
+
+/**
+ * Records the open PRs' current heads, each at `now` the first time it is seen, and forgets every
+ * other head (a PR pushed again, closed or merged), except one whose run is still going.
+ */
+export function seeAutoTryHeads(repoId: number, heads: { pr: number; sha: string }[], now: number) {
+	const d = getDb();
+	const insert = d.prepare(`INSERT OR IGNORE INTO auto_tries (repo_id, pr_number, head_sha, seen_at) VALUES (?, ?, ?, ?)`);
+	const current = new Set(heads.map((h) => `${h.pr}@${h.sha}`));
+	d.transaction(() => {
+		for (const h of heads) insert.run(repoId, h.pr, h.sha, now);
+		const live = new Set(getRunningTries(repoId).map((t) => t.id));
+		const drop = d.prepare(`DELETE FROM auto_tries WHERE repo_id = ? AND pr_number = ? AND head_sha = ?`);
+		for (const r of autoTryRows(repoId)) {
+			if (current.has(`${r.pr}@${r.headSha}`) || (r.runId !== null && live.has(r.runId))) continue;
+			drop.run(repoId, r.pr, r.headSha);
+		}
+	})();
+}
+
+export function setAutoTry(repoId: number, pr: number, headSha: string, outcome: AutoTryOutcome, runId?: number) {
+	getDb()
+		.prepare(
+			`INSERT INTO auto_tries (repo_id, pr_number, head_sha, seen_at, outcome, run_id) VALUES (?, ?, ?, 0, ?, ?)
+			 ON CONFLICT(repo_id, pr_number, head_sha) DO UPDATE SET outcome = excluded.outcome, run_id = COALESCE(excluded.run_id, run_id)`
+		)
+		.run(repoId, pr, headSha, outcome, runId ?? null);
+}
+
+/** Records a try run, and that it is `pr`'s automatic try at `headSha`, in one step: a crash leaves both or neither. */
+export function insertAutoTry(b: Parameters<typeof insertBatch>[0], pr: number, headSha: string): BatchRow {
+	return getDb().transaction(() => {
+		const row = insertBatch(b);
+		setAutoTry(b.repoId, pr, headSha, 'started', row.id);
+		return row;
+	})();
+}
+
+/** Marks an automatic try cancelled (its run and its head), in one step. */
+export function cancelAutoTryRow(t: BatchRow, reason: string) {
+	const pr = t.members[0];
+	getDb().transaction(() => {
+		setBatchStatus(t.id, 'cancelled', reason);
+		setAutoTry(t.repo_id, pr, t.heads[pr], 'cancelled');
+	})();
+}
+
+/**
+ * Whether a run of the queue's own (a batch or a bisection step) finished with `pr` at `headSha`
+ * in it: its author already saw that head's CI. Looks at the latest runs only.
+ */
+export function queueRanHead(repoId: number, pr: number, headSha: string): boolean {
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind IN ('batch', 'bisect') AND ci_result != 'pending' AND heads LIKE ? ORDER BY id DESC LIMIT 200`)
+			.all(repoId, `%"${pr}":"${headSha}"%`) as RawBatch[]
+	).map(parse);
+	return rows.some((r) => r.heads[pr] === headSha);
+}
+
+/** Automatic tries still running. */
+export function runningAutoTries(repoId: number): BatchRow[] {
+	const ids = new Set(autoTryRows(repoId).flatMap((r) => (r.outcome === 'started' && r.runId !== null ? [r.runId] : [])));
+	return getRunningTries(repoId).filter((t) => ids.has(t.id));
+}
+
+export function autoTriesPrimed(repoId: number): boolean {
+	return !!getDb().prepare(`SELECT 1 FROM auto_try_primed WHERE repo_id = ?`).get(repoId);
+}
+
+/** Turned on: the open PRs' heads as they are now are not tried, only later pushes (as a CI push trigger would). */
+export function primeAutoTries(repoId: number, heads: { pr: number; sha: string }[], now: number) {
+	const d = getDb();
+	d.transaction(() => {
+		seeAutoTryHeads(repoId, heads, now);
+		const mark = d.prepare(`UPDATE auto_tries SET outcome = 'existing' WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND (outcome IS NULL OR outcome = 'cancelled')`);
+		for (const h of heads) mark.run(repoId, h.pr, h.sha);
+		d.prepare(`INSERT OR REPLACE INTO auto_try_primed (repo_id, at) VALUES (?, ?)`).run(repoId, now);
+	})();
+}
+
+/** Turned off: turned on again, it starts from the heads open then. */
+export function unprimeAutoTries(repoId: number) {
+	getDb().prepare(`DELETE FROM auto_try_primed WHERE repo_id = ?`).run(repoId);
 }
 
 // --- default-branch health ---

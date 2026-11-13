@@ -46,6 +46,15 @@ export interface PRState {
 	targetsDefault?: boolean;
 	/** The head is in a fork: its code runs in this repo's CI only once a writer approved that head. */
 	fromFork?: boolean;
+	/**
+	 * Its try runs at its head (or at the head a restack replaced): one passed, one is running, the
+	 * latest failed, or none. Unset where not looked up; only `requireTryPass` reads it.
+	 */
+	tried?: 'passed' | 'running' | 'failed' | 'none';
+	/** Why its latest try failed, when it could not even start (it does not apply). */
+	tryFailure?: string;
+	/** An automatic try will start for it on its own (no `/mq try` needed). */
+	autoTried?: boolean;
 }
 
 /**
@@ -108,6 +117,20 @@ export interface BatchConfig {
 	bisectRuns: number;
 	/** Which notices are posted as PR comments; see `CommentMode`. */
 	comments: CommentMode;
+	/**
+	 * Try each new commit pushed to an open PR (batch mode only), as a CI push trigger would: one
+	 * run of it on top of the default branch, cancelled by the next push. Drafts, forks, queued PRs
+	 * and PRs labelled `no-auto-try` are left out.
+	 */
+	autoTry: boolean;
+	/** Automatic tries running at once (`/mq try` runs are not counted); the rest wait, oldest push first. */
+	autoTryMax: number;
+	/** How long after a push its try starts, so a burst of pushes is tried once. */
+	autoTryDelayMs: number;
+	/** Drafts get automatic tries too. */
+	autoTryDrafts: boolean;
+	/** A queued PR enters a batch only once a try passed on its current head (any default branch). */
+	requireTryPass: boolean;
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
@@ -125,7 +148,12 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	stopOnFirstFailure: true,
 	masterRunMinGapMs: 0,
 	bisectRuns: 1,
-	comments: 'all'
+	comments: 'all',
+	autoTry: false,
+	autoTryMax: 2,
+	autoTryDelayMs: 2 * 60 * 1000,
+	autoTryDrafts: false,
+	requireTryPass: false
 };
 
 export type AdmissionCode =
@@ -137,7 +165,10 @@ export type AdmissionCode =
 	| 'changes-requested'
 	| 'stack-broken'
 	| 'parent-not-ready'
-	| 'wrong-base';
+	| 'wrong-base'
+	| 'try-pending'
+	| 'not-tried'
+	| 'try-failed';
 
 /** Why the planner holds a queued PR: its own admission, a known conflict, or its stack. */
 export type HoldCode =
@@ -164,6 +195,9 @@ const EVERY_HOLD: Record<HoldCode, true> = {
 	'stack-broken': true,
 	'parent-not-ready': true,
 	'wrong-base': true,
+	'try-pending': true,
+	'not-tried': true,
+	'try-failed': true,
 	conflict: true,
 	'workflow-permission': true,
 	'merge-refused': true,
@@ -215,11 +249,16 @@ export function holdAdvice(code: HoldCode): string {
 			return 'Fix what GitHub named, then push to retry.';
 		case 'failed':
 			return 'Fix the failure and push.';
+		case 'not-tried':
+			return 'Comment `/mq try` to test it on the default branch.';
+		case 'try-failed':
+			return 'Fix the failure and push, or comment `/mq try` to run it again.';
 		// Nothing the author can do: it waits for other PRs, or for the queue itself.
 		case 'deferred':
 		case 'parent-held':
 		case 'parent-not-ready':
 		case 'not-fetched':
+		case 'try-pending':
 			return '';
 	}
 }
@@ -281,6 +320,13 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 				reason: `Approved on an earlier push; approve its current head ${state.headSha.slice(0, 7)}`
 			};
 		}
+	}
+
+	if (config.requireTryPass && state.tried !== undefined && state.tried !== 'passed') {
+		if (state.tried === 'running') return { ok: false, code: 'try-pending', reason: 'Waits for its try run to pass' };
+		if (state.tried === 'failed') return { ok: false, code: 'try-failed', reason: state.tryFailure ?? 'Its try run failed' };
+		if (state.autoTried) return { ok: false, code: 'try-pending', reason: 'Waits for its automatic try run' };
+		return { ok: false, code: 'not-tried', reason: 'Needs a passed try run before it is batched' };
 	}
 
 	if (state.fromFork && !state.approvedShas.includes(state.headSha)) {

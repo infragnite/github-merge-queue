@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import { HOLD_CODES, holdAdvice, type HoldCode } from './batching';
 
 /** Waiting on other PRs or on the queue: nothing for the author to do. */
-const SILENT: HoldCode[] = ['deferred', 'parent-held', 'parent-not-ready', 'not-fetched'];
+const SILENT: HoldCode[] = ['deferred', 'parent-held', 'parent-not-ready', 'not-fetched', 'try-pending'];
 import * as format from './hold-format';
 import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice, statusBlock } from './hold-format';
 

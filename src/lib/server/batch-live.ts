@@ -476,7 +476,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					baseRef: p.base.ref,
 					state: 'open' as const,
 					merged: false,
-					body: p.body ?? null
+					body: p.body ?? null,
+					labels: (p.labels ?? []).map((l: { name?: string } | string) => (typeof l === 'string' ? l : (l.name ?? '')))
 				})),
 			pr: async (n): Promise<LivePR> => {
 				const p = await github.getPR(owner, name, n);
@@ -492,7 +493,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					baseRef: p.base.ref,
 					state: p.state,
 					merged: !!p.merged,
-					body: p.body ?? null
+					body: p.body ?? null,
+					labels: (p.labels ?? []).map((l: { name?: string } | string) => (typeof l === 'string' ? l : (l.name ?? '')))
 				};
 			},
 			readiness: async (n, headSha, author, opts): Promise<Readiness> => {

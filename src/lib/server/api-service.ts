@@ -171,6 +171,8 @@ function holdActions(it: QueueItem, hold: store.Hold): NextAction[] {
 		case 'not-approved':
 		case 'stale-approval':
 		case 'changes-requested':
+		case 'try-failed':
+		case 'not-tried':
 			return [{ do: 'fix', why: hold.reason }];
 		case 'dependency-closed':
 		case 'dependency-invalid':
@@ -397,6 +399,7 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 	if (config.depth !== undefined && config.depth < 1) throw new ApiError(400, 'depth must be >= 1');
 	if (config.comments !== undefined && !COMMENT_MODES.includes(config.comments as CommentMode)) throw new ApiError(400, `comments must be one of ${COMMENT_MODES.join(', ')}`);
 	if (config.bisectRuns !== undefined && (config.bisectRuns < 1 || !Number.isInteger(config.bisectRuns))) throw new ApiError(400, 'bisectRuns must be a whole number >= 1');
+	if (config.autoTryMax !== undefined && (config.autoTryMax < 1 || !Number.isInteger(config.autoTryMax))) throw new ApiError(400, 'autoTryMax must be a whole number >= 1');
 	const mode = body.mode;
 	if (mode !== undefined && mode !== 'serial' && mode !== 'batch') throw new ApiError(400, 'mode must be serial or batch');
 	const ci = body.ci as Record<string, unknown> | undefined;
