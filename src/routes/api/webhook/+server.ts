@@ -23,6 +23,24 @@ import { log } from '$lib/server/log';
 import { recordWebhook } from '$lib/server/telemetry';
 import type { RequestHandler } from './$types';
 
+/**
+ * Deliveries that fail the signature check (or don't parse) come from anyone who can reach the
+ * endpoint: logged at most once a minute, with how many were left out since, so they can't flood
+ * the logs. They are all counted in the metrics.
+ */
+const UNSIGNED_LOG_MS = 60_000;
+let unsigned = { at: -Infinity, leftOut: 0 };
+function logUnsigned(): number | undefined | false {
+	const now = Date.now();
+	if (now - unsigned.at < UNSIGNED_LOG_MS) {
+		unsigned.leftOut++;
+		return false;
+	}
+	const leftOut = unsigned.leftOut || undefined;
+	unsigned = { at: now, leftOut: 0 };
+	return leftOut;
+}
+
 /** The PR a delivery is about, when it is about one. */
 function prOf(payload: Record<string, unknown>): number | undefined {
 	const n = (payload.pull_request as { number?: number } | undefined)?.number ?? (payload.issue as { number?: number } | undefined)?.number;
@@ -81,7 +99,13 @@ export const POST: RequestHandler = async ({ request }) => {
 	// GitHub's id of this delivery: what to look up under the App's "Recent Deliveries" (kept there a few days).
 	const delivery = request.headers.get('x-github-delivery') ?? undefined;
 	const noted = (outcome: string, fields: Record<string, unknown> = {}, level: 'info' | 'warn' = 'info') => {
-		recordWebhook(event ?? 'unknown', outcome);
+		// Before the signature is checked the event header is anyone's text: not a label then.
+		recordWebhook(level === 'warn' ? 'unverified' : (event ?? 'unknown'), outcome);
+		if (level === 'warn') {
+			const leftOut = logUnsigned();
+			if (leftOut === false) return;
+			fields = { ...fields, left_out: leftOut };
+		}
 		log[level]('webhook delivery', { delivery, event: event ?? undefined, outcome, ...fields });
 	};
 
