@@ -3,11 +3,16 @@ import { verifySessionToken } from '$lib/server/auth';
 import { getUserById } from '$lib/server/db';
 import { drainProcessor, startProcessor } from '$lib/server/processor';
 import { watchEventLoop } from '$lib/server/loop-watch';
+import { startStallWatch } from '$lib/server/stall-watch';
+import { dirname, join } from 'node:path';
 import { RequestLimiter, addressKey } from '$lib/server/request-limit';
 import { env } from '$env/dynamic/private';
 
 startProcessor();
 watchEventLoop();
+// A blocked main thread can't log; this thread says what blocks it, also into the data volume.
+const dbPath = env.DATABASE_PATH || './data/merge-queue.db';
+startStallWatch({ logFile: dbPath === ':memory:' ? undefined : join(dirname(dbPath), 'stall.log') });
 // adapter-node emits this on SIGTERM/SIGINT once it stops taking requests.
 process.on('sveltekit:shutdown' as 'beforeExit', () => void drainProcessor());
 
