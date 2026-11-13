@@ -4,6 +4,7 @@
 
 import { getDb } from './db';
 import type { BatchRow } from './batch-store';
+import { recordRun } from './telemetry';
 
 /**
  * An Actions job attempt, as the workflow-jobs API gives it. Check runs (and older callers) carry
@@ -178,6 +179,7 @@ export async function recordRunCosts(
 				job.run(j.id, b.id, repo.id, j.run_id ?? null, j.run_attempt ?? 1, j.workflow_name ?? null, j.name, j.conclusion ?? null, j.runner_name ?? null, msOf(j.created_at), msOf(j.started_at), msOf(j.completed_at));
 			}
 		})();
+		recordRun(repo.id, b.kind, jobs, cost.wallMs);
 		recorded++;
 	}
 	return recorded;

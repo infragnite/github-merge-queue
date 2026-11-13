@@ -5,6 +5,7 @@ import * as github from './github';
 import { loadStackInput } from './stack-source';
 import { analyzeStacks, detectAutoClose, type StackAnalysis } from './stacks';
 import { memoByGeneration } from './wake';
+import { log } from './log';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -78,7 +79,7 @@ export async function closedPRReason(
 		});
 		return issue ? issue.message : 'PR was closed';
 	} catch (err) {
-		console.error(`[stacks] Could not explain closure of #${pr.number}:`, err instanceof Error ? err.message : err);
+		log.error('could not explain why a PR was closed', { pr: pr.number, err });
 		return 'PR was closed';
 	}
 }

@@ -10,6 +10,7 @@ import { withActivity } from './activity';
 import { markDirty } from './wake';
 import { runCommand, type CommandDeps, type PRComment } from './pr-commands';
 import type { Repo } from '$lib/types';
+import { log } from './log';
 
 function liveCommandDeps(repo: Repo): CommandDeps {
 	const { owner, name } = repo;
@@ -31,5 +32,5 @@ function liveCommandDeps(repo: Repo): CommandDeps {
 
 export async function runLiveCommand(repo: Repo, c: PRComment): Promise<void> {
 	const r = await runCommand(repo, liveCommandDeps(repo), c);
-	if (r) console.log(`[commands] ${repo.owner}/${repo.name}#${c.pr}: /mq ${r.command} by ${c.login}: ${r.ok ? 'done' : 'refused'}`);
+	if (r) log.info('/mq command', { repo: `${repo.owner}/${repo.name}`, pr: c.pr, command: r.command, by: c.login, outcome: r.ok ? 'done' : 'refused' });
 }

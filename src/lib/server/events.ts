@@ -4,6 +4,8 @@
 
 import { EventEmitter } from 'node:events';
 import { getDb } from './db';
+import { log } from './log';
+import { recordQueueEvent, repoLabel } from './telemetry';
 
 export type QueueEventKind =
 	| 'queued'
@@ -56,6 +58,8 @@ export function emitEvent(repoId: number, pr: number | null, kind: QueueEventKin
 		db.prepare(`DELETE FROM queue_events WHERE created_at < datetime('now', ?)`).run(`-${KEEP_DAYS} days`);
 	}
 	bus.emit(`repo:${repoId}`);
+	recordQueueEvent(repoId, kind);
+	log.info('queue event', { repo: repoLabel(repoId), pr: pr ?? undefined, event: kind, data });
 }
 
 type Row = { id: number; pr_number: number | null; kind: QueueEventKind; data: string; created_at: string };

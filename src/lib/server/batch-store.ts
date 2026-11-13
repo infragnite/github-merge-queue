@@ -4,6 +4,8 @@
 import type Database from 'better-sqlite3';
 import { getDb } from './db';
 import { DEFAULT_BATCH_CONFIG, type BatchConfig, type Priority } from './batching';
+import { log } from './log';
+import { recordBatchEnded, recordBatchStarted, repoLabel } from './telemetry';
 
 export type QueueMode = 'serial' | 'batch';
 
@@ -447,7 +449,9 @@ export function insertBatch(b: {
 			snapshot(b.repoId),
 			b.passed ? 1 : 0
 		);
-	return getBatch(Number(r.lastInsertRowid))!;
+	const row = getBatch(Number(r.lastInsertRowid))!;
+	recordBatchStarted(b.repoId, b.kind, b.members.length, !!b.express);
+	return row;
 }
 
 /** A bisecting batch landed `prs` on master `sha` (tree `tree`): the rest bisects on top of it. */
@@ -567,13 +571,35 @@ export function getRecentBatches(repoId: number, limit = 50): BatchRow[] {
 /** `reason` says why it ended early (see `BatchRow.end_reason`); without one, a reason given before stays. */
 export function setBatchStatus(id: number, status: BatchStatus, reason?: string) {
 	const done = ['landed', 'failed', 'superseded', 'cancelled'].includes(status);
+	const before = getBatch(id);
 	getDb()
 		.prepare(
 			`UPDATE batches SET status = ?, finished_at = CASE WHEN ? THEN datetime('now') ELSE finished_at END,
 			   end_reason = COALESCE(?, end_reason) WHERE id = ?`
 		)
 		.run(status, done ? 1 : 0, reason ?? null, id);
+	// A bisection step ends passed; a batch that passed still has to land.
+	const ends = (b: Pick<BatchRow, 'kind' | 'status'>) => FINAL.includes(b.status) || (b.kind === 'bisect' && b.status === 'passed');
+	if (!before || ends(before)) return;
+	const after = getBatch(id)!;
+	if (!ends(after)) return;
+	recordBatchEnded(after.repo_id, after.kind, after.status, after.end_reason, Date.now() - batchCreatedMs(after));
+	log.info('run ended', {
+		repo: repoLabel(after.repo_id),
+		batch: after.id,
+		number: after.kind === 'batch' ? after.number : undefined,
+		kind: after.kind,
+		status: after.status,
+		reason: after.end_reason ?? undefined,
+		ci: after.ci_result,
+		prs: after.members,
+		landed: after.landed.length ? after.landed : undefined,
+		ejected: after.ejected.length ? after.ejected : undefined,
+		branch: after.branch
+	});
 }
+
+const FINAL: BatchStatus[] = ['landed', 'failed', 'superseded', 'cancelled'];
 
 /** When a batch was created, in epoch ms. */
 export function batchCreatedMs(b: BatchRow): number {

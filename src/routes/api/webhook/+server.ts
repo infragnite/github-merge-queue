@@ -19,7 +19,33 @@ import { changesBranchRules, forgetPushPolicy } from '$lib/server/push-policy';
 import { bumpGeneration, markDirty } from '$lib/server/wake';
 import { commentFromPayload } from '$lib/server/pr-commands';
 import { runLiveCommand } from '$lib/server/pr-commands-live';
+import { log } from '$lib/server/log';
+import { recordWebhook } from '$lib/server/telemetry';
 import type { RequestHandler } from './$types';
+
+/**
+ * Deliveries that fail the signature check (or don't parse) come from anyone who can reach the
+ * endpoint: logged at most once a minute, with how many were left out since, so they can't flood
+ * the logs. They are all counted in the metrics.
+ */
+const UNSIGNED_LOG_MS = 60_000;
+let unsigned = { at: -Infinity, leftOut: 0 };
+function logUnsigned(): number | undefined | false {
+	const now = Date.now();
+	if (now - unsigned.at < UNSIGNED_LOG_MS) {
+		unsigned.leftOut++;
+		return false;
+	}
+	const leftOut = unsigned.leftOut || undefined;
+	unsigned = { at: now, leftOut: 0 };
+	return leftOut;
+}
+
+/** The PR a delivery is about, when it is about one. */
+function prOf(payload: Record<string, unknown>): number | undefined {
+	const n = (payload.pull_request as { number?: number } | undefined)?.number ?? (payload.issue as { number?: number } | undefined)?.number;
+	return typeof n === 'number' ? n : undefined;
+}
 
 function verifySignature(payload: string, signature: string | null, secret: string): boolean {
 	if (!signature) return false;
@@ -70,9 +96,22 @@ export const POST: RequestHandler = async ({ request }) => {
 	const body = await request.text();
 	const event = request.headers.get('x-github-event');
 	const signature = request.headers.get('x-hub-signature-256');
+	// GitHub's id of this delivery: what to look up under the App's "Recent Deliveries" (kept there a few days).
+	const delivery = request.headers.get('x-github-delivery') ?? undefined;
+	const noted = (outcome: string, fields: Record<string, unknown> = {}, level: 'info' | 'warn' = 'info') => {
+		// Before the signature is checked the event header is anyone's text: not a label then.
+		recordWebhook(level === 'warn' ? 'unverified' : (event ?? 'unknown'), outcome);
+		if (level === 'warn') {
+			const leftOut = logUnsigned();
+			if (leftOut === false) return;
+			fields = { ...fields, left_out: leftOut };
+		}
+		log[level]('webhook delivery', { delivery, event: event ?? undefined, outcome, ...fields });
+	};
 
 	// Mandatory signature verification
 	if (!verifySignature(body, signature, webhookSecret)) {
+		noted('bad-signature', {}, 'warn');
 		return json({ error: 'Invalid signature' }, { status: 401 });
 	}
 
@@ -80,22 +119,31 @@ export const POST: RequestHandler = async ({ request }) => {
 	try {
 		payload = JSON.parse(body);
 	} catch {
+		noted('bad-json', {}, 'warn');
 		return json({ error: 'Invalid JSON' }, { status: 400 });
 	}
 
+	const action = typeof payload.action === 'string' ? payload.action : undefined;
 	const repository = payload.repository as { full_name?: string } | undefined;
-	if (!repository?.full_name || !repository.full_name.includes('/')) return json({ ok: true });
+	if (!repository?.full_name || !repository.full_name.includes('/')) {
+		noted('no-repo', { action });
+		return json({ ok: true });
+	}
 
 	const [owner, name] = repository.full_name.split('/');
 	const repo = getRepoByOwnerName(owner, name);
-	if (!repo) return json({ ok: true });
+	if (!repo) {
+		noted('unknown-repo', { action, repo: repository.full_name, pr: prOf(payload) });
+		return json({ ok: true });
+	}
+	noted('handled', { action, repo: repository.full_name, pr: prOf(payload) });
 	if (changesPRs(event, payload)) bumpGeneration(repo.id);
 	if (changesBranchRules(event)) forgetPushPolicy(repo.id);
 	if (wakesQueue(event, payload)) {
 		markDirty(repo.id);
 		if (event === 'check_suite') {
 			const branch = (payload.check_suite as { head_branch?: string } | undefined)?.head_branch;
-			console.log(`[webhook] ${owner}/${name}: CI finished on ${branch}; waking the queue`);
+			log.info('CI finished on a queue branch; waking the queue', { repo: `${owner}/${name}`, branch, delivery });
 		}
 	}
 
@@ -108,7 +156,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			if ((action === 'privatized' || (payload.repository as { private?: boolean }).private === true) && getQueueSettings(repo.id).publicView) {
 				updateQueueSettings(repo.id, { publicView: false });
 				forgetVisibility(repo.id);
-				console.warn(`[webhook] ${owner}/${name} is now private: its public queue page is turned off`);
+				log.warn('repository is now private: its public queue page is turned off', { repo: `${owner}/${name}`, delivery });
 			}
 			break;
 		}
@@ -123,7 +171,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			if (headSha) {
 				const item = queueItems.find((i) => i.head_sha === headSha && i.status === 'checking');
 				if (item) {
-					console.log(`[webhook] Check event for ${owner}/${name}#${item.pr_number}`);
+					log.debug('check event for a queued PR', { repo: `${owner}/${name}`, pr: item.pr_number, delivery });
 				}
 			}
 			break;
@@ -158,7 +206,7 @@ export const POST: RequestHandler = async ({ request }) => {
 							prUser.avatar_url || '',
 							'auto (dependabot)'
 						);
-						console.log(`[webhook] Auto-queued dependabot PR #${prNumber}: ${pullRequest.title}`);
+						log.info('queued a dependabot PR', { repo: `${owner}/${name}`, pr: prNumber, title: pullRequest.title, delivery });
 					}
 					break;
 				}
@@ -184,11 +232,11 @@ export const POST: RequestHandler = async ({ request }) => {
 							item.created_at
 						);
 						removeFromQueue(item.id);
-						console.log(`[webhook] PR #${prNumber} merged externally, removed from queue`);
+						log.info('PR merged outside the queue; removed from it', { repo: `${owner}/${name}`, pr: prNumber, delivery });
 					} else if (action === 'closed') {
 						const reason = await closedPRReason(repo, pullRequest);
 						updateQueueItemStatus(item.id, 'cancelled', reason);
-						console.log(`[webhook] PR #${prNumber} closed, removed from queue: ${reason}`);
+						log.info('PR closed; removed from the queue', { repo: `${owner}/${name}`, pr: prNumber, reason, delivery });
 					} else if (action === 'synchronize') {
 						const newSha = pullRequest.head?.sha;
 						if (newSha) {
@@ -199,12 +247,12 @@ export const POST: RequestHandler = async ({ request }) => {
 							if (item.status === 'checking' && !batchMode) {
 								updateQueueItemStatus(item.id, 'queued');
 							}
-							console.log(`[webhook] PR #${prNumber} updated, new SHA: ${newSha.slice(0, 8)}`);
+							log.info('PR pushed to', { repo: `${owner}/${name}`, pr: prNumber, sha: newSha, delivery });
 						}
 					}
 				}
 			} catch (err) {
-				console.error(`[webhook] Error handling pull_request event:`, err instanceof Error ? err.message : err);
+				log.error('handling a pull_request delivery failed', { repo: `${owner}/${name}`, delivery, err });
 			}
 			break;
 		}
@@ -215,7 +263,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			const comment = commentFromPayload(payload);
 			if (comment) {
 				void runLiveCommand(repo, comment).catch((err) =>
-					console.error(`[webhook] /mq command on ${owner}/${name}#${comment.pr}:`, err instanceof Error ? err.message : err)
+					log.error('/mq command failed', { repo: `${owner}/${name}`, pr: comment.pr, delivery, err })
 				);
 			}
 			break;
@@ -234,7 +282,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			const sha = (payload as { sha: string }).sha;
 			const item = queueItems.find((i) => i.head_sha === sha && i.status === 'checking');
 			if (item) {
-				console.log(`[webhook] Status event for ${owner}/${name}#${item.pr_number}`);
+				log.debug('status event for a queued PR', { repo: `${owner}/${name}`, pr: item.pr_number, delivery });
 			}
 			break;
 		}

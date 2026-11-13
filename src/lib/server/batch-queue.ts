@@ -45,6 +45,7 @@ import { RateLimitedError } from './rate-limit';
 import { HeadMovedError } from './head-moved';
 import { failureAction } from './activity';
 import { emitEvent, heldPRs, lastRepoEvent, type QueueEventKind } from './events';
+import { log } from './log';
 
 /** The error, and what to do about it: a pause reason always says what to do. */
 function withAction(call: string, e: unknown): string {
@@ -200,6 +201,9 @@ export interface QueueDeps {
 }
 
 /** Why a PR deferred behind `ahead` waits. */
+/** The last plan logged per repository and kind (see `logPlan`). */
+const lastPlans = new Map<string, string>();
+
 const deferredReason = (ahead: number[]) => `Conflicts with ${ahead.map((a) => `#${a}`).join(' ')} ahead of it; waits for them to land`;
 
 /** A refused merge's hold reason: GitHub's own words. */
@@ -263,12 +267,24 @@ class Tick {
 	}
 
 	log(msg: string) {
-		(this.d.log ?? ((m) => console.log(`[batch-queue] ${this.d.repo.owner}/${this.d.repo.name}: ${m}`)))(msg);
+		(this.d.log ?? ((m) => log.info(m, { repo: `${this.d.repo.owner}/${this.d.repo.name}` })))(msg);
 	}
 
 	/** Catch handler for a call whose failure must not stop the tick; the failure is still logged. */
 	bestEffort(what: string) {
 		return (err: unknown) => this.log(`${what} failed (ignored): ${err instanceof Error ? err.message : err}`);
+	}
+
+	/**
+	 * Logs what the planner saw and chose, for finding out later why a PR waited (an urgent PR
+	 * behind a bisection, a red branch): only when it differs from the last plan of the same kind.
+	 */
+	logPlan(kind: 'all' | 'urgent', fields: Record<string, unknown>) {
+		const key = `${this.repoId}:${kind}`;
+		const said = JSON.stringify(fields);
+		if (lastPlans.get(key) === said) return;
+		lastPlans.set(key, said);
+		log.info('plan', { repo: `${this.d.repo.owner}/${this.d.repo.name}`, ...fields });
 	}
 
 	event(pr: number | null, kind: QueueEventKind, data: Record<string, unknown> = {}) {
@@ -2324,7 +2340,19 @@ class Tick {
 		// stacked) until one passes: that batch carries a fix and lands. When no untried PR can be
 		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
 		const red = this.masterState(await this.d.git.tree(masterSha)) === 'red';
-		if (red && opts.urgentOnly) return 'idle';
+		const said = (fields: Record<string, unknown>) =>
+			!opts.holdsOnly &&
+			this.logPlan(opts.urgentOnly ? 'urgent' : 'all', {
+				red,
+				urgent_only: opts.urgentOnly ? true : undefined,
+				queue: queue.map((e) => ({ pr: e.pr, priority: e.priority })),
+				active: active.map((b) => ({ batch: b.id, number: b.number, status: b.status, prs: b.members })),
+				...fields
+			});
+		if (red && opts.urgentOnly) {
+			said({ batch: null, why: `${this.d.repo.default_branch} is red: urgent PRs wait with the rest for a batch that fixes it` });
+			return 'idle';
+		}
 		const analysis = await this.analysis();
 		let plan: Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express' | 'held'>;
 		/** Plans again without the try of `n`, when building its stack did not give the tree it tested. */
@@ -2333,7 +2361,10 @@ class Tick {
 			// Siblings go only beside siblings: a stacked pipeline still in flight (built before the
 			// branch turned red) is decided first.
 			// (With `holdsOnly` nothing starts anyway; the plan still says what holds the PRs.)
-			if (!opts.holdsOnly && (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha))) return 'idle';
+			if (!opts.holdsOnly && (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha))) {
+				said({ batch: null, why: `${this.d.repo.default_branch} is red: the runs in flight are decided first` });
+				return 'idle';
+			}
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
 			const dependencies = await this.dependencies();
 			plan = planRedBatch({
@@ -2373,8 +2404,12 @@ class Tick {
 			without = (n) => planWith(new Set([...landable].filter((m) => m !== n)));
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
-			if (opts.urgentOnly && !plan.express) return 'idle';
+			if (opts.urgentOnly && !plan.express) {
+				said({ batch: null, why: 'no urgent PR is ready', held: plan.held.map((h) => ({ pr: h.pr, code: h.admission.code })) });
+				return 'idle';
+			}
 		}
+		said({ batch: plan.batch, express: plan.express, held: plan.held.map((h) => ({ pr: h.pr, code: h.admission.code, reason: h.admission.reason })) });
 		// On a red branch the deferred PRs were left out of the plan; they are still held.
 		if (!opts.urgentOnly) await this.recordHolds(red ? [...plan.held, ...[...deferred].map(([pr, admission]) => ({ pr, admission }))] : plan.held);
 		if (!plan.batch || opts.holdsOnly) return 'idle';

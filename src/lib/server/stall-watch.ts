@@ -8,6 +8,7 @@
 
 import * as nodeFs from 'node:fs';
 import { Worker } from 'node:worker_threads';
+import { log } from './log';
 
 export interface StallChild {
 	pid: number;
@@ -240,7 +241,7 @@ export function startStallWatch(opts: StallWatchOptions = {}) {
 			cwd: process.cwd()
 		}
 	});
-	worker.on('error', (e) => console.error('[stall] the watchdog thread stopped:', e));
+	worker.on('error', (err) => log.error('the stall watchdog thread stopped', { err }));
 	worker.unref();
 }
 
