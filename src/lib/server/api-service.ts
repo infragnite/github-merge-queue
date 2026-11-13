@@ -323,7 +323,8 @@ export function enqueue(
 	const priority = parsePriority(body.priority);
 	if (priority === 'urgent') requireRole(caller, 'maintain', 'Queueing a PR as urgent');
 	if (pr.state !== 'open') throw new ApiError(409, `#${pr.number} is not open`);
-	const existing = db.getQueueItems(repo.id).find((i) => i.pr_number === pr.number);
+	// Every entry, finished ones too: a PR has one row, so a cancelled or merged one is replaced.
+	const existing = db.getAllQueueItems(repo.id).find((i) => i.pr_number === pr.number);
 	if (existing && !['merged', 'failed', 'cancelled'].includes(existing.status)) {
 		throw new ApiError(409, `#${pr.number} is already queued`);
 	}
