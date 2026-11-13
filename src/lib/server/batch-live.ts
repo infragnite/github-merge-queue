@@ -3,6 +3,7 @@
 
 import { env } from '$env/dynamic/private';
 import { existsSync, mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
@@ -200,7 +201,8 @@ export class Mirror {
 		const dir = join(env.MIRROR_DIR || './data/mirrors', repo.owner, `${repo.name}.git`);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
-			new GitRunner(dir).run(['init', '-q', '--bare']);
+			// Once, when the repository is added: git creates an empty bare repository in an instant.
+			execFileSync('git', ['init', '-q', '--bare'], { cwd: dir, timeout: 30_000, stdio: 'ignore' });
 		}
 		this.git = new GitRunner(dir, mergeDriverEnv(dir));
 		this.plain = new GitRunner(dir);
@@ -224,12 +226,13 @@ export class Mirror {
 		};
 	}
 
-	has(sha: string): boolean {
-		return this.git.run(['cat-file', '-e', `${sha}^{commit}`], { allowFail: true }).code === 0;
+	async has(sha: string): Promise<boolean> {
+		return (await this.git.run(['cat-file', '-e', `${sha}^{commit}`], { allowFail: true })).code === 0;
 	}
 
 	async fetch(shas: string[]) {
-		const missing = [...new Set(shas)].filter((s) => !this.has(s));
+		const missing: string[] = [];
+		for (const s of new Set(shas)) if (!(await this.has(s))) missing.push(s);
 		if (missing.length === 0) return;
 		await this.network(`fetch ${missing.map((s) => s.slice(0, 8)).join(' ')}`, [
 			'fetch', '-q', '--no-tags', this.url, ...missing
@@ -375,13 +378,13 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 	const dispatchRef = () => ci().dispatchRef || repo.default_branch;
 	// What the required check waits for, read from the workflow file in the tested commit, by its blob.
 	const gates = new Map<string, ((name: string) => boolean) | null>();
-	const gateAt = (sha: string) => {
+	const gateAt = async (sha: string) => {
 		const path = `${sha}:.github/workflows/${ci().workflow}`;
-		const blob = mirror.git.run(['rev-parse', '--verify', '-q', path], { allowFail: true });
+		const blob = await mirror.git.run(['rev-parse', '--verify', '-q', path], { allowFail: true });
 		if (blob.code !== 0 || !blob.out) return null;
 		const key = `${blob.out}\0${ci().requiredCheck}`;
 		if (!gates.has(key)) {
-			const file = mirror.git.run(['cat-file', 'blob', blob.out], { allowFail: true });
+			const file = await mirror.git.run(['cat-file', 'blob', blob.out], { allowFail: true });
 			gates.set(key, file.code === 0 ? gateFeeds(file.out, ci().requiredCheck) : null);
 		}
 		return gates.get(key)!;
@@ -393,14 +396,14 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 		analysis: () => currentStackAnalysis(repo),
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
-			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
+			tree: async (sha) => (await mirror.git.run(['rev-parse', `${sha}^{tree}`])).out,
 			// Checked where `--attr-source` is used, so an old git stops planning and landing, not the rest.
 			build: async (base, members, opts) => (requireGitVersion(), buildBatch(mirror.git, base, members, opts)),
 			restack: async (head, upstream, onto, attrs) => (requireGitVersion(), replay(mirror.git, { head, upstream, onto, attrs })),
 			baseline: async (base) => baselineCommit(mirror.git, base),
 			mergeTrees: async (onto, head, attrs) => (requireGitVersion(), mergeTrees(mirror.git, onto, head, attrs)),
 			mergeCommit: async (tree, parents, message) => queueMergeCommit(mirror.git, tree, parents, message),
-			changed: async (from, to) => mirror.git.run(['diff', '--name-only', from, to]).out.split('\n').filter(Boolean)
+			changed: async (from, to) => (await mirror.git.run(['diff', '--name-only', from, to])).out.split('\n').filter(Boolean)
 		},
 		ci: {
 			// Pushing the mq/* branch triggers the workflow; the base is in the batch commit's trailer.
@@ -414,7 +417,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				if (r !== 'pending' || !opts?.failFast) return r;
 				// Only a job the required check waits for can decide it early; unknown, then no early stop.
 				// The gate itself may not exist yet: GitHub makes its check run once its needs end.
-				const feeds = gateAt(headSha);
+				const feeds = await gateAt(headSha);
 				if (!feeds) return r;
 				const file = `.github/workflows/${ci().workflow}`;
 				const ciSuites = required.length
@@ -426,7 +429,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				const file = `.github/workflows/${ci().workflow}`;
 				const suites = new Set((await github.workflowRunsForSha(owner, name, headSha)).filter((w) => w.path?.split('@')[0] === file).map((w) => w.check_suite_id));
 				const jobs = await github.actionsJobsForSha(owner, name, headSha);
-				return stalledRun(jobs, { now: Date.now(), hangMs, notBefore, suites: suites.size ? suites : undefined, feeds: gateAt(headSha) ?? undefined });
+				return stalledRun(jobs, { now: Date.now(), hangMs, notBefore, suites: suites.size ? suites : undefined, feeds: (await gateAt(headSha)) ?? undefined });
 			},
 			cancel: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);

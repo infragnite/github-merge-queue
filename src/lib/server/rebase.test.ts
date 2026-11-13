@@ -24,7 +24,7 @@ const write = (branch: string, file: string, text: string, msg: string) => {
 };
 
 describe('replaying a PR onto a new base', () => {
-	test('restacks a child onto its rebased parent, keeping author and message', () => {
+	test('restacks a child onto its rebased parent, keeping author and message', async () => {
 		git.branch('a', 'main');
 		git.commit('a', 'a1', 'lib.txt');
 		git.branch('b', 'a');
@@ -33,7 +33,7 @@ describe('replaying a PR onto a new base', () => {
 		git.commit('b', 'b2');
 		git.commit('main', 'm1');
 		git.rebase('a', 'main');
-		const r = replay(runner, { head: git.sha('b'), upstream: oldParent, onto: git.sha('a'), date: 1 });
+		const r = (await replay(runner, { head: git.sha('b'), upstream: oldParent, onto: git.sha('a'), date: 1 }));
 		expect(r.ok).toBe(true);
 		if (!r.ok) return;
 		expect(r.replayed).toBe(2);
@@ -42,32 +42,32 @@ describe('replaying a PR onto a new base', () => {
 		expect(git.git('ls-tree', '-r', '--name-only', r.head).split('\n').sort()).toEqual(['b1.txt', 'b2.txt', 'lib.txt', 'm1.txt']);
 	});
 
-	test('skips commits already on the new base (merged in from main)', () => {
+	test('skips commits already on the new base (merged in from main)', async () => {
 		git.branch('a', 'main');
 		git.commit('a', 'a1');
 		git.commit('main', 'm1');
 		git.mergeInto('a', 'main');
 		git.commit('a', 'a2');
-		const r = replay(runner, { head: git.sha('a'), upstream: git.sha('main~1'), onto: git.sha('main') });
+		const r = (await replay(runner, { head: git.sha('a'), upstream: git.sha('main~1'), onto: git.sha('main') }));
 		expect(r.ok && r.replayed).toBe(2);
 	});
 
-	test('a conflict is not a trivial rebase', () => {
+	test('a conflict is not a trivial rebase', async () => {
 		write('main', 'f.txt', 'base\n', 'base');
 		git.branch('a', 'main');
 		write('a', 'f.txt', 'from a\n', 'a1');
 		write('main', 'f.txt', 'from main\n', 'm1');
-		const r = replay(runner, { head: git.sha('a'), upstream: git.sha('main~1'), onto: git.sha('main') });
+		const r = (await replay(runner, { head: git.sha('a'), upstream: git.sha('main~1'), onto: git.sha('main') }));
 		expect(r).toMatchObject({ ok: false, conflicts: ['f.txt'] });
 	});
 
-	test('a change that applies as a whole but not commit by commit is not trivial either', () => {
+	test('a change that applies as a whole but not commit by commit is not trivial either', async () => {
 		write('main', 'f.txt', 'base\n', 'base');
 		git.branch('a', 'main');
 		write('a', 'f.txt', 'from a\n', 'a1'); // conflicts with main...
 		write('a', 'f.txt', 'from main\n', 'a2'); // ...but the PR ends up where main is
 		write('main', 'f.txt', 'from main\n', 'm1');
-		const r = replay(runner, { head: git.sha('a'), upstream: git.sha('main~1'), onto: git.sha('main') });
+		const r = (await replay(runner, { head: git.sha('a'), upstream: git.sha('main~1'), onto: git.sha('main') }));
 		expect(r.ok).toBe(false);
 	});
 });
@@ -97,15 +97,15 @@ describe('merge drivers in a restack', () => {
 		return { head: git.sha('b'), upstream: oldParent, onto: git.sha('a') };
 	};
 
-	test("a parent's own attributes do not pick the driver: the default branch's do", () => {
+	test("a parent's own attributes do not pick the driver: the default branch's do", async () => {
 		const s = stack(false);
-		const r = replay(queue, { ...s, attrs: git.sha('main'), date: 1 });
+		const r = (await replay(queue, { ...s, attrs: git.sha('main'), date: 1 }));
 		expect(r).toMatchObject({ ok: false, conflicts: [LIST] });
 	});
 
-	test('the default branch routing the list to the driver restacks cleanly', () => {
+	test('the default branch routing the list to the driver restacks cleanly', async () => {
 		const s = stack(true);
-		const r = replay(queue, { ...s, attrs: git.sha('main'), date: 1 });
+		const r = (await replay(queue, { ...s, attrs: git.sha('main'), date: 1 }));
 		expect(r.ok).toBe(true);
 		if (r.ok) expect(git.git('show', `${r.head}:${LIST}`)).toBe('a\nd\ne');
 	});
