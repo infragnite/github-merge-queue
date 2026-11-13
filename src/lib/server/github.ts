@@ -44,9 +44,10 @@ async function ghFetch(token: string, path: string, init?: RequestInit, budget?:
 	}
 	if (!res.ok) {
 		// A missing App permission names only the symptom; the call says which permission it is.
+		const call = `${init?.method ?? 'GET'} ${path.split('?')[0]}`;
 		const missingPermission = res.status === 403 && /not accessible by integration/i.test(body.message ?? '');
-		const message = missingPermission ? `${body.message}: ${init?.method ?? 'GET'} ${path.split('?')[0]}` : body.message;
-		throw new GitHubError(res.status, message || `GitHub API ${res.status}: ${path}`, body);
+		const message = missingPermission ? `${body.message}: ${call}` : body.message;
+		throw new GitHubError(res.status, message || `GitHub API ${res.status}: ${call}`, body, call);
 	}
 	return body;
 }

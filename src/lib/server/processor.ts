@@ -10,7 +10,7 @@ import { liveDeps } from './batch-live';
 import { takeDirty } from './wake';
 import { withRepoLock } from './repo-lock';
 import { RateLimitedError } from './rate-limit';
-import { clearTickError, noteTickError } from './tick-errors';
+import { clearTickError, describeTickError, noteTickError } from './tick-errors';
 import { recordRunCosts } from './ci-savings';
 import { noteVisibility, readOnlyViewers, visibilityDue } from './public-view';
 import { repoVisibility } from './api-service';
@@ -195,7 +195,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		}
 		if (err instanceof RateLimitedError) return; // logged once by `rateLimited` on the next cycle
 		// Transient GitHub or git errors: the next cycle picks up where this one stopped.
-		console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
+		console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}: ${describeTickError(err)}`);
 	} finally {
 		const took = Date.now() - started;
 		if (took >= SLOW_TICK_MS) console.log(`[merge-queue] Batch tick for ${repo.owner}/${repo.name} took ${took} ms`);

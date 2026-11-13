@@ -30,7 +30,7 @@ vi.mock('$lib/server/stack-runtime', async (orig) => ({
 }));
 vi.mock('$lib/server/pipeline-view', async (orig) => ({
 	...(await orig<typeof import('$lib/server/pipeline-view')>()),
-	pipelineView: vi.fn(async () => ({ mode: 'serial', paused: 'App lacks permission X', master: null, active: [], recent: [], error: null, rateLimitedUntil: null, tickError: { message: 'boom', count: 1, since: 0 }, progressErrors: { a: 'b' }, activity: { since: 1, phase: { kind: 'forming', label: 'Forming a batch', prs: [1], branch: 'mq/batch-1', since: 1 }, step: { label: 'pushing mq/batch-1', prs: [1], since: 1 }, failure: { phase: 'Forming a batch', step: 'pushing mq/batch-1', prs: [1], action: 'Grant the GitHub App the Workflows (read and write) permission', at: 1 } } }))
+	pipelineView: vi.fn(async () => ({ mode: 'serial', paused: 'App lacks permission X', master: null, active: [], recent: [], error: null, rateLimitedUntil: null, tickError: { kind: 'stuck', detail: 'boom', count: 3, since: 0 }, progressErrors: { a: 'b' }, activity: { since: 1, phase: { kind: 'forming', label: 'Forming a batch', prs: [1], branch: 'mq/batch-1', since: 1 }, step: { label: 'pushing mq/batch-1', prs: [1], since: 1 }, failure: { phase: 'Forming a batch', step: 'pushing mq/batch-1', prs: [1], action: 'Grant the GitHub App the Workflows (read and write) permission', at: 1 } } }))
 }));
 
 const db = await import('$lib/server/db');

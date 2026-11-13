@@ -381,10 +381,14 @@
 	{#if pipe?.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
 	{#if form?.error}<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{form.error}</p>{/if}
 	{#if pipe?.tickError && !pipe.rateLimitedUntil}
-		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-			The queue's last step failed: <span class="font-mono text-xs">{pipe.tickError.message}</span>
-			{#if pipe.tickError.count > 1}<span class="text-xs text-red-600"> · {pipe.tickError.count}× since {new Date(pipe.tickError.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{/if}
-			<span class="block text-xs text-red-600">It tries again on its next step.</span>
+		{@const since = new Date(pipe.tickError.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert" data-testid="tick-error">
+			{#if pipe.tickError.kind === 'github'}
+				GitHub's API has been failing since {since} ({pipe.tickError.count} steps in a row), so nothing moves. The queue keeps retrying; there is nothing to do.
+			{:else}
+				The queue has been stuck on this error since {since} ({pipe.tickError.count} steps in a row), so nothing moves. It keeps retrying; if it doesn't clear, report it with this message.
+			{/if}
+			<span class="block font-mono text-xs text-red-600">{pipe.tickError.detail}</span>
 		</p>
 	{/if}
 	{#if pipe?.rateLimitedUntil}

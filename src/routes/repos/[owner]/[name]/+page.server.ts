@@ -24,6 +24,7 @@ import { markDirty } from '$lib/server/wake';
 import { dashboardStackAnalysis } from '$lib/server/stack-runtime';
 import { queueBoard, type BoardItem, type QueueBoard } from '$lib/server/queue-model';
 import type { StackAnalysis } from '$lib/server/stacks';
+import { describeTickError } from '$lib/server/tick-errors';
 import type { Repo } from '$lib/types';
 import type { PageServerLoad, Actions } from './$types';
 
@@ -98,7 +99,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 	const analysis: Promise<{ analysis: StackAnalysis; error: string | null }> = dashboardStackAnalysis(repo, { cachedOnly: readonly })
 		.then((a) => ({ analysis: a, error: null }))
 		.catch((e) => {
-			if (!readonly) console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
+			if (!readonly) console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed: ${describeTickError(e)}`);
 			return { analysis: { prs: new Map(), stacks: [], issues: [] }, error: readonly ? 'Stacks could not be loaded' : `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
 		});
 

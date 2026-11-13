@@ -6,7 +6,7 @@ import * as store from './batch-store';
 import { getQueueItems } from './db';
 import { redMasterView, type RedMasterView } from './red-master-view';
 import { dashboardStackAnalysis } from './stack-runtime';
-import { tickError, type TickError } from './tick-errors';
+import { tickErrorView, type TickErrorView } from './tick-errors';
 import { activityOf, type ActivityView } from './activity';
 import { batchCard, ciMayStillRun, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
 import type { StackAnalysis } from './stacks';
@@ -25,7 +25,7 @@ export interface PipelineView {
 	/** Set while GitHub's rate limit holds the queue: when calls resume (epoch ms). */
 	rateLimitedUntil: number | null;
 	/** The queue's last failed step, until a step succeeds. */
-	tickError: TickError | null;
+	tickError: TickErrorView | null;
 	/** Batch heads whose CI progress could not be read, with why (the last known progress is shown). */
 	progressErrors: Record<string, string>;
 	/** What the queue itself is doing now (forming a batch, restacking, landing), and its last failed step. */
@@ -104,7 +104,7 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 		recent: recent.map(card),
 		error: null,
 		rateLimitedUntil: budget?.blockedUntil ?? null,
-		tickError: tickError(repo.id),
+		tickError: tickErrorView(repo.id),
 		activity: activityOf(repo.id),
 		serverTime: Date.now(),
 		progressErrors: Object.fromEntries(
