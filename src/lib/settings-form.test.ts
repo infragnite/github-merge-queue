@@ -33,7 +33,9 @@ test('a submitted form becomes the settings API body, durations in milliseconds 
 		autoRebase: false,
 		masterRun: false,
 		stopOnFirstFailure: false,
-		autoTry: false
+		autoTry: false,
+		autoTryDrafts: false,
+		requireTryPass: false
 	});
 	expect(body.ci).toEqual({ workflow: 'ci.yml', dispatchRef: '' });
 });
@@ -87,7 +89,7 @@ test('urgent batches have no size setting of their own: they follow the batch si
 
 test('automatic tries have their own section: on/off, how many at once, and the delay after a push in minutes', () => {
 	const g = SETTING_GROUPS.find((x) => x.id === 'auto-try')!;
-	expect(g.fields.map((f) => f.name)).toEqual(['config.autoTry', 'config.autoTryMax', 'config.autoTryDelayMs']);
+	expect(g.fields.map((f) => f.name)).toEqual(['config.autoTry', 'config.autoTryMax', 'config.autoTryDelayMs', 'config.autoTryDrafts', 'config.requireTryPass']);
 	expect(g.help).toMatch(/no-auto-try/);
 	const max = ALL_FIELDS.find((f) => f.name === 'config.autoTryMax')!;
 	expect(max).toMatchObject({ kind: 'number', min: 1 });

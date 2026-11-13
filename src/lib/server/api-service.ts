@@ -171,6 +171,8 @@ function holdActions(it: QueueItem, hold: store.Hold): NextAction[] {
 		case 'not-approved':
 		case 'stale-approval':
 		case 'changes-requested':
+		case 'try-failed':
+		case 'not-tried':
 			return [{ do: 'fix', why: hold.reason }];
 		case 'dependency-closed':
 		case 'dependency-invalid':

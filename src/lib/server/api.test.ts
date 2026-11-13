@@ -385,7 +385,7 @@ describe('queue control', () => {
 	});
 
 	test('automatic tries: off by default; at least one at once, a whole number', () => {
-		expect(api.patchConfig(repo, admin, {}).config).toMatchObject({ autoTry: false, autoTryMax: 2, autoTryDelayMs: 120_000 });
+		expect(api.patchConfig(repo, admin, {}).config).toMatchObject({ autoTry: false, autoTryMax: 2, autoTryDelayMs: 120_000, autoTryDrafts: false, requireTryPass: false });
 		expect(api.patchConfig(repo, admin, { config: { autoTry: true, autoTryMax: 4, autoTryDelayMs: 0 } }).config).toMatchObject({ autoTry: true, autoTryMax: 4, autoTryDelayMs: 0 });
 		expect(() => api.patchConfig(repo, admin, { config: { autoTryMax: 0 } })).toThrow('autoTryMax must be a whole number >= 1');
 		expect(() => api.patchConfig(repo, admin, { config: { autoTryMax: 1.5 } })).toThrow('autoTryMax must be a whole number >= 1');

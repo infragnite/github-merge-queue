@@ -344,6 +344,20 @@ class Tick {
 			if (ciGreen === null && from[0].ciGreen === true) ciGreen = true;
 		}
 		if (!this.settings().config.requirePRChecks) ciGreen = true;
+		const config = this.settings().config;
+		let tried: PRState['tried'];
+		let tryFailure: string | undefined;
+		let autoTried: boolean | undefined;
+		if (config.requireTryPass) {
+			tried = store.tryStatus(this.repoId, n, [p.headSha, ...from.map((f) => f.sha)]);
+			const outcome = store.autoTryOutcome(this.repoId, n, p.headSha);
+			if (tried === 'none' && outcome === 'conflict') {
+				tried = 'failed';
+				tryFailure = `Its try could not start: it does not apply on ${this.d.repo.default_branch}`;
+			}
+			const s = store.getQueueSettings(this.repoId);
+			autoTried = s.mode === 'batch' && config.autoTry && !this.autoTryBar(p, null);
+		}
 		return {
 			pr: n,
 			headSha: p.headSha,
@@ -352,7 +366,8 @@ class Tick {
 			approvedShas,
 			changesRequested: r.changesRequested,
 			targetsDefault: p.baseRef === this.d.repo.default_branch,
-			fromFork: !p.sameRepo
+			fromFork: !p.sameRepo,
+			...(tried ? { tried, autoTried, ...(tryFailure ? { tryFailure } : {}) } : {})
 		};
 	}
 
@@ -1889,9 +1904,15 @@ class Tick {
 	// --- try runs ---
 
 	/** Tests one PR on top of master, outside the pipeline, so its author gets CI on demand. */
-	async startTry(n: number, opts: { auto?: boolean } = {}): Promise<BatchRow> {
+	async startTry(n: number, opts: { auto?: boolean; head?: string } = {}): Promise<BatchRow> {
 		const p = await this.pr(n, true);
 		if (p.state !== 'open') throw new Error(`#${n} is not open`);
+		// An automatic try is of the head whose delay is over: one pushed since waits its own delay.
+		if (opts.head && p.headSha !== opts.head) throw new HeadMovedError(p.headRef, opts.head);
+		if (opts.auto) {
+			const bar = this.autoTryBar(p, null);
+			if (bar) throw new Error(`#${n} is not tried automatically: ${bar}`);
+		}
 		const same = store.runningTryOf(this.repoId, n, p.headSha);
 		if (same) throw new Error(`#${n} is already being tried at this head, in ${same.branch}`);
 		if (!p.sameRepo) {
@@ -1913,9 +1934,9 @@ class Tick {
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			throw e;
 		}
-		const run = store.insertBatch({
+		const row = {
 			repoId: this.repoId,
-			kind: 'try',
+			kind: 'try' as const,
 			branch,
 			baseSha: masterSha,
 			headSha: r.headSha,
@@ -1923,9 +1944,9 @@ class Tick {
 			baseTree: await this.d.git.tree(masterSha),
 			members: [n],
 			heads: { [n]: p.headSha }
-		});
+		};
+		const run = opts.auto ? store.insertAutoTry(row, n, p.headSha) : store.insertBatch(row);
 		store.branchPushed(this.repoId, branch);
-		if (opts.auto) store.setAutoTry(this.repoId, n, p.headSha, 'started', run.id);
 		const title = `Trying on ${this.d.repo.default_branch} in ${branch}${opts.auto ? ' (automatic, on push)' : ''}`;
 		await this.d.github
 			.setPRCheck(p.headSha, { state: 'in_progress', title: short(title), suffix: '/try', url: this.branchRuns(branch) })
@@ -1940,13 +1961,14 @@ class Tick {
 	 * Why `p` gets no automatic try now, or null when it may have one. `p` undefined: no longer open.
 	 * `open` is every open PR (a base that is one of their branches is a stack the PR is tried with).
 	 */
-	private autoTryBar(p: LivePR | undefined, open: Map<number, LivePR>): string | null {
+	private autoTryBar(p: LivePR | undefined, open: Map<number, LivePR> | null): string | null {
 		const def = this.d.repo.default_branch;
 		if (!p) return 'the PR was closed';
-		if (p.draft) return 'it is a draft';
+		if (p.draft && !this.settings().config.autoTryDrafts) return 'it is a draft';
 		if (!p.sameRepo) return 'it comes from a fork';
 		if (p.labels?.includes(AUTO_TRY_LABEL)) return `it has the ${AUTO_TRY_LABEL} label`;
-		if (p.baseRef !== def && ![...open.values()].some((o) => o.sameRepo && o.headRef === p.baseRef && o.pr !== p.pr)) return `it targets ${p.baseRef}, not ${def}`;
+		// Without the list (a queued PR's admission), its base was checked by admission itself.
+		if (open && p.baseRef !== def && ![...open.values()].some((o) => o.sameRepo && o.headRef === p.baseRef && o.pr !== p.pr)) return `it targets ${p.baseRef}, not ${def}`;
 		const it = this.item(p.pr);
 		if (it && IN_BATCH.includes(it.status)) return 'the queue is testing it';
 		return null;
@@ -1956,10 +1978,19 @@ class Tick {
 	private async cancelAutoTry(t: BatchRow, reason: string) {
 		const n = t.members[0];
 		const head = t.heads[n];
+		// Recorded first: a crash after it leaves only a branch and a run, which the intent has swept next tick.
+		store.intendBranch(this.repoId, t.branch, t.head_sha);
+		store.cancelAutoTryRow(t, reason);
 		await this.d.ci.cancel(t.head_sha).catch(this.bestEffort('ci.cancel'));
-		await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
-		store.setBatchStatus(t.id, 'cancelled', reason);
-		store.setAutoTry(this.repoId, n, head, 'cancelled');
+		// Left to the sweep of the intent next tick when the deletion fails.
+		const deleted = await this.d.github.deleteBranch(t.branch).then(
+			() => true,
+			(e) => {
+				this.bestEffort('github.deleteBranch')(e);
+				return false;
+			}
+		);
+		if (deleted) store.branchPushed(this.repoId, t.branch);
 		await this.d.github
 			.setPRCheck(head, { state: 'neutral', title: short(`Cancelled: ${reason}`), suffix: '/try', url: this.branchRuns(t.branch) })
 			.catch(this.bestEffort('github.setPRCheck'));
@@ -1976,7 +2007,6 @@ class Tick {
 	async autoTries() {
 		const settings = store.getQueueSettings(this.repoId);
 		const on = settings.mode === 'batch' && settings.config.autoTry;
-		if (!on) store.unprimeAutoTries(this.repoId);
 		const running = store.runningAutoTries(this.repoId);
 		if ((!on && !running.length) || !this.d.github.openPRs) return;
 		this.open ??= new Map((await this.d.github.openPRs()).map((x) => [x.pr, x]));
@@ -2015,18 +2045,22 @@ class Tick {
 		let slots = settings.config.autoTryMax - store.runningAutoTries(this.repoId).length;
 		for (const r of store.autoTryRows(this.repoId)) {
 			if (slots <= 0) break;
-			if (r.outcome !== null && r.outcome !== 'cancelled') continue;
-			if (now - r.seenAt < settings.config.autoTryDelayMs) continue;
+			const it = this.item(r.pr);
+			// Queued, it is tested by the queue; unless the queue waits for a passed try first, which then
+			// starts even for a head that was open when automatic tries were turned on.
+			const waitsForTry = settings.config.requireTryPass && it?.status === 'queued';
+			if (it && !waitsForTry) continue;
+			if (r.outcome !== null && r.outcome !== 'cancelled' && !(waitsForTry && r.outcome === 'existing')) continue;
+			if (now - r.seenAt < settings.config.autoTryDelayMs && !(waitsForTry && r.outcome === 'existing')) continue;
 			const p = open.get(r.pr);
 			if (!p || p.headSha !== r.headSha || this.autoTryBar(p, open)) continue;
-			// Queued: the queue tests it.
-			if (this.item(r.pr)) continue;
-			if (store.hasTry(this.repoId, r.pr, r.headSha)) {
+			// Tried already, or run by the queue itself (a batch that failed or was left): its CI is known.
+			if (store.hasTry(this.repoId, r.pr, r.headSha) || (!waitsForTry && store.queueRanHead(this.repoId, r.pr, r.headSha))) {
 				store.setAutoTry(this.repoId, r.pr, r.headSha, 'tried');
 				continue;
 			}
 			try {
-				await this.startTry(r.pr, { auto: true });
+				await this.startTry(r.pr, { auto: true, head: r.headSha });
 				slots--;
 			} catch (e) {
 				if (e instanceof RateLimitedError) throw e;
@@ -2045,7 +2079,7 @@ class Tick {
 						.catch(this.bestEffort('github.setPRCheck'));
 					this.event(r.pr, 'tried', { status: 'conflict', headSha: r.headSha, auto: true });
 				} else {
-					// An outage or a head that moved: tried again next tick.
+					// An outage, or a head that moved or became barred meanwhile: looked at again next tick.
 					this.log(`could not start the automatic try of #${r.pr}: ${message}`);
 				}
 			}
@@ -2592,9 +2626,21 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	await t.reconcile();
 	await t.advanceTries();
 	await t.advanceMaster();
-	await tickPipeline(t, deps);
-	// After the queue's own work: its batches take runners first.
-	if (!store.getQueueSettings(deps.repo.id).pausedReason) await t.autoTries();
+	try {
+		await tickPipeline(t, deps);
+	} catch (e) {
+		// A failing pipeline must not keep stale tries running: they are still cancelled (and started).
+		if (!(e instanceof RateLimitedError) && !store.getQueueSettings(deps.repo.id).pausedReason) {
+			t.forgetPRs();
+			await t.autoTries().catch((err) => t.log(`automatic tries after a failed tick: ${err instanceof Error ? err.message : err}`));
+		}
+		throw e;
+	}
+	// After the queue's own work: its batches take runners first. What it read of PRs may be minutes old by now.
+	if (!store.getQueueSettings(deps.repo.id).pausedReason) {
+		t.forgetPRs();
+		await t.autoTries();
+	}
 }
 
 /** The pipeline's part of a tick: following the default branch, advancing batches, planning new ones. */
