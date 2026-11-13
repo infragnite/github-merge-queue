@@ -50,9 +50,12 @@ test('one for a repository the queue does not manage, and one with a bad signatu
 test('unsigned deliveries cannot flood the logs: one line a minute, saying how many were left out', async () => {
 	vi.useFakeTimers({ toFake: ['Date'] });
 	try {
-		vi.setSystemTime(new Date('2026-11-13T08:00:00Z'));
+		// After the earlier test's unsigned delivery, logged at the real time: a fixed date would fall
+		// inside (or before) its minute once the real clock passes it.
+		const start = Date.now() + 3_600_000;
+		vi.setSystemTime(start);
 		for (let i = 0; i < 50; i++) await deliver({ repository: { full_name: 'acme/repo' } }, { id: `bad-${i}`, secret: 'wrong' });
-		vi.setSystemTime(new Date('2026-11-13T08:01:01Z'));
+		vi.setSystemTime(start + 61_000);
 		await deliver({ repository: { full_name: 'acme/repo' } }, { id: 'bad-late', secret: 'wrong' });
 		const bad = logs.filter((l) => l.outcome === 'bad-signature');
 		expect(bad.map((l) => [l.delivery, l.left_out])).toEqual([
