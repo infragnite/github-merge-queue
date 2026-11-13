@@ -4,7 +4,7 @@ import { GitHubError } from './github-retry';
 
 const repo = 7;
 const t0 = Date.parse('2026-11-13T07:30:40Z');
-const server = () => new GitHubError(500, 'Server Error', { message: 'Server Error' }, 'GET /repos/qnox/krusty/pulls');
+const server = () => new GitHubError(500, 'Server Error', { message: 'Server Error' }, undefined, 'GET /repos/qnox/krusty/pulls');
 
 describe('tick errors on the queue page', () => {
 	beforeEach(() => clearTickError(repo));
@@ -25,7 +25,7 @@ describe('tick errors on the queue page', () => {
 	it('says GitHub is failing and there is nothing to do once its errors persist', () => {
 		noteTickError(repo, server(), t0);
 		noteTickError(repo, server(), t0 + 60_000);
-		noteTickError(repo, new GitHubError(502, 'Bad Gateway', {}, 'POST /graphql'), t0 + 120_000);
+		noteTickError(repo, new GitHubError(502, 'Bad Gateway', {}, undefined, 'POST /graphql'), t0 + 120_000);
 		expect(tickErrorView(repo)).toEqual({
 			kind: 'github',
 			since: t0,

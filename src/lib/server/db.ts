@@ -3,6 +3,8 @@ import { env } from '$env/dynamic/private';
 import type { User, Repo, RepoWithStats, QueueItem, HistoryItem } from '$lib/types';
 import type { StackStore } from './stack-source';
 import { migrateBatches } from './batch-store';
+import { log } from './log';
+import { recordTimeInQueue, repoLabel } from './telemetry';
 
 let db: Database.Database;
 
@@ -260,13 +262,18 @@ export function addToHistory(
 	errorMessage: string | null,
 	queuedAt: string | null
 ) {
-	return getDb()
+	const result = getDb()
 		.prepare(
 			`INSERT INTO merge_history
 		 (repo_id, pr_number, pr_title, pr_url, author_login, merged_sha, status, error_message, queued_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 		.run(repoId, prNumber, prTitle, prUrl, authorLogin, mergedSha, status, errorMessage, queuedAt);
+	const queued = queuedAt ? Date.parse(queuedAt.includes('T') ? queuedAt : `${queuedAt.replace(' ', 'T')}Z`) : NaN;
+	const ms = Number.isFinite(queued) ? Date.now() - queued : undefined;
+	if (ms !== undefined) recordTimeInQueue(repoId, status, ms);
+	log.info('PR left the queue', { repo: repoLabel(repoId), pr: prNumber, status, reason: errorMessage ?? undefined, sha: mergedSha ?? undefined, queued_ms: ms });
+	return result;
 }
 
 export function getRepoHistory(repoId: number, limit = 20): HistoryItem[] {

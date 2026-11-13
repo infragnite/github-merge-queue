@@ -5,6 +5,7 @@ import { upsertUser } from '$lib/server/db';
 import { getUser, checkOrgMembership } from '$lib/server/github';
 import { safeNext } from '$lib/server/next-path';
 import type { RequestHandler } from './$types';
+import { log } from '$lib/server/log';
 
 const ALLOWED_ORG = 'infragnite';
 
@@ -37,7 +38,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 
 	const tokenData = await tokenRes.json();
 	if (!tokenData.access_token) {
-		console.error('[auth] Token exchange failed');
+		log.error('sign-in: token exchange failed');
 		redirect(302, '/login?error=auth_failed');
 	}
 
