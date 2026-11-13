@@ -108,6 +108,16 @@ export interface BatchConfig {
 	bisectRuns: number;
 	/** Which notices are posted as PR comments; see `CommentMode`. */
 	comments: CommentMode;
+	/**
+	 * Try each new commit pushed to an open PR (batch mode only), as a CI push trigger would: one
+	 * run of it on top of the default branch, cancelled by the next push. Drafts, forks, queued PRs
+	 * and PRs labelled `no-auto-try` are left out.
+	 */
+	autoTry: boolean;
+	/** Automatic tries running at once (`/mq try` runs are not counted); the rest wait, oldest push first. */
+	autoTryMax: number;
+	/** How long after a push its try starts, so a burst of pushes is tried once. */
+	autoTryDelayMs: number;
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
@@ -125,7 +135,10 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	stopOnFirstFailure: true,
 	masterRunMinGapMs: 0,
 	bisectRuns: 1,
-	comments: 'all'
+	comments: 'all',
+	autoTry: false,
+	autoTryMax: 2,
+	autoTryDelayMs: 2 * 60 * 1000
 };
 
 export type AdmissionCode =

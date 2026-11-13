@@ -36,6 +36,9 @@ export const BATCH_FIELDS: SettingField[] = [
 	{ name: 'config.autoRebase', label: 'Restack automatically', help: 'Rebase PRs whose parent was rebased or merged, when that needs no conflict resolution.', kind: 'boolean' },
 	{ name: 'config.masterRun', label: 'Run CI on the default branch after landing', help: 'Saves caches and runs what the repo runs there.', kind: 'boolean' },
 	{ name: 'config.masterRunMinGapMs', label: 'Least time between those runs', help: '0 runs one per landed batch.', kind: 'duration', unitMs: MIN, unit: 'min' },
+	{ name: 'config.autoTry', label: 'Try each push', help: 'Each new commit pushed to an open PR gets one CI run on top of the default branch, as a CI push trigger would, shown as its /try check. A newer push, closing the PR, making it a draft or the queue batching it cancels the run. Drafts, forks and queued PRs are left out. Open PRs are tried from their next push on.', kind: 'boolean' },
+	{ name: 'config.autoTryMax', label: 'Tries at once', help: 'Automatic tries running at the same time; the rest wait, oldest push first. /mq try runs are not counted. Queue batches start first.', kind: 'number', min: 1 },
+	{ name: 'config.autoTryDelayMs', label: 'Delay after a push', help: 'How long after a push its try starts, so a burst of pushes is tried once, at its last commit.', kind: 'duration', unitMs: MIN, unit: 'min' },
 	{
 		name: 'config.comments',
 		label: 'PR comments',
@@ -124,6 +127,7 @@ export const SETTING_GROUPS: { id: string; title: string; help: string; fields: 
 	{ id: 'failures', title: 'Urgent PRs and failures', help: 'Urgent PRs skip ahead; a failed batch is narrowed down to the PR that breaks it.', fields: pick('config.bisectRuns', 'config.retryFailed', 'config.stopOnFirstFailure') },
 	{ id: 'rules', title: 'Who can enter a batch', help: 'What a PR needs before the queue tests it.', fields: pick('config.requireApproval', 'config.approvalOnHead', 'config.requirePRChecks', 'config.autoRebase') },
 	{ id: 'ci', title: 'CI', help: 'How the queue starts and reads CI.', fields: [...pick('config.ciTimeoutMs', 'config.jobHangMs', 'config.masterRun', 'config.masterRunMinGapMs'), ...CI_FIELDS] },
+	{ id: 'auto-try', title: 'Automatic tries', help: 'Early CI for authors before they queue. A passed try lands without another run when queued while neither the PR nor the default branch changed. Label a PR no-auto-try to leave it out.', fields: pick('config.autoTry', 'config.autoTryMax', 'config.autoTryDelayMs') },
 	{ id: 'notices', title: 'PR comments', help: 'How much the queue says on PRs.', fields: pick('config.comments') },
 	{ id: 'visibility', title: 'Visibility', help: 'Who can see the queue page.', fields: VIEW_FIELDS }
 ];

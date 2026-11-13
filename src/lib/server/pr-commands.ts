@@ -205,7 +205,7 @@ async function perform(repo: Repo, deps: CommandDeps, n: number, caller: Caller,
 			try {
 				run = await deps.startTry(n);
 			} catch (e) {
-				if (e instanceof Error && /is not open|does not apply|comes from a fork/.test(e.message)) throw new Refused(e.message);
+				if (e instanceof Error && /is not open|does not apply|comes from a fork|is already being tried/.test(e.message)) throw new Refused(e.message);
 				throw e;
 			}
 			return `Started a try run on top of \`${repo.default_branch}\`, on branch \`${run.branch}\`. Its CI shows on that branch; nothing is merged. If it passes and neither this PR nor \`${repo.default_branch}\` changes, \`/mq queue\` lands it without another run.`;
