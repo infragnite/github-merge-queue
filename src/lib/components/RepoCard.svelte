@@ -19,7 +19,7 @@
 			: s.state === 'red'
 				? `${repo.default_branch} is failing CI; only PRs that pass on it can land`
 				: s.state === 'waiting'
-					? 'PRs are in line; none is being tested yet (CI, approvals or a batch to fill)'
+					? s.triesWaiting > 0 ? 'Tries are queued to start' : 'PRs are in line; none is being tested yet (CI, approvals or a batch to fill)'
 					: undefined
 	);
 </script>
@@ -58,7 +58,10 @@
 			{#if s.waiting > 0}
 				<span class="whitespace-nowrap text-gray-600">{s.waiting} waiting</span>
 			{/if}
-			{#if s.attention + s.testing + s.waiting === 0}
+			{#if s.triesRunning > 0}<span class="whitespace-nowrap text-indigo-700">{s.triesRunning} {s.triesRunning === 1 ? 'try' : 'tries'} active</span>{/if}
+			{#if s.triesWaiting > 0}<span class="whitespace-nowrap text-gray-600">{s.triesWaiting} {s.triesWaiting === 1 ? 'try' : 'tries'} queued</span>{/if}
+			{#if s.baselineRunning}<span class="whitespace-nowrap text-indigo-700">Checking {repo.default_branch}</span>{/if}
+			{#if s.attention + s.testing + s.waiting + s.triesRunning + s.triesWaiting === 0 && !s.baselineRunning}
 				<span class="text-gray-500">Nothing queued</span>
 			{/if}
 		</span>

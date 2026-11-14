@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 
 process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
-const { emitEvent, waitForEvents, unreportedDequeues } = await import('./events');
+const { emitEvent, waitForEvents, unreportedDequeues, subscribeRepoChanges } = await import('./events');
 
 function repo() {
 	const user = db.upsertUser(1, 'dev', null, null);
@@ -73,4 +73,18 @@ describe('queue events', () => {
 		const got = await waitForEvents(r, { after: 0, waitMs: 50 });
 		expect(got).toEqual({ events: [], cursor: 0 });
 	});
+});
+
+
+test('UI subscribers receive only selected repositories, and detach cleanly', () => {
+	const a = repo(), b = repo();
+	let changed = 0;
+	const off = subscribeRepoChanges([a, a], () => changed++);
+	emitEvent(b, 1, 'queued');
+	expect(changed).toBe(0);
+	emitEvent(a, 1, 'tried');
+	expect(changed).toBe(1);
+	off();
+	emitEvent(a, 1, 'merged');
+	expect(changed).toBe(1);
 });

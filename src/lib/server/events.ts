@@ -42,6 +42,16 @@ export interface QueueEvent {
 const bus = new EventEmitter();
 bus.setMaxListeners(0);
 
+/** A webhook/UI hint has no durable event payload or history entry. */
+export function notifyRepoChange(repoId: number) { bus.emit(`repo:${repoId}`); }
+
+/** UI invalidations share the event bus, but never expose event contents. */
+export function subscribeRepoChanges(repoIds: number[], changed: () => void): () => void {
+	const keys = [...new Set(repoIds)].map((id) => `repo:${id}`);
+	for (const key of keys) bus.on(key, changed);
+	return () => { for (const key of keys) bus.off(key, changed); };
+}
+
 // Kept long enough to analyse the queue's history later (wait times, holds, ejections, pauses).
 const KEEP_DAYS = 400;
 let inserts = 0;
@@ -57,7 +67,7 @@ export function emitEvent(repoId: number, pr: number | null, kind: QueueEventKin
 	if (++inserts % 500 === 0) {
 		db.prepare(`DELETE FROM queue_events WHERE created_at < datetime('now', ?)`).run(`-${KEEP_DAYS} days`);
 	}
-	bus.emit(`repo:${repoId}`);
+	notifyRepoChange(repoId);
 	recordQueueEvent(repoId, kind);
 	log.info('queue event', { repo: repoLabel(repoId), pr: pr ?? undefined, event: kind, data });
 }

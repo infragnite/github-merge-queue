@@ -1,5 +1,7 @@
 <script lang="ts">
+	import GitHubRefs from '$lib/components/GitHubRefs.svelte';
 	import { enhance } from '$app/forms';
+	import { watchRepoUpdates } from '$lib/live-refresh';
 	import { invalidateAll } from '$app/navigation';
 	import QueueItem from '$lib/components/QueueItem.svelte';
 	import AttentionRow from '$lib/components/AttentionRow.svelte';
@@ -124,11 +126,8 @@
 		refreshing = false;
 	}
 
-	// Tries and new pushes progress independently of merge queue membership.
-	$effect(() => {
-		const id = setInterval(refresh, 10_000);
-		return () => clearInterval(id);
-	});
+	const streamRepoId = $derived(data.repo.id);
+	$effect(() => watchRepoUpdates(refresh, `/api/ui/events?repo=${streamRepoId}`));
 
 	function handleDragStart(e: DragEvent, index: number) {
 		// Some mobile browsers start a native drag on a long press; touch drags go through touchDrag.
@@ -336,7 +335,7 @@
 				<span>into <span class="font-mono text-gray-700">{data.repo.default_branch}</span></span>
 				{#if pipe?.master}
 					{@const m = MASTER[pipe.master.state] ?? { label: pipe.master.state, tone: 'text-gray-700', dot: 'bg-gray-400', hint: '' }}
-					<span class="inline-flex items-center gap-1 {m.tone}" title={m.hint}><span class="h-1.5 w-1.5 rounded-full {m.dot}" aria-hidden="true"></span>{m.label} <span class="font-mono">{pipe.master.sha.slice(0, 7)}</span></span>
+					<span class="inline-flex items-center gap-1 {m.tone}" title={m.hint}><span class="h-1.5 w-1.5 rounded-full {m.dot}" aria-hidden="true"></span>{m.label} <a href="https://github.com/{data.repo.owner}/{data.repo.name}/commit/{pipe.master.sha}" target="_blank" rel="noopener" class="font-mono hover:underline">{pipe.master.sha.slice(0, 7)}</a></span>
 				{/if}
 				{#if data.readonly}
 					<span>{batchMode ? `batches of up to ${data.limits.maxBatch}` : 'one by one'}</span>
@@ -373,8 +372,8 @@
 		</div>
 	</div>
 
-	{#if pipe?.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
-	{#if form?.error}<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{form.error}</p>{/if}
+	{#if pipe?.error}<p class="text-sm text-red-600"><GitHubRefs text={pipe.error} owner={data.repo.owner} name={data.repo.name} /></p>{/if}
+	{#if form?.error}<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert"><GitHubRefs text={String(form.error)} owner={data.repo.owner} name={data.repo.name} /></p>{/if}
 	{#if pipe?.tickError && !pipe.rateLimitedUntil}
 		{@const since = new Date(pipe.tickError.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
 		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert" data-testid="tick-error">
@@ -383,7 +382,7 @@
 			{:else}
 				The queue has been stuck on this error since {since} ({pipe.tickError.count} steps in a row), so nothing moves. It keeps retrying; if it doesn't clear, report it with this message.
 			{/if}
-			<span class="block font-mono text-xs text-red-600">{pipe.tickError.detail}</span>
+			<span class="block font-mono text-xs text-red-600"><GitHubRefs text={pipe.tickError.detail} owner={data.repo.owner} name={data.repo.name} /></span>
 		</p>
 	{/if}
 	{#if pipe?.rateLimitedUntil}
@@ -393,7 +392,7 @@
 	{/if}
 	{#if pipe?.paused}
 		<form method="POST" action="?/resume" use:enhance class="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-			<span class="min-w-0 flex-1">{data.readonly ? pipe.paused : `Paused: ${pipe.paused}`}</span>
+			<span class="min-w-0 flex-1"><GitHubRefs text={data.readonly ? pipe.paused : `Paused: ${pipe.paused}`} owner={data.repo.owner} name={data.repo.name} /></span>
 			{#if data.can.resume}<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>{/if}
 		</form>
 	{/if}
@@ -405,7 +404,7 @@
 				<a href="https://github.com/{data.repo.owner}/{data.repo.name}/commit/{pipe.red.sha}" target="_blank" rel="noopener" class="font-mono underline">{pipe.red.sha.slice(0, 7)}</a>
 				{pipe.red.phase === 'alone' ? '· batches are one PR each' : pipe.red.phase === 'waiting' ? '· nothing left to try' : '· batches run side by side on it'}
 			</p>
-			<p class="mt-0.5 text-xs text-red-700">{pipe.red.text}</p>
+			<p class="mt-0.5 text-xs text-red-700"><GitHubRefs text={pipe.red.text} owner={data.repo.owner} name={data.repo.name} /></p>
 		</div>
 	{/if}
 
@@ -457,7 +456,7 @@
 						{#if w.kind === 'run'}
 							<BatchCard batch={w.card} owner={data.repo.owner} name={data.repo.name} canCancel={data.can.cancel} progressErrors={pipe.progressErrors} stopsEarly={data.stopsEarly} prep={w.prep} now={clock + skew} />
 						{:else}
-							<PrepCard slot={w.slot} />
+							<PrepCard slot={w.slot} owner={data.repo.owner} name={data.repo.name} commits={pipe.master ? [pipe.master.sha] : []} />
 						{/if}
 					{/each}
 				{/if}
@@ -474,7 +473,7 @@
 										<span class="tabular-nums text-gray-500">Try position {run.position}</span>
 										<a class="font-medium hover:underline" href={`https://github.com/${data.repo.owner}/${data.repo.name}/pull/${run.pr}`}>PR #{run.pr}</a>
 										<span class="text-gray-500">{run.automatic ? 'Automatic try' : 'Manual try'} · {pipe.paused ? 'queue paused' : pipe.runs.running.length >= pipe.runs.parallelTries ? 'waiting for a slot' : 'waiting to start'}</span>
-										<span class="font-mono text-xs text-gray-500">{run.headSha?.slice(0, 7)}</span>
+										<a href="https://github.com/{data.repo.owner}/{data.repo.name}/commit/{run.headSha}" target="_blank" rel="noopener" class="font-mono text-xs text-gray-500 hover:underline">{run.headSha?.slice(0, 7)}</a>
 									</li>
 								{/each}
 							</ol>
@@ -492,7 +491,7 @@
 						<input type="search" bind:value={search} placeholder="Find #, title or author" class="ml-auto w-full rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm sm:w-48" aria-label="Find a PR in the queue" />
 					{/if}
 				</div>
-				{#if board?.error}<p class="text-sm text-red-600">{board.error}</p>{/if}
+				{#if board?.error}<p class="text-sm text-red-600"><GitHubRefs text={board.error} owner={data.repo.owner} name={data.repo.name} /></p>{/if}
 				{#if data.queueItems.length === 0}
 					<p class="rounded-xl border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">Queue is empty.{#if !readonly} Add a pull request to start.{/if}</p>
 				{:else if shownStacks.length > 0}
@@ -584,7 +583,7 @@
 												{@const row = e.rows.find((r) => r.pr_number === pr.pr)}
 												<li class="flex min-w-0 items-center gap-2 pl-8">
 													<a href={row?.pr_url || pr.url || `https://github.com/${data.repo.owner}/${data.repo.name}/pull/${pr.pr}`} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{pr.pr}</a>
-													<span class="min-w-0 truncate text-gray-800">{pr.title}</span>
+													<span class="min-w-0 truncate text-gray-800"><GitHubRefs text={pr.title} owner={data.repo.owner} name={data.repo.name} /></span>
 													{#if row}<span class="ml-auto shrink-0 text-xs {row.status === 'merged' ? 'text-green-700' : 'text-red-700'}">{row.status}</span>{/if}
 												</li>
 											{/each}
@@ -594,7 +593,7 @@
 									<div class="flex min-w-0 items-center gap-3 px-4 py-2.5">
 										<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] {ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}" aria-hidden="true">{ok ? '✓' : '✕'}</span>
 										<a href={e.row.pr_url} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{e.row.pr_number}</a>
-										<span class="min-w-0 truncate text-gray-900">{e.row.pr_title}</span>
+										<span class="min-w-0 truncate text-gray-900"><GitHubRefs text={e.row.pr_title} owner={data.repo.owner} name={data.repo.name} /></span>
 										<span class="hidden shrink-0 text-xs text-gray-500 sm:inline">{e.row.author_login}</span>
 										<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-500"><span class={ok ? 'text-green-700' : 'text-red-700'}>{e.row.status}</span> · {clockTime(e.at)}</span>
 									</div>
@@ -608,4 +607,4 @@
 	{/if}
 </div>
 
-<AddPrDialog bind:open={showAddDialog} prs={data.openPrs} canUrgent={data.can.urgent && batchMode} />
+<AddPrDialog owner={data.repo.owner} name={data.repo.name} bind:open={showAddDialog} prs={data.openPrs} canUrgent={data.can.urgent && batchMode} />

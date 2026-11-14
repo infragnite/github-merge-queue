@@ -1,4 +1,5 @@
 <script lang="ts">
+	import GitHubRefs from './GitHubRefs.svelte';
 	import { enhance } from '$app/forms';
 	import { runHref } from '$lib/actions-link';
 	import { runNote } from '$lib/run-note';
@@ -101,9 +102,16 @@
 					{#if pr.depth > 0}<span class="text-gray-300" aria-hidden="true">└</span>{/if}
 					{#if bisecting}<span class="h-1.5 w-1.5 shrink-0 rounded-full {SEG[segOf(pr)].cls}" title={SEG[segOf(pr)].label} aria-label={SEG[segOf(pr)].label}></span>{/if}
 					<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="shrink-0 font-mono text-xs text-gray-500 hover:text-indigo-600">#{pr.pr}</a>
-					<span class="min-w-0 truncate text-gray-800" title={pr.trail || pr.title}>{pr.title}</span>
+					<span class="min-w-0 truncate text-gray-800" title={pr.trail || pr.title}><GitHubRefs text={pr.title} {owner} {name} /></span>
 					{#if pr.link && pr.link !== 'healthy'}<span class="shrink-0 rounded bg-amber-50 px-1.5 text-[11px] text-amber-800">{pr.link}</span>{/if}
 				</li>
+{/snippet}
+
+{#snippet failedJobs(progress: NonNullable<Card['progress']>)}
+	{#each progress.failedJobLinks ?? progress.failedJobs.map((name) => ({ name, url: null })) as job, i}
+		{#if i > 0}, {/if}
+		{#if job.url}<a href={job.url} target="_blank" rel="noopener" class="underline decoration-red-300 underline-offset-2 hover:decoration-red-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500">{job.name}</a>{:else}{job.name}{/if}
+	{/each}
 {/snippet}
 
 {#snippet jobsBar(pr: NonNullable<Card['progress']>, small: boolean)}
@@ -117,7 +125,7 @@
 <article id="batch-{batch.id}" class="scroll-mt-4 rounded-xl border border-border-subtle bg-surface-raised p-3 shadow-sm sm:p-4">
 	<header class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
 		<span class="h-2 w-2 shrink-0 rounded-full {DOT[status] ?? 'bg-gray-300'} {live ? 'motion-safe:animate-pulse' : ''}" aria-hidden="true"></span>
-		<h3 class="shrink-0 text-sm font-semibold text-gray-900">{title}</h3>
+		<h3 class="shrink-0 text-sm font-semibold text-gray-900"><a href={runHref(owner, name, batch)} target="_blank" rel="noopener" class="underline decoration-transparent underline-offset-2 hover:text-indigo-600 hover:decoration-current focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500">{title}</a></h3>
 		{#if batch.kind === 'batch'}<span class="hidden shrink-0 text-xs text-gray-500 sm:inline">{batch.prs.length} PR{batch.prs.length === 1 ? '' : 's'}</span>{/if}
 		<span class="min-w-0 truncate"><StatusChip {status} label={status === 'passed' && batch.kind === 'batch' ? 'passed, landing' : null} /></span>
 		<span class="ml-auto shrink-0 text-xs tabular-nums text-gray-500" title="Started {batch.createdAt} UTC">{fmt(stats.elapsedMs)}</span>
@@ -126,8 +134,6 @@
 				<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>
 			</summary>
 			<div class="absolute right-0 z-10 mt-1 w-52 overflow-hidden rounded-lg border border-border-subtle bg-surface-raised py-1 text-sm shadow-lg">
-				<a href={runHref(owner, name, batch)} target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">{batch.runUrl ? 'Open the CI run' : 'GitHub Actions runs'}</a>
-				{#if p?.url}<a href={p.url} target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">{p.failed ? 'Open the failed job' : 'Open a running job'}</a>{/if}
 				<a href="https://github.com/{owner}/{name}/commit/{batch.headSha}" target="_blank" rel="noopener" class="block px-3 py-1.5 text-gray-700 hover:bg-surface-sunken">Commit <span class="font-mono text-xs text-gray-500">{batch.headSha.slice(0, 7)}</span></a>
 				{#if cancellable}
 					<form
@@ -166,7 +172,7 @@
 				<span><span class="font-medium tabular-nums text-gray-800">{stats.jobs.done}/{stats.jobs.total}</span> jobs</span>
 				{#if stats.jobs.running}<span><span class="font-medium tabular-nums text-gray-800">{stats.jobs.running}</span> running</span>{/if}
 				{#if stats.jobs.waiting}<span><span class="font-medium tabular-nums text-gray-800">{stats.jobs.waiting}</span> waiting for a runner</span>{/if}
-				{#if stats.jobs.failed}<span class="text-red-700"><span class="font-medium tabular-nums">{stats.jobs.failed}</span> failed{batch.kind !== 'batch' ? `: ${p.failedJobs.join(', ')}` : ''}</span>{/if}
+				{#if stats.jobs.failed}<span class="text-red-700"><span class="font-medium tabular-nums">{stats.jobs.failed}</span> failed: {@render failedJobs(p)}</span>{/if}
 			</p>
 		</div>
 		{#if progressError}<p class="mt-1 text-xs text-gray-500" title={progressError}>Last known progress; reading it now failed: {progressError}</p>{/if}
@@ -175,32 +181,35 @@
 	{:else if waiting}
 		<p class="mt-2 text-xs text-gray-500">Waiting for its CI to start.</p>
 	{/if}
-	{#if note}<p class="mt-1.5 text-xs text-gray-600">{note}</p>{/if}
+	{#if note}<p class="mt-1.5 text-xs text-gray-600"><GitHubRefs text={note} {owner} {name} commits={[batch.headSha]} /></p>{/if}
 
 	<!-- What runs inside the batch now: preparation first, then each step still going, one row each. -->
 	{#if prep.length > 0 || stats.running.length > 0}
 		<div class="mt-3 divide-y divide-border-subtle overflow-hidden rounded-lg bg-surface-sunken/60">
 			{#each prep as slot (slot.key)}
-				<PrepCard {slot} inWell />
+				<PrepCard {slot} {owner} {name} commits={[batch.headSha]} inWell />
 			{/each}
 			{#each stats.running as run (run.id)}
 				{@const rs = runStatus(run)}
-				<div class="flex min-w-0 items-center gap-2 px-3 py-2 text-sm">
+				<div class="space-y-1 px-3 py-2">
+				<div class="flex min-w-0 items-center gap-2 text-sm">
 					<span class="h-1.5 w-1.5 shrink-0 rounded-full {rs === 'failing' ? 'bg-red-500' : 'bg-sky-500'}" aria-hidden="true"></span>
 					<a href={runHref(owner, name, run)} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600" title={run.runUrl ? `CI run of ${run.branch}` : `GitHub Actions runs of ${run.branch}`}>Step {stepNo(run)}</a>
-					<span class="min-w-0 truncate font-mono text-xs text-gray-500" title={run.prs.map((x) => `#${x.pr}`).join(' ')}>{run.prs.length === 1 ? `#${run.prs[0].pr} alone` : run.prs.map((x) => `#${x.pr}`).join(' ')}</span>
+					<span class="min-w-0 truncate font-mono text-xs text-gray-500" title={run.prs.map((x) => `#${x.pr}`).join(' ')}>{#each run.prs as pr, i}{i > 0 ? ' ' : ''}<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="hover:text-indigo-600 hover:underline">#{pr.pr}</a>{/each}{run.prs.length === 1 ? ' alone' : ''}</span>
 					{#if rs === 'failing'}<StatusChip status="failing" />{/if}
 					<span class="ml-auto flex shrink-0 items-center gap-2">
 						{#if run.progress}<span class="hidden sm:flex">{@render jobsBar(run.progress, true)}</span><span class="w-11 text-right text-xs tabular-nums text-gray-500">{run.progress.done}/{run.progress.total}</span>{/if}
 						<span class="hidden w-12 text-right text-xs tabular-nums text-gray-500 sm:inline">{fmt(batchStats(run, now).elapsedMs)}</span>
 					</span>
 				</div>
+				{#if run.progress?.failed}<p class="text-xs text-red-700">Failed: {@render failedJobs(run.progress)}</p>{/if}
+				</div>
 			{/each}
 		</div>
 	{/if}
 
 	{#if batch.kind === 'batch'}
-		{#if batch.context.length > 0}<p class="mt-2 text-xs text-gray-500">On top of {batch.context.map((n) => `#${n}`).join(' ')}, which passed</p>{/if}
+		{#if batch.context.length > 0}<p class="mt-2 text-xs text-gray-500">On top of {#each batch.context as pr, i}{i > 0 ? ' ' : ''}<a href={prLink(pr)} target="_blank" rel="noopener" class="hover:text-indigo-600 hover:underline">#{pr}</a>{/each}, which passed</p>{/if}
 		<ul class="mt-2.5 space-y-0.5 text-[13px]">
 			{#each open.slice(0, MAX_PRS) as pr (pr.pr)}{@render prRow(pr)}{/each}
 		</ul>
@@ -222,15 +231,16 @@
 						<li class="flex min-w-0 items-center gap-2">
 							<span class="h-1.5 w-1.5 shrink-0 rounded-full {SEG[segOf(pr)].cls}" aria-hidden="true"></span>
 							<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="shrink-0 font-mono hover:text-indigo-600">#{pr.pr}</a>
-							<span class="min-w-0 truncate">{pr.title}</span>
+							<span class="min-w-0 truncate"><GitHubRefs text={pr.title} {owner} {name} /></span>
 							<span class="ml-auto shrink-0">{pr.activity === 'landed' ? 'landed' : pr.activity === 'left' ? 'back in line' : pr.verdict === 'failing' ? 'failing' : 'cleared'}</span>
 						</li>
 					{/each}
 					{#each finished as run (run.id)}
-						<li class="flex min-w-0 items-center gap-2">
-							<span class="shrink-0">Step {stepNo(run)}</span>
-							<span class="min-w-0 truncate font-mono">{run.prs.map((x) => `#${x.pr}`).join(' ')}</span>
+						<li class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+							<a href={runHref(owner, name, run)} target="_blank" rel="noopener" class="shrink-0 font-medium hover:text-indigo-600 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500">Step {stepNo(run)}</a>
+							<span class="min-w-0 truncate font-mono">{#each run.prs as pr, i}{i > 0 ? ' ' : ''}<a href={prLink(pr.pr, pr.url)} target="_blank" rel="noopener" class="hover:text-indigo-600 hover:underline">#{pr.pr}</a>{/each}</span>
 							<span class="ml-auto shrink-0"><StatusChip status={runStatus(run) === 'landed' ? 'passed' : runStatus(run)} /></span>
+							{#if run.progress?.failed}<span class="w-full text-red-700">{@render failedJobs(run.progress)}</span>{/if}
 						</li>
 					{/each}
 				</ul>

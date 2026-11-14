@@ -83,6 +83,8 @@ export interface CIProgress {
 	/** Link to a job of the run, for opening it on GitHub. */
 	url: string | null;
 	failedJobs: string[];
+	/** Each failed job keeps its own destination, including matrix jobs. */
+	failedJobLinks?: { name: string; url: string }[];
 }
 
 export interface BatchCard {
@@ -120,7 +122,8 @@ export function summarizeJobs(jobs: Array<{ name: string; status: string; conclu
 		failed: failed.length,
 		running: jobs.filter((j) => j.status === 'in_progress').length,
 		url: (failed[0] ?? jobs.find((j) => j.status !== 'completed') ?? jobs[0])?.html_url ?? null,
-		failedJobs: failed.map((j) => j.name).sort()
+		failedJobs: failed.map((j) => j.name).sort(),
+		failedJobLinks: failed.map((j) => ({ name: j.name, url: j.html_url })).sort((a, b) => a.name.localeCompare(b.name))
 	};
 }
 

@@ -60,3 +60,23 @@ test('with the last stack analysis, a PR stacked on a failed parent needs attent
 	});
 	expect(s).toMatchObject({ waiting: 1, attention: 2 });
 });
+
+
+test('eight active tries keep an empty merge queue Running', () => {
+	expect(summarize({ ...base, items: [], triesRunning: 8 })).toMatchObject({ state: 'running', testing: 0, waiting: 0, triesRunning: 8 });
+});
+
+test('queued tries keep an empty merge queue Waiting, without claiming CI is running', () => {
+	expect(summarize({ ...base, items: [], triesWaiting: 2 })).toMatchObject({ state: 'waiting', triesRunning: 0, triesWaiting: 2 });
+});
+
+test('try activity does not change merge order counts or override pause and red state', () => {
+	const input = { ...base, items: [item(1)], triesRunning: 1, triesWaiting: 2 };
+	expect(summarize(input)).toMatchObject({ state: 'running', testing: 0, waiting: 1, triesRunning: 1, triesWaiting: 2 });
+	expect(summarize({ ...input, paused: 'Stopped' }).state).toBe('paused');
+	expect(summarize({ ...input, masterRed: true }).state).toBe('red');
+});
+
+test('an active baseline check is running work even without queued PRs', () => {
+	expect(summarize({ ...base, items: [], baselineRunning: true })).toMatchObject({ state: 'running', baselineRunning: true });
+});

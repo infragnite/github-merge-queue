@@ -1,8 +1,9 @@
 <script lang="ts">
+	import GitHubRefs from './GitHubRefs.svelte';
 	import { enhance } from '$app/forms';
 
 	type OpenPr = { number: number; title: string; url: string; author: string; authorAvatar: string; draft: boolean };
-	let { open = $bindable(false), prs, canUrgent }: { open: boolean; prs: OpenPr[]; canUrgent: boolean } = $props();
+	let { open = $bindable(false), prs, canUrgent, owner, name }: { owner: string; name: string; open: boolean; prs: OpenPr[]; canUrgent: boolean } = $props();
 
 	let dialog = $state<HTMLDialogElement | null>(null);
 	let search = $state('');
@@ -71,7 +72,7 @@
 				{readyCount} open{draftCount ? ` · ${draftCount} draft${draftCount === 1 ? '' : 's'}` : ''}{needle ? ` · ${ready.length + (showDrafts ? drafts.length : 0)} shown` : ''}
 			</p>
 
-			{#if error}<p class="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{error}</p>{/if}
+			{#if error}<p class="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert"><GitHubRefs text={error} {owner} {name} /></p>{/if}
 
 			<ul class="mt-2 min-h-0 flex-1 space-y-2 overflow-y-auto">
 				{#each [...ready, ...(showDrafts ? drafts : [])] as pr (pr.number)}
@@ -83,7 +84,7 @@
 								{#if pr.draft}<span class="rounded bg-gray-200 px-1.5 py-0.5 text-xs text-gray-600">Draft</span>{/if}
 								<span class="truncate text-xs text-gray-500">{pr.author}</span>
 							</div>
-							<p class="truncate text-sm text-gray-600">{pr.title}</p>
+							<p class="truncate text-sm text-gray-600"><GitHubRefs text={pr.title} {owner} {name} /></p>
 							{#if pr.draft}<p class="text-xs text-gray-500">Queued drafts are listed under Needs attention until they are marked ready on GitHub.</p>{/if}
 						</div>
 						<form method="POST" action="?/addToQueue" use:enhance={submit(`${pr.number}`)} class="flex shrink-0 flex-col gap-1.5 sm:flex-row">

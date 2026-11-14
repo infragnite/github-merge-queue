@@ -1,4 +1,5 @@
 <script lang="ts">
+	import GitHubRefs from './GitHubRefs.svelte';
 	import { enhance } from '$app/forms';
 	import StatusBadge from './StatusBadge.svelte';
 	import type { ViewItem } from '$lib/types';
@@ -98,7 +99,7 @@
 	<a href={item.pr_url} target="_blank" rel="noopener" class="shrink-0 font-medium text-gray-900 hover:text-indigo-600">#{item.pr_number}</a>
 	<div class="min-w-0 flex-1">
 		<div class="flex min-w-0 items-center gap-1.5">
-			<p class="min-w-0 truncate text-gray-700" title={item.pr_title}>{item.pr_title}</p>
+			<p class="min-w-0 truncate text-gray-700" title={item.pr_title}><GitHubRefs text={item.pr_title} owner={repoOwner} name={repoName} /></p>
 			{#if parent !== null}
 				<a href={prLink(parent)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Lands after #{parent}">on #{parent}</a>
 			{/if}
@@ -106,7 +107,7 @@
 				<a href={prLink(d)} target="_blank" rel="noopener" class="shrink-0 rounded bg-sky-50 px-1 text-xs text-sky-700 hover:underline" title="Depends on #{d}; lands after it">needs #{d}</a>
 			{/each}
 			{#if after.length}
-				<span class="shrink-0 rounded bg-gray-100 px-1 text-xs text-gray-600" title="Conflicts with {after.map((n) => `#${n}`).join(', ')}, ahead of it; it goes once they land">after {after.map((n) => `#${n}`).join(' ')}</span>
+				<span class="shrink-0 rounded bg-gray-100 px-1 text-xs text-gray-600" title="Conflicts with {after.map((n) => `#${n}`).join(', ')}, ahead of it; it goes once they land">after {#each after as pr, i}{i > 0 ? ' ' : ''}<a href={prLink(pr)} target="_blank" rel="noopener" class="hover:text-indigo-600 hover:underline">#{pr}</a>{/each}</span>
 			{/if}
 		</div>
 		{#if item.status === 'conflict'}
@@ -119,10 +120,10 @@
 				{/if}; retried automatically
 			</p>
 		{:else if note}
-			<p class="truncate text-xs {noteTone}" title={note}>{note}</p>
+			<p class="truncate text-xs {noteTone}" title={note}><GitHubRefs text={note} owner={repoOwner} name={repoName} /></p>
 		{/if}
 		{#each warnings as w, i (i)}
-			<p class="truncate text-xs text-amber-700" title={w}>{w}</p>
+			<p class="truncate text-xs text-amber-700" title={w}><GitHubRefs text={w} owner={repoOwner} name={repoName} /></p>
 		{/each}
 	</div>
 	<span class="hidden shrink-0 text-xs text-gray-500 md:inline lg:hidden 2xl:inline">{item.author_login}</span>

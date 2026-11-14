@@ -1,5 +1,8 @@
 <script lang="ts">
+	import GitHubRefs from '$lib/components/GitHubRefs.svelte';
 	import { enhance } from '$app/forms';
+	import { invalidateAll } from '$app/navigation';
+	import { watchRepoUpdates } from '$lib/live-refresh';
 	import RepoCard from '$lib/components/RepoCard.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 
@@ -20,6 +23,8 @@
 	let pending = $state<string | null>(null);
 	let search = $state('');
 	let searchInput = $state<HTMLInputElement | null>(null);
+
+	$effect(() => watchRepoUpdates(async () => { if (!adding) await invalidateAll(); }));
 
 	const needle = $derived(search.trim().toLowerCase());
 	const found = $derived((addable?.repos ?? []).filter((r) => !needle || r.toLowerCase().includes(needle)));
@@ -194,7 +199,7 @@
 									<a href={item.pr_url} target="_blank" rel="noopener" class="font-medium text-gray-900 hover:text-indigo-600">
 										#{item.pr_number}
 									</a>
-									<span class="ml-2 text-gray-500">{item.pr_title}</span>
+									<span class="ml-2 text-gray-500"><GitHubRefs text={item.pr_title} owner={item.repo_owner} name={item.repo_name} /></span>
 									<span class="block text-xs text-gray-500 sm:hidden">{item.repo_owner}/{item.repo_name}</span>
 								</td>
 								<td class="hidden px-4 py-3 text-gray-500 sm:table-cell">
