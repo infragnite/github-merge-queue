@@ -2,7 +2,11 @@ export class GitHubError extends Error {
 	constructor(
 		public status: number,
 		message: string,
-		public body?: { message?: string; sha?: string; [k: string]: unknown }
+		public body?: { message?: string; sha?: string; [k: string]: unknown },
+		/** GitHub's `x-github-request-id`, which GitHub support can look up. */
+		public requestId?: string,
+		/** The call that failed, such as `GET /repos/o/r/pulls` (no query), for logs. */
+		public call?: string
 	) {
 		super(message);
 	}

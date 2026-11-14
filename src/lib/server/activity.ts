@@ -7,6 +7,7 @@
 // their calls, and what the call is for follows from the calls before it (a build after a failed
 // build is the conflict check of one PR) and the branch it pushes (mq/batch-*, *-bisect-*, mq/try-*).
 
+import { withDoing } from './stall-watch';
 import { RateLimitedError } from './rate-limit';
 import { GitHubError } from './github-retry';
 import type { QueueDeps } from './batch-queue';
@@ -178,7 +179,7 @@ export function trackActivity(deps: QueueDeps, opts: TrackOptions = {}): QueueDe
 		const outer = a.step;
 		a.step = { label, prs, since: now() };
 		try {
-			const r = await fn();
+			const r = await withDoing(label, fn);
 			if (a.failedCall === call) {
 				a.failure = null;
 				a.failedCall = null;

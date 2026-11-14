@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { approvalsFrom, checkResult, checkRunRequest, earlyFailure, gateFeeds, postPRReport, prReportCalls, queuePage, stalledRun, statusFromCheck } from './batch-live';
+import { approvalsFrom, checkResult, checkRunRequest, earlyFailure, gateFeeds, postTryReport, workflowRunUrl, postPRReport, prReportCalls, queuePage, stalledRun, statusFromCheck } from './batch-live';
 import { RateLimitedError } from './rate-limit';
 import type { GhReview } from './github';
 
@@ -380,7 +380,7 @@ describe("the queue's check run on a PR", () => {
 
 	test('Details opens the queue page; a CI run link goes in the summary', () => {
 		const r = checkRunRequest('s1', { state: 'failure', title: 'Left the queue: failed', url: 'https://ci/run/9' }, at);
-		expect(r.details_url).toBe('https://mq.example/repos/o/r');
+		expect(r.details_url).toBe('https://ci/run/9');
 		expect(r.output.summary).toBe('Left the queue: failed\n\nCI run: https://ci/run/9');
 	});
 
@@ -466,5 +466,35 @@ describe('posting both, while a ruleset still requires the status', () => {
 		calls.length = 0;
 		await expect(postPRReport('check-run', fail('check-run'), ok('status'), () => {})).rejects.toThrow('check-run refused');
 		expect(calls).toEqual(['check-run']);
+	});
+});
+
+
+describe('canonical try reporting', () => {
+	test('a new head gets only a Check Run', async () => {
+		const calls: string[] = [];
+		await postTryReport({ state: 'queued', title: 'Cooldown', suffix: '/try' }, async () => { calls.push('check'); }, async () => false, async () => { calls.push('status'); });
+		expect(calls).toEqual(['check']);
+	});
+
+	test.each([['queued', 'pending'], ['in_progress', 'pending'], ['success', 'success'], ['failure', 'failure'], ['neutral', 'failure'], ['action_required', 'failure']] as const)('existing legacy status reaches %s without being stranded', async (state, legacy) => {
+		const calls: string[] = [];
+		await postTryReport({ state, title: 'Try', suffix: '/try' }, async () => { calls.push('check'); }, async () => true, async (s) => { calls.push(s); });
+		expect(calls).toEqual(['check', legacy]);
+	});
+
+	test('a failed canonical report is retried, never replaced with a legacy report', async () => {
+		let lookedUp = false;
+		await expect(postTryReport({ state: 'queued', title: 'Try' }, async () => { throw new Error('Checks refused'); }, async () => { lookedUp = true; return false; }, async () => {})).rejects.toThrow('Checks refused');
+		expect(lookedUp).toBe(false);
+	});
+
+	test('legacy update failures propagate so queue reporting retries', async () => {
+		await expect(postTryReport({ state: 'success', title: 'Try' }, async () => {}, async () => true, async () => { throw new Error('Status refused'); })).rejects.toThrow('Status refused');
+	});
+
+	test('a specific run is selected only from the configured workflow on that commit', () => {
+		expect(workflowRunUrl('o', 'r', 'ci.yml', [{ id: 10, path: '.github/workflows/ci.yml' }, { id: 30, path: '.github/workflows/docs.yml' }, { id: 20, path: '.github/workflows/ci.yml@refs/heads/mq/try-1' }])).toBe('https://github.com/o/r/actions/runs/20');
+		expect(workflowRunUrl('o', 'r', 'ci.yml', [{ id: 30, path: '.github/workflows/docs.yml' }])).toBeNull();
 	});
 });

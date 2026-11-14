@@ -473,6 +473,15 @@ describe('/mq retry', () => {
 describe('/mq try', () => {
 	const batchMode = () => store.updateQueueSettings(repo.id, { mode: 'batch' });
 
+	test('a waiting try replies with its run queue position instead of claiming CI started', async () => {
+		batchMode();
+		const pending = store.insertBatch({ repoId: repo.id, kind: 'try', queued: true, branch: 'mq/try-4-waiting', baseSha: 'b', baseTree: 'bt', headSha: 'h', treeSha: 't', members: [4], heads: { 4: 'pr4' } });
+		deps.startTry = async () => pending;
+		expect(await run('/mq try', 'dev', 4)).toMatchObject({ ok: true });
+		expect(deps.replies[0][1]).toContain('run queue position #1');
+		expect(deps.replies[0][1]).not.toContain('Started a try run');
+	});
+
 	test('starts a try run and replies with its branch', async () => {
 		batchMode();
 		expect(await run('/mq try', 'dev', 4)).toMatchObject({ ok: true, reaction: '+1' });

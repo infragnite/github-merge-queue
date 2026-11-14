@@ -16,6 +16,12 @@ import { noteVisibility, readOnlyViewers, visibilityDue } from './public-view';
 import { repoVisibility } from './api-service';
 import { dashboardStackAnalysis } from './stack-runtime';
 import { pipelineView } from './pipeline-view';
+import { log } from './log';
+import { recordTick } from './telemetry';
+import { livenessProblem } from './liveness';
+import { withDoing } from './stall-watch';
+
+const label = (repo: { owner: string; name: string }) => `${repo.owner}/${repo.name}`;
 
 /** The reset time last logged per repo, so a rate limit is logged once, not every cycle. */
 const loggedLimit = new Map<number, number>();
@@ -25,7 +31,7 @@ async function rateLimited(repo: RepoRef): Promise<boolean> {
 	noteTickError(repo.id, new Error(`GitHub rate limit for this app is used up; the queue resumes at ${new Date(until).toISOString().slice(11, 16)} UTC`));
 	if (loggedLimit.get(repo.id) !== until) {
 		loggedLimit.set(repo.id, until);
-		console.warn(`[merge-queue] ${repo.owner}/${repo.name}: GitHub rate limit reached; the queue waits until ${new Date(until).toISOString()}`);
+		log.warn('GitHub rate limit reached; the queue waits for the reset', { repo: label(repo), until: new Date(until).toISOString() });
 	}
 	return true;
 }
@@ -34,11 +40,20 @@ type RepoRef = { id: number; owner: string; name: string; default_branch: string
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
 let running = false;
+const startedAt = Date.now();
+let runningSince: number | null = null;
+let lastCycleEnd: number | null = null;
+
+/** Why the processor looks hung (for the health check), or null while its cycles keep finishing. */
+export function processorProblem(now = Date.now()): string | null {
+	if (!intervalId) return null;
+	return livenessProblem({ now, startedAt, lastCycleEnd, runningSince });
+}
 
 export function startProcessor() {
 	if (intervalId) return;
 	const interval = parseInt(env.PROCESSOR_INTERVAL || '15', 10) * 1000;
-	console.log(`[merge-queue] Processor started (interval: ${interval / 1000}s)`);
+	log.info('processor started', { interval_s: interval / 1000 });
 	intervalId = setInterval(processAll, interval);
 	setTimeout(processAll, 3000);
 }
@@ -59,24 +74,27 @@ export async function drainProcessor(timeoutMs = 25_000): Promise<void> {
 	stopping = true;
 	const deadline = Date.now() + timeoutMs;
 	while (running && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
-	console.log(`[merge-queue] Processor stopped${running ? ' (a cycle was still running)' : ''}`);
+	log.info('processor stopped', { cycle_running: running });
 }
 let stopping = false;
 
 async function processAll() {
 	if (running || stopping) return;
 	running = true;
+	runningSince = Date.now();
 
 	try {
 		const repos = db.getRepos();
 		for (const repo of repos) {
 			if (stopping) break;
-			await processRepo(repo);
+			await withDoing(`${repo.owner}/${repo.name}`, () => processRepo(repo));
 		}
 	} catch (err) {
-		console.error('[merge-queue] Processor error:', err);
+		log.error('processor cycle failed', { err });
 	} finally {
 		running = false;
+		runningSince = null;
+		lastCycleEnd = Date.now();
 	}
 }
 
@@ -94,7 +112,7 @@ async function recordOpenPRHeads(repo: RepoRef) {
 		db.stackStore(repo.id).recordHeads(prs.map((p) => ({ pr: p.number, sha: p.head.sha })));
 		db.prunePRHeads(repo.id, prs.map((p) => p.number));
 	} catch (err) {
-		console.error(`[merge-queue] Head polling failed for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
+		log.error('polling PR heads failed', { repo: label(repo), err });
 	}
 }
 
@@ -110,7 +128,7 @@ async function recordCosts(repo: RepoRef) {
 	try {
 		await recordRunCosts(repo, (sha, spend, branch) => github.actionsJobAttemptsForSha(repo.owner, repo.name, sha, branch, spend));
 	} catch (err) {
-		console.warn(`[merge-queue] Recording CI run times for ${repo.owner}/${repo.name} failed:`, err instanceof Error ? err.message : err);
+		log.warn('recording CI run times failed', { repo: label(repo), err });
 	}
 }
 
@@ -126,7 +144,7 @@ async function keepPublicPage(repo: RepoRef) {
 		noteVisibility(repo.id, await repoVisibility(() => github.getRepo(repo.owner, repo.name)), () => {
 			updateQueueSettings(repo.id, { publicView: false });
 			emitEvent(repo.id, null, 'settings', { by: 'merge-queue', changes: { publicView: { from: true, to: false } }, why: 'the repository is private on GitHub' });
-			console.warn(`[merge-queue] ${repo.owner}/${repo.name} is private on GitHub: its public queue page is turned off`);
+			log.warn('repository is private on GitHub: its public queue page is turned off', { repo: label(repo) });
 		});
 	}
 	if (!readOnlyViewers(repo.id) || Date.now() - (lastWarm.get(repo.id) ?? 0) < 60_000) return;
@@ -155,7 +173,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	if (await rateLimited(repo)) return;
 	await recordOpenPRHeads(repo);
 	await recordCosts(repo);
-	await keepPublicPage(repo).catch((err) => console.warn(`[merge-queue] Public page upkeep for ${repo.owner}/${repo.name} failed:`, err instanceof Error ? err.message : err));
+	await keepPublicPage(repo).catch((err) => log.warn('public page upkeep failed', { repo: label(repo), err }));
 
 	// Both modes run on the batch runtime: one by one is one run in flight, of the head stack.
 	const last = lastBatchTick.get(repo.id) ?? 0;
@@ -164,6 +182,7 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 	takeDirty(repo.id);
 	lastBatchTick.set(repo.id, Date.now());
 	const started = Date.now();
+	let outcome: Parameters<typeof recordTick>[2] = 'ok';
 	try {
 		// Tracked, so the queue page shows the step running (forming a batch, a restack) and a failed one.
 		const buildKind = () => (getActiveBatches(repo.id).some((b) => b.status === 'bisecting') ? ('bisect' as const) : ('forming' as const));
@@ -171,19 +190,25 @@ async function processRepo(repo: ReturnType<typeof db.getRepos>[number]) {
 		clearTickError(repo.id);
 	} catch (err) {
 		noteTickError(repo.id, err);
+		outcome = 'error';
 		if (missingPermission(err)) {
+			outcome = 'paused';
 			// Retrying can't fix it; say so once, where the dashboard shows it, instead of every tick.
 			const reason = `The GitHub App lacks a permission (${err.message}). Grant it in the App's settings, approve it on this account's installation, then resume.`;
 			updateQueueSettings(repo.id, { pausedReason: reason });
 			emitEvent(repo.id, null, 'paused', { reason });
-			console.error(`[merge-queue] Paused ${repo.owner}/${repo.name}: ${reason}`);
+			log.error('queue paused: the GitHub App lacks a permission', { repo: label(repo), reason, err });
 			return;
 		}
-		if (err instanceof RateLimitedError) return; // logged once by `rateLimited` on the next cycle
+		if (err instanceof RateLimitedError) {
+			outcome = 'rate_limited';
+			return; // logged once by `rateLimited` on the next cycle
+		}
 		// Transient GitHub or git errors: the next cycle picks up where this one stopped.
-		console.error(`[merge-queue] Batch queue error for ${repo.owner}/${repo.name}:`, err instanceof Error ? err.message : err);
+		log.error('queue tick failed', { repo: label(repo), err });
 	} finally {
 		const took = Date.now() - started;
-		if (took >= SLOW_TICK_MS) console.log(`[merge-queue] Batch tick for ${repo.owner}/${repo.name} took ${took} ms`);
+		recordTick(repo.id, took, outcome);
+		if (took >= SLOW_TICK_MS) log.info('slow queue tick', { repo: label(repo), took_ms: took, outcome });
 	}
 }

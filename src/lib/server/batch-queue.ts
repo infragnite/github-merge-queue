@@ -44,13 +44,14 @@ import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
 import { HeadMovedError } from './head-moved';
 import { failureAction } from './activity';
-import { emitEvent, heldPRs, type QueueEventKind } from './events';
+import { emitEvent, heldPRs, unreportedDequeues, lastRepoEvent, type QueueEventKind } from './events';
+import { log } from './log';
 
-/** The error, and what to do about it when someone can (a pause reason must say what to do). */
+/** The error, and what to do about it: a pause reason always says what to do. */
 function withAction(call: string, e: unknown): string {
 	const message = e instanceof Error ? e.message : String(e);
 	const action = failureAction(call, e);
-	return action ? `${message}. ${action}` : message;
+	return `${message}. ${action ?? 'Resume to try again'}`;
 }
 
 /** A PR as the queue sees it; `PRState`'s readiness fields come from `QueueGitHub.readiness`. */
@@ -69,6 +70,8 @@ export interface LivePR {
 	merged: boolean;
 	/** Its description, where it declares what it depends on (`Depends-On:`). */
 	body?: string | null;
+	/** Its labels' names (`no-auto-try` keeps it from automatic tries). */
+	labels?: string[];
 }
 
 export type Readiness = Pick<PRState, 'ciGreen' | 'approvedShas' | 'changesRequested'>;
@@ -200,10 +203,33 @@ export interface QueueDeps {
 }
 
 /** Why a PR deferred behind `ahead` waits. */
+/** The last plan logged per repository and kind (see `logPlan`). */
+const lastPlans = new Map<string, string>();
+
 const deferredReason = (ahead: number[]) => `Conflicts with ${ahead.map((a) => `#${a}`).join(' ')} ahead of it; waits for them to land`;
+
+/** A refused merge's hold reason: GitHub's own words. */
+const refusedReason = (message: string) => `GitHub refused the merge: ${message}`;
+
+/**
+ * GitHub's refusal of one PR's merge, which its author fixes: a rule, a review, a required check, its
+ * stack. Anything else (an outage, a merge still running, a base that moved) pauses for a resume.
+ */
+const PR_REFUSAL =
+	/rule violations|approving review|reviews? (?:are|is) required|review is required|code owner|verified signatures|signed commits|conversations? must be resolved|comments must be resolved|must be (?:successfully )?deployed|draft|is closed|open PRs? in its GitHub stack/i;
+
+/** `why`, ending in what to do: resume, unless it already says so. */
+const resumable = (why: string) => `${why}${/[.!?]$/.test(why) ? '' : '.'}${/\bresume\b/i.test(why) ? '' : ' Resume to try again.'}`;
+
+/** Holds whose notice a recheck may post later, when it failed or was kept quiet. */
+const TOLD_LATER: ReadonlySet<string> = new Set<HoldCode>(['conflict', 'workflow-permission', 'merge-refused']);
 
 const LIVE = ['queued', 'checking', 'updating', 'merging', 'conflict'];
 export const CONFLICT_LABEL = 'needs-rebase';
+/** A PR with this label is never tried automatically. */
+export const AUTO_TRY_LABEL = 'no-auto-try';
+/** Queue statuses of a PR a batch carries: the queue is testing it. */
+const IN_BATCH = ['checking', 'updating', 'merging'];
 
 /** `wait`: the failed check's workflow is still running other jobs; GitHub re-runs only finished runs. */
 export type RerunResult = 'rerun' | 'none' | 'wait';
@@ -241,9 +267,11 @@ class Tick {
 	private readonly movedThisTick = new Set<number>();
 
 	private readonly d: QueueDeps;
+	private readonly postLinkedCheck: QueueDeps['github']['setPRCheck'];
 
 	constructor(deps: QueueDeps) {
 		const repoId = deps.repo.id;
+		this.postLinkedCheck = deps.github.setPRCheck;
 		// A check replaces the one sent before it for the same commit: whatever that one waited for goes.
 		const setPRCheck = async (sha: string, c: PRCheck) => {
 			store.setRunLinkWait(repoId, { sha, suffix: c.suffix ?? '' });
@@ -257,12 +285,24 @@ class Tick {
 	}
 
 	log(msg: string) {
-		(this.d.log ?? ((m) => console.log(`[batch-queue] ${this.d.repo.owner}/${this.d.repo.name}: ${m}`)))(msg);
+		(this.d.log ?? ((m) => log.info(m, { repo: `${this.d.repo.owner}/${this.d.repo.name}` })))(msg);
 	}
 
 	/** Catch handler for a call whose failure must not stop the tick; the failure is still logged. */
 	bestEffort(what: string) {
 		return (err: unknown) => this.log(`${what} failed (ignored): ${err instanceof Error ? err.message : err}`);
+	}
+
+	/**
+	 * Logs what the planner saw and chose, for finding out later why a PR waited (an urgent PR
+	 * behind a bisection, a red branch): only when it differs from the last plan of the same kind.
+	 */
+	logPlan(kind: 'all' | 'urgent', fields: Record<string, unknown>) {
+		const key = `${this.repoId}:${kind}`;
+		const said = JSON.stringify(fields);
+		if (lastPlans.get(key) === said) return;
+		lastPlans.set(key, said);
+		log.info('plan', { repo: `${this.d.repo.owner}/${this.d.repo.name}`, ...fields });
 	}
 
 	event(pr: number | null, kind: QueueEventKind, data: Record<string, unknown> = {}) {
@@ -316,6 +356,20 @@ class Tick {
 			if (ciGreen === null && from[0].ciGreen === true) ciGreen = true;
 		}
 		if (!this.settings().config.requirePRChecks) ciGreen = true;
+		const config = this.settings().config;
+		let tried: PRState['tried'];
+		let tryFailure: string | undefined;
+		let autoTried: boolean | undefined;
+		if (config.requireTryPass) {
+			tried = store.tryStatus(this.repoId, n, [p.headSha, ...from.map((f) => f.sha)]);
+			const outcome = store.autoTryOutcome(this.repoId, n, p.headSha);
+			if (tried === 'none' && outcome === 'conflict') {
+				tried = 'failed';
+				tryFailure = `Its try could not start: it does not apply on ${this.d.repo.default_branch}`;
+			}
+			const s = store.getQueueSettings(this.repoId);
+			autoTried = s.mode === 'batch' && config.autoTry && !this.autoTryBar(p, null);
+		}
 		return {
 			pr: n,
 			headSha: p.headSha,
@@ -324,7 +378,8 @@ class Tick {
 			approvedShas,
 			changesRequested: r.changesRequested,
 			targetsDefault: p.baseRef === this.d.repo.default_branch,
-			fromFork: !p.sameRepo
+			fromFork: !p.sameRepo,
+			...(tried ? { tried, autoTried, ...(tryFailure ? { tryFailure } : {}) } : {})
 		};
 	}
 
@@ -389,6 +444,21 @@ class Tick {
 
 	/** Checks that link a branch's runs are sent again, with the same title, linking the run itself once CI lists it. */
 	async linkRuns() {
+		// Cards also need links for baselines and work already running before link waits existed.
+		const active = store.getActiveBatches(this.repoId);
+		const runs = [...active, ...active.flatMap((b) => store.getBisectRuns(b.id)), ...store.getRunningTries(this.repoId)];
+		const baseline = store.getRunningBaseline(this.repoId);
+		if (baseline) runs.push(baseline);
+		for (const run of runs) {
+			if (run.run_url || !['testing', 'retrying'].includes(run.status)) continue;
+			try {
+				const url = await this.d.ci.runUrl(run.head_sha);
+				if (url) store.setBatchRunUrl(run.id, url);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('ci.runUrl')(e);
+			}
+		}
 		const waits = store.runLinkWaits(this.repoId);
 		for (const branch of new Set(waits.map((w) => w.branch))) {
 			const run = store.getBatchByBranch(this.repoId, branch);
@@ -397,21 +467,27 @@ class Tick {
 				store.clearRunLinkWaits(this.repoId, branch);
 				continue;
 			}
-			const url = await this.d.ci.runUrl(run.head_sha).catch(() => null);
+			const url = run.run_url;
 			if (!url) continue;
 			store.setBatchRunUrl(run.id, url);
-			// Each check sent drops its wait (see the constructor): one cut short is sent on the next tick.
-			for (const w of waits.filter((w) => w.branch === branch)) {
-				await this.d.github
-					.setPRCheck(w.sha, { state: 'in_progress', title: w.title, ...(w.suffix ? { suffix: w.suffix } : {}), url })
-					.catch(this.bestEffort('github.setPRCheck'));
+			for (const w of store.runLinkWaits(this.repoId).filter((w) => w.branch === branch)) {
+				try {
+					await this.postLinkedCheck(w.sha, { state: 'in_progress', title: w.title, ...(w.suffix ? { suffix: w.suffix } : {}), url });
+					store.setRunLinkWait(this.repoId, { sha: w.sha, suffix: w.suffix });
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					this.bestEffort('github.setPRCheck')(e);
+				}
 			}
 		}
 	}
 
+	/** The batch being landed: a pause while it lands is that batch's, and cancelling it ends the pause. */
+	landing: number | null = null;
+
 	pause(reason: string) {
 		store.updateQueueSettings(this.repoId, { pausedReason: reason });
-		this.event(null, 'paused', { reason });
+		this.event(null, 'paused', { reason, ...(this.landing !== null ? { batch: this.landing } : {}) });
 		this.log(reason);
 	}
 
@@ -590,7 +666,7 @@ class Tick {
 	 * told on the PR. A push clears it and the PR is picked up again.
 	 */
 	/** `base`: the default branch head it conflicted with alone; the conflict is checked again once the branch moves. Without one, only a push retries it. */
-	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' = 'conflict', base?: string, parent?: number) {
+	async conflict(n: number, reason: string, files: string[], fix: string, code: 'conflict' | 'workflow-permission' | 'merge-refused' = 'conflict', base?: string, parent?: number) {
 		const it = this.item(n);
 		const p = await this.pr(n);
 		// Told this conflict on this head already (it was tried again and still conflicts): the check says it again, no new comment.
@@ -599,7 +675,7 @@ class Tick {
 		const same = !!was && was.code === code && was.head === p.headSha && was.reason === reason;
 		const toldBefore = same && (!!was?.told || (!!was?.quiet && !this.speaks('attention')));
 		// A conflict with the default branch may go away when the branch moves: it is checked again then. A
-		// restack's conflict (old parent commits) and a workflow change wait for a push.
+		// restack's conflict (old parent commits), a workflow change and a refused merge wait for a push.
 		const save = (told: boolean) =>
 			it && store.setHold(it.id, { code, reason, head: p.headSha, told, ...(told ? {} : { quiet: true }), ...(base ? { base } : {}), ...(parent !== undefined ? { parent } : {}), ...(files.length ? { files } : {}), ...(fix ? { fix } : {}) });
 		if (it) {
@@ -899,7 +975,14 @@ class Tick {
 		// Recorded before the first merge: a crash before it is cleared is finished by `recoverLanding`.
 		store.setLandingIntent(this.repoId, { batchId: batch.id, srcId: src.id, prs: part, group: prs });
 		const merged: number[] = [];
-		const ok = (await this.landNow(batch, part, src, merged)) && this.skipped.size === 0;
+		this.landing = batch.id;
+		let landed: boolean;
+		try {
+			landed = await this.landNow(batch, part, src, merged);
+		} finally {
+			this.landing = null;
+		}
+		const ok = landed && this.skipped.size === 0;
 		// What landed is recorded together with clearing the intent, so a crash can't split them.
 		// A landing of part of the group (one stopped, or left PRs out) puts on master a tree no run
 		// tested on its own (only the whole group was), so it is not marked green; the next tick
@@ -1024,7 +1107,7 @@ class Tick {
 			// Each merge lands exactly the tree tested for its step; once a PR is left out, only the
 			// first merge still has one (the group's base): something merged around the queue is a pause.
 			if ((!this.skipped.size || !merged.length) && (await this.d.git.tree(master)) !== expected) {
-				this.pause(`Master changed while batch ${batch.number} was landing (before #${n}); was something merged outside the queue?`);
+				this.pause(`Master changed while batch ${batch.number} was landing (before #${n}): something was merged outside the queue. Resume to test the rest on top of it.`);
 				return false;
 			}
 			const step = src.steps[n];
@@ -1063,6 +1146,32 @@ class Tick {
 				);
 				continue;
 			}
+			// Pushes the head the PR lands as, in place of its tested head: whether it landed there, or
+			// the author pushed first (back in line), or the queue stopped.
+			const replace = async (to: string, what: string, reason: string): Promise<'pushed' | 'moved' | 'stopped'> => {
+				try {
+					await this.d.github.pushHead(p.headRef, to, head);
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					if (e instanceof HeadMovedError) {
+						await this.headMovedWhileLanding(batch, n, head, prs, src);
+						return 'moved';
+					}
+					this.pause(`Could not push the ${what} #${n}: ${withAction('pushHead', e)}`);
+					return 'stopped';
+				}
+				store.recordRebasedHead(this.repoId, n, head, to, true);
+				this.event(n, 'rebased', { from: head, to, onto: def, reason });
+				head = to;
+				// GitHub takes a moment to see the new head; merging before that is refused.
+				if (!(await this.waitForHead(n, head))) {
+					this.pause(`GitHub did not pick up the new head of #${n} in time. Resume once #${n} on GitHub shows the new head.`);
+					return 'stopped';
+				}
+				return 'pushed';
+			};
+			/** Master merged into the PR with `tree`: GitHub's squash of that head onto master is `tree`. */
+			const mergeIn = (tree: string) => this.d.git.mergeCommit(tree, [head, master], `Merge ${def} into ${p.headRef}`);
 			if (asIs) {
 				// Nothing to change.
 			} else if (step.fork) {
@@ -1075,29 +1184,15 @@ class Tick {
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
-				if (!r.ok || (!this.skipped.size && r.tree !== step.tree)) {
-					this.pause(`Could not restack #${n} onto master to land it: ${r.ok ? 'the result differs from the tested tree' : r.reason}`);
-					return false;
-				}
-				try {
-					await this.d.github.pushHead(p.headRef, r.head, head);
-				} catch (e) {
-					if (e instanceof RateLimitedError) throw e;
-					if (e instanceof HeadMovedError) {
-						await this.headMovedWhileLanding(batch, n, head, prs, src);
-						continue;
-					}
-					this.pause(`Could not push the restacked #${n}: ${withAction('pushHead', e)}`);
-					return false;
-				}
-				store.recordRebasedHead(this.repoId, n, head, r.head, true);
-				this.event(n, 'rebased', { from: head, to: r.head, onto: def, reason: 'landing after its parent' });
-				head = r.head;
-				// GitHub takes a moment to see the new head; merging before that is refused.
-				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the restacked head of #${n} in time`);
-					return false;
-				}
+				const done =
+					r.ok && (this.skipped.size || r.tree === step.tree)
+						? await replace(r.head, 'restacked', 'landing after its parent')
+						: // Its own commits don't replay onto master one by one (it merged its parent in, say),
+							// though the tree it was tested with does: master merged in with that tree lands it.
+							// The batch's commit carries that tree into the mirror, however long ago it was built.
+							(await this.d.git.fetch([src.head_sha]), await replace(await mergeIn(step.tree), 'merge of master into', `merged ${def} with the tested tree to land after its parent`));
+				if (done === 'moved') continue;
+				if (done === 'stopped') return false;
 			} else {
 				// A file the queue's merge drivers merged where GitHub's line merge conflicts or differs:
 				// merge master into the PR with the tree the queue merged; GitHub's squash of that head is then this tree.
@@ -1107,28 +1202,12 @@ class Tick {
 						this.skip(this.skipped, prs, n);
 						continue;
 					}
-					this.pause(`Could not merge ${def} into #${n} to land it: the result differs from the tested tree`);
+					this.pause(`Could not merge ${def} into #${n} to land it: the result differs from the tested tree. Merge ${def} into #${n} by hand and push, then resume.`);
 					return false;
 				}
-				const merge = await this.d.git.mergeCommit(t.queue, [head, master], `Merge ${def} into ${p.headRef}`);
-				try {
-					await this.d.github.pushHead(p.headRef, merge, head);
-				} catch (e) {
-					if (e instanceof RateLimitedError) throw e;
-					if (e instanceof HeadMovedError) {
-						await this.headMovedWhileLanding(batch, n, head, prs, src);
-						continue;
-					}
-					this.pause(`Could not push the merge of ${def} into #${n}: ${withAction('pushHead', e)}`);
-					return false;
-				}
-				store.recordRebasedHead(this.repoId, n, head, merge, true);
-				this.event(n, 'rebased', { from: head, to: merge, onto: def, reason: `merged ${def} with the queue's merge drivers to land` });
-				head = merge;
-				if (!(await this.waitForHead(n, head))) {
-					this.pause(`GitHub did not pick up the new head of #${n} in time`);
-					return false;
-				}
+				const done = await replace(await mergeIn(t.queue), 'merge of master into', `merged ${def} with the queue's merge drivers to land`);
+				if (done === 'moved') continue;
+				if (done === 'stopped') return false;
 			}
 			if (p.baseRef !== def) await this.d.github.retargetBase(n, def);
 			// The default branch requires this status, so only the queue can merge, and only what it
@@ -1164,9 +1243,35 @@ class Tick {
 					this.skip(this.skipped, prs, n);
 					continue;
 				}
-				await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
-				this.pause(`Landing batch ${batch.number} stopped at #${n}: ${m.message ?? 'merge refused'}`);
-				return false;
+				const why = m.message ?? 'merge refused';
+				if (!PR_REFUSAL.test(why)) {
+					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
+					this.pause(`Landing batch ${batch.number} stopped at #${n}: ${resumable(why)}`);
+					return false;
+				}
+				// The same refusal already holds another PR: it is the repository's, not this PR's. Once
+				// the repository is fixed, resuming retries both.
+				const others = this.items().filter((i) => {
+					const h = i.pr_number !== n ? store.storedHold(i as QueueItem & { hold?: string | null }) : null;
+					return h?.code === 'merge-refused' && h.reason === refusedReason(why);
+				});
+				if (others.length) {
+					await this.d.github.setPRCheck(head, { state: 'queued', title: short(`Waiting for the merge queue (landing stopped)`) }).catch(this.bestEffort('github.setPRCheck'));
+					for (const o of others) {
+						db.updateQueueItemStatus(o.id, 'queued', null as unknown as string);
+						store.setHold(o.id, null);
+						if (o.head_sha) await this.d.github.setPRCheck(o.head_sha, { state: 'queued', title: short('Waiting for the merge queue') }).catch(this.bestEffort('github.setPRCheck'));
+						this.event(o.pr_number, 'requeued', { reason: `the same refusal as #${n}: the repository's, not the PR's` });
+					}
+					this.pause(
+						`GitHub refused to merge #${n} with the same reason as #${others[0].pr_number} (${why}), so the cause is likely in the repository's settings, not in the PRs. Fix that, then resume.`
+					);
+					return false;
+				}
+				// Only this PR: it waits for its author's push; the rest lands without it.
+				this.skip(this.skipped, prs, n);
+				await this.conflict(n, refusedReason(why), [], '', 'merge-refused');
+				continue;
 			}
 			merged.push(n);
 			master = m.sha ?? (await this.d.github.defaultBranchSha());
@@ -1188,7 +1293,7 @@ class Tick {
 			return merged.length > 0;
 		}
 		if ((await this.d.git.tree(master)) !== expected) {
-			this.pause(`Master after batch ${batch.number} does not match the tested tree; was something merged outside the queue?`);
+			this.pause(`Master after batch ${batch.number} does not match the tested tree: something was merged outside the queue. Resume to check ${def} alone and go on from there.`);
 			return false;
 		}
 		await this.d.github.setStatus(master, 'success', `Tree tested in ${src.branch} (${src.head_sha.slice(0, 7)})`);
@@ -1283,7 +1388,8 @@ class Tick {
 		let m: { merged: boolean; sha?: string | null; message?: string } = { merged: false };
 		for (let i = 0; i < 4; i++) {
 			m = await this.d.github.squashMerge(n, `${title} (#${n})`, head);
-			if (m.merged || !/modified|not mergeable|try again|base branch was modified|405|409/i.test(m.message ?? '')) return m;
+			// A required status GitHub has not registered yet (the queue's own, set just before) is retried too.
+			if (m.merged || !/modified|not mergeable|try again|base branch was modified|405|409|status check .* is expected/i.test(m.message ?? '')) return m;
 			await this.sleep(2000 * (i + 1));
 		}
 		return m;
@@ -1340,7 +1446,7 @@ class Tick {
 				await this.retire(run);
 				store.setBatchStatus(run.id, 'failed');
 				store.clearMasterHealth(this.repoId);
-				this.pause(`The check of ${this.d.repo.default_branch} alone (${run.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
+				this.pause(`The check of ${this.d.repo.default_branch} alone (${run.branch}) got no CI result in time. Make the CI workflow run on pushes to mq/** branches, then resume.`);
 				return;
 			}
 			// Its tree passed in a batch; a default-branch run that never reports must not hold anything.
@@ -1391,7 +1497,7 @@ class Tick {
 		} catch (e) {
 			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
-			this.pause(`Could not start a check of ${this.d.repo.default_branch} alone: ${e instanceof Error ? e.message : e}`);
+			this.pause(`Could not start a check of ${this.d.repo.default_branch} alone: ${e instanceof Error ? e.message : e}. Resume to try again.`);
 			return;
 		}
 		store.insertBatch({
@@ -1460,9 +1566,12 @@ class Tick {
 		store.setBatchStatus(batch.id, 'failed');
 		await this.retire(batch);
 		this.requeue(batch.members);
+		const why = `Waiting: ${this.d.repo.default_branch} is red, and this PR does not fix it`;
 		for (const n of batch.members) {
 			const it = this.item(n);
-			if (it) db.updateQueueItemStatus(it.id, 'queued', `Waiting: ${this.d.repo.default_branch} is red, and this PR does not fix it`);
+			if (!it) continue;
+			db.updateQueueItemStatus(it.id, 'queued', why);
+			await this.d.github.setPRCheck(batch.heads[n], { state: 'queued', title: short(why) }).catch(this.bestEffort('github.setPRCheck'));
 		}
 	}
 
@@ -1526,7 +1635,7 @@ class Tick {
 			if (r === 'pending') {
 				if (this.timedOut(head)) {
 					await this.supersede([head, ...rest], 'ci-timeout');
-					this.pause(`Batch ${head.number} (${head.branch}) got no CI result in time; is the workflow running on mq/* branches?`);
+					this.pause(`Batch ${head.number} (${head.branch}) got no CI result in time. Make the CI workflow run on pushes to mq/** branches, then resume.`);
 				}
 				return;
 			}
@@ -1612,7 +1721,7 @@ class Tick {
 				await this.retire(batch);
 				store.setBatchStatus(batch.id, 'failed');
 				this.requeue(batch.members);
-				this.pause(`Bisection run ${run.branch} got no CI result in time`);
+				this.pause(`Bisection run ${run.branch} got no CI result in time. Make the CI workflow run on pushes to mq/** branches, then resume.`);
 				return;
 			}
 		}
@@ -1839,7 +1948,7 @@ class Tick {
 			if (e instanceof RateLimitedError) throw e;
 			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 			store.branchPushed(this.repoId, branch);
-			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}`);
+			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}. Resume to try again.`);
 			return;
 		}
 		for (const n of g.members) {
@@ -1854,9 +1963,17 @@ class Tick {
 	// --- try runs ---
 
 	/** Tests one PR on top of master, outside the pipeline, so its author gets CI on demand. */
-	async startTry(n: number): Promise<BatchRow> {
+	async startTry(n: number, opts: { auto?: boolean; head?: string } = {}): Promise<BatchRow> {
 		const p = await this.pr(n, true);
 		if (p.state !== 'open') throw new Error(`#${n} is not open`);
+		// An automatic try is of the head whose delay is over: one pushed since waits its own delay.
+		if (opts.head && p.headSha !== opts.head) throw new HeadMovedError(p.headRef, opts.head);
+		if (opts.auto) {
+			const bar = this.autoTryBar(p, null);
+			if (bar) throw new Error(`#${n} is not tried automatically: ${bar}`);
+		}
+		const same = store.runningTryOf(this.repoId, n, p.headSha);
+		if (same) throw new Error(`#${n} is already being tried at this head, in ${same.branch}`);
 		if (!p.sameRepo) {
 			// A try run executes the PR's code (its workflow too) in this repo's CI.
 			const s = await this.state(n, true);
@@ -1868,17 +1985,10 @@ class Tick {
 		const r = await this.buildOn(masterSha, [member], masterSha);
 		if (!r.ok) throw new Error(`#${n} does not apply on ${this.d.repo.default_branch}: ${r.reason.replace(/^#\d+ /, '')}`);
 		const branch = `mq/try-${n}-${this.d.now()}`;
-		store.intendBranch(this.repoId, branch, r.headSha);
-		await this.d.github.pushBranch(branch, r.headSha);
-		try {
-			await this.d.ci.start(branch, masterSha, r.headSha, [n]);
-		} catch (e) {
-			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
-			throw e;
-		}
-		const run = store.insertBatch({
+		const row = {
 			repoId: this.repoId,
-			kind: 'try',
+			kind: 'try' as const,
+			queued: true,
 			branch,
 			baseSha: masterSha,
 			headSha: r.headSha,
@@ -1886,11 +1996,277 @@ class Tick {
 			baseTree: await this.d.git.tree(masterSha),
 			members: [n],
 			heads: { [n]: p.headSha }
-		});
-		store.branchPushed(this.repoId, branch);
-		await this.checkAwaitingRun(p.headSha, { state: 'in_progress', title: short(`Trying on ${this.d.repo.default_branch} in ${branch}`), suffix: '/try' }, branch);
-		this.event(n, 'tried', { status: 'started', branch, run: run.id });
-		return run;
+		};
+		const run = opts.auto ? store.insertAutoTry(row, n, p.headSha) : store.insertBatch(row);
+		this.event(n, 'tried', { status: 'queued', branch, run: run.id, ...(opts.auto ? { auto: true } : {}) });
+		await this.drainTries();
+		return store.getBatch(run.id)!;
+	}
+
+	/** Only admitted tries are pushed: a push itself starts CI. Merge runs use no try slots. */
+	async drainTries() {
+		const limit = this.settings().config.parallelTries;
+		for (const queued of store.getQueuedTries(this.repoId)) {
+			const n = queued.members[0];
+			let p: LivePR;
+			try {
+				p = await this.pr(n, !this.settings().pausedReason && store.trySlotsInUse(this.repoId).length < limit);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				if ((e as { status?: number }).status === 404) store.setBatchStatus(queued.id, 'cancelled', 'PR no longer exists');
+				else this.bestEffort('queued try PR')(e);
+				continue;
+			}
+			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === queued.id);
+			const reason = p.state !== 'open' ? 'the PR was closed' : p.headSha !== queued.heads[n]
+				? 'a newer commit was pushed' : automatic ? this.autoTryBar(p, null) : null;
+			if (reason) {
+				store.setBatchStatus(queued.id, 'cancelled', reason);
+				await this.d.github.setPRCheck(queued.heads[n], { state: 'neutral', title: `Cancelled: ${reason}`, suffix: '/try' }).catch(this.bestEffort('github.setPRCheck'));
+				this.event(n, 'tried', { status: 'cancelled', run: queued.id, reason, auto: automatic });
+				continue;
+			}
+			if (this.settings().pausedReason || store.trySlotsInUse(this.repoId).length >= limit) continue;
+			if (!p.sameRepo && !(await this.state(n, true)).approvedShas.includes(p.headSha)) {
+				store.setBatchStatus(queued.id, 'cancelled', 'Fork approval was removed while waiting');
+				await this.d.github.setPRCheck(p.headSha, { state: 'action_required', title: 'A writer must approve this fork head before trying it', suffix: '/try' }).catch(this.bestEffort('github.setPRCheck'));
+				continue;
+			}
+			const master = await this.d.github.defaultBranchSha();
+			if (master !== queued.base_sha) {
+				await this.d.git.fetch([master, p.headSha]);
+				const r = await this.buildOn(master, [{ pr: n, headSha: p.headSha, title: p.title, parentHeadSha: null, ...(p.sameRepo ? {} : { drivers: false }) }], master);
+				if (!r.ok) {
+					store.setBatchCI(queued.id, 'failure');
+					store.setBatchStatus(queued.id, 'failed', r.reason);
+					await this.d.github.setPRCheck(p.headSha, { state: 'failure', title: `Does not apply on ${this.d.repo.default_branch}`, summary: r.reason, suffix: '/try' }).catch(this.bestEffort('github.setPRCheck'));
+					continue;
+				}
+				store.prepareQueuedTry(queued.id, { baseSha: master, baseTree: await this.d.git.tree(master), headSha: r.headSha, treeSha: r.tree });
+			}
+			const run = store.getBatch(queued.id)!;
+			// Reserve the slot before a push can start CI. A crash is recovered through the branch intent.
+			store.intendBranch(this.repoId, run.branch, run.head_sha);
+			store.tryStarted(run.id, this.d.now());
+			await this.d.github.pushBranch(run.branch, run.head_sha);
+			await this.d.ci.start(run.branch, run.base_sha, run.head_sha, [n]);
+			store.branchPushed(this.repoId, run.branch);
+
+			this.event(n, 'tried', { status: 'started', branch: run.branch, run: run.id, ...(automatic ? { auto: true } : {}) });
+		}
+		const starting = new Set(store.branchIntents(this.repoId).map((i) => i.branch));
+		for (const run of store.getRunningTries(this.repoId)) {
+			if (starting.has(run.branch) || (run.queue_position !== 0 && run.reported_run_url)) continue;
+			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === run.id);
+			try {
+				const url = run.run_url ?? await this.d.ci.runUrl(run.head_sha);
+				// Report admission immediately, then update once Actions has created its run.
+				if (run.queue_position !== 0 && !url) continue;
+				await this.d.github.setPRCheck(run.heads[run.members[0]], {
+					state: 'in_progress', title: short(`Trying on ${this.d.repo.default_branch} in ${run.branch}${automatic ? ' (automatic, on push)' : ''}`),
+					suffix: '/try', ...(url ? { url } : {})
+				});
+				store.tryStartedReported(run.id, url);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRCheck')(e);
+			}
+		}
+
+		for (const [i, run] of store.getQueuedTries(this.repoId).entries()) {
+			const position = i + 1;
+			if (run.queue_position === position) continue;
+			try {
+				await this.d.github.setPRCheck(run.heads[run.members[0]], {
+					state: 'queued', title: `Run queue position #${position}: waiting for a try slot`, suffix: '/try',
+					summary: `This try is #${position} in the runs queue. At most ${limit} tries run in parallel. Merge batches and bisects are exempt.`
+				});
+				store.tryPositionReported(run.id, position);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRCheck')(e);
+			}
+		}
+	}
+
+	// --- automatic tries ---
+
+	/**
+	 * Why `p` gets no automatic try now, or null when it may have one. `p` undefined: no longer open.
+	 * `open` is every open PR (a base that is one of their branches is a stack the PR is tried with).
+	 */
+	private autoTryBar(p: LivePR | undefined, open: Map<number, LivePR> | null): string | null {
+		const def = this.d.repo.default_branch;
+		if (!p) return 'the PR was closed';
+		if (p.draft && !this.settings().config.autoTryDrafts) return 'it is a draft';
+		if (!p.sameRepo) return 'it comes from a fork';
+		if (p.labels?.includes(AUTO_TRY_LABEL)) return `it has the ${AUTO_TRY_LABEL} label`;
+		// Without the list (a queued PR's admission), its base was checked by admission itself.
+		if (open && p.baseRef !== def && ![...open.values()].some((o) => o.sameRepo && o.headRef === p.baseRef && o.pr !== p.pr)) return `it targets ${p.baseRef}, not ${def}`;
+		const it = this.item(p.pr);
+		if (it && IN_BATCH.includes(it.status)) return 'the queue is testing it';
+		return null;
+	}
+
+	/** Stops an automatic try: its CI, its branch, and its check says why. */
+	private async cancelAutoTry(t: BatchRow, reason: string) {
+		const n = t.members[0];
+		const head = t.heads[n];
+		if (t.status === 'queued') {
+			store.cancelAutoTryRow(t, reason);
+		} else {
+			// Recorded first: a crash after it leaves only a branch and a run, which the intent has swept next tick.
+			store.intendBranch(this.repoId, t.branch, t.head_sha);
+			store.cancelAutoTryRow(t, reason);
+			await this.d.ci.cancel(t.head_sha);
+			// Left to the sweep of the intent next tick when the deletion fails.
+			const deleted = await this.d.github.deleteBranch(t.branch).then(
+				() => true,
+				(e) => {
+					this.bestEffort('github.deleteBranch')(e);
+					return false;
+				}
+			);
+			if (deleted) store.branchPushed(this.repoId, t.branch);
+		}
+		await this.d.github
+			.setPRCheck(head, { state: 'neutral', title: short(`Cancelled: ${reason}`), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.run_url ?? undefined })
+			.catch(this.bestEffort('github.setPRCheck'));
+		this.event(n, 'tried', { status: 'cancelled', branch: t.branch, run: t.id, headSha: head, auto: true, reason });
+		this.log(`automatic try of #${n} cancelled: ${reason}`);
+	}
+
+	/**
+	 * Automatic tries, after the queue's own work in a tick (its batches go first). Cancels each
+	 * running one whose PR was pushed to, closed, made a draft, opted out, retargeted or batched;
+	 * then, turned on in batch mode, starts the heads whose delay is over, oldest push first, up to
+	 * the limit.
+	 */
+	async autoTries() {
+		const settings = store.getQueueSettings(this.repoId);
+		const on = settings.mode === 'batch' && settings.config.autoTry;
+		const running = store.runningAutoTries(this.repoId);
+		const cooling = store.autoTryRows(this.repoId).filter((r) => r.cooldownReportedUntil !== null && (r.outcome === null || r.outcome === 'cancelled'));
+		if ((!on && !running.length && !cooling.length) || !this.d.github.openPRs) return;
+		this.open ??= new Map((await this.d.github.openPRs()).map((x) => [x.pr, x]));
+		const open = this.open;
+
+		// A received-event status must not wait forever after a push, closure or setting change.
+		for (const r of cooling) {
+			let p = open.get(r.pr);
+			if (!p && on) {
+				try {
+					const fresh = await this.d.github.pr(r.pr);
+					if (fresh.state === 'open') { p = fresh; open.set(r.pr, fresh); }
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					if ((e as { status?: number }).status !== 404) continue;
+				}
+			}
+			const queued = this.item(r.pr) && !settings.config.requireTryPass;
+			const reason = !on ? 'automatic tries were disabled' : p && p.headSha !== r.headSha ? 'a newer commit was pushed' : queued ? 'the PR is in the merge queue' : this.autoTryBar(p, open);
+			if (!reason) continue;
+			try {
+				await this.d.github.setPRCheck(r.headSha, { state: 'neutral', title: `Cancelled: ${reason}`, suffix: '/try' });
+				store.setAutoTry(this.repoId, r.pr, r.headSha, 'cancelled');
+				store.cooldownReported(this.repoId, r.pr, r.headSha, null);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRCheck')(e);
+			}
+		}
+
+		for (const t of running) {
+			const n = t.members[0];
+			let p = open.get(n);
+			if (!p) {
+				// Not in the list: closed, merged or gone; anything else (an outage) is looked at next tick.
+				try {
+					const fresh = await this.d.github.pr(n);
+					if (fresh.state === 'open') continue;
+					if (fresh.merged) {
+						await this.cancelAutoTry(t, 'the PR was merged');
+						continue;
+					}
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					if ((e as { status?: number }).status !== 404) continue;
+				}
+			}
+			const reason = p && p.headSha !== t.heads[n] ? 'a newer commit was pushed' : this.autoTryBar(p, open);
+			if (reason) await this.cancelAutoTry(t, reason);
+		}
+		if (!on) return;
+
+		const now = this.d.now();
+		const heads = [...open.values()].map((p) => ({ pr: p.pr, sha: p.headSha }));
+		if (!store.autoTriesPrimed(this.repoId)) {
+			store.primeAutoTries(this.repoId, heads, now);
+			return;
+		}
+		store.seeAutoTryHeads(this.repoId, heads, now);
+
+		const due: store.AutoTryRow[] = [];
+		for (const r of store.autoTryRows(this.repoId)) {
+			const it = this.item(r.pr);
+			// Queued, it is tested by the queue; unless the queue waits for a passed try first, which then
+			// starts even for a head that was open when automatic tries were turned on.
+			const waitsForTry = settings.config.requireTryPass && it?.status === 'queued';
+			if (it && !waitsForTry) continue;
+			if (r.outcome !== null && r.outcome !== 'cancelled' && !(waitsForTry && r.outcome === 'existing')) continue;
+			const p = open.get(r.pr);
+			if (!p || p.headSha !== r.headSha || this.autoTryBar(p, open)) continue;
+			// Tried already, or run by the queue itself (a batch that failed or was left): its CI is known.
+			if (store.hasTry(this.repoId, r.pr, r.headSha) || (!waitsForTry && store.queueRanHead(this.repoId, r.pr, r.headSha))) {
+				store.setAutoTry(this.repoId, r.pr, r.headSha, 'tried');
+				continue;
+			}
+			const until = r.seenAt + settings.config.autoTryDelayMs;
+			if (now < until && !(waitsForTry && r.outcome === 'existing')) {
+				if (r.cooldownReportedUntil !== until) {
+					const at = (ms: number) => `${new Date(ms).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+					try {
+						await this.d.github.setPRCheck(r.headSha, {
+							state: 'queued', suffix: '/try', title: `Push received: auto try after ${at(until)}`,
+							summary: `Commit ${r.headSha.slice(0, 8)} was observed at ${at(r.seenAt)}. Waiting for the cooldown until ${at(until)}. Then this try joins the runs queue; it starts when a parallel try slot is free. A newer push resets the cooldown.`
+						});
+						store.cooldownReported(this.repoId, r.pr, r.headSha, until);
+					} catch (e) {
+						if (e instanceof RateLimitedError) throw e;
+						this.bestEffort('github.setPRCheck')(e);
+					}
+				}
+				continue;
+			}
+
+			due.push(r);
+		}
+		// Acknowledge every new push before slow git preparation can delay the other PRs' statuses.
+		for (const r of due) {
+			try {
+				await this.startTry(r.pr, { auto: true, head: r.headSha });
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				const message = e instanceof Error ? e.message : String(e);
+				if (/ does not apply on /.test(message)) {
+					store.setAutoTry(this.repoId, r.pr, r.headSha, 'conflict');
+					const def = this.d.repo.default_branch;
+					const why = message.replace(/^#\d+ does not apply on [^:]+: ?/, '');
+					await this.d.github
+						.setPRCheck(r.headSha, {
+							state: 'failure',
+							title: short(`Does not apply on ${def}`),
+							summary: `${why ? `${why.replace(/\.$/, '')}. ` : ''}Rebase it (or the bottom of its stack) on \`${def}\` and push.`,
+							suffix: '/try'
+						})
+						.catch(this.bestEffort('github.setPRCheck'));
+					this.event(r.pr, 'tried', { status: 'conflict', headSha: r.headSha, auto: true });
+				} else {
+					// An outage, or a head that moved or became barred meanwhile: looked at again next tick.
+					this.log(`could not start the automatic try of #${r.pr}: ${message}`);
+				}
+			}
+		}
 	}
 
 	async advanceTries() {
@@ -1898,7 +2274,12 @@ class Tick {
 			let r = await this.d.ci.result(t.head_sha);
 			if (r === 'pending' && !this.timedOut(t)) continue;
 			if (r === 'pending') {
-				await this.d.ci.cancel(t.head_sha).catch(this.bestEffort('ci.cancel'));
+				try {
+					await this.d.ci.cancel(t.head_sha);
+				} catch (e) {
+					store.intendBranch(this.repoId, t.branch, t.head_sha);
+					this.bestEffort('ci.cancel')(e);
+				}
 				r = 'failure';
 			}
 			store.setBatchCI(t.id, r);
@@ -1910,7 +2291,7 @@ class Tick {
 			const summary =
 				r === 'success' ? `${desc}. \`/mq queue\` lands it ahead of every PR but urgent ones, without another run, while neither it nor \`${def}\` changes.` : undefined;
 			await this.d.github
-				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: await this.runLink(t) })
+				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.run_url ?? undefined })
 				.catch(this.bestEffort('github.setPRCheck'));
 			await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
 			this.event(n, 'tried', { status: r, branch: t.branch, run: t.id, headSha: t.heads[n] });
@@ -1934,7 +2315,8 @@ class Tick {
 					if ((await this.d.ci.runUrl(row.head_sha)) === null) await this.d.ci.start(branch, row.base_sha, row.head_sha, [...row.context, ...row.members]);
 				} else {
 					this.log(`removing ${branch}: left behind by an interrupted start`);
-					await this.d.ci.cancel(sha).catch(this.bestEffort('ci.cancel'));
+					if (row?.kind === 'try') await this.d.ci.cancel(sha);
+					else await this.d.ci.cancel(sha).catch(this.bestEffort('ci.cancel'));
 					await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 				}
 				store.branchPushed(this.repoId, branch);
@@ -1991,8 +2373,8 @@ class Tick {
 		// Still held, and its comment failed or the setting kept it quiet and now allows it: posted now.
 		const now = this.item(it.pr_number);
 		const hold = now ? store.storedHold(now as QueueItem & { hold?: string | null }) : null;
-		if (!hold || hold.told || hold.head !== p.headSha || (hold.code !== 'conflict' && hold.code !== 'workflow-permission')) return;
-		const notice = { pr: it.pr_number, head: p.headSha, code: hold.code as 'conflict' | 'workflow-permission', reason: hold.reason, files: hold.files ?? [], ...(hold.fix ? { fix: hold.fix } : {}) };
+		if (!hold || hold.told || hold.head !== p.headSha || !TOLD_LATER.has(hold.code)) return;
+		const notice = { pr: it.pr_number, head: p.headSha, code: hold.code as HoldCode, reason: hold.reason, files: hold.files ?? [], ...(hold.fix ? { fix: hold.fix } : {}) };
 		if (!(await this.say(it.pr_number, holdNotice(notice), 'attention'))) return;
 		const { quiet: _, ...rest } = hold;
 		store.setHold(it.id, { ...rest, told: true });
@@ -2001,7 +2383,8 @@ class Tick {
 	/** Puts a held conflict back in line when what it conflicted with moved and it may apply now; whether it did. */
 	private async releaseConflict(it: QueueItem, p: LivePR, master: string): Promise<boolean> {
 		const hold = store.storedHold(it as QueueItem & { hold?: string | null });
-		if (hold?.code === 'workflow-permission') return false;
+		// Only the author's push retries these: moving master changes nothing about them.
+		if (hold?.code === 'workflow-permission' || hold?.code === 'merge-refused') return false;
 		// A restack's conflict with its rebased parent: back in line once the parent moved; the restack tries again.
 		if (hold?.code === 'conflict' && hold.parent !== undefined) {
 			const parent = await this.pr(hold.parent).catch((e) => {
@@ -2244,11 +2627,27 @@ class Tick {
 			store.setHold(it.id, { code, reason, told, head: head ?? undefined, ...(told ? {} : { quiet: true }) });
 			this.event(it.pr_number, 'held', { code, reason });
 		}
-		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).
+	}
+
+	/** Finish reports for removed PRs even if they never had a hold, or the queue is paused. */
+	async clearDepartedReports() {
 		const live = new Set(this.items().map((i) => i.pr_number));
-		for (const n of heldPRs(this.repoId)) {
+		for (const n of new Set([...heldPRs(this.repoId), ...unreportedDequeues(this.repoId)])) {
 			if (live.has(n)) continue;
-			if ((await tell(n, () => ({ state: 'queued', title: 'Not in the merge queue' }))) !== false) this.event(n, 'released', { reason: 'left the queue' });
+			try {
+				const p = await this.pr(n);
+				if (this.item(n)) continue; // requeued while GitHub was being read
+				// Do not overwrite the successful report of a PR that landed meanwhile.
+				if (!p.merged) await this.d.github.setPRCheck(p.headSha, {
+					state: 'action_required', title: 'Not in the merge queue',
+					summary: 'This PR was removed from the merge queue. Queue it again with `/mq queue` when it is ready.'
+				});
+				this.event(n, 'released', { reason: 'left the queue' });
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				// No acknowledgement: retry the read or report on the next tick.
+				this.bestEffort('clearDepartedReports')(e);
+			}
 		}
 	}
 
@@ -2308,7 +2707,19 @@ class Tick {
 		// stacked) until one passes: that batch carries a fix and lands. When no untried PR can be
 		// batched, each PR gets one more go alone, in case another PR in its batch broke it too.
 		const red = this.masterState(await this.d.git.tree(masterSha)) === 'red';
-		if (red && opts.urgentOnly) return 'idle';
+		const said = (fields: Record<string, unknown>) =>
+			!opts.holdsOnly &&
+			this.logPlan(opts.urgentOnly ? 'urgent' : 'all', {
+				red,
+				urgent_only: opts.urgentOnly ? true : undefined,
+				queue: queue.map((e) => ({ pr: e.pr, priority: e.priority })),
+				active: active.map((b) => ({ batch: b.id, number: b.number, status: b.status, prs: b.members })),
+				...fields
+			});
+		if (red && opts.urgentOnly) {
+			said({ batch: null, why: `${this.d.repo.default_branch} is red: urgent PRs wait with the rest for a batch that fixes it` });
+			return 'idle';
+		}
 		const analysis = await this.analysis();
 		let plan: Pick<ReturnType<typeof planNextBatch>, 'batch' | 'express' | 'held'>;
 		/** Plans again without the try of `n`, when building its stack did not give the tree it tested. */
@@ -2317,7 +2728,10 @@ class Tick {
 			// Siblings go only beside siblings: a stacked pipeline still in flight (built before the
 			// branch turned red) is decided first.
 			// (With `holdsOnly` nothing starts anyway; the plan still says what holds the PRs.)
-			if (!opts.holdsOnly && (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha))) return 'idle';
+			if (!opts.holdsOnly && (active.length >= settings.config.depth || active.some((b) => b.base_sha !== masterSha))) {
+				said({ batch: null, why: `${this.d.repo.default_branch} is red: the runs in flight are decided first` });
+				return 'idle';
+			}
 			const tried = new Set(store.getMasterHealth(this.repoId)!.tried);
 			const dependencies = await this.dependencies();
 			plan = planRedBatch({
@@ -2357,8 +2771,12 @@ class Tick {
 			without = (n) => planWith(new Set([...landable].filter((m) => m !== n)));
 			// Nothing urgent is ready: the bisection goes on. What holds PRs back is said when the
 			// queue plans them all (a PR stacked on one being bisected isn't "unqueued" meanwhile).
-			if (opts.urgentOnly && !plan.express) return 'idle';
+			if (opts.urgentOnly && !plan.express) {
+				said({ batch: null, why: 'no urgent PR is ready', held: plan.held.map((h) => ({ pr: h.pr, code: h.admission.code })) });
+				return 'idle';
+			}
 		}
+		said({ batch: plan.batch, express: plan.express, held: plan.held.map((h) => ({ pr: h.pr, code: h.admission.code, reason: h.admission.reason })) });
 		// On a red branch the deferred PRs were left out of the plan; they are still held.
 		if (!opts.urgentOnly) await this.recordHolds(red ? [...plan.held, ...[...deferred].map(([pr, admission]) => ({ pr, admission }))] : plan.held);
 		if (!plan.batch || opts.holdsOnly) return 'idle';
@@ -2409,11 +2827,35 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	const t = new Tick(deps);
 	const settings = store.getQueueSettings(deps.repo.id);
 	await t.recoverInterrupted();
-	if (settings.pausedReason) return;
+	await t.clearDepartedReports();
+	if (settings.pausedReason) {
+		await t.drainTries();
+		return;
+	}
 	await t.reconcile();
 	await t.linkRuns();
 	await t.advanceTries();
 	await t.advanceMaster();
+	try {
+		await tickPipeline(t, deps);
+	} catch (e) {
+		// A failing pipeline must not keep stale tries running: they are still cancelled (and started).
+		if (!(e instanceof RateLimitedError) && !store.getQueueSettings(deps.repo.id).pausedReason) {
+			t.forgetPRs();
+			await t.autoTries().catch((err) => t.log(`automatic tries after a failed tick: ${err instanceof Error ? err.message : err}`));
+		}
+		throw e;
+	}
+	// After the queue's own work: its batches take runners first. What it read of PRs may be minutes old by now.
+	if (!store.getQueueSettings(deps.repo.id).pausedReason) {
+		t.forgetPRs();
+		await t.autoTries();
+		await t.drainTries();
+	}
+}
+
+/** The pipeline's part of a tick: following the default branch, advancing batches, planning new ones. */
+async function tickPipeline(t: Tick, deps: QueueDeps): Promise<void> {
 
 	let active = store.getActiveBatches(deps.repo.id);
 	let masterSha = await deps.github.defaultBranchSha();
@@ -2546,6 +2988,13 @@ export async function cancelBatch(deps: QueueDeps, id: number, by: string): Prom
 	for (const r of store.getBisectRuns(id)) if (r.status === 'testing' || r.status === 'retrying') store.setBatchStatus(r.id, 'cancelled', reason);
 	await t.supersede(above, 'below-cancelled', `batch ${b.number} below it was cancelled`);
 	t.event(null, 'cancelled', { batch: id, number: b.number, by, requeued, rebuilt: above.map((x) => x.id) });
+	// A pause its landing caused: nothing of it is left to resume.
+	const paused = store.getQueueSettings(deps.repo.id).pausedReason;
+	const cause = paused ? lastRepoEvent(deps.repo.id, 'paused') : null;
+	if (cause && cause.data.batch === id && cause.data.reason === paused) {
+		store.updateQueueSettings(deps.repo.id, { pausedReason: null });
+		t.event(null, 'resumed', { by, reason: `batch ${b.number}, whose landing paused the queue, was cancelled` });
+	}
 	t.log(`batch ${b.number} cancelled by ${by}: ${requeued.map((n) => `#${n}`).join(' ') || 'no PRs'} back in line`);
 	return { requeued, rebuilt: above.map((x) => x.id) };
 }

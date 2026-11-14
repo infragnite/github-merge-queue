@@ -35,6 +35,7 @@ import { AuthError, bearer, resolveCaller, type AuthGitHub } from '$lib/server/a
 import * as api from '$lib/server/api-service';
 import { RequestLimiter, addressKey } from '$lib/server/request-limit';
 import { GitHubError } from '$lib/server/github-retry';
+import { log } from '$lib/server/log';
 
 // Per address before the token is checked, per user after: agents poll, but not this much.
 const byAddress = new RequestLimiter(240, 240);
@@ -98,6 +99,8 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 				// The dashboard's analysis: at most one fresh one a minute, none while the rate limit is low.
 				// Without the stacks (GitHub unreachable) every PR is a stack of its own.
 				return json(api.queueState(repo, await dashboardStackAnalysis(repo).catch(() => null)));
+			case 'GET runs':
+				return json(api.runsState(repo));
 			case 'POST pulls/:n/queue': {
 				const pr = await github.getPR(repo.owner, repo.name, n);
 				return json(api.enqueue(repo, caller, pr, await body()), { status: 201 });
@@ -170,7 +173,7 @@ const handle: RequestHandler = async ({ params, request, url, getClientAddress }
 		}
 	} catch (e) {
 		if (e instanceof AuthError || e instanceof api.ApiError) return json({ error: e.message }, { status: e.status });
-		console.error('[api] error:', e instanceof Error ? e.message : e);
+		log.error('agent API call failed', { err: e });
 		return json({ error: 'Internal error' }, { status: 500 });
 	}
 };

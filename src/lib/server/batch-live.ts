@@ -3,6 +3,7 @@
 
 import { env } from '$env/dynamic/private';
 import { existsSync, mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as github from './github';
@@ -18,6 +19,7 @@ import { bumpGeneration, memoByGeneration } from './wake';
 import type { LivePR, PRCheck, QueueDeps, Readiness } from './batch-queue';
 import type { CheckRunRequest, GhReview } from './github';
 import type { PRReport } from './batch-store';
+import { log } from './log';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
@@ -200,7 +202,8 @@ export class Mirror {
 		const dir = join(env.MIRROR_DIR || './data/mirrors', repo.owner, `${repo.name}.git`);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
-			new GitRunner(dir).run(['init', '-q', '--bare']);
+			// Once, when the repository is added: git creates an empty bare repository in an instant.
+			execFileSync('git', ['init', '-q', '--bare'], { cwd: dir, timeout: 30_000, stdio: 'ignore' });
 		}
 		this.git = new GitRunner(dir, mergeDriverEnv(dir));
 		this.plain = new GitRunner(dir);
@@ -224,12 +227,13 @@ export class Mirror {
 		};
 	}
 
-	has(sha: string): boolean {
-		return this.git.run(['cat-file', '-e', `${sha}^{commit}`], { allowFail: true }).code === 0;
+	async has(sha: string): Promise<boolean> {
+		return (await this.git.run(['cat-file', '-e', `${sha}^{commit}`], { allowFail: true })).code === 0;
 	}
 
 	async fetch(shas: string[]) {
-		const missing = [...new Set(shas)].filter((s) => !this.has(s));
+		const missing: string[] = [];
+		for (const s of new Set(shas)) if (!(await this.has(s))) missing.push(s);
 		if (missing.length === 0) return;
 		await this.network(`fetch ${missing.map((s) => s.slice(0, 8)).join(' ')}`, [
 			'fetch', '-q', '--no-tags', this.url, ...missing
@@ -263,15 +267,15 @@ export class Mirror {
 		const started = Date.now();
 		try {
 			await this.plain.runAsync(args, { env: await this.auth(), timeoutMs: NETWORK_TIMEOUT_MS });
-			console.log(`[git] ${name}: ${what} took ${Date.now() - started} ms`);
+			log.info('git network call', { repo: name, what, took_ms: Date.now() - started });
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const outcome = expected(message);
 			if (outcome) {
-				console.log(`[git] ${name}: ${what} refused after ${Date.now() - started} ms: ${outcome.message}`);
+				log.info('git network call refused', { repo: name, what, took_ms: Date.now() - started, err: outcome });
 				throw outcome;
 			}
-			console.error(`[git] ${name}: ${what} failed after ${Date.now() - started} ms: ${message}`);
+			log.error('git network call failed', { repo: name, what, took_ms: Date.now() - started, err: message });
 			throw err;
 		}
 	}
@@ -316,7 +320,7 @@ export function checkRunRequest(sha: string, check: PRCheck, at: { name: string;
 	return {
 		name: `${at.name}${check.suffix ?? ''}`,
 		head_sha: sha,
-		details_url: at.detailsUrl,
+		details_url: check.url ?? at.detailsUrl,
 		...(open ? { status: check.state as 'queued' | 'in_progress' } : { status: 'completed' as const, conclusion: check.state as Exclude<PRCheck['state'], 'queued' | 'in_progress'> }),
 		output: { title: check.title, summary }
 	};
@@ -368,6 +372,29 @@ export async function postPRReport(
 	}
 }
 
+/** Tries have one canonical Check Run. Only pre-existing legacy statuses are maintained. */
+export async function postTryReport(
+	check: PRCheck,
+	postCheck: () => Promise<unknown>,
+	legacyExists: () => Promise<boolean>,
+	postLegacy: (state: 'success' | 'failure' | 'pending') => Promise<unknown>
+): Promise<void> {
+	// Failure must retry: there is no legacy fallback for new heads.
+	await postCheck();
+	if (await legacyExists()) {
+		// A cancelled try must not leave its old legacy status pending forever.
+		const state = check.state === 'queued' || check.state === 'in_progress' ? 'pending' : check.state === 'success' ? 'success' : 'failure';
+		await postLegacy(state);
+	}
+}
+
+/** The configured workflow on this tested commit, not an Actions search or an arbitrary job. */
+export function workflowRunUrl(owner: string, repo: string, workflow: string, runs: Array<{ id: number; path?: string }>): string | null {
+	const path = `.github/workflows/${workflow}`;
+	const run = runs.filter((r) => r.path?.split('@')[0] === path).sort((a, b) => b.id - a.id)[0];
+	return run ? `https://github.com/${owner}/${repo}/actions/runs/${run.id}` : null;
+}
+
 export function liveDeps(repo: RepoRef): QueueDeps {
 	const { owner, name } = repo;
 	const mirror = new Mirror(repo);
@@ -375,13 +402,13 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 	const dispatchRef = () => ci().dispatchRef || repo.default_branch;
 	// What the required check waits for, read from the workflow file in the tested commit, by its blob.
 	const gates = new Map<string, ((name: string) => boolean) | null>();
-	const gateAt = (sha: string) => {
+	const gateAt = async (sha: string) => {
 		const path = `${sha}:.github/workflows/${ci().workflow}`;
-		const blob = mirror.git.run(['rev-parse', '--verify', '-q', path], { allowFail: true });
+		const blob = await mirror.git.run(['rev-parse', '--verify', '-q', path], { allowFail: true });
 		if (blob.code !== 0 || !blob.out) return null;
 		const key = `${blob.out}\0${ci().requiredCheck}`;
 		if (!gates.has(key)) {
-			const file = mirror.git.run(['cat-file', 'blob', blob.out], { allowFail: true });
+			const file = await mirror.git.run(['cat-file', 'blob', blob.out], { allowFail: true });
 			gates.set(key, file.code === 0 ? gateFeeds(file.out, ci().requiredCheck) : null);
 		}
 		return gates.get(key)!;
@@ -393,14 +420,14 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 		analysis: () => currentStackAnalysis(repo),
 		git: {
 			fetch: (shas) => mirror.fetch(shas),
-			tree: async (sha) => mirror.git.run(['rev-parse', `${sha}^{tree}`]).out,
+			tree: async (sha) => (await mirror.git.run(['rev-parse', `${sha}^{tree}`])).out,
 			// Checked where `--attr-source` is used, so an old git stops planning and landing, not the rest.
 			build: async (base, members, opts) => (requireGitVersion(), buildBatch(mirror.git, base, members, opts)),
 			restack: async (head, upstream, onto, attrs) => (requireGitVersion(), replay(mirror.git, { head, upstream, onto, attrs })),
 			baseline: async (base) => baselineCommit(mirror.git, base),
 			mergeTrees: async (onto, head, attrs) => (requireGitVersion(), mergeTrees(mirror.git, onto, head, attrs)),
 			mergeCommit: async (tree, parents, message) => queueMergeCommit(mirror.git, tree, parents, message),
-			changed: async (from, to) => mirror.git.run(['diff', '--name-only', from, to]).out.split('\n').filter(Boolean)
+			changed: async (from, to) => (await mirror.git.run(['diff', '--name-only', from, to])).out.split('\n').filter(Boolean)
 		},
 		ci: {
 			// Pushing the mq/* branch triggers the workflow; the base is in the batch commit's trailer.
@@ -414,7 +441,7 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				if (r !== 'pending' || !opts?.failFast) return r;
 				// Only a job the required check waits for can decide it early; unknown, then no early stop.
 				// The gate itself may not exist yet: GitHub makes its check run once its needs end.
-				const feeds = gateAt(headSha);
+				const feeds = await gateAt(headSha);
 				if (!feeds) return r;
 				const file = `.github/workflows/${ci().workflow}`;
 				const ciSuites = required.length
@@ -426,19 +453,14 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				const file = `.github/workflows/${ci().workflow}`;
 				const suites = new Set((await github.workflowRunsForSha(owner, name, headSha)).filter((w) => w.path?.split('@')[0] === file).map((w) => w.check_suite_id));
 				const jobs = await github.actionsJobsForSha(owner, name, headSha);
-				return stalledRun(jobs, { now: Date.now(), hangMs, notBefore, suites: suites.size ? suites : undefined, feeds: gateAt(headSha) ?? undefined });
+				return stalledRun(jobs, { now: Date.now(), hangMs, notBefore, suites: suites.size ? suites : undefined, feeds: (await gateAt(headSha)) ?? undefined });
 			},
 			cancel: async (headSha) => {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);
 				for (const r of runs.filter((r) => r.status !== 'completed')) await github.cancelWorkflowRun(owner, name, r.id);
 			},
-			// Re-runs the workflow runs behind the required check's failed (or cancelled, timed-out) runs,
-			// not whatever else failed on the commit.
-			runUrl: async (headSha) => {
-				const runs = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
-				// A failed job's page shows the failure; otherwise any of the check's jobs.
-				return (runs.find((r) => r.conclusion && r.conclusion !== 'success') ?? runs[0])?.html_url ?? null;
-			},
+			runUrl: async (headSha) => workflowRunUrl(owner, name, ci().workflow, await github.workflowRunsForSha(owner, name, headSha)),
+			// Re-runs the workflow behind the required check, rather than unrelated failures.
 			rerunFailed: async (headSha) => {
 				const checks = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
 				const suites = new Set(
@@ -472,7 +494,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					baseRef: p.base.ref,
 					state: 'open' as const,
 					merged: false,
-					body: p.body ?? null
+					body: p.body ?? null,
+					labels: (p.labels ?? []).map((l: { name?: string } | string) => (typeof l === 'string' ? l : (l.name ?? '')))
 				})),
 			pr: async (n): Promise<LivePR> => {
 				const p = await github.getPR(owner, name, n);
@@ -488,7 +511,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 					baseRef: p.base.ref,
 					state: p.state,
 					merged: !!p.merged,
-					body: p.body ?? null
+					body: p.body ?? null,
+					labels: (p.labels ?? []).map((l: { name?: string } | string) => (typeof l === 'string' ? l : (l.name ?? '')))
 				};
 			},
 			readiness: async (n, headSha, author, opts): Promise<Readiness> => {
@@ -540,11 +564,20 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			setPRCheck: async (sha, check) => {
 				const { prStatus, prReport } = ci();
 				const page = queuePage(env.APP_URL, owner, name, sha);
+				if (check.suffix === '/try') {
+					await postTryReport(
+						check,
+						() => github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page })),
+						() => github.hasCommitStatus(owner, name, sha, `${prStatus}/try`),
+						(state) => github.createCommitStatus(owner, name, sha, { ...statusFromCheck(check, prStatus, page), state })
+					);
+					return;
+				}
 				await postPRReport(
 					prReport,
 					() => github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page })),
 					() => github.createCommitStatus(owner, name, sha, statusFromCheck(check, prStatus, page)),
-					(e) => console.warn(`[merge-queue] ${owner}/${name}: check run not posted (does the app have the Checks write permission?): ${e instanceof Error ? e.message : e}`)
+					(e) => log.warn('check run not posted (does the app have the Checks write permission?)', { repo: `${owner}/${name}`, err: e })
 				);
 			},
 			label: async (n, label, on) => {

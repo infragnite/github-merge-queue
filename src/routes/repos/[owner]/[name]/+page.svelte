@@ -124,13 +124,8 @@
 		refreshing = false;
 	}
 
-	// Auto-refresh every 10s when queue is active
+	// Tries and new pushes progress independently of merge queue membership.
 	$effect(() => {
-		const hasActive = data.queueItems.some(
-			(i) => !['merged', 'failed', 'cancelled'].includes(i.status)
-		);
-		if (!hasActive) return;
-
 		const id = setInterval(refresh, 10_000);
 		return () => clearInterval(id);
 	});
@@ -381,10 +376,14 @@
 	{#if pipe?.error}<p class="text-sm text-red-600">{pipe.error}</p>{/if}
 	{#if form?.error}<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{form.error}</p>{/if}
 	{#if pipe?.tickError && !pipe.rateLimitedUntil}
-		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-			The queue's last step failed: <span class="font-mono text-xs">{pipe.tickError.message}</span>
-			{#if pipe.tickError.count > 1}<span class="text-xs text-red-600"> · {pipe.tickError.count}× since {new Date(pipe.tickError.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{/if}
-			<span class="block text-xs text-red-600">It tries again on its next step.</span>
+		{@const since = new Date(pipe.tickError.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+		<p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert" data-testid="tick-error">
+			{#if pipe.tickError.kind === 'github'}
+				GitHub's API has been failing since {since} ({pipe.tickError.count} steps in a row), so nothing moves. The queue keeps retrying; there is nothing to do.
+			{:else}
+				The queue has been stuck on this error since {since} ({pipe.tickError.count} steps in a row), so nothing moves. It keeps retrying; if it doesn't clear, report it with this message.
+			{/if}
+			<span class="block font-mono text-xs text-red-600">{pipe.tickError.detail}</span>
 		</p>
 	{/if}
 	{#if pipe?.rateLimitedUntil}
@@ -397,6 +396,17 @@
 			<span class="min-w-0 flex-1">{data.readonly ? pipe.paused : `Paused: ${pipe.paused}`}</span>
 			{#if data.can.resume}<button type="submit" class="rounded-md bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700">Resume</button>{/if}
 		</form>
+	{/if}
+
+	{#if pipe?.red}
+		<div class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800" role="status" data-testid="red-master">
+			<p class="font-medium">
+				{data.repo.default_branch} is red since {new Date(pipe.red.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}:
+				<a href="https://github.com/{data.repo.owner}/{data.repo.name}/commit/{pipe.red.sha}" target="_blank" rel="noopener" class="font-mono underline">{pipe.red.sha.slice(0, 7)}</a>
+				{pipe.red.phase === 'alone' ? '· batches are one PR each' : pipe.red.phase === 'waiting' ? '· nothing left to try' : '· batches run side by side on it'}
+			</p>
+			<p class="mt-0.5 text-xs text-red-700">{pipe.red.text}</p>
+		</div>
 	{/if}
 
 	<!-- Views: what runs now and the line; what needs someone; what already happened. -->
@@ -432,7 +442,12 @@
 		<div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
 			<!-- Running work in run order: preparation first, then the runs; cards keep their place. -->
 			<section aria-labelledby="running" class="min-w-0 space-y-3">
-				<h2 id="running" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Running</h2>
+				<div class="flex flex-wrap items-center justify-between gap-2">
+					<h2 id="running" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Running</h2>
+					{#if pipe?.runs.waiting.length}
+						<a href="#runs-queue" class="text-sm text-indigo-600 underline underline-offset-2">{pipe.runs.waiting.length} {pipe.runs.waiting.length === 1 ? 'try' : 'tries'} queued ↓</a>
+					{/if}
+				</div>
 				{#if !pipe}
 					<p class="text-sm text-gray-500">Loading…</p>
 				{:else if work.length === 0}
@@ -446,11 +461,33 @@
 						{/if}
 					{/each}
 				{/if}
+				{#if pipe?.runs}
+					<section aria-labelledby="runs-queue" class="rounded-xl border border-border-subtle bg-surface-raised p-4 space-y-3">
+						<div class="flex flex-wrap items-center justify-between gap-2">
+							<h3 id="runs-queue" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Runs queue</h3>
+							<span class="text-sm text-gray-500">{pipe.runs.running.length}/{pipe.runs.parallelTries} try slots in use{#if pipe.runs.running.some((r) => r.stopping)} ({pipe.runs.running.filter((r) => r.stopping).length} stopping){/if} · merge batches and bisects are exempt</span>
+						</div>
+						{#if pipe.runs.waiting.length}
+							<ol class="divide-y divide-border-subtle">
+								{#each pipe.runs.waiting as run (run.id)}
+									<li class="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-sm">
+										<span class="tabular-nums text-gray-500">Try position {run.position}</span>
+										<a class="font-medium hover:underline" href={`https://github.com/${data.repo.owner}/${data.repo.name}/pull/${run.pr}`}>PR #{run.pr}</a>
+										<span class="text-gray-500">{run.automatic ? 'Automatic try' : 'Manual try'} · {pipe.paused ? 'queue paused' : pipe.runs.running.length >= pipe.runs.parallelTries ? 'waiting for a slot' : 'waiting to start'}</span>
+										<span class="font-mono text-xs text-gray-500">{run.headSha?.slice(0, 7)}</span>
+									</li>
+								{/each}
+							</ol>
+						{:else}
+							<p class="text-sm text-gray-500">No tries queued for a slot.</p>
+						{/if}
+					</section>
+				{/if}
 			</section>
 
 			<section class="min-w-0 space-y-3 lg:sticky lg:top-4" aria-labelledby="in-line">
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-					<h2 id="in-line" class="text-xs font-semibold uppercase tracking-wide text-gray-500">In line <span class="tabular-nums text-gray-500">{inLine}</span></h2>
+					<h2 id="in-line" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Merge queue <span class="tabular-nums text-gray-500">{inLine}</span></h2>
 					{#if data.queueItems.length > 0}
 						<input type="search" bind:value={search} placeholder="Find #, title or author" class="ml-auto w-full rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm sm:w-48" aria-label="Find a PR in the queue" />
 					{/if}

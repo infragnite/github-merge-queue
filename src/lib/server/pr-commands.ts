@@ -23,6 +23,7 @@ import { RequestLimiter } from './request-limit';
 import type { Priority } from './batching';
 import type { StackAnalysis } from './stacks';
 import type { Repo } from '$lib/types';
+import { log } from './log';
 
 export type Command =
 	| { name: 'queue'; priority: Priority }
@@ -54,7 +55,7 @@ export interface CommandDeps {
 	pr(n: number): Promise<{ number: number; title: string; html_url: string; state: string; user: { login: string; avatar_url: string } }>;
 	analysis(): Promise<StackAnalysis>;
 	/** Starts a try run (under the repo lock); throws with the queue's reason when it can't. */
-	startTry(n: number): Promise<{ branch: string }>;
+	startTry(n: number): Promise<{ branch: string; status?: string; id?: number; end_reason?: string | null }>;
 	react(commentId: number, content: Reaction): Promise<void>;
 	reply(n: number, body: string): Promise<void>;
 	/** Tells the processor the queue changed. */
@@ -126,7 +127,7 @@ export async function runCommand(repo: Repo, deps: CommandDeps, c: PRComment): P
 		role = await deps.role(c.login);
 	} catch (e) {
 		// Nobody acts on a guess about who they are.
-		console.error(`[commands] ${repo.owner}/${repo.name}#${c.pr}: could not look up ${c.login}'s role:`, e instanceof Error ? e.message : e);
+		log.error("/mq command: could not look up the commenter's role", { repo: `${repo.owner}/${repo.name}`, pr: c.pr, by: c.login, err: e });
 		return null;
 	}
 	// A bot reads at most, as an installation token does on the API: its rights can't be checked.
@@ -142,17 +143,17 @@ export async function runCommand(repo: Repo, deps: CommandDeps, c: PRComment): P
 		if (e instanceof AuthError || e instanceof api.ApiError || e instanceof Refused) {
 			text = unname(e.message, c.pr);
 		} else {
-			console.error(`[commands] ${repo.owner}/${repo.name}#${c.pr} ${command.name}:`, e instanceof Error ? e.message : e);
+			log.error('/mq command failed', { repo: `${repo.owner}/${repo.name}`, pr: c.pr, command: command.name, err: e });
 			text = `Could not ${command.name === 'try' ? 'start a try run' : `run \`/mq ${command.name}\``}: something went wrong in the merge queue. Try again shortly.`;
 		}
 	}
 	const reaction: Reaction = ok ? '+1' : 'confused';
-	await deps.react(c.commentId, reaction).catch((e) => console.warn(`[commands] reaction on ${c.commentId}:`, e instanceof Error ? e.message : e));
+	await deps.react(c.commentId, reaction).catch((e) => log.warn('/mq command: reaction not posted', { comment: c.commentId, err: e }));
 	let reply: string | null = null;
 	if (text !== null && replies.take(`${repo.id}:${c.login.toLowerCase()}`) === 0) {
 		reply = `${quote(c.body)}\n\n${text}`;
 		await deps.reply(c.pr, reply).catch((e) => {
-			console.warn(`[commands] reply on #${c.pr}:`, e instanceof Error ? e.message : e);
+			log.warn('/mq command: reply not posted', { pr: c.pr, err: e });
 			reply = null;
 		});
 	}
@@ -200,13 +201,19 @@ async function perform(repo: Repo, deps: CommandDeps, n: number, caller: Caller,
 		case 'try': {
 			requireRole(caller, 'write', 'Starting a try run');
 			if (store.getQueueSettings(repo.id).mode !== 'batch') throw new Refused('Try runs need the queue in batch mode');
-			let run: { branch: string };
+			let run: Awaited<ReturnType<CommandDeps['startTry']>>;
 			try {
 				run = await deps.startTry(n);
 			} catch (e) {
-				if (e instanceof Error && /is not open|does not apply|comes from a fork/.test(e.message)) throw new Refused(e.message);
+				if (e instanceof Error && /is not open|does not apply|comes from a fork|is already being tried/.test(e.message)) throw new Refused(e.message);
 				throw e;
 			}
+			if (run.status === 'queued') {
+				const position = store.getQueuedTries(repo.id).findIndex((r) => r.id === run.id) + 1;
+				deps.wake();
+				return `Try queued at run queue position #${position}. Its CI branch will be pushed when a parallel try slot is free; its /try check shows its position.`;
+			}
+			if (run.status === 'cancelled' || run.status === 'failed') return `The try did not start: ${run.end_reason ?? 'the PR changed while waiting'}. Request another try when it is ready.`;
 			return `Started a try run on top of \`${repo.default_branch}\`, on branch \`${run.branch}\`. Its CI shows on that branch; nothing is merged. If it passes and neither this PR nor \`${repo.default_branch}\` changes, \`/mq queue\` lands it without another run.`;
 		}
 	}
@@ -248,7 +255,7 @@ async function status(repo: Repo, deps: CommandDeps, n: number): Promise<string>
 	try {
 		analysis = await deps.analysis();
 	} catch (e) {
-		console.warn(`[commands] status of #${n}: no stack analysis:`, e instanceof Error ? e.message : e);
+		log.warn('/mq status: no stack analysis', { pr: n, err: e });
 	}
 	const known = analysis?.prs.has(n) ? api.stackState(repo, n, analysis) : null;
 	const found = known?.queue ?? api.queueEntry(repo.id, n, analysis);

@@ -20,12 +20,14 @@ import { withRepoLock } from '$lib/server/repo-lock';
 import { cancelBatch } from '$lib/server/batch-queue';
 import { liveDeps } from '$lib/server/batch-live';
 import { emitEvent } from '$lib/server/events';
+import { runQueue } from '$lib/server/run-queue';
 import { markDirty } from '$lib/server/wake';
 import { dashboardStackAnalysis } from '$lib/server/stack-runtime';
 import { queueBoard, type BoardItem, type QueueBoard } from '$lib/server/queue-model';
 import type { StackAnalysis } from '$lib/server/stacks';
 import type { Repo } from '$lib/types';
 import type { PageServerLoad, Actions } from './$types';
+import { log } from '$lib/server/log';
 
 // The page refreshes every few seconds per viewer: what it reads from GitHub is shared and reused
 // for a while, so open dashboards don't spend the App's rate limit (the queue needs it).
@@ -98,7 +100,7 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 	const analysis: Promise<{ analysis: StackAnalysis; error: string | null }> = dashboardStackAnalysis(repo, { cachedOnly: readonly })
 		.then((a) => ({ analysis: a, error: null }))
 		.catch((e) => {
-			if (!readonly) console.error(`[stacks] ${repo.owner}/${repo.name}: analysis for the dashboard failed:`, e instanceof Error ? e.message : e);
+			if (!readonly) log.error('stack analysis for the dashboard failed', { repo: `${repo.owner}/${repo.name}`, err: e });
 			return { analysis: { prs: new Map(), stacks: [], issues: [] }, error: readonly ? 'Stacks could not be loaded' : `Stack analysis failed: ${e instanceof Error ? e.message : e}` };
 		});
 
@@ -107,8 +109,8 @@ export const load: PageServerLoad = async ({ params, locals, url, setHeaders }) 
 		.then((p) => (readonly ? publicPipeline(p) : p))
 		.catch((e) => {
 		const why = e instanceof Error ? e.message : String(e);
-		console.error(`[batches] ${repo.owner}/${repo.name}: batch view failed:`, why);
-		return { mode: 'serial', paused: null, master: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {}, activity: readonly ? publicActivity(activityOf(repo.id)) : activityOf(repo.id), serverTime: Date.now() };
+		log.error('batch view failed', { repo: `${repo.owner}/${repo.name}`, err: why });
+		return { runs: runQueue(repo.id), mode: 'serial', paused: null, master: null, red: null, active: [], recent: [], error: readonly ? 'Batches could not be loaded' : `Loading batches failed: ${why}`, rateLimitedUntil: null, tickError: null, progressErrors: {}, activity: readonly ? publicActivity(activityOf(repo.id)) : activityOf(repo.id), serverTime: Date.now() };
 	});
 
 	// Built by the planners' own queue model; PRs being tested are in the batches, not in line.
@@ -240,7 +242,7 @@ export const actions: Actions = {
 			updateQueueSettings(repo.id, { pausedReason: null });
 			emitEvent(repo.id, null, 'resumed', { by: me.login });
 			markDirty(repo.id);
-			console.log(`[merge-queue] ${repo.owner}/${repo.name} resumed by ${me.login} (was paused: ${was})`);
+			log.info('queue resumed', { repo: `${repo.owner}/${repo.name}`, by: me.login, was });
 		}),
 
 	/** Queues an open PR. What is stored about it comes from GitHub, not from the form. */

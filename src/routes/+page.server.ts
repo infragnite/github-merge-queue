@@ -6,6 +6,7 @@ import { webCaller } from '$lib/server/web-auth';
 import { visibleRepos } from '$lib/server/visible-repos';
 import { repoSummary } from '$lib/server/repo-summary';
 import type { PageServerLoad, Actions } from './$types';
+import { log } from '$lib/server/log';
 
 export const load: PageServerLoad = async ({ locals }) => {
 	if (!locals.user) redirect(302, '/login');
@@ -34,7 +35,7 @@ export const load: PageServerLoad = async ({ locals }) => {
 		);
 		return { repos: [...new Set(mine.map((r) => r.full_name))].sort((a, b) => a.localeCompare(b)), installUrl, error: null as string | null };
 	})().catch((e) => {
-		console.error('[dashboard] listing addable repositories failed:', e instanceof Error ? e.message : e);
+		log.error('listing addable repositories failed', { err: e });
 		return { repos: [] as string[], installUrl: null, error: 'Repositories you can add could not be listed' };
 	});
 

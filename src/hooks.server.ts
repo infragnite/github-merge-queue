@@ -3,13 +3,21 @@ import { verifySessionToken } from '$lib/server/auth';
 import { getUserById } from '$lib/server/db';
 import { drainProcessor, startProcessor } from '$lib/server/processor';
 import { watchEventLoop } from '$lib/server/loop-watch';
+import { startTelemetry, stopTelemetry } from '$lib/server/telemetry';
+import { log } from '$lib/server/log';
+import { startStallWatch } from '$lib/server/stall-watch';
+import { dirname, join } from 'node:path';
 import { RequestLimiter, addressKey } from '$lib/server/request-limit';
 import { env } from '$env/dynamic/private';
 
+startTelemetry();
 startProcessor();
 watchEventLoop();
+// A blocked main thread can't log; this thread says what blocks it, also into the data volume.
+const dbPath = env.DATABASE_PATH || './data/merge-queue.db';
+startStallWatch({ logFile: dbPath === ':memory:' ? undefined : join(dirname(dbPath), 'stall.log') });
 // adapter-node emits this on SIGTERM/SIGINT once it stops taking requests.
-process.on('sveltekit:shutdown' as 'beforeExit', () => void drainProcessor());
+process.on('sveltekit:shutdown' as 'beforeExit', () => void drainProcessor().then(stopTelemetry));
 
 // Without a session: a public queue page refreshes every 10 s (with its data request), so 120 a
 // minute per address is several open tabs; sign-in gets less. Behind a reverse proxy, set
@@ -18,7 +26,7 @@ const anonymous = new RequestLimiter(120, 120);
 const signIn = new RequestLimiter(10, 10);
 // Sign-in for everyone together, whatever their address: a ceiling that address rotation can't lift.
 const signInAll = new RequestLimiter(300, 300);
-if (!env.ADDRESS_HEADER) console.log('[merge-queue] ADDRESS_HEADER is not set: request limits key on the connecting address (a reverse proxy in front makes it one key for everyone)');
+if (!env.ADDRESS_HEADER) log.info('ADDRESS_HEADER is not set: request limits key on the connecting address (a reverse proxy in front makes it one key for everyone)');
 // Signed GitHub deliveries, health probes and the token-authenticated API have their own checks.
 const UNLIMITED = /^\/api\/(webhook|health|v1)\b/;
 

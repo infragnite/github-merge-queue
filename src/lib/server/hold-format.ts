@@ -15,6 +15,9 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	'changes-requested': ['address-review'],
 	'stack-broken': ['restack'],
 	'wrong-base': ['retarget'],
+	'try-pending': [],
+	'not-tried': ['run-try'],
+	'try-failed': ['fix-failure'],
 	'parent-not-ready': [],
 	'parent-held': [],
 	'parent-not-queued': ['queue-parent'],
@@ -25,6 +28,7 @@ export const NEXT_ACTIONS: Record<HoldCode, string[]> = {
 	deferred: [],
 	conflict: ['resolve-conflict'],
 	'workflow-permission': ['grant-workflows-permission'],
+	'merge-refused': ['fix-merge-refusal'],
 	failed: ['fix-failure']
 };
 

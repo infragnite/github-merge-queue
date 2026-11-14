@@ -128,6 +128,13 @@ describe('admission', () => {
 		expect(admit(ready(2), stacks([1, 2], {}, [bogus]), cfg)).toMatchObject({ code: 'stack-broken' });
 	});
 
+	test('a cut ancestry cycle remains held, along with its descendants', () => {
+		const issue: StackIssue = { kind: 'stack-cycle', pr: 1, parent: 2, severity: 'blocking', message: 'Ambiguous stack ancestry cycle' };
+		const s = stacks([1, 2, 3], { 3: 1 }, [issue, { ...issue, pr: 2, parent: 1 }]);
+		for (const n of [1, 2]) expect(admit(ready(n), s, cfg)).toMatchObject({ ok: false, code: 'stack-broken', reason: issue.message });
+		expect(admit(ready(3), s, cfg)).toMatchObject({ ok: false, code: 'parent-not-ready' });
+	});
+
 	test("a PR on another PR's branch but not on its latest commit is told to rebase onto it, not that its base is wrong", () => {
 		const off: StackIssue = { kind: 'base-mismatch', pr: 2, parent: 1, severity: 'blocking', message: "Not on #1's latest commit" };
 		expect(admit(ready(2, { targetsDefault: false }), stacks([1, 2], {}, [off]), cfg)).toEqual({

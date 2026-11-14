@@ -3,25 +3,32 @@
 
 import * as github from './github';
 import * as store from './batch-store';
+import { getQueueItems } from './db';
+import { redMasterView, type RedMasterView } from './red-master-view';
 import { dashboardStackAnalysis } from './stack-runtime';
-import { tickError, type TickError } from './tick-errors';
+import { tickErrorView, type TickErrorView } from './tick-errors';
 import { activityOf, type ActivityView } from './activity';
 import { batchCard, ciMayStillRun, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
 import type { StackAnalysis } from './stacks';
+import { log } from './log';
+import { runQueue, type RunQueue } from './run-queue';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
 export interface PipelineView {
+	runs: RunQueue;
 	mode: string;
 	paused: string | null;
 	master: { sha: string; state: string; since: number } | null;
+	/** While the default branch is red: what the queue does about it, and what gets it back to normal. */
+	red: RedMasterView | null;
 	active: BatchCard[];
 	recent: BatchCard[];
 	error: string | null;
 	/** Set while GitHub's rate limit holds the queue: when calls resume (epoch ms). */
 	rateLimitedUntil: number | null;
 	/** The queue's last failed step, until a step succeeds. */
-	tickError: TickError | null;
+	tickError: TickErrorView | null;
 	/** Batch heads whose CI progress could not be read, with why (the last known progress is shown). */
 	progressErrors: Record<string, string>;
 	/** What the queue itself is doing now (forming a batch, restacking, landing), and its last failed step. */
@@ -51,7 +58,7 @@ async function progressFor(repo: RepoRef, sha: string, low: boolean): Promise<CI
 		return value;
 	} catch (e) {
 		const why = e instanceof Error ? e.message : String(e);
-		console.warn(`[batches] ${repo.owner}/${repo.name}: CI progress for ${sha.slice(0, 8)} failed: ${why}`);
+		log.warn('reading CI progress failed', { repo: `${repo.owner}/${repo.name}`, sha, err: why });
 		progressErrors.set(key, why);
 		return hit?.value ?? null;
 	}
@@ -93,13 +100,15 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 	const master = store.getMasterHealth(repo.id);
 	return {
 		mode: settings.mode,
+		runs: runQueue(repo.id),
 		paused: settings.pausedReason,
 		master: master ? { sha: master.sha, state: master.state, since: master.since } : null,
+		red: redMasterView(master, getQueueItems(repo.id), repo.default_branch),
 		active: [...sideRuns, ...active].map(card),
 		recent: recent.map(card),
 		error: null,
 		rateLimitedUntil: budget?.blockedUntil ?? null,
-		tickError: tickError(repo.id),
+		tickError: tickErrorView(repo.id),
 		activity: activityOf(repo.id),
 		serverTime: Date.now(),
 		progressErrors: Object.fromEntries(
@@ -118,9 +127,11 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
  */
 export function publicPipeline(p: PipelineView): PipelineView {
 	return {
+		runs: p.runs,
 		mode: p.mode,
 		paused: p.paused ? 'The queue is paused' : null,
 		master: p.master ? { sha: p.master.sha, state: p.master.state, since: p.master.since } : null,
+		red: p.red,
 		active: p.active,
 		recent: p.recent,
 		error: p.error ? 'Batches could not be loaded' : null,

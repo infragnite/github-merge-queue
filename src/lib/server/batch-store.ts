@@ -4,10 +4,14 @@
 import type Database from 'better-sqlite3';
 import { getDb } from './db';
 import { DEFAULT_BATCH_CONFIG, type BatchConfig, type Priority } from './batching';
+import { log } from './log';
+import { recordBatchEnded, recordBatchStarted, repoLabel } from './telemetry';
 
 export type QueueMode = 'serial' | 'batch';
 
 export type BatchStatus =
+	/** Prepared try waiting for a concurrency slot; its branch has not been pushed. */
+	| 'queued'
 	/** Built and pushed; CI running. */
 	| 'testing'
 	/** Failed once; failed jobs re-running to rule out a flake. */
@@ -62,6 +66,12 @@ export interface BatchRow {
 	/** The CI run that tests `head_sha`, once GitHub listed it; until then links go to the branch's runs. */
 	run_url: string | null;
 	created_at: string;
+	/** Actual CI start, excluding time spent waiting for a try slot. */
+	started_at?: string | null;
+	/** Last waiting position successfully reported to GitHub. */
+	queue_position?: number | null;
+	/** Specific URL acknowledged by the running try report, separate from discovery. */
+	reported_run_url?: string | null;
 	finished_at: string | null;
 	/** When its latest CI result came in (null while none has, and in rows from before it was recorded). */
 	ci_done_at: string | null;
@@ -266,10 +276,15 @@ export function migrateBatches(database: Database.Database) {
 		['retries', 'INTEGER NOT NULL DEFAULT 0'],
 		['end_reason', 'TEXT'],
 		['settings', 'TEXT'],
-		['run_url', 'TEXT']
+		['run_url', 'TEXT'],
+		['started_at', 'TEXT'],
+		['queue_position', 'INTEGER'],
+		['reported_run_url', 'TEXT']
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
+	// Preserve try links deployed before the shared run URL field.
+	database.exec(`UPDATE batches SET run_url = reported_run_url WHERE run_url IS NULL AND reported_run_url IS NOT NULL`);
 	// Batches from before `ejected` was recorded: a PR that left one and was then ejected, with no
 	// later batch it was in, was ejected from it. Once only, in one go: later batches record it.
 	database.exec(`CREATE TABLE IF NOT EXISTS done_migrations (name TEXT PRIMARY KEY)`);
@@ -323,6 +338,24 @@ export function migrateBatches(database: Database.Database) {
 	add('batch_failures', `INTEGER NOT NULL DEFAULT 0`);
 	// Why the planner holds this queued PR back: { code, wait, reason } (see setHold).
 	add('hold', `TEXT`);
+	// Automatic tries: each open PR's current head, when the queue first saw it, and what became of it.
+	database.exec(`
+		CREATE TABLE IF NOT EXISTS auto_tries (
+			repo_id INTEGER NOT NULL,
+			pr_number INTEGER NOT NULL,
+			head_sha TEXT NOT NULL,
+			seen_at INTEGER NOT NULL,
+			outcome TEXT,
+			run_id INTEGER,
+			PRIMARY KEY (repo_id, pr_number, head_sha)
+		);
+		CREATE TABLE IF NOT EXISTS auto_try_primed (
+			repo_id INTEGER PRIMARY KEY,
+			at INTEGER NOT NULL
+		);
+	`);
+	const autoCols = database.prepare(`PRAGMA table_info(auto_tries)`).all() as Array<{ name: string }>;
+	if (!autoCols.some((c) => c.name === 'cooldown_reported_until')) database.exec('ALTER TABLE auto_tries ADD COLUMN cooldown_reported_until INTEGER');
 }
 
 // --- settings ---
@@ -330,6 +363,8 @@ export function migrateBatches(database: Database.Database) {
 /** The saved config over the defaults, without settings that no longer exist (such as the old urgent batch size). */
 function knownConfig(saved: Partial<BatchConfig>): BatchConfig {
 	const config = { ...DEFAULT_BATCH_CONFIG };
+	const legacy = (saved as Partial<BatchConfig> & { autoTryMax?: number }).autoTryMax;
+	if (saved.parallelTries === undefined && legacy !== undefined) config.parallelTries = legacy;
 	for (const k of Object.keys(config) as (keyof BatchConfig)[]) if (saved[k] !== undefined) (config as Record<string, unknown>)[k] = saved[k];
 	return config;
 }
@@ -367,6 +402,8 @@ export function updateQueueSettings(
 			   ci = excluded.ci, paused_reason = excluded.paused_reason, public_view = excluded.public_view`
 		)
 		.run(repoId, next.mode, JSON.stringify(next.config), JSON.stringify(next.ci), next.pausedReason, next.publicView ? 1 : 0);
+	// Automatic tries off (or no batch mode): turned on again, they start from the heads open then.
+	if (!next.config.autoTry || next.mode !== 'batch') unprimeAutoTries(repoId);
 	return next;
 }
 
@@ -430,6 +467,7 @@ export function insertBatch(b: {
 	express?: boolean;
 	/** Recorded already decided (a batch landing on a try's pass): its CI is that try's. */
 	passed?: boolean;
+	queued?: boolean;
 }): BatchRow {
 	const r = getDb()
 		.prepare(
@@ -453,12 +491,14 @@ export function insertBatch(b: {
 			b.kind === 'batch'
 				? (getDb().prepare(`SELECT COALESCE(MAX(number), 0) + 1 AS n FROM batches WHERE repo_id = ? AND kind = 'batch'`).get(b.repoId) as { n: number }).n
 				: null,
-			b.passed ? 'passed' : 'testing',
+			b.queued ? 'queued' : b.passed ? 'passed' : 'testing',
 			b.passed ? 'success' : 'pending',
 			snapshot(b.repoId),
 			b.passed ? 1 : 0
 		);
-	return getBatch(Number(r.lastInsertRowid))!;
+	const row = getBatch(Number(r.lastInsertRowid))!;
+	if (!b.queued) recordBatchStarted(b.repoId, b.kind, b.members.length, !!b.express);
+	return row;
 }
 
 /** A bisecting batch landed `prs` on master `sha` (tree `tree`): the rest bisects on top of it. */
@@ -578,17 +618,40 @@ export function getRecentBatches(repoId: number, limit = 50): BatchRow[] {
 /** `reason` says why it ended early (see `BatchRow.end_reason`); without one, a reason given before stays. */
 export function setBatchStatus(id: number, status: BatchStatus, reason?: string) {
 	const done = ['landed', 'failed', 'superseded', 'cancelled'].includes(status);
+	const before = getBatch(id);
 	getDb()
 		.prepare(
 			`UPDATE batches SET status = ?, finished_at = CASE WHEN ? THEN datetime('now') ELSE finished_at END,
 			   end_reason = COALESCE(?, end_reason) WHERE id = ?`
 		)
 		.run(status, done ? 1 : 0, reason ?? null, id);
+	// A bisection step ends passed; a batch that passed still has to land.
+	const ends = (b: Pick<BatchRow, 'kind' | 'status'>) => FINAL.includes(b.status) || (b.kind === 'bisect' && b.status === 'passed');
+	if (!before || ends(before)) return;
+	const after = getBatch(id)!;
+	if (!ends(after)) return;
+	recordBatchEnded(after.repo_id, after.kind, after.status, after.end_reason, Date.now() - batchCreatedMs(after));
+	log.info('run ended', {
+		repo: repoLabel(after.repo_id),
+		batch: after.id,
+		number: after.kind === 'batch' ? after.number : undefined,
+		kind: after.kind,
+		status: after.status,
+		reason: after.end_reason ?? undefined,
+		ci: after.ci_result,
+		prs: after.members,
+		landed: after.landed.length ? after.landed : undefined,
+		ejected: after.ejected.length ? after.ejected : undefined,
+		branch: after.branch
+	});
 }
+
+const FINAL: BatchStatus[] = ['landed', 'failed', 'superseded', 'cancelled'];
 
 /** When a batch was created, in epoch ms. */
 export function batchCreatedMs(b: BatchRow): number {
-	return Date.parse(b.created_at.includes('T') ? b.created_at : `${b.created_at.replace(' ', 'T')}Z`);
+	const at = b.started_at ?? b.created_at;
+	return Date.parse(at.includes('T') ? at : `${at.replace(' ', 'T')}Z`);
 }
 
 export function setBatchRetried(id: number, at: number) {
@@ -758,6 +821,41 @@ export function getRunningTries(repoId: number): BatchRow[] {
 	).map(parse);
 }
 
+/** FIFO tries waiting to push their branches and start CI. */
+export function getQueuedTries(repoId: number): BatchRow[] {
+	return (getDb().prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status = 'queued' ORDER BY id`).all(repoId) as RawBatch[]).map(parse);
+}
+
+/** Slots remain reserved while a cancelled try still has an unsettled CI/branch cleanup intent. */
+export function trySlotsInUse(repoId: number): BatchRow[] {
+	return (getDb().prepare(`SELECT * FROM batches b WHERE repo_id = ? AND kind = 'try'
+		AND (status = 'testing' OR (status IN ('cancelled', 'failed') AND EXISTS
+		(SELECT 1 FROM branch_intents i WHERE i.repo_id = b.repo_id AND i.branch = b.branch))) ORDER BY id`).all(repoId) as RawBatch[]).map(parse);
+}
+
+/** Rebuild a waiting try on the current default branch, before its branch can trigger CI. */
+export function prepareQueuedTry(id: number, b: { baseSha: string; baseTree: string; headSha: string; treeSha: string }) {
+	getDb().prepare(`UPDATE batches SET base_sha = ?, base_tree = ?, head_sha = ?, tree_sha = ? WHERE id = ? AND status = 'queued'`)
+		.run(b.baseSha, b.baseTree, b.headSha, b.treeSha, id);
+}
+
+export function tryStarted(id: number, at: number) {
+	const changed = getDb().prepare(`UPDATE batches SET status = 'testing', started_at = ?, queue_position = 0 WHERE id = ? AND status = 'queued'`).run(new Date(at).toISOString(), id);
+	if (changed.changes) {
+		const b = getBatch(id)!;
+		recordBatchStarted(b.repo_id, b.kind, b.members.length, b.express);
+	}
+}
+
+export function tryPositionReported(id: number, position: number) {
+	getDb().prepare(`UPDATE batches SET queue_position = ? WHERE id = ? AND status = 'queued'`).run(position, id);
+}
+
+/** The running report reached GitHub; zero means it still needs retrying after admission. */
+export function tryStartedReported(id: number, url: string | null = null) {
+	getDb().prepare(`UPDATE batches SET queue_position = NULL, run_url = ?, reported_run_url = ? WHERE id = ? AND status = 'testing'`).run(url, url, id);
+}
+
 /**
  * The latest finished `try` run of `pr` at `headSha` on a default branch with tree `baseTree`, if
  * any: whether its pass may stand in for a run of the queue's own (see `Tick.reusableTry`).
@@ -769,6 +867,164 @@ export function latestTry(repoId: number, pr: number, headSha: string, baseTree:
 			.all(repoId, baseTree) as RawBatch[]
 	).map(parse);
 	return rows.find((r) => r.members.length === 1 && r.members[0] === pr && r.heads[pr] === headSha) ?? null;
+}
+
+/** Whether a try of `pr` at `headSha` ran or runs, a cancelled one aside: that head needs no automatic one. */
+export function hasTry(repoId: number, pr: number, headSha: string): boolean {
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status != 'cancelled' AND members = ?`)
+			.all(repoId, JSON.stringify([pr])) as RawBatch[]
+	).map(parse);
+	return rows.some((r) => r.members.length === 1 && r.members[0] === pr && r.heads[pr] === headSha);
+}
+
+/**
+ * Where the try runs of `pr` at any of `heads` stand: one passed, one is running, the latest
+ * finished one failed, or none (cancelled ones don't count).
+ */
+export function tryStatus(repoId: number, pr: number, heads: string[]): 'passed' | 'running' | 'queued' | 'failed' | 'none' {
+	const want = new Set(heads);
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status != 'cancelled' AND members = ? ORDER BY id DESC`)
+			.all(repoId, JSON.stringify([pr])) as RawBatch[]
+	)
+		.map(parse)
+		.filter((r) => want.has(r.heads[pr]));
+	if (rows.some((r) => r.ci_result === 'success')) return 'passed';
+	if (rows.some((r) => r.status === 'testing')) return 'running';
+	if (rows.some((r) => r.status === 'queued')) return 'queued';
+	return rows.length ? 'failed' : 'none';
+}
+
+/** What became of `pr` at `headSha` as an automatic try, if it was seen. */
+export function autoTryOutcome(repoId: number, pr: number, headSha: string): AutoTryOutcome | null {
+	const r = getDb().prepare(`SELECT outcome FROM auto_tries WHERE repo_id = ? AND pr_number = ? AND head_sha = ?`).get(repoId, pr, headSha) as
+		| { outcome: AutoTryOutcome | null }
+		| undefined;
+	return r?.outcome ?? null;
+}
+
+/** A running `try` run of `pr` at `headSha`, if any. */
+export function runningTryOf(repoId: number, pr: number, headSha: string): BatchRow | null {
+	return [...getRunningTries(repoId), ...getQueuedTries(repoId)].find((t) => t.members.length === 1 && t.members[0] === pr && t.heads[pr] === headSha) ?? null;
+}
+
+// --- automatic tries ---
+
+/**
+ * What became of a head: null while it waits for its delay or a free slot; `started` (its run is
+ * `run_id`); `cancelled` (its run was stopped, and it may start again once nothing keeps it out);
+ * `existing` (open when automatic tries were turned on); `tried` (a `/mq try` covered it);
+ * `conflict` (it does not apply on the default branch).
+ */
+export type AutoTryOutcome = 'started' | 'cancelled' | 'existing' | 'tried' | 'conflict';
+
+export interface AutoTryRow {
+	pr: number;
+	headSha: string;
+	seenAt: number;
+	outcome: AutoTryOutcome | null;
+	runId: number | null;
+	cooldownReportedUntil: number | null;
+}
+
+export function autoTryRows(repoId: number): AutoTryRow[] {
+	return (
+		getDb()
+			.prepare(`SELECT pr_number, head_sha, seen_at, outcome, run_id, cooldown_reported_until FROM auto_tries WHERE repo_id = ? ORDER BY seen_at, pr_number`)
+			.all(repoId) as Array<{ pr_number: number; head_sha: string; seen_at: number; outcome: AutoTryOutcome | null; run_id: number | null; cooldown_reported_until: number | null }>
+	).map((r) => ({ pr: r.pr_number, headSha: r.head_sha, seenAt: r.seen_at, outcome: r.outcome, runId: r.run_id, cooldownReportedUntil: r.cooldown_reported_until }));
+}
+
+export function cooldownReported(repoId: number, pr: number, headSha: string, until: number | null) {
+	getDb().prepare(`UPDATE auto_tries SET cooldown_reported_until = ? WHERE repo_id = ? AND pr_number = ? AND head_sha = ?`).run(until, repoId, pr, headSha);
+}
+
+/**
+ * Records the open PRs' current heads, each at `now` the first time it is seen, and forgets every
+ * other head (a PR pushed again, closed or merged), except one whose run is still going.
+ */
+export function seeAutoTryHeads(repoId: number, heads: { pr: number; sha: string }[], now: number) {
+	const d = getDb();
+	const insert = d.prepare(`INSERT OR IGNORE INTO auto_tries (repo_id, pr_number, head_sha, seen_at) VALUES (?, ?, ?, ?)`);
+	const current = new Set(heads.map((h) => `${h.pr}@${h.sha}`));
+	d.transaction(() => {
+		for (const h of heads) insert.run(repoId, h.pr, h.sha, now);
+		const live = new Set(getRunningTries(repoId).map((t) => t.id));
+		const drop = d.prepare(`DELETE FROM auto_tries WHERE repo_id = ? AND pr_number = ? AND head_sha = ?`);
+		for (const r of autoTryRows(repoId)) {
+			if (current.has(`${r.pr}@${r.headSha}`) || (r.runId !== null && live.has(r.runId))) continue;
+			drop.run(repoId, r.pr, r.headSha);
+		}
+	})();
+}
+
+export function setAutoTry(repoId: number, pr: number, headSha: string, outcome: AutoTryOutcome, runId?: number) {
+	getDb()
+		.prepare(
+			`INSERT INTO auto_tries (repo_id, pr_number, head_sha, seen_at, outcome, run_id) VALUES (?, ?, ?, 0, ?, ?)
+			 ON CONFLICT(repo_id, pr_number, head_sha) DO UPDATE SET outcome = excluded.outcome, run_id = COALESCE(excluded.run_id, run_id)`
+		)
+		.run(repoId, pr, headSha, outcome, runId ?? null);
+}
+
+/** Records a try run, and that it is `pr`'s automatic try at `headSha`, in one step: a crash leaves both or neither. */
+export function insertAutoTry(b: Parameters<typeof insertBatch>[0], pr: number, headSha: string): BatchRow {
+	return getDb().transaction(() => {
+		const row = insertBatch(b);
+		setAutoTry(b.repoId, pr, headSha, 'started', row.id);
+		return row;
+	})();
+}
+
+/** Marks an automatic try cancelled (its run and its head), in one step. */
+export function cancelAutoTryRow(t: BatchRow, reason: string) {
+	const pr = t.members[0];
+	getDb().transaction(() => {
+		setBatchStatus(t.id, 'cancelled', reason);
+		setAutoTry(t.repo_id, pr, t.heads[pr], 'cancelled');
+	})();
+}
+
+/**
+ * Whether a run of the queue's own (a batch or a bisection step) finished with `pr` at `headSha`
+ * in it: its author already saw that head's CI. Looks at the latest runs only.
+ */
+export function queueRanHead(repoId: number, pr: number, headSha: string): boolean {
+	const rows = (
+		getDb()
+			.prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind IN ('batch', 'bisect') AND ci_result != 'pending' AND heads LIKE ? ORDER BY id DESC LIMIT 200`)
+			.all(repoId, `%"${pr}":"${headSha}"%`) as RawBatch[]
+	).map(parse);
+	return rows.some((r) => r.heads[pr] === headSha);
+}
+
+/** Automatic tries still running. */
+export function runningAutoTries(repoId: number): BatchRow[] {
+	const ids = new Set(autoTryRows(repoId).flatMap((r) => (r.outcome === 'started' && r.runId !== null ? [r.runId] : [])));
+	return [...getRunningTries(repoId), ...getQueuedTries(repoId)].filter((t) => ids.has(t.id));
+}
+
+export function autoTriesPrimed(repoId: number): boolean {
+	return !!getDb().prepare(`SELECT 1 FROM auto_try_primed WHERE repo_id = ?`).get(repoId);
+}
+
+/** Turned on: the open PRs' heads as they are now are not tried, only later pushes (as a CI push trigger would). */
+export function primeAutoTries(repoId: number, heads: { pr: number; sha: string }[], now: number) {
+	const d = getDb();
+	d.transaction(() => {
+		seeAutoTryHeads(repoId, heads, now);
+		const mark = d.prepare(`UPDATE auto_tries SET outcome = 'existing' WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND (outcome IS NULL OR outcome = 'cancelled')`);
+		for (const h of heads) mark.run(repoId, h.pr, h.sha);
+		d.prepare(`INSERT OR REPLACE INTO auto_try_primed (repo_id, at) VALUES (?, ?)`).run(repoId, now);
+	})();
+}
+
+/** Turned off: turned on again, it starts from the heads open then. */
+export function unprimeAutoTries(repoId: number) {
+	getDb().prepare(`DELETE FROM auto_try_primed WHERE repo_id = ?`).run(repoId);
 }
 
 // --- default-branch health ---

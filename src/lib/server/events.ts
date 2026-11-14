@@ -4,6 +4,8 @@
 
 import { EventEmitter } from 'node:events';
 import { getDb } from './db';
+import { log } from './log';
+import { recordQueueEvent, repoLabel } from './telemetry';
 
 export type QueueEventKind =
 	| 'queued'
@@ -56,6 +58,8 @@ export function emitEvent(repoId: number, pr: number | null, kind: QueueEventKin
 		db.prepare(`DELETE FROM queue_events WHERE created_at < datetime('now', ?)`).run(`-${KEEP_DAYS} days`);
 	}
 	bus.emit(`repo:${repoId}`);
+	recordQueueEvent(repoId, kind);
+	log.info('queue event', { repo: repoLabel(repoId), pr: pr ?? undefined, event: kind, data });
 }
 
 type Row = { id: number; pr_number: number | null; kind: QueueEventKind; data: string; created_at: string };
@@ -100,12 +104,27 @@ export function heldPRs(repoId: number): number[] {
 	return rows.filter((r) => r.kind === 'held').map((r) => r.pr_number);
 }
 
+/** Removals whose terminal GitHub report has not been posted yet, including across restarts. */
+export function unreportedDequeues(repoId: number): number[] {
+	return (getDb().prepare(
+		`SELECT pr_number FROM queue_events e WHERE repo_id = ? AND kind = 'dequeued'
+		 AND id = (SELECT MAX(id) FROM queue_events f WHERE f.repo_id = e.repo_id AND f.pr_number = e.pr_number
+		 AND f.kind IN ('queued', 'dequeued', 'released', 'merged', 'ejected'))`
+	).all(repoId) as Array<{ pr_number: number }>).map((r) => r.pr_number);
+}
+
 /** The kind of the PR's newest event among `kinds`; null when it has none (events are kept about a year). */
 export function lastEventOf(repoId: number, pr: number, kinds: QueueEventKind[]): { kind: QueueEventKind; data: Record<string, unknown> } | null {
 	const r = getDb()
 		.prepare(`SELECT kind, data FROM queue_events WHERE repo_id = ? AND pr_number = ? AND kind IN (${kinds.map(() => '?').join(', ')}) ORDER BY id DESC LIMIT 1`)
 		.get(repoId, pr, ...kinds) as { kind: QueueEventKind; data: string } | undefined;
 	return r ? { kind: r.kind, data: JSON.parse(r.data) } : null;
+}
+
+/** The repository's newest event of `kind` that is about no one PR (a pause, say). */
+export function lastRepoEvent(repoId: number, kind: QueueEventKind): { data: Record<string, unknown> } | null {
+	const r = getDb().prepare('SELECT data FROM queue_events WHERE repo_id = ? AND pr_number IS NULL AND kind = ? ORDER BY id DESC LIMIT 1').get(repoId, kind) as { data: string } | undefined;
+	return r ? { data: JSON.parse(r.data) } : null;
 }
 
 /** The newest event id for a repo (the cursor to start from when there are no events yet). */

@@ -67,6 +67,7 @@ export type IssueKind =
 	| 'base-mismatch'
 	| 'base-branch-missing'
 	| 'auto-closed'
+	| 'stack-cycle'
 	| 'commits-truncated';
 
 export interface StackIssue {
@@ -460,6 +461,33 @@ export function analyzeStacks(input: StackInput): StackAnalysis {
 	for (const pr of all) {
 		const issue = detectAutoClose(pr, input);
 		if (issue) issues.push(issue);
+	}
+
+	// Rewritten commits and historical heads are evidence, not a strict git ancestry
+	// order: they can infer reciprocal parents. Cut every edge in a cycle and hold
+	// its PRs rather than presenting a cyclic tree or guessing a merge order.
+	const checked = new Set<number>();
+	for (const start of infos.keys()) {
+		const path: number[] = [];
+		const at = new Map<number, number>();
+		let n: number | null = start;
+		while (n !== null && infos.has(n) && !checked.has(n) && !at.has(n)) {
+			at.set(n, path.length);
+			path.push(n);
+			n = infos.get(n)!.parent;
+		}
+		if (n !== null && at.has(n)) {
+			const cycle = path.slice(at.get(n)!);
+			const message = `Ambiguous stack ancestry cycle: ${[...cycle, cycle[0]].map((p) => `#${p}`).join(' → ')}; restack these PRs`;
+			for (const member of cycle) {
+				const info = infos.get(member)!;
+				info.issues.push({ kind: 'stack-cycle', pr: member, parent: info.parent!, severity: 'blocking', message });
+				info.parent = null;
+				info.link = null;
+				info.expectedBase = input.defaultBranch;
+			}
+		}
+		for (const member of path) checked.add(member);
 	}
 
 	// Children, depth and broken propagation (parents first).

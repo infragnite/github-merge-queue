@@ -1,4 +1,6 @@
 import { actionsJobsFor } from './ci-savings';
+import { recordGitHubError } from './telemetry';
+import { log } from './log';
 import { env } from '$env/dynamic/private';
 import { createSign } from 'crypto';
 import { mergeInStack, needsAsyncMerge } from './stacked-merge';
@@ -40,13 +42,18 @@ async function ghFetch(token: string, path: string, init?: RequestInit, budget?:
 		const graphqlLimited = Array.isArray(body?.errors) && body.errors.some((e: { type?: string }) => e?.type === 'RATE_LIMITED');
 		const message = graphqlLimited ? body.errors.map((e: { message?: string }) => e.message).join('; ') : (body.message ?? '');
 		const limited = noteResponse(budget, res.status, res.headers, message, Date.now(), graphqlLimited);
-		if (limited) throw limited;
+		if (limited) {
+			recordGitHubError('rate_limited');
+			throw limited;
+		}
 	}
 	if (!res.ok) {
 		// A missing App permission names only the symptom; the call says which permission it is.
+		const call = `${init?.method ?? 'GET'} ${path.split('?')[0]}`;
 		const missingPermission = res.status === 403 && /not accessible by integration/i.test(body.message ?? '');
-		const message = missingPermission ? `${body.message}: ${init?.method ?? 'GET'} ${path.split('?')[0]}` : body.message;
-		throw new GitHubError(res.status, message || `GitHub API ${res.status}: ${path}`, body);
+		const message = missingPermission ? `${body.message}: ${call}` : body.message;
+		recordGitHubError(res.status);
+		throw new GitHubError(res.status, message || `GitHub API ${res.status}: ${call}`, body, res.headers.get('x-github-request-id') ?? undefined, call);
 	}
 	return body;
 }
@@ -389,7 +396,7 @@ export async function pushRules(owner: string, repo: string, branch: string): Pr
 	// `protected` is also true for a branch only rulesets cover; `protection.enabled` is classic protection.
 	if (b?.protected && b?.protection?.enabled !== false) {
 		classic = await readClassicReviews(() => ghFetchAsApp(`${path}/branches/${refPath(branch)}/protection/required_pull_request_reviews`));
-		if (classic === 'unreadable') console.warn(`[merge-queue] ${owner}/${repo}: can't read ${branch}'s review protection (it needs the Administration permission); going by its rulesets`);
+		if (classic === 'unreadable') log.warn("can't read the branch's review protection (it needs the Administration permission); going by its rulesets", { repo: `${owner}/${repo}`, branch });
 	}
 	return { rules, classic };
 }
@@ -477,6 +484,15 @@ export async function squashMergeAt(owner: string, repo: string, n: number, titl
 		return mergeResultFromData({ merged: !!r?.merged, sha: r?.mergeCommit?.oid });
 	} catch (e) {
 		return mergeResultFromError(e);
+	}
+}
+
+/** Latest statuses, paginated so the transition cannot miss a legacy try context. */
+export async function hasCommitStatus(owner: string, repo: string, sha: string, context: string): Promise<boolean> {
+	for (let page = 1; ; page++) {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
+		if (data.statuses.some((s: { context: string }) => s.context === context)) return true;
+		if (data.statuses.length < 100) return false;
 	}
 }
 

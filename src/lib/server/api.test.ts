@@ -120,6 +120,33 @@ beforeEach(() => {
 });
 
 describe('stack state for agents', () => {
+	test.each<{ open: number[]; parents: Record<number, number>; pr: number }>([
+		{ open: [1], parents: { 1: 1 }, pr: 1 },
+		{ open: [1, 2], parents: { 1: 2, 2: 1 }, pr: 1 },
+		{ open: [1, 2, 3], parents: { 1: 2, 2: 1, 3: 2 }, pr: 3 }
+	])('rejects cyclic ancestry without blocking the server: $parents, PR $pr', ({ open, parents, pr }) => {
+		expect(() => api.stackState(repo, pr, analysis(open, parents))).toThrow(
+			expect.objectContaining({ status: 409, message: expect.stringContaining('Stack dependency cycle') })
+		);
+	});
+
+	test('both stack endpoints reject a cycle in child links', () => {
+		const a = analysis([1, 2], { 2: 1 });
+		a.prs.get(2)!.children.push(1);
+		for (const read of [() => api.stackState(repo, 1, a), () => api.stacksState(a)]) {
+			expect(read).toThrow(expect.objectContaining({ status: 409, message: 'Stack dependency cycle involving #1' }));
+		}
+	});
+
+	test('a cut ancestry cycle is reported as a blocking issue with a fix action', () => {
+		const issue: StackIssue = { kind: 'stack-cycle', pr: 1, parent: 2, severity: 'blocking', message: 'Ambiguous stack ancestry cycle' };
+		const a = analysis([1, 2, 3], { 3: 1 }, [issue]);
+		expect(api.stackState(repo, 1, a)).toMatchObject({
+			broken: true, issues: [issue], nextActions: [{ do: 'fix', why: issue.message }],
+			stack: { pr: 1, children: [{ pr: 3, children: [] }] }
+		});
+	});
+
 	test('a stacked child waiting on its queued parent', () => {
 		const a = analysis([1, 2, 3], { 2: 1, 3: 2 });
 		api.enqueue(repo, writer, pull(1), {});
@@ -317,6 +344,17 @@ describe('queue control', () => {
 		expect(() => api.dequeue(repo, writer, 1)).toThrow(/not queued/);
 	});
 
+	test('a PR the queue cancelled or merged can be queued again', () => {
+		// Closing a queued PR cancels its entry; reopened, it goes back in line (krusty #3474).
+		api.enqueue(repo, writer, pull(1), {});
+		db.updateQueueItemStatus(db.getQueueItems(repo.id)[0].id, 'cancelled', 'PR was closed');
+		expect(api.enqueue(repo, writer, pull(1), {})).toMatchObject({ position: 1, priority: 'normal' });
+		api.enqueue(repo, writer, pull(2), {});
+		db.updateQueueItemStatus(db.getQueueItems(repo.id).find((i) => i.pr_number === 2)!.id, 'merged');
+		expect(api.enqueue(repo, writer, pull(2), {})).toMatchObject({ position: 2 });
+		expect(db.getAllQueueItems(repo.id).map((i) => [i.pr_number, i.status])).toEqual([[1, 'queued'], [2, 'queued']]);
+	});
+
 	test('a PR in a running batch cannot be dequeued', () => {
 		api.enqueue(repo, writer, pull(1), {});
 		store.insertBatch({
@@ -371,6 +409,29 @@ describe('queue control', () => {
 		expect(() => api.patchConfig(repo, admin, { mode: 'fast' })).toThrow(/mode must be/);
 		expect(api.patchConfig(repo, admin, { config: { comments: 'attention' } }).config.comments).toBe('attention');
 		expect(() => api.patchConfig(repo, admin, { config: { comments: 'some' } })).toThrow(/comments must be one of all, attention, none/);
+	});
+
+	test('automatic tries: off by default; at least one at once, a whole number', () => {
+		expect(api.patchConfig(repo, admin, {}).config).toMatchObject({ autoTry: false, parallelTries: 2, autoTryDelayMs: 120_000, autoTryDrafts: false, requireTryPass: false });
+		expect(api.patchConfig(repo, admin, { config: { autoTry: true, parallelTries: 4, autoTryDelayMs: 0 } }).config).toMatchObject({ autoTry: true, parallelTries: 4, autoTryDelayMs: 0 });
+		expect(() => api.patchConfig(repo, admin, { config: { parallelTries: 0 } })).toThrow('parallelTries must be a whole number >= 1');
+		expect(() => api.patchConfig(repo, admin, { config: { parallelTries: 1.5 } })).toThrow('parallelTries must be a whole number >= 1');
+		expect(() => api.patchConfig(repo, admin, { config: { autoTry: 'yes' } })).toThrow(/autoTry must be a boolean/);
+	});
+
+	test('the old automatic-tries setting remains an alias for the shared cap', () => {
+		expect(api.patchConfig(repo, admin, { config: { autoTryMax: 3 } }).config.parallelTries).toBe(3);
+	});
+
+	test('try requests expose their runs-queue position separately from the merge queue', () => {
+		const insert = (pr: number, queued = false) => store.insertBatch({ repoId: repo.id, kind: 'try', branch: `mq/try-${pr}`, baseSha: 'b', baseTree: 'bt', headSha: `h${pr}`, treeSha: `t${pr}`, members: [pr], heads: { [pr]: `pr${pr}` }, queued });
+		const running = insert(1);
+		const first = insert(2, true);
+		const second = insert(3, true);
+		expect(api.tryRunState(first)).toMatchObject({ status: 'queued', position: 1 });
+		expect(api.tryRunState(second)).toMatchObject({ status: 'queued', position: 2 });
+		expect(api.tryRunState(running)).toMatchObject({ status: 'testing', position: null });
+		expect(api.queueState(repo)).toMatchObject({ waiting: [], runs: { parallelTries: 2, running: [{ pr: 1 }], waiting: [{ pr: 2, position: 1 }, { pr: 3, position: 2 }] } });
 	});
 
 	test('the PR report is a check run, a status, or both; both by default', () => {

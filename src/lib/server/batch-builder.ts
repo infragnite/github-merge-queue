@@ -23,7 +23,9 @@
 //
 // Needs git >= 2.41 (`merge-tree --write-tree --merge-base`, `--attr-source`).
 
-import { execFile, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { withDoing } from './stall-watch';
+import { log } from './log';
 
 export interface BatchMember {
 	pr: number;
@@ -72,63 +74,105 @@ export function redact(text: string): string {
 		.replace(/\bgh[opsu]_[A-Za-z0-9]{20,}/g, '***');
 }
 
+/** A git command slower than this is logged, with its arguments and time. */
+const SLOW_GIT_MS = 5_000;
+/** More output than this is a runaway command: it is killed. */
+const MAX_GIT_OUTPUT = 64 * 1024 * 1024;
+
+export interface GitRunOptions {
+	allowFail?: boolean;
+	input?: string;
+	env?: NodeJS.ProcessEnv;
+	timeoutMs?: number;
+}
+
+export interface GitResult {
+	code: number;
+	out: string;
+	err?: string;
+}
+
 export class GitRunner {
 	constructor(
 		readonly dir: string,
-		private readonly env: NodeJS.ProcessEnv = {}
+		private readonly env: NodeJS.ProcessEnv = {},
+		private readonly watch: { slowMs?: number; log?: (msg: string) => void } = {}
 	) {}
 
-	run(args: string[], opts: { allowFail?: boolean; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}) {
-		try {
-			const out = execFileSync('git', args, {
-				// Local plumbing takes seconds; a hung git must not stall the event loop for long.
-				timeout: opts.timeoutMs ?? 2 * 60 * 1000,
-				killSignal: 'SIGKILL',
-				cwd: this.dir,
-				encoding: 'utf8',
-				input: opts.input,
-				env: { ...process.env, ...this.env, ...opts.env },
-				stdio: ['pipe', 'pipe', 'pipe'],
-				maxBuffer: 64 * 1024 * 1024
-			});
-			return { code: 0, out: out.trim() };
-		} catch (e) {
-			const err = e as { status?: number; stdout?: string; stderr?: string };
-			if (!opts.allowFail) {
-				throw new Error(redact(`git ${args.join(' ')} failed: ${err.stderr || err.stdout || e}`));
-			}
-			return { code: err.status ?? 1, out: (err.stdout ?? '').trim(), err: err.stderr ?? '' };
-		}
+	/** Logs `args` when it took at least the slow threshold. */
+	private timed(args: string[], started: number) {
+		const took = Date.now() - started;
+		if (took >= (this.watch.slowMs ?? SLOW_GIT_MS)) (this.watch.log ?? ((m) => log.info(m)))(redact(`[git] slow: git ${args.join(' ')} took ${took} ms`));
 	}
 
 	/**
-	 * Same as `run`, without blocking the event loop: for network git (fetch, push), which can
-	 * take minutes on a large repository and would otherwise freeze every request meanwhile.
+	 * Runs git off the event loop: a slow or stuck git never freezes requests or ticks. The command
+	 * runs in its own process group, and a timeout kills the whole group, so a merge driver or
+	 * helper git started can't keep running after it.
 	 */
-	runAsync(
-		args: string[],
-		opts: { allowFail?: boolean; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}
-	): Promise<{ code: number; out: string; err?: string }> {
-		return new Promise((resolve, reject) => {
-			execFile(
-				'git',
-				args,
-				{
-					timeout: opts.timeoutMs ?? 2 * 60 * 1000,
-					killSignal: 'SIGKILL',
-					cwd: this.dir,
-					encoding: 'utf8',
-					env: { ...process.env, ...this.env, ...opts.env },
-					maxBuffer: 64 * 1024 * 1024
-				},
-				(e, stdout, stderr) => {
-					if (!e) return resolve({ code: 0, out: stdout.trim() });
-					const code = typeof e.code === 'number' ? e.code : 1;
-					const why = e.killed ? `killed after ${opts.timeoutMs ?? 120000} ms` : stderr || stdout || e.message;
-					if (!opts.allowFail) return reject(new Error(redact(`git ${args.join(' ')} failed: ${why}`)));
-					resolve({ code, out: stdout.trim(), err: stderr });
+	run(args: string[], opts: GitRunOptions = {}): Promise<GitResult> {
+		const started = Date.now();
+		return withDoing(redact(`git ${args.join(' ')}`).slice(0, 300), () => this.spawn(args, opts)).finally(() => this.timed(args, started));
+	}
+
+	/** `run`, for the network commands (fetch, push) that call it by this name. */
+	runAsync(args: string[], opts: GitRunOptions = {}): Promise<GitResult> {
+		return this.run(args, opts);
+	}
+
+	private spawn(args: string[], opts: GitRunOptions): Promise<GitResult> {
+		const timeoutMs = opts.timeoutMs ?? 2 * 60 * 1000;
+		return new Promise<GitResult>((resolve, reject) => {
+			const child = spawn('git', args, {
+				cwd: this.dir,
+				env: { ...process.env, ...this.env, ...opts.env },
+				stdio: ['pipe', 'pipe', 'pipe'],
+				detached: true
+			});
+			const out: Buffer[] = [];
+			const err: Buffer[] = [];
+			let size = 0;
+			let why: string | null = null;
+			const killGroup = () => {
+				try {
+					if (child.pid) process.kill(-child.pid, 'SIGKILL');
+				} catch {
+					// already gone
 				}
-			);
+			};
+			const take = (into: Buffer[]) => (b: Buffer) => {
+				size += b.length;
+				if (size <= MAX_GIT_OUTPUT) return void into.push(b);
+				why ??= `output over ${MAX_GIT_OUTPUT} bytes`;
+				killGroup();
+			};
+			child.stdout.on('data', take(out));
+			child.stderr.on('data', take(err));
+			const timer = setTimeout(() => {
+				why ??= `killed after ${timeoutMs} ms`;
+				killGroup();
+			}, timeoutMs);
+			child.on('error', (e) => {
+				clearTimeout(timer);
+				reject(new Error(redact(`git ${args.join(' ')} failed: ${e.message}`)));
+			});
+			// 'exit', not 'close': something git started may hold the pipes open after git itself ends.
+			child.on('exit', (code) => {
+				clearTimeout(timer);
+				// Nothing the command started outlives it.
+				killGroup();
+				setImmediate(() => {
+					const stdout = Buffer.concat(out).toString('utf8');
+					const stderr = Buffer.concat(err).toString('utf8');
+					if (code === 0 && !why) return resolve({ code: 0, out: stdout.trim() });
+					if (!opts.allowFail) return reject(new Error(redact(`git ${args.join(' ')} failed: ${why ?? (stderr || stdout || `exit code ${code}`)}`)));
+					resolve({ code: code ?? 1, out: stdout.trim(), err: stderr });
+				});
+			});
+			child.stdin.on('error', () => {
+				// git exited before reading all its input; its exit code says why
+			});
+			child.stdin.end(opts.input ?? '');
 		});
 	}
 }
@@ -152,9 +196,9 @@ export const BASE_TRAILER = 'Merge-Queue-Base';
  * A commit with `baseSha`'s own tree on top of it, so CI can test the default branch alone on a
  * queue branch (its trailer names the base, like a batch's).
  */
-export function baselineCommit(git: GitRunner, baseSha: string): string {
-	const tree = git.run(['rev-parse', `${baseSha}^{tree}`]).out;
-	return git.run(['commit-tree', tree, '-p', baseSha, '-F', '-'], {
+export async function baselineCommit(git: GitRunner, baseSha: string): Promise<string> {
+	const tree = (await git.run(['rev-parse', `${baseSha}^{tree}`])).out;
+	return (await git.run(['commit-tree', tree, '-p', baseSha, '-F', '-'], {
 		input: `Merge queue: ${baseSha.slice(0, 12)} alone\n\n${BASE_TRAILER}: ${baseSha}\n`,
 		env: {
 			GIT_AUTHOR_NAME: 'merge-queue',
@@ -162,16 +206,16 @@ export function baselineCommit(git: GitRunner, baseSha: string): string {
 			GIT_COMMITTER_NAME: 'merge-queue',
 			GIT_COMMITTER_EMAIL: 'merge-queue@users.noreply.github.com'
 		}
-	}).out;
+	})).out;
 }
 
 /** Applies `members` in order on top of `baseSha`. Stops at the first PR that conflicts. */
-export function buildBatch(
+export async function buildBatch(
 	git: GitRunner,
 	baseSha: string,
 	members: BatchMember[],
 	opts: BuildOptions = {}
-): BuildResult {
+): Promise<BuildResult> {
 	const author = opts.author ?? { name: 'merge-queue[bot]', email: 'merge-queue[bot]@users.noreply.github.com' };
 	const when = opts.date !== undefined ? `@${opts.date} +0000` : undefined;
 	const env: NodeJS.ProcessEnv = {
@@ -183,7 +227,7 @@ export function buildBatch(
 	};
 
 	let tip = baseSha;
-	let tipTree = git.run(['rev-parse', `${baseSha}^{tree}`]).out;
+	let tipTree = (await git.run(['rev-parse', `${baseSha}^{tree}`])).out;
 	const commits: BuiltCommit[] = [];
 	for (const m of members) {
 		// Attributes come from the default branch, never from a PR: they pick the queue's merge drivers.
@@ -191,10 +235,10 @@ export function buildBatch(
 		const args = [`--attr-source=${attrs}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages'];
 		// The parent may have moved on after the child branched: the child's work
 		// starts at the newest parent commit it contains, not at the parent's head.
-		const fork = m.parentHeadSha ? git.run(['merge-base', m.parentHeadSha, m.headSha]).out : null;
+		const fork = m.parentHeadSha ? (await git.run(['merge-base', m.parentHeadSha, m.headSha])).out : null;
 		if (fork) args.push(`--merge-base=${fork}`);
 		args.push(tip, m.headSha);
-		const r = git.run(args, { allowFail: true });
+		const r = (await git.run(args, { allowFail: true }));
 		const lines = r.out.split('\n').filter(Boolean);
 		if (r.code !== 0) {
 			const conflicts = r.code === 1 ? lines.slice(1) : [];
@@ -216,11 +260,11 @@ export function buildBatch(
 			continue;
 		}
 		// A squash keeps the squashed commits' author (as `git merge --squash` would), not the queue's.
-		const [authorName, authorEmail] = git.run(['log', '-1', '--format=%an%x00%ae', m.headSha]).out.split('\0');
-		const sha = git.run(['commit-tree', tree, '-p', tip, '-F', '-'], {
+		const [authorName, authorEmail] = (await git.run(['log', '-1', '--format=%an%x00%ae', m.headSha])).out.split('\0');
+		const sha = (await git.run(['commit-tree', tree, '-p', tip, '-F', '-'], {
 			input: `${squashMessage(m)}\n\n${BASE_TRAILER}: ${baseSha}\n`,
 			env: { ...env, GIT_AUTHOR_NAME: authorName, GIT_AUTHOR_EMAIL: authorEmail }
-		}).out;
+		})).out;
 		commits.push({ pr: m.pr, sha, tree, fork });
 		tip = sha;
 		tipTree = tree;
@@ -236,17 +280,17 @@ export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
  * `attrs` (the default branch the batch was built with, which a PR landed before it may have
  * changed), and by lines with no attributes, as GitHub merges. Each is the tree, or null on a conflict.
  */
-export function mergeTrees(git: GitRunner, onto: string, head: string, attrs: string): { queue: string | null; line: string | null } {
-	const tree = (source: string) => {
-		const r = git.run([`--attr-source=${source}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages', onto, head], { allowFail: true });
+export async function mergeTrees(git: GitRunner, onto: string, head: string, attrs: string): Promise<{ queue: string | null; line: string | null }> {
+	const tree = async (source: string) => {
+		const r = (await git.run([`--attr-source=${source}`, 'merge-tree', '--write-tree', '--name-only', '--no-messages', onto, head], { allowFail: true }));
 		return r.code === 0 ? r.out.split('\n')[0] : null;
 	};
-	return { queue: tree(attrs), line: tree(EMPTY_TREE) };
+	return { queue: await tree(attrs), line: await tree(EMPTY_TREE) };
 }
 
 /** A merge commit of `tree` on `parents`, committed by the queue. */
-export function queueMergeCommit(git: GitRunner, tree: string, parents: string[], message: string): string {
-	return git.run(['commit-tree', tree, ...parents.flatMap((p) => ['-p', p]), '-F', '-'], {
+export async function queueMergeCommit(git: GitRunner, tree: string, parents: string[], message: string): Promise<string> {
+	return (await git.run(['commit-tree', tree, ...parents.flatMap((p) => ['-p', p]), '-F', '-'], {
 		input: `${message}\n`,
 		env: {
 			GIT_AUTHOR_NAME: 'merge-queue',
@@ -254,5 +298,5 @@ export function queueMergeCommit(git: GitRunner, tree: string, parents: string[]
 			GIT_COMMITTER_NAME: 'merge-queue',
 			GIT_COMMITTER_EMAIL: 'merge-queue@users.noreply.github.com'
 		}
-	}).out;
+	})).out;
 }

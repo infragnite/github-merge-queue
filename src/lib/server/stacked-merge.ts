@@ -14,10 +14,13 @@ export interface AsyncMergeApi {
 	sleep(ms: number): Promise<void>;
 }
 
-/** What the REST API says about a PR's GitHub stack: its position from the bottom (1) and its size. */
+/** What the REST API says about a PR's GitHub stack: the stack's number, and its position from the bottom (1) and size. */
 export interface StackedPR {
-	stack?: { position?: number; size?: number } | null;
+	stack?: { number?: number; position?: number; size?: number } | null;
 }
+
+/** A stack as `GET /repos/{o}/{r}/stacks/{number}` returns it: its PRs, bottom first. */
+type Stack = { pull_requests?: Array<{ number: number; state: string }> };
 
 type AsyncResult = { status?: string; details?: { message?: string; uuid?: string; sha?: string } };
 
@@ -41,12 +44,29 @@ export async function mergeInStack(
 	api: AsyncMergeApi,
 	req: { pulls: string; n: number; title: string; sha: string; pr: StackedPR }
 ): Promise<MergeResult> {
-	const below = (req.pr.stack?.position ?? 1) - 1;
-	if (below > 0) {
+	// The PR's position still counts the PRs below it that merged: only the stack says which are open.
+	const number = req.pr.stack?.number;
+	let below: number[] = [];
+	const unchecked = (why: string): MergeResult => ({ merged: false, sha: null, message: `${why}, so the PRs below it can't be checked; GitHub's merge would merge them with it` });
+	if ((req.pr.stack?.position ?? 1) > 1 && number === undefined) return unchecked(`GitHub did not say which stack #${req.n} is in`);
+	if (number !== undefined && (req.pr.stack?.position ?? 1) > 1) {
+		let stack: Stack;
+		try {
+			stack = (await api.get(`${req.pulls.replace(/\/pulls$/, '')}/stacks/${number}`)) as Stack;
+		} catch (e) {
+			return mergeResultFromError(e);
+		}
+		const prs = stack.pull_requests ?? [];
+		const at = prs.findIndex((p) => p.number === req.n);
+		if (at < 0) return unchecked(`GitHub's stack ${number} does not list #${req.n}`);
+		below = prs.slice(0, at).filter((p) => p.state === 'open').map((p) => p.number);
+	}
+	if (below.length) {
+		const k = below.length;
 		return {
 			merged: false,
 			sha: null,
-			message: `#${req.n} sits above ${below} open PR${below === 1 ? '' : 's'} in its GitHub stack, and GitHub's merge would merge them with it; merge or unstack the PRs below it first`
+			message: `#${req.n} sits above ${k} open PR${k === 1 ? '' : 's'} in its GitHub stack (${below.map((b) => `#${b}`).join(', ')}), and GitHub's merge would merge them with it; merge or unstack the PRs below it first`
 		};
 	}
 	const base = `${req.pulls}/${req.n}/merge-async`;

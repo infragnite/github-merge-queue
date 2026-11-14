@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import { HOLD_CODES, holdAdvice, type HoldCode } from './batching';
 
 /** Waiting on other PRs or on the queue: nothing for the author to do. */
-const SILENT: HoldCode[] = ['deferred', 'parent-held', 'parent-not-ready', 'not-fetched'];
+const SILENT: HoldCode[] = ['deferred', 'parent-held', 'parent-not-ready', 'not-fetched', 'try-pending'];
 import * as format from './hold-format';
 import { ejectedNotice, holdCheck, holdNotice, NEXT_ACTIONS, readNotice, statusBlock } from './hold-format';
 
@@ -64,6 +64,18 @@ describe('the hold comment', () => {
 				"**Merge queue:** Changes .github/workflows/ci.yml, which the merge queue app may not push. A repository admin grants the app the Workflows: Read and write permission; then push to retry.",
 				'',
 				'<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"h2","code":"workflow-permission","reason":"Changes .github/workflows/ci.yml, which the merge queue app may not push","files":[".github/workflows/ci.yml"],"nextActions":["grant-workflows-permission"]} -->'
+			].join('\n')
+		);
+	});
+
+	test('a merge GitHub refused says to fix what GitHub named and push', () => {
+		const reason = "GitHub refused the merge: #2 sits above 1 open PR in its GitHub stack, and GitHub's merge would merge them with it; merge or unstack the PRs below it first";
+		const body = holdNotice({ pr: 2, head: 'h2', code: 'merge-refused', reason, files: [] });
+		expect(body).toBe(
+			[
+				`**Merge queue:** ${reason}. Fix what GitHub named, then push to retry.`,
+				'',
+				`<!-- merge-queue {"v":1,"kind":"hold","pr":2,"head":"h2","code":"merge-refused","reason":${JSON.stringify(reason)},"nextActions":["fix-merge-refusal"]} -->`
 			].join('\n')
 		);
 	});
