@@ -1,4 +1,5 @@
 <script lang="ts">
+	import GitHubRefs from './GitHubRefs.svelte';
 	import { enhance } from '$app/forms';
 	import type { ViewItem } from '$lib/types';
 
@@ -19,14 +20,14 @@
 
 <div class="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:gap-4">
 	<div class="min-w-0 flex-1">
-		<p class="text-sm text-gray-900">{reason}</p>
+		<p class="text-sm text-gray-900"><GitHubRefs text={reason} owner={repoOwner} name={repoName} /></p>
 		<p class="mt-0.5 flex min-w-0 items-center gap-2 text-xs text-gray-500">
 			<a href={item.pr_url} target="_blank" rel="noopener" class="shrink-0 font-mono hover:text-indigo-600">#{item.pr_number}</a>
-			<span class="min-w-0 truncate">{item.pr_title}</span>
+			<span class="min-w-0 truncate"><GitHubRefs text={item.pr_title} owner={repoOwner} name={repoName} /></span>
 			<span class="shrink-0">· {item.author_login}</span>
 		</p>
 		{#each warnings as w, i (i)}
-			<p class="mt-0.5 text-xs text-amber-700">{w}</p>
+			<p class="mt-0.5 text-xs text-amber-700"><GitHubRefs text={w} owner={repoOwner} name={repoName} /></p>
 		{/each}
 	</div>
 	{#if !readonly}

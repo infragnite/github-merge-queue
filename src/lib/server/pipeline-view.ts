@@ -38,17 +38,23 @@ export interface PipelineView {
 }
 
 /**
- * Job counts change by the minute; dashboards refreshing every 10s share one lookup per minute.
+ * Viewers share cached job counts; CI webhooks mark them stale.
  * While the rate-limit budget is low, or a lookup fails, the last counts are shown.
  */
-const PROGRESS_TTL_MS = 60_000;
-const progressCache = new Map<string, { at: number; value: CIProgress }>();
+const PROGRESS_TTL_MS = 30_000;
+const progressCache = new Map<string, { at: number; value: CIProgress; stale?: boolean }>();
 const progressErrors = new Map<string, string>();
 
-async function progressFor(repo: RepoRef, sha: string, low: boolean): Promise<CIProgress | null> {
+/** Job webhooks make the next view read fresh progress rather than waiting for its cache TTL. */
+export function invalidateProgress(owner: string, name: string, sha: string) {
+	const hit = progressCache.get(`${owner}/${name}@${sha}`);
+	if (hit) hit.stale = true;
+}
+
+export async function progressFor(repo: RepoRef, sha: string, low: boolean): Promise<CIProgress | null> {
 	const key = `${repo.owner}/${repo.name}@${sha}`;
 	const hit = progressCache.get(key);
-	if (hit && (low || Date.now() - hit.at < PROGRESS_TTL_MS)) return hit.value;
+	if (hit && (low || (!hit.stale && Date.now() - hit.at < PROGRESS_TTL_MS))) return hit.value;
 	if (low) return null;
 	try {
 		const value = summarizeJobs(await github.actionsJobsForSha(repo.owner, repo.name, sha));

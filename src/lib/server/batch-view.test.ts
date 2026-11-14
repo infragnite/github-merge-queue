@@ -76,7 +76,7 @@ test('counts jobs, treating skipped and neutral as passing', () => {
 			{ name: 'e2e', status: 'in_progress', conclusion: null, html_url: 'd' },
 			{ name: 'release', status: 'queued', conclusion: null, html_url: 'e' }
 		])
-	).toEqual({ total: 5, done: 3, failed: 1, running: 1, url: 'c', failedJobs: ['test'] });
+	).toEqual({ total: 5, done: 3, failed: 1, running: 1, url: 'c', failedJobs: ['test'], failedJobLinks: [{ name: 'test', url: 'c' }] });
 });
 
 test("a bisecting batch shows each PR's verdict and, apart from it, what is happening to it", () => {
@@ -169,4 +169,17 @@ test('carries the CI run each card and bisection step links to', () => {
 	const card = batchCard(row({ run_url: 'https://github.com/o/r/runs/7' }), [step], analysis, new Map(), new Map());
 	expect(card.runUrl).toBe('https://github.com/o/r/runs/7');
 	expect(card.bisection.map((b) => b.runUrl)).toEqual([null]);
+});
+
+
+test('failed matrix jobs retain their own job URLs when sorted by name', () => {
+	const p = summarizeJobs([
+		{ name: 'test (wasm)', status: 'completed', conclusion: 'failure', html_url: 'https://github.com/o/r/actions/runs/1/job/3' },
+		{ name: 'test (jvm)', status: 'completed', conclusion: 'failure', html_url: 'https://github.com/o/r/actions/runs/1/job/2' },
+		{ name: 'lint', status: 'completed', conclusion: 'success', html_url: 'https://github.com/o/r/actions/runs/1/job/1' }
+	]);
+	expect(p.failedJobLinks).toEqual([
+		{ name: 'test (jvm)', url: 'https://github.com/o/r/actions/runs/1/job/2' },
+		{ name: 'test (wasm)', url: 'https://github.com/o/r/actions/runs/1/job/3' }
+	]);
 });

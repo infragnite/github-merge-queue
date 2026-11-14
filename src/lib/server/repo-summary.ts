@@ -3,7 +3,7 @@
 // dashboard stays cheap however many repositories it lists.
 
 import { getQueueItems } from './db';
-import { getActiveBatches, getMasterHealth, getQueueSettings } from './batch-store';
+import { getActiveBatches, getMasterHealth, getQueueSettings, trySlotsInUse, getQueuedTries, getRunningBaseline } from './batch-store';
 import { boardItem } from './api-service';
 import { dashboardStackAnalysis } from './stack-runtime';
 import type { Repo } from '../types';
@@ -22,6 +22,9 @@ export interface RepoSummary {
 	modeLabel: string;
 	/** PRs being tested now. */
 	testing: number;
+	triesRunning: number;
+	triesWaiting: number;
+	baselineRunning: boolean;
 	/** PRs in line, not yet tested and not needing anyone. */
 	waiting: number;
 	/** PRs someone has to look at: failed, in conflict, or held for a reason only a person can fix. */
@@ -36,6 +39,9 @@ type Inputs = {
 	masterRed: boolean;
 	/** Batch mode: the PRs of the batches in flight that are still in them (not landed or left). */
 	inflight: number[];
+	triesRunning?: number;
+	triesWaiting?: number;
+	baselineRunning?: boolean;
 	/** The queue page's last stack analysis, when there is one: PRs stacked on a held one need attention too. */
 	analysis?: StackAnalysis | null;
 };
@@ -52,13 +58,19 @@ export function summarize(input: Inputs): RepoSummary {
 	const board = queueBoard(input.items, input.analysis ?? NO_STACKS, new Set(testingPrs));
 	const testing = new Set(testingPrs).size;
 	const waiting = board.stacks.reduce((n, s) => n + s.rows.length, 0);
-	const state: RepoState = input.paused !== null ? 'paused' : input.masterRed ? 'red' : testing > 0 ? 'running' : waiting > 0 ? 'waiting' : 'idle';
+	const triesRunning = input.triesRunning ?? 0;
+	const triesWaiting = input.triesWaiting ?? 0;
+	const baselineRunning = input.baselineRunning ?? false;
+	const state: RepoState = input.paused !== null ? 'paused' : input.masterRed ? 'red' : testing > 0 || triesRunning > 0 || baselineRunning ? 'running' : waiting > 0 || triesWaiting > 0 ? 'waiting' : 'idle';
 	return {
 		state,
 		paused: input.paused,
 		mode: input.mode,
 		modeLabel: input.mode === 'batch' ? `Batches of up to ${input.maxBatch}` : 'One by one',
 		testing,
+		triesRunning,
+		triesWaiting,
+		baselineRunning,
 		waiting,
 		attention: board.attention.length
 	};
@@ -76,6 +88,9 @@ export async function repoSummary(repo: Repo): Promise<RepoSummary> {
 		paused: settings.pausedReason,
 		masterRed: getMasterHealth(repo.id)?.state === 'red',
 		inflight: mode === 'batch' ? getActiveBatches(repo.id).flatMap((b) => b.members.filter((n) => !b.landed.includes(n) && !b.left_prs.includes(n))) : [],
+		triesRunning: trySlotsInUse(repo.id).length,
+		triesWaiting: getQueuedTries(repo.id).length,
+		baselineRunning: getRunningBaseline(repo.id) !== null,
 		analysis
 	});
 }

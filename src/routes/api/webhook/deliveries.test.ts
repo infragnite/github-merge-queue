@@ -90,3 +90,18 @@ test("an unsigned delivery's event header is not a metric label: anyone could ma
 		telemetry.useMeterProvider(null);
 	}
 });
+
+
+test('signed CI notifications invalidate UI subscribers; invalid signatures do not', async () => {
+	const { subscribeRepoChanges } = await import('$lib/server/events');
+	const id = db.getRepoByOwnerName('acme', 'repo')!.id;
+	const changed = vi.fn();
+	const off = subscribeRepoChanges([id], changed);
+	try {
+		const body = { action: 'completed', repository: { full_name: 'acme/repo' }, check_run: { head_sha: 'abc' } };
+		await deliver(body, { event: 'check_run' });
+		expect(changed).toHaveBeenCalledOnce();
+		await deliver(body, { event: 'check_run', secret: 'wrong' });
+		expect(changed).toHaveBeenCalledOnce();
+	} finally { off(); }
+});

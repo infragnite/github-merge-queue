@@ -1,3 +1,5 @@
+import { notifyRepoChange } from '$lib/server/events';
+import { invalidateProgress } from '$lib/server/pipeline-view';
 import { json } from '@sveltejs/kit';
 import { createHmac } from 'crypto';
 import { env } from '$env/dynamic/private';
@@ -287,6 +289,11 @@ export const POST: RequestHandler = async ({ request }) => {
 			break;
 		}
 	}
+
+	const ciPayload = payload.check_run ?? payload.check_suite ?? payload.workflow_run ?? payload.workflow_job;
+	const ciHead = (ciPayload as { head_sha?: string } | undefined)?.head_sha;
+	if (ciHead) invalidateProgress(owner, name, ciHead);
+	notifyRepoChange(repo.id);
 
 	return json({ ok: true });
 };
