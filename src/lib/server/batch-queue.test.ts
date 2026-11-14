@@ -4504,6 +4504,66 @@ describe('automatic tries on each push', () => {
 		expect(events.lastEventOf(repo.id, 1, ['tried'])?.data).toMatchObject({ status: 'started', auto: true, run: t.id });
 	});
 
+	test('cooldown status acknowledges a push with its deadline once, and resets on the next head', async () => {
+		await enabledNow();
+		open(1);
+		await tick();
+		const old = git.sha('pr1');
+		const row = store.autoTryRows(repo.id).find((r) => r.pr === 1)!;
+		const report = tryChecks(1).at(-1)!;
+		expect(report).toMatchObject({ state: 'queued', title: expect.stringMatching(/^Push received: auto try after .* UTC$/) });
+		expect(report.summary).toContain(old.slice(0, 8));
+		expect(report.summary).toContain('cooldown');
+		expect(row.cooldownReportedUntil).toBe(row.seenAt + DELAY);
+		await run(2);
+		expect(tryChecks(1).filter((r) => r.title.startsWith('Push received'))).toHaveLength(1);
+		later(30_000);
+		git.commit('pr1', 'new push', 'new-push.txt');
+		await tick();
+		expect(tryChecks(1, old).at(-1)).toMatchObject({ state: 'neutral', title: 'Cancelled: a newer commit was pushed' });
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('Push received') });
+		expect(started()).toEqual([]);
+	});
+
+	test('disabling automatic tries finishes an outstanding cooldown status', async () => {
+		await enabledNow();
+		open(1);
+		await tick();
+		store.updateQueueSettings(repo.id, { config: { autoTry: false } });
+		await tick();
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'neutral', title: 'Cancelled: automatic tries were disabled' });
+		expect(started()).toEqual([]);
+	});
+
+	test('new pushes are acknowledged before an older try starts slow git preparation', async () => {
+		await enabledNow();
+		open(1);
+		await tick();
+		later();
+		open(2);
+		const d = world.deps();
+		const build = d.git.build;
+		d.git.build = async (...args) => {
+			expect(tryChecks(2).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('Push received') });
+			return build(...args);
+		};
+		await tickBatchQueue(d);
+		expect(started()).toEqual([1]);
+	});
+
+	test('a failed cooldown report is retried on the next tick', async () => {
+		await enabledNow();
+		open(1);
+		const d = world.deps();
+		const post = d.github.setPRCheck;
+		d.github.setPRCheck = async () => { throw new Error('GitHub unavailable'); };
+		await tickBatchQueue(d);
+		expect(store.autoTryRows(repo.id).find((r) => r.pr === 1)!.cooldownReportedUntil).toBeNull();
+		d.github.setPRCheck = post;
+		await tickBatchQueue(d);
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('Push received') });
+	});
+
 	test('its result lands on the PR as a /try check, and the PR is not tried again', async () => {
 		await enabledNow();
 		open(1);

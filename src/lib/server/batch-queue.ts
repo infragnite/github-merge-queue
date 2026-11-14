@@ -1959,7 +1959,7 @@ class Tick {
 				continue;
 			}
 			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === queued.id);
-			const reason = this.settings().mode !== 'batch' ? 'the queue left batch mode' : p.state !== 'open' ? 'the PR was closed' : p.headSha !== queued.heads[n]
+			const reason = p.state !== 'open' ? 'the PR was closed' : p.headSha !== queued.heads[n]
 				? 'a newer commit was pushed' : automatic ? this.autoTryBar(p, null) : null;
 			if (reason) {
 				store.setBatchStatus(queued.id, 'cancelled', reason);
@@ -2084,9 +2084,35 @@ class Tick {
 		const settings = store.getQueueSettings(this.repoId);
 		const on = settings.mode === 'batch' && settings.config.autoTry;
 		const running = store.runningAutoTries(this.repoId);
-		if ((!on && !running.length) || !this.d.github.openPRs) return;
+		const cooling = store.autoTryRows(this.repoId).filter((r) => r.cooldownReportedUntil !== null && (r.outcome === null || r.outcome === 'cancelled'));
+		if ((!on && !running.length && !cooling.length) || !this.d.github.openPRs) return;
 		this.open ??= new Map((await this.d.github.openPRs()).map((x) => [x.pr, x]));
 		const open = this.open;
+
+		// A received-event status must not wait forever after a push, closure or setting change.
+		for (const r of cooling) {
+			let p = open.get(r.pr);
+			if (!p && on) {
+				try {
+					const fresh = await this.d.github.pr(r.pr);
+					if (fresh.state === 'open') { p = fresh; open.set(r.pr, fresh); }
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					if ((e as { status?: number }).status !== 404) continue;
+				}
+			}
+			const queued = this.item(r.pr) && !settings.config.requireTryPass;
+			const reason = !on ? 'automatic tries were disabled' : p && p.headSha !== r.headSha ? 'a newer commit was pushed' : queued ? 'the PR is in the merge queue' : this.autoTryBar(p, open);
+			if (!reason) continue;
+			try {
+				await this.d.github.setPRCheck(r.headSha, { state: 'neutral', title: `Cancelled: ${reason}`, suffix: '/try' });
+				store.setAutoTry(this.repoId, r.pr, r.headSha, 'cancelled');
+				store.cooldownReported(this.repoId, r.pr, r.headSha, null);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRCheck')(e);
+			}
+		}
 
 		for (const t of running) {
 			const n = t.members[0];
@@ -2118,6 +2144,7 @@ class Tick {
 		}
 		store.seeAutoTryHeads(this.repoId, heads, now);
 
+		const due: store.AutoTryRow[] = [];
 		for (const r of store.autoTryRows(this.repoId)) {
 			const it = this.item(r.pr);
 			// Queued, it is tested by the queue; unless the queue waits for a passed try first, which then
@@ -2125,7 +2152,6 @@ class Tick {
 			const waitsForTry = settings.config.requireTryPass && it?.status === 'queued';
 			if (it && !waitsForTry) continue;
 			if (r.outcome !== null && r.outcome !== 'cancelled' && !(waitsForTry && r.outcome === 'existing')) continue;
-			if (now - r.seenAt < settings.config.autoTryDelayMs && !(waitsForTry && r.outcome === 'existing')) continue;
 			const p = open.get(r.pr);
 			if (!p || p.headSha !== r.headSha || this.autoTryBar(p, open)) continue;
 			// Tried already, or run by the queue itself (a batch that failed or was left): its CI is known.
@@ -2133,6 +2159,28 @@ class Tick {
 				store.setAutoTry(this.repoId, r.pr, r.headSha, 'tried');
 				continue;
 			}
+			const until = r.seenAt + settings.config.autoTryDelayMs;
+			if (now < until && !(waitsForTry && r.outcome === 'existing')) {
+				if (r.cooldownReportedUntil !== until) {
+					const at = (ms: number) => `${new Date(ms).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+					try {
+						await this.d.github.setPRCheck(r.headSha, {
+							state: 'queued', suffix: '/try', title: `Push received: auto try after ${at(until)}`,
+							summary: `Commit ${r.headSha.slice(0, 8)} was observed at ${at(r.seenAt)}. Waiting for the cooldown until ${at(until)}. Then this try joins the runs queue; it starts when a parallel try slot is free. A newer push resets the cooldown.`
+						});
+						store.cooldownReported(this.repoId, r.pr, r.headSha, until);
+					} catch (e) {
+						if (e instanceof RateLimitedError) throw e;
+						this.bestEffort('github.setPRCheck')(e);
+					}
+				}
+				continue;
+			}
+
+			due.push(r);
+		}
+		// Acknowledge every new push before slow git preparation can delay the other PRs' statuses.
+		for (const r of due) {
 			try {
 				await this.startTry(r.pr, { auto: true, head: r.headSha });
 			} catch (e) {

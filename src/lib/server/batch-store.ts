@@ -338,6 +338,8 @@ export function migrateBatches(database: Database.Database) {
 			at INTEGER NOT NULL
 		);
 	`);
+	const autoCols = database.prepare(`PRAGMA table_info(auto_tries)`).all() as Array<{ name: string }>;
+	if (!autoCols.some((c) => c.name === 'cooldown_reported_until')) database.exec('ALTER TABLE auto_tries ADD COLUMN cooldown_reported_until INTEGER');
 }
 
 // --- settings ---
@@ -879,14 +881,19 @@ export interface AutoTryRow {
 	seenAt: number;
 	outcome: AutoTryOutcome | null;
 	runId: number | null;
+	cooldownReportedUntil: number | null;
 }
 
 export function autoTryRows(repoId: number): AutoTryRow[] {
 	return (
 		getDb()
-			.prepare(`SELECT pr_number, head_sha, seen_at, outcome, run_id FROM auto_tries WHERE repo_id = ? ORDER BY seen_at, pr_number`)
-			.all(repoId) as Array<{ pr_number: number; head_sha: string; seen_at: number; outcome: AutoTryOutcome | null; run_id: number | null }>
-	).map((r) => ({ pr: r.pr_number, headSha: r.head_sha, seenAt: r.seen_at, outcome: r.outcome, runId: r.run_id }));
+			.prepare(`SELECT pr_number, head_sha, seen_at, outcome, run_id, cooldown_reported_until FROM auto_tries WHERE repo_id = ? ORDER BY seen_at, pr_number`)
+			.all(repoId) as Array<{ pr_number: number; head_sha: string; seen_at: number; outcome: AutoTryOutcome | null; run_id: number | null; cooldown_reported_until: number | null }>
+	).map((r) => ({ pr: r.pr_number, headSha: r.head_sha, seenAt: r.seen_at, outcome: r.outcome, runId: r.run_id, cooldownReportedUntil: r.cooldown_reported_until }));
+}
+
+export function cooldownReported(repoId: number, pr: number, headSha: string, until: number | null) {
+	getDb().prepare(`UPDATE auto_tries SET cooldown_reported_until = ? WHERE repo_id = ? AND pr_number = ? AND head_sha = ?`).run(until, repoId, pr, headSha);
 }
 
 /**
