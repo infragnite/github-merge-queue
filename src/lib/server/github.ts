@@ -487,6 +487,15 @@ export async function squashMergeAt(owner: string, repo: string, n: number, titl
 	}
 }
 
+/** Latest statuses, paginated so the transition cannot miss a legacy try context. */
+export async function hasCommitStatus(owner: string, repo: string, sha: string, context: string): Promise<boolean> {
+	for (let page = 1; ; page++) {
+		const data = await ghFetchAsApp(`/repos/${owner}/${repo}/commits/${sha}/status?per_page=100&page=${page}`);
+		if (data.statuses.some((s: { context: string }) => s.context === context)) return true;
+		if (data.statuses.length < 100) return false;
+	}
+}
+
 export async function createCommitStatus(
 	owner: string,
 	repo: string,

@@ -5062,6 +5062,42 @@ describe('automatic tries on each push', () => {
 		expect(started()).toEqual([1]);
 	});
 
+	test('a try report acquires its specific workflow URL once Actions discovers the run, without repeated reports', async () => {
+		let url: string | null = null;
+		const deps = world.deps.bind(world);
+		world.deps = () => {
+			const d = deps();
+			d.ci.runUrl = async () => url;
+			return d;
+		};
+		await enabledNow();
+		open(1);
+		holdCI(1);
+		await tick();
+		later();
+		await tick();
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'in_progress' });
+		expect(tryChecks(1).at(-1)!.url).toBeUndefined();
+		const before = tryChecks(1).length;
+		await tick();
+		expect(tryChecks(1)).toHaveLength(before);
+		url = 'https://github.com/o/r/actions/runs/123';
+		await tick();
+		expect(tryChecks(1).at(-1)!.url).toBe(url);
+		expect(store.getBatch(tries(1).at(-1)!.id)!.reported_run_url).toBe(url);
+		await tick();
+		expect(tryChecks(1)).toHaveLength(before + 1);
+		// A final API failure must not discard the specific URL already published.
+		world.deps = () => {
+			const d = deps();
+			d.ci.runUrl = async () => { throw new Error('Actions unavailable'); };
+			return d;
+		};
+		releaseCI();
+		await tick();
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'success', url });
+	});
+
 	test('a GitHub error starting a try is retried next tick, and does not keep the other PRs from starting', async () => {
 		const deps = world.deps.bind(world);
 		world.deps = () => {
