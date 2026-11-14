@@ -1997,14 +1997,17 @@ class Tick {
 		}
 		const starting = new Set(store.branchIntents(this.repoId).map((i) => i.branch));
 		for (const run of store.getRunningTries(this.repoId)) {
-			if (run.queue_position !== 0 || starting.has(run.branch)) continue;
+			if (starting.has(run.branch) || (run.queue_position !== 0 && run.reported_run_url)) continue;
 			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === run.id);
 			try {
+				const url = await this.d.ci.runUrl(run.head_sha);
+				// Report admission immediately, then update once Actions has created its run.
+				if (run.queue_position !== 0 && !url) continue;
 				await this.d.github.setPRCheck(run.heads[run.members[0]], {
 					state: 'in_progress', title: short(`Trying on ${this.d.repo.default_branch} in ${run.branch}${automatic ? ' (automatic, on push)' : ''}`),
-					suffix: '/try', url: this.branchRuns(run.branch)
+					suffix: '/try', ...(url ? { url } : {})
 				});
-				store.tryStartedReported(run.id);
+				store.tryStartedReported(run.id, url);
 			} catch (e) {
 				if (e instanceof RateLimitedError) throw e;
 				this.bestEffort('github.setPRCheck')(e);
@@ -2068,7 +2071,7 @@ class Tick {
 			if (deleted) store.branchPushed(this.repoId, t.branch);
 		}
 		await this.d.github
-			.setPRCheck(head, { state: 'neutral', title: short(`Cancelled: ${reason}`), suffix: '/try', url: this.branchRuns(t.branch) })
+			.setPRCheck(head, { state: 'neutral', title: short(`Cancelled: ${reason}`), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.reported_run_url ?? undefined })
 			.catch(this.bestEffort('github.setPRCheck'));
 		this.event(n, 'tried', { status: 'cancelled', branch: t.branch, run: t.id, headSha: head, auto: true, reason });
 		this.log(`automatic try of #${n} cancelled: ${reason}`);
@@ -2229,7 +2232,7 @@ class Tick {
 			const summary =
 				r === 'success' ? `${desc}. \`/mq queue\` lands it ahead of every PR but urgent ones, without another run, while neither it nor \`${def}\` changes.` : undefined;
 			await this.d.github
-				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: await this.runLink(t) })
+				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.reported_run_url ?? undefined })
 				.catch(this.bestEffort('github.setPRCheck'));
 			await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
 			this.event(n, 'tried', { status: r, branch: t.branch, run: t.id, headSha: t.heads[n] });

@@ -320,7 +320,7 @@ export function checkRunRequest(sha: string, check: PRCheck, at: { name: string;
 	return {
 		name: `${at.name}${check.suffix ?? ''}`,
 		head_sha: sha,
-		details_url: at.detailsUrl,
+		details_url: check.url ?? at.detailsUrl,
 		...(open ? { status: check.state as 'queued' | 'in_progress' } : { status: 'completed' as const, conclusion: check.state as Exclude<PRCheck['state'], 'queued' | 'in_progress'> }),
 		output: { title: check.title, summary }
 	};
@@ -370,6 +370,29 @@ export async function postPRReport(
 			warn(e);
 		}
 	}
+}
+
+/** Tries have one canonical Check Run. Only pre-existing legacy statuses are maintained. */
+export async function postTryReport(
+	check: PRCheck,
+	postCheck: () => Promise<unknown>,
+	legacyExists: () => Promise<boolean>,
+	postLegacy: (state: 'success' | 'failure' | 'pending') => Promise<unknown>
+): Promise<void> {
+	// Failure must retry: there is no legacy fallback for new heads.
+	await postCheck();
+	if (await legacyExists()) {
+		// A cancelled try must not leave its old legacy status pending forever.
+		const state = check.state === 'queued' || check.state === 'in_progress' ? 'pending' : check.state === 'success' ? 'success' : 'failure';
+		await postLegacy(state);
+	}
+}
+
+/** The configured workflow on this tested commit, not an Actions search or an arbitrary job. */
+export function workflowRunUrl(owner: string, repo: string, workflow: string, runs: Array<{ id: number; path?: string }>): string | null {
+	const path = `.github/workflows/${workflow}`;
+	const run = runs.filter((r) => r.path?.split('@')[0] === path).sort((a, b) => b.id - a.id)[0];
+	return run ? `https://github.com/${owner}/${repo}/actions/runs/${run.id}` : null;
 }
 
 export function liveDeps(repo: RepoRef): QueueDeps {
@@ -436,13 +459,8 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 				const runs = await github.workflowRunsForSha(owner, name, headSha);
 				for (const r of runs.filter((r) => r.status !== 'completed')) await github.cancelWorkflowRun(owner, name, r.id);
 			},
-			// Re-runs the workflow runs behind the required check's failed (or cancelled, timed-out) runs,
-			// not whatever else failed on the commit.
-			runUrl: async (headSha) => {
-				const runs = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
-				// A failed job's page shows the failure; otherwise any of the check's jobs.
-				return (runs.find((r) => r.conclusion && r.conclusion !== 'success') ?? runs[0])?.html_url ?? null;
-			},
+			runUrl: async (headSha) => workflowRunUrl(owner, name, ci().workflow, await github.workflowRunsForSha(owner, name, headSha)),
+			// Re-runs the workflow behind the required check, rather than unrelated failures.
 			rerunFailed: async (headSha) => {
 				const checks = await github.checkRunsNamed(owner, name, headSha, ci().requiredCheck);
 				const suites = new Set(
@@ -546,6 +564,15 @@ export function liveDeps(repo: RepoRef): QueueDeps {
 			setPRCheck: async (sha, check) => {
 				const { prStatus, prReport } = ci();
 				const page = queuePage(env.APP_URL, owner, name, sha);
+				if (check.suffix === '/try') {
+					await postTryReport(
+						check,
+						() => github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page })),
+						() => github.hasCommitStatus(owner, name, sha, `${prStatus}/try`),
+						(state) => github.createCommitStatus(owner, name, sha, { ...statusFromCheck(check, prStatus, page), state })
+					);
+					return;
+				}
 				await postPRReport(
 					prReport,
 					() => github.createCheckRun(owner, name, checkRunRequest(sha, check, { name: prStatus, detailsUrl: page })),

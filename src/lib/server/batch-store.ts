@@ -68,6 +68,8 @@ export interface BatchRow {
 	started_at?: string | null;
 	/** Last waiting position successfully reported to GitHub. */
 	queue_position?: number | null;
+	/** Specific workflow URL successfully published on the running try check. */
+	reported_run_url?: string | null;
 	finished_at: string | null;
 	/** When its latest CI result came in (null while none has, and in rows from before it was recorded). */
 	ci_done_at: string | null;
@@ -265,7 +267,8 @@ export function migrateBatches(database: Database.Database) {
 		['end_reason', 'TEXT'],
 		['settings', 'TEXT'],
 		['started_at', 'TEXT'],
-		['queue_position', 'INTEGER']
+		['queue_position', 'INTEGER'],
+		['reported_run_url', 'TEXT']
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
@@ -806,8 +809,8 @@ export function tryPositionReported(id: number, position: number) {
 }
 
 /** The running report reached GitHub; zero means it still needs retrying after admission. */
-export function tryStartedReported(id: number) {
-	getDb().prepare(`UPDATE batches SET queue_position = NULL WHERE id = ? AND status = 'testing'`).run(id);
+export function tryStartedReported(id: number, url: string | null = null) {
+	getDb().prepare(`UPDATE batches SET queue_position = NULL, reported_run_url = ? WHERE id = ? AND status = 'testing'`).run(url, id);
 }
 
 /**
