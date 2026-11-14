@@ -1995,8 +1995,9 @@ class Tick {
 
 			this.event(n, 'tried', { status: 'started', branch: run.branch, run: run.id, ...(automatic ? { auto: true } : {}) });
 		}
+		const starting = new Set(store.branchIntents(this.repoId).map((i) => i.branch));
 		for (const run of store.getRunningTries(this.repoId)) {
-			if (run.queue_position !== 0) continue;
+			if (run.queue_position !== 0 || starting.has(run.branch)) continue;
 			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === run.id);
 			try {
 				await this.d.github.setPRCheck(run.heads[run.members[0]], {

@@ -5019,8 +5019,10 @@ describe('automatic tries on each push', () => {
 		world.pushFailures = 1;
 		await tick();
 		expect(started()).toEqual([2]);
+		expect(tryChecks(1).filter((c) => c.state === 'in_progress')).toEqual([]);
 		await tick();
 		expect(started()).toEqual([2, 1]);
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'in_progress' });
 	});
 
 	test('turned off: nothing new starts, a push still cancels the running try; turned on again, only later pushes count', async () => {
