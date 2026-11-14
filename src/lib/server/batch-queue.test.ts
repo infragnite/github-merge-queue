@@ -2225,7 +2225,44 @@ describe('batch queue runtime', () => {
 		const last = world.prChecks.filter((x) => x.sha === git.sha('pr1')).at(-1)!;
 		// A neutral conclusion would pass a required check.
 		expect(['success', 'neutral', 'skipped']).not.toContain(last.state);
-		expect(last).toMatchObject({ state: 'queued', title: 'Not in the merge queue' });
+		expect(last).toMatchObject({ state: 'action_required', title: 'Not in the merge queue' });
+	});
+
+	test('a cancelled batch followed by dequeue finishes its report without any prior hold, even while paused', async () => {
+		pr(1);
+		await tickBatchQueue(world.deps());
+		const b = store.getActiveBatches(repo.id)[0];
+		await cancelBatch(world.deps(), b.id, 'dev');
+		db.removeFromQueue(db.getQueueItems(repo.id)[0].id);
+		events.emitEvent(repo.id, 1, 'dequeued', { by: 'dev' });
+		store.updateQueueSettings(repo.id, { pausedReason: 'maintenance' });
+		await run(2);
+		const checks = world.prChecks.filter((x) => x.sha === git.sha('pr1'));
+		expect(checks.map((x) => x.state)).toEqual(['in_progress', 'queued', 'action_required']);
+		expect(checks.at(-1)).toMatchObject({ title: 'Not in the merge queue' });
+		expect(events.unreportedDequeues(repo.id)).toEqual([]);
+	});
+
+	test('a failed removal report is retried, but a requeued PR is not reported as removed', async () => {
+		pr(1);
+		const item = db.getQueueItems(repo.id)[0];
+		db.removeFromQueue(item.id);
+		events.emitEvent(repo.id, 1, 'dequeued');
+		store.updateQueueSettings(repo.id, { pausedReason: 'maintenance' });
+		const d = world.deps();
+		const post = d.github.setPRCheck;
+		d.github.setPRCheck = async () => { throw new Error('GitHub unavailable'); };
+		await tickBatchQueue(d);
+		expect(events.unreportedDequeues(repo.id)).toEqual([1]);
+		d.github.setPRCheck = post;
+		await tickBatchQueue(d);
+		expect(world.prChecks).toHaveLength(1);
+		expect(events.unreportedDequeues(repo.id)).toEqual([]);
+		events.emitEvent(repo.id, 1, 'dequeued');
+		db.addToQueue(repo.id, 1, 'pr1', 'url', 'dev', '', 'dev');
+		events.emitEvent(repo.id, 1, 'queued');
+		await tickBatchQueue(d);
+		expect(world.prChecks).toHaveLength(1);
 	});
 
 	test('an ejected PR gets a failed check with its CI run, and a comment with the same block', async () => {
@@ -2409,7 +2446,7 @@ describe('batch queue runtime', () => {
 		const told = world.prChecks.filter((x) => x.sha === git.sha('pr1') && x.name === 'merge-queue').map((x) => [x.state, x.title]);
 		expect(told).toEqual([
 			['action_required', 'Changes requested'],
-			['queued', 'Not in the merge queue']
+			['action_required', 'Not in the merge queue']
 		]);
 		expect(events.listEvents(repo.id, { pr: 1 }).map((e) => e.kind).filter((k) => k === 'held' || k === 'released')).toEqual(['held', 'released']);
 	});

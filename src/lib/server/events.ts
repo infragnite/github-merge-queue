@@ -104,6 +104,15 @@ export function heldPRs(repoId: number): number[] {
 	return rows.filter((r) => r.kind === 'held').map((r) => r.pr_number);
 }
 
+/** Removals whose terminal GitHub report has not been posted yet, including across restarts. */
+export function unreportedDequeues(repoId: number): number[] {
+	return (getDb().prepare(
+		`SELECT pr_number FROM queue_events e WHERE repo_id = ? AND kind = 'dequeued'
+		 AND id = (SELECT MAX(id) FROM queue_events f WHERE f.repo_id = e.repo_id AND f.pr_number = e.pr_number
+		 AND f.kind IN ('queued', 'dequeued', 'released', 'merged', 'ejected'))`
+	).all(repoId) as Array<{ pr_number: number }>).map((r) => r.pr_number);
+}
+
 /** The kind of the PR's newest event among `kinds`; null when it has none (events are kept about a year). */
 export function lastEventOf(repoId: number, pr: number, kinds: QueueEventKind[]): { kind: QueueEventKind; data: Record<string, unknown> } | null {
 	const r = getDb()
