@@ -4,9 +4,12 @@ import { listInstallationRepos, getRepo as getGhRepo, appInstallUrl } from '$lib
 import { atLeast } from '$lib/server/api-auth';
 import { webCaller } from '$lib/server/web-auth';
 import { visibleRepos } from '$lib/server/visible-repos';
+import { installationRepoCache } from '$lib/server/installation-repo-cache';
 import { repoSummary } from '$lib/server/repo-summary';
 import type { PageServerLoad, Actions } from './$types';
 import { log } from '$lib/server/log';
+
+const availableRepos = installationRepoCache(listInstallationRepos);
 
 export const load: PageServerLoad = async ({ locals }) => {
 	if (!locals.user) redirect(302, '/login');
@@ -22,7 +25,7 @@ export const load: PageServerLoad = async ({ locals }) => {
 		let available: Array<{ full_name: string; default_branch: string }> = [];
 		const installUrl = await appInstallUrl();
 		try {
-			available = await listInstallationRepos();
+			available = await availableRepos();
 		} catch {
 			return { repos: [], installUrl, error: 'GitHub could not be asked which repositories the app is installed on' };
 		}
