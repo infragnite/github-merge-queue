@@ -1926,17 +1926,10 @@ class Tick {
 		const r = await this.buildOn(masterSha, [member], masterSha);
 		if (!r.ok) throw new Error(`#${n} does not apply on ${this.d.repo.default_branch}: ${r.reason.replace(/^#\d+ /, '')}`);
 		const branch = `mq/try-${n}-${this.d.now()}`;
-		store.intendBranch(this.repoId, branch, r.headSha);
-		await this.d.github.pushBranch(branch, r.headSha);
-		try {
-			await this.d.ci.start(branch, masterSha, r.headSha, [n]);
-		} catch (e) {
-			await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
-			throw e;
-		}
 		const row = {
 			repoId: this.repoId,
 			kind: 'try' as const,
+			queued: true,
 			branch,
 			baseSha: masterSha,
 			headSha: r.headSha,
@@ -1946,13 +1939,92 @@ class Tick {
 			heads: { [n]: p.headSha }
 		};
 		const run = opts.auto ? store.insertAutoTry(row, n, p.headSha) : store.insertBatch(row);
-		store.branchPushed(this.repoId, branch);
-		const title = `Trying on ${this.d.repo.default_branch} in ${branch}${opts.auto ? ' (automatic, on push)' : ''}`;
-		await this.d.github
-			.setPRCheck(p.headSha, { state: 'in_progress', title: short(title), suffix: '/try', url: this.branchRuns(branch) })
-			.catch(this.bestEffort('github.setPRCheck'));
-		this.event(n, 'tried', { status: 'started', branch, run: run.id, ...(opts.auto ? { auto: true } : {}) });
-		return run;
+		this.event(n, 'tried', { status: 'queued', branch, run: run.id, ...(opts.auto ? { auto: true } : {}) });
+		await this.drainTries();
+		return store.getBatch(run.id)!;
+	}
+
+	/** Only admitted tries are pushed: a push itself starts CI. Merge runs use no try slots. */
+	async drainTries() {
+		const limit = this.settings().config.parallelTries;
+		for (const queued of store.getQueuedTries(this.repoId)) {
+			const n = queued.members[0];
+			let p: LivePR;
+			try {
+				p = await this.pr(n, !this.settings().pausedReason && store.trySlotsInUse(this.repoId).length < limit);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				if ((e as { status?: number }).status === 404) store.setBatchStatus(queued.id, 'cancelled', 'PR no longer exists');
+				else this.bestEffort('queued try PR')(e);
+				continue;
+			}
+			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === queued.id);
+			const reason = p.state !== 'open' ? 'the PR was closed' : p.headSha !== queued.heads[n]
+				? 'a newer commit was pushed' : automatic ? this.autoTryBar(p, null) : null;
+			if (reason) {
+				store.setBatchStatus(queued.id, 'cancelled', reason);
+				await this.d.github.setPRCheck(queued.heads[n], { state: 'neutral', title: `Cancelled: ${reason}`, suffix: '/try' }).catch(this.bestEffort('github.setPRCheck'));
+				this.event(n, 'tried', { status: 'cancelled', run: queued.id, reason, auto: automatic });
+				continue;
+			}
+			if (this.settings().pausedReason || store.trySlotsInUse(this.repoId).length >= limit) continue;
+			if (!p.sameRepo && !(await this.state(n, true)).approvedShas.includes(p.headSha)) {
+				store.setBatchStatus(queued.id, 'cancelled', 'Fork approval was removed while waiting');
+				await this.d.github.setPRCheck(p.headSha, { state: 'action_required', title: 'A writer must approve this fork head before trying it', suffix: '/try' }).catch(this.bestEffort('github.setPRCheck'));
+				continue;
+			}
+			const master = await this.d.github.defaultBranchSha();
+			if (master !== queued.base_sha) {
+				await this.d.git.fetch([master, p.headSha]);
+				const r = await this.buildOn(master, [{ pr: n, headSha: p.headSha, title: p.title, parentHeadSha: null, ...(p.sameRepo ? {} : { drivers: false }) }], master);
+				if (!r.ok) {
+					store.setBatchCI(queued.id, 'failure');
+					store.setBatchStatus(queued.id, 'failed', r.reason);
+					await this.d.github.setPRCheck(p.headSha, { state: 'failure', title: `Does not apply on ${this.d.repo.default_branch}`, summary: r.reason, suffix: '/try' }).catch(this.bestEffort('github.setPRCheck'));
+					continue;
+				}
+				store.prepareQueuedTry(queued.id, { baseSha: master, baseTree: await this.d.git.tree(master), headSha: r.headSha, treeSha: r.tree });
+			}
+			const run = store.getBatch(queued.id)!;
+			// Reserve the slot before a push can start CI. A crash is recovered through the branch intent.
+			store.intendBranch(this.repoId, run.branch, run.head_sha);
+			store.tryStarted(run.id, this.d.now());
+			await this.d.github.pushBranch(run.branch, run.head_sha);
+			await this.d.ci.start(run.branch, run.base_sha, run.head_sha, [n]);
+			store.branchPushed(this.repoId, run.branch);
+
+			this.event(n, 'tried', { status: 'started', branch: run.branch, run: run.id, ...(automatic ? { auto: true } : {}) });
+		}
+		const starting = new Set(store.branchIntents(this.repoId).map((i) => i.branch));
+		for (const run of store.getRunningTries(this.repoId)) {
+			if (run.queue_position !== 0 || starting.has(run.branch)) continue;
+			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === run.id);
+			try {
+				await this.d.github.setPRCheck(run.heads[run.members[0]], {
+					state: 'in_progress', title: short(`Trying on ${this.d.repo.default_branch} in ${run.branch}${automatic ? ' (automatic, on push)' : ''}`),
+					suffix: '/try', url: this.branchRuns(run.branch)
+				});
+				store.tryStartedReported(run.id);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRCheck')(e);
+			}
+		}
+
+		for (const [i, run] of store.getQueuedTries(this.repoId).entries()) {
+			const position = i + 1;
+			if (run.queue_position === position) continue;
+			try {
+				await this.d.github.setPRCheck(run.heads[run.members[0]], {
+					state: 'queued', title: `Run queue position #${position}: waiting for a try slot`, suffix: '/try',
+					summary: `This try is #${position} in the runs queue. At most ${limit} tries run in parallel. Merge batches and bisects are exempt.`
+				});
+				store.tryPositionReported(run.id, position);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRCheck')(e);
+			}
+		}
 	}
 
 	// --- automatic tries ---
@@ -1978,19 +2050,23 @@ class Tick {
 	private async cancelAutoTry(t: BatchRow, reason: string) {
 		const n = t.members[0];
 		const head = t.heads[n];
-		// Recorded first: a crash after it leaves only a branch and a run, which the intent has swept next tick.
-		store.intendBranch(this.repoId, t.branch, t.head_sha);
-		store.cancelAutoTryRow(t, reason);
-		await this.d.ci.cancel(t.head_sha).catch(this.bestEffort('ci.cancel'));
-		// Left to the sweep of the intent next tick when the deletion fails.
-		const deleted = await this.d.github.deleteBranch(t.branch).then(
-			() => true,
-			(e) => {
-				this.bestEffort('github.deleteBranch')(e);
-				return false;
-			}
-		);
-		if (deleted) store.branchPushed(this.repoId, t.branch);
+		if (t.status === 'queued') {
+			store.cancelAutoTryRow(t, reason);
+		} else {
+			// Recorded first: a crash after it leaves only a branch and a run, which the intent has swept next tick.
+			store.intendBranch(this.repoId, t.branch, t.head_sha);
+			store.cancelAutoTryRow(t, reason);
+			await this.d.ci.cancel(t.head_sha);
+			// Left to the sweep of the intent next tick when the deletion fails.
+			const deleted = await this.d.github.deleteBranch(t.branch).then(
+				() => true,
+				(e) => {
+					this.bestEffort('github.deleteBranch')(e);
+					return false;
+				}
+			);
+			if (deleted) store.branchPushed(this.repoId, t.branch);
+		}
 		await this.d.github
 			.setPRCheck(head, { state: 'neutral', title: short(`Cancelled: ${reason}`), suffix: '/try', url: this.branchRuns(t.branch) })
 			.catch(this.bestEffort('github.setPRCheck'));
@@ -2008,9 +2084,35 @@ class Tick {
 		const settings = store.getQueueSettings(this.repoId);
 		const on = settings.mode === 'batch' && settings.config.autoTry;
 		const running = store.runningAutoTries(this.repoId);
-		if ((!on && !running.length) || !this.d.github.openPRs) return;
+		const cooling = store.autoTryRows(this.repoId).filter((r) => r.cooldownReportedUntil !== null && (r.outcome === null || r.outcome === 'cancelled'));
+		if ((!on && !running.length && !cooling.length) || !this.d.github.openPRs) return;
 		this.open ??= new Map((await this.d.github.openPRs()).map((x) => [x.pr, x]));
 		const open = this.open;
+
+		// A received-event status must not wait forever after a push, closure or setting change.
+		for (const r of cooling) {
+			let p = open.get(r.pr);
+			if (!p && on) {
+				try {
+					const fresh = await this.d.github.pr(r.pr);
+					if (fresh.state === 'open') { p = fresh; open.set(r.pr, fresh); }
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					if ((e as { status?: number }).status !== 404) continue;
+				}
+			}
+			const queued = this.item(r.pr) && !settings.config.requireTryPass;
+			const reason = !on ? 'automatic tries were disabled' : p && p.headSha !== r.headSha ? 'a newer commit was pushed' : queued ? 'the PR is in the merge queue' : this.autoTryBar(p, open);
+			if (!reason) continue;
+			try {
+				await this.d.github.setPRCheck(r.headSha, { state: 'neutral', title: `Cancelled: ${reason}`, suffix: '/try' });
+				store.setAutoTry(this.repoId, r.pr, r.headSha, 'cancelled');
+				store.cooldownReported(this.repoId, r.pr, r.headSha, null);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('github.setPRCheck')(e);
+			}
+		}
 
 		for (const t of running) {
 			const n = t.members[0];
@@ -2042,16 +2144,14 @@ class Tick {
 		}
 		store.seeAutoTryHeads(this.repoId, heads, now);
 
-		let slots = settings.config.autoTryMax - store.runningAutoTries(this.repoId).length;
+		const due: store.AutoTryRow[] = [];
 		for (const r of store.autoTryRows(this.repoId)) {
-			if (slots <= 0) break;
 			const it = this.item(r.pr);
 			// Queued, it is tested by the queue; unless the queue waits for a passed try first, which then
 			// starts even for a head that was open when automatic tries were turned on.
 			const waitsForTry = settings.config.requireTryPass && it?.status === 'queued';
 			if (it && !waitsForTry) continue;
 			if (r.outcome !== null && r.outcome !== 'cancelled' && !(waitsForTry && r.outcome === 'existing')) continue;
-			if (now - r.seenAt < settings.config.autoTryDelayMs && !(waitsForTry && r.outcome === 'existing')) continue;
 			const p = open.get(r.pr);
 			if (!p || p.headSha !== r.headSha || this.autoTryBar(p, open)) continue;
 			// Tried already, or run by the queue itself (a batch that failed or was left): its CI is known.
@@ -2059,9 +2159,30 @@ class Tick {
 				store.setAutoTry(this.repoId, r.pr, r.headSha, 'tried');
 				continue;
 			}
+			const until = r.seenAt + settings.config.autoTryDelayMs;
+			if (now < until && !(waitsForTry && r.outcome === 'existing')) {
+				if (r.cooldownReportedUntil !== until) {
+					const at = (ms: number) => `${new Date(ms).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+					try {
+						await this.d.github.setPRCheck(r.headSha, {
+							state: 'queued', suffix: '/try', title: `Push received: auto try after ${at(until)}`,
+							summary: `Commit ${r.headSha.slice(0, 8)} was observed at ${at(r.seenAt)}. Waiting for the cooldown until ${at(until)}. Then this try joins the runs queue; it starts when a parallel try slot is free. A newer push resets the cooldown.`
+						});
+						store.cooldownReported(this.repoId, r.pr, r.headSha, until);
+					} catch (e) {
+						if (e instanceof RateLimitedError) throw e;
+						this.bestEffort('github.setPRCheck')(e);
+					}
+				}
+				continue;
+			}
+
+			due.push(r);
+		}
+		// Acknowledge every new push before slow git preparation can delay the other PRs' statuses.
+		for (const r of due) {
 			try {
 				await this.startTry(r.pr, { auto: true, head: r.headSha });
-				slots--;
 			} catch (e) {
 				if (e instanceof RateLimitedError) throw e;
 				const message = e instanceof Error ? e.message : String(e);
@@ -2091,7 +2212,12 @@ class Tick {
 			let r = await this.d.ci.result(t.head_sha);
 			if (r === 'pending' && !this.timedOut(t)) continue;
 			if (r === 'pending') {
-				await this.d.ci.cancel(t.head_sha).catch(this.bestEffort('ci.cancel'));
+				try {
+					await this.d.ci.cancel(t.head_sha);
+				} catch (e) {
+					store.intendBranch(this.repoId, t.branch, t.head_sha);
+					this.bestEffort('ci.cancel')(e);
+				}
 				r = 'failure';
 			}
 			store.setBatchCI(t.id, r);
@@ -2127,7 +2253,8 @@ class Tick {
 					if ((await this.d.ci.runUrl(row.head_sha)) === null) await this.d.ci.start(branch, row.base_sha, row.head_sha, [...row.context, ...row.members]);
 				} else {
 					this.log(`removing ${branch}: left behind by an interrupted start`);
-					await this.d.ci.cancel(sha).catch(this.bestEffort('ci.cancel'));
+					if (row?.kind === 'try') await this.d.ci.cancel(sha);
+					else await this.d.ci.cancel(sha).catch(this.bestEffort('ci.cancel'));
 					await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 				}
 				store.branchPushed(this.repoId, branch);
@@ -2639,7 +2766,10 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	const settings = store.getQueueSettings(deps.repo.id);
 	await t.recoverInterrupted();
 	await t.clearDepartedReports();
-	if (settings.pausedReason) return;
+	if (settings.pausedReason) {
+		await t.drainTries();
+		return;
+	}
 	await t.reconcile();
 	await t.advanceTries();
 	await t.advanceMaster();
@@ -2657,6 +2787,7 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	if (!store.getQueueSettings(deps.repo.id).pausedReason) {
 		t.forgetPRs();
 		await t.autoTries();
+		await t.drainTries();
 	}
 }
 

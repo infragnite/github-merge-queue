@@ -412,11 +412,26 @@ describe('queue control', () => {
 	});
 
 	test('automatic tries: off by default; at least one at once, a whole number', () => {
-		expect(api.patchConfig(repo, admin, {}).config).toMatchObject({ autoTry: false, autoTryMax: 2, autoTryDelayMs: 120_000, autoTryDrafts: false, requireTryPass: false });
-		expect(api.patchConfig(repo, admin, { config: { autoTry: true, autoTryMax: 4, autoTryDelayMs: 0 } }).config).toMatchObject({ autoTry: true, autoTryMax: 4, autoTryDelayMs: 0 });
-		expect(() => api.patchConfig(repo, admin, { config: { autoTryMax: 0 } })).toThrow('autoTryMax must be a whole number >= 1');
-		expect(() => api.patchConfig(repo, admin, { config: { autoTryMax: 1.5 } })).toThrow('autoTryMax must be a whole number >= 1');
+		expect(api.patchConfig(repo, admin, {}).config).toMatchObject({ autoTry: false, parallelTries: 2, autoTryDelayMs: 120_000, autoTryDrafts: false, requireTryPass: false });
+		expect(api.patchConfig(repo, admin, { config: { autoTry: true, parallelTries: 4, autoTryDelayMs: 0 } }).config).toMatchObject({ autoTry: true, parallelTries: 4, autoTryDelayMs: 0 });
+		expect(() => api.patchConfig(repo, admin, { config: { parallelTries: 0 } })).toThrow('parallelTries must be a whole number >= 1');
+		expect(() => api.patchConfig(repo, admin, { config: { parallelTries: 1.5 } })).toThrow('parallelTries must be a whole number >= 1');
 		expect(() => api.patchConfig(repo, admin, { config: { autoTry: 'yes' } })).toThrow(/autoTry must be a boolean/);
+	});
+
+	test('the old automatic-tries setting remains an alias for the shared cap', () => {
+		expect(api.patchConfig(repo, admin, { config: { autoTryMax: 3 } }).config.parallelTries).toBe(3);
+	});
+
+	test('try requests expose their runs-queue position separately from the merge queue', () => {
+		const insert = (pr: number, queued = false) => store.insertBatch({ repoId: repo.id, kind: 'try', branch: `mq/try-${pr}`, baseSha: 'b', baseTree: 'bt', headSha: `h${pr}`, treeSha: `t${pr}`, members: [pr], heads: { [pr]: `pr${pr}` }, queued });
+		const running = insert(1);
+		const first = insert(2, true);
+		const second = insert(3, true);
+		expect(api.tryRunState(first)).toMatchObject({ status: 'queued', position: 1 });
+		expect(api.tryRunState(second)).toMatchObject({ status: 'queued', position: 2 });
+		expect(api.tryRunState(running)).toMatchObject({ status: 'testing', position: null });
+		expect(api.queueState(repo)).toMatchObject({ waiting: [], runs: { parallelTries: 2, running: [{ pr: 1 }], waiting: [{ pr: 2, position: 1 }, { pr: 3, position: 2 }] } });
 	});
 
 	test('the PR report is a check run, a status, or both; both by default', () => {

@@ -444,6 +444,28 @@
 			</p>
 		{/if}
 
+		{#if pipe?.runs}
+			<section aria-labelledby="runs-queue" class="rounded-xl border border-border-subtle bg-surface-raised p-4 space-y-3">
+				<div class="flex flex-wrap items-center justify-between gap-2">
+					<h2 id="runs-queue" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Runs queue</h2>
+					<span class="text-sm text-gray-500">{pipe.runs.running.length}/{pipe.runs.parallelTries} try slots in use{#if pipe.runs.running.some((r) => r.stopping)} ({pipe.runs.running.filter((r) => r.stopping).length} stopping){/if} · merge batches and bisects are exempt</span>
+				</div>
+				{#if pipe.runs.waiting.length}
+					<ol class="divide-y divide-border-subtle">
+						{#each pipe.runs.waiting as run (run.id)}
+							<li class="flex items-center gap-3 py-2 text-sm">
+								<span class="tabular-nums text-gray-500">#{run.position}</span>
+								<a class="font-medium hover:underline" href={`https://github.com/${data.repo.owner}/${data.repo.name}/pull/${run.pr}`}>PR #{run.pr}</a>
+								<span class="text-gray-500">{run.automatic ? 'Automatic try' : 'Manual try'} · waiting for a slot</span>
+							</li>
+						{/each}
+					</ol>
+				{:else}
+					<p class="text-sm text-gray-500">No tries waiting.</p>
+				{/if}
+			</section>
+		{/if}
+
 		<div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
 			<!-- Running work in run order: preparation first, then the runs; cards keep their place. -->
 			<section aria-labelledby="running" class="min-w-0 space-y-3">
@@ -465,7 +487,7 @@
 
 			<section class="min-w-0 space-y-3 lg:sticky lg:top-4" aria-labelledby="in-line">
 				<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-					<h2 id="in-line" class="text-xs font-semibold uppercase tracking-wide text-gray-500">In line <span class="tabular-nums text-gray-500">{inLine}</span></h2>
+					<h2 id="in-line" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Merge queue <span class="tabular-nums text-gray-500">{inLine}</span></h2>
 					{#if data.queueItems.length > 0}
 						<input type="search" bind:value={search} placeholder="Find #, title or author" class="ml-auto w-full rounded-lg border border-border-subtle bg-surface-raised px-2.5 py-1 text-sm sm:w-48" aria-label="Find a PR in the queue" />
 					{/if}

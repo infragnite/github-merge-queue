@@ -10,6 +10,8 @@ import { recordBatchEnded, recordBatchStarted, repoLabel } from './telemetry';
 export type QueueMode = 'serial' | 'batch';
 
 export type BatchStatus =
+	/** Prepared try waiting for a concurrency slot; its branch has not been pushed. */
+	| 'queued'
 	/** Built and pushed; CI running. */
 	| 'testing'
 	/** Failed once; failed jobs re-running to rule out a flake. */
@@ -62,6 +64,10 @@ export interface BatchRow {
 	express: boolean;
 	ci_result: 'pending' | 'success' | 'failure';
 	created_at: string;
+	/** Actual CI start, excluding time spent waiting for a try slot. */
+	started_at?: string | null;
+	/** Last waiting position successfully reported to GitHub. */
+	queue_position?: number | null;
 	finished_at: string | null;
 	/** When its latest CI result came in (null while none has, and in rows from before it was recorded). */
 	ci_done_at: string | null;
@@ -257,7 +263,9 @@ export function migrateBatches(database: Database.Database) {
 		['ci_done_at', 'TEXT'],
 		['retries', 'INTEGER NOT NULL DEFAULT 0'],
 		['end_reason', 'TEXT'],
-		['settings', 'TEXT']
+		['settings', 'TEXT'],
+		['started_at', 'TEXT'],
+		['queue_position', 'INTEGER']
 	]) {
 		if (!batchCols.some((c) => c.name === name)) database.exec(`ALTER TABLE batches ADD COLUMN ${name} ${ddl}`);
 	}
@@ -330,6 +338,8 @@ export function migrateBatches(database: Database.Database) {
 			at INTEGER NOT NULL
 		);
 	`);
+	const autoCols = database.prepare(`PRAGMA table_info(auto_tries)`).all() as Array<{ name: string }>;
+	if (!autoCols.some((c) => c.name === 'cooldown_reported_until')) database.exec('ALTER TABLE auto_tries ADD COLUMN cooldown_reported_until INTEGER');
 }
 
 // --- settings ---
@@ -337,6 +347,8 @@ export function migrateBatches(database: Database.Database) {
 /** The saved config over the defaults, without settings that no longer exist (such as the old urgent batch size). */
 function knownConfig(saved: Partial<BatchConfig>): BatchConfig {
 	const config = { ...DEFAULT_BATCH_CONFIG };
+	const legacy = (saved as Partial<BatchConfig> & { autoTryMax?: number }).autoTryMax;
+	if (saved.parallelTries === undefined && legacy !== undefined) config.parallelTries = legacy;
 	for (const k of Object.keys(config) as (keyof BatchConfig)[]) if (saved[k] !== undefined) (config as Record<string, unknown>)[k] = saved[k];
 	return config;
 }
@@ -439,6 +451,7 @@ export function insertBatch(b: {
 	express?: boolean;
 	/** Recorded already decided (a batch landing on a try's pass): its CI is that try's. */
 	passed?: boolean;
+	queued?: boolean;
 }): BatchRow {
 	const r = getDb()
 		.prepare(
@@ -462,13 +475,13 @@ export function insertBatch(b: {
 			b.kind === 'batch'
 				? (getDb().prepare(`SELECT COALESCE(MAX(number), 0) + 1 AS n FROM batches WHERE repo_id = ? AND kind = 'batch'`).get(b.repoId) as { n: number }).n
 				: null,
-			b.passed ? 'passed' : 'testing',
+			b.queued ? 'queued' : b.passed ? 'passed' : 'testing',
 			b.passed ? 'success' : 'pending',
 			snapshot(b.repoId),
 			b.passed ? 1 : 0
 		);
 	const row = getBatch(Number(r.lastInsertRowid))!;
-	recordBatchStarted(b.repoId, b.kind, b.members.length, !!b.express);
+	if (!b.queued) recordBatchStarted(b.repoId, b.kind, b.members.length, !!b.express);
 	return row;
 }
 
@@ -621,7 +634,8 @@ const FINAL: BatchStatus[] = ['landed', 'failed', 'superseded', 'cancelled'];
 
 /** When a batch was created, in epoch ms. */
 export function batchCreatedMs(b: BatchRow): number {
-	return Date.parse(b.created_at.includes('T') ? b.created_at : `${b.created_at.replace(' ', 'T')}Z`);
+	const at = b.started_at ?? b.created_at;
+	return Date.parse(at.includes('T') ? at : `${at.replace(' ', 'T')}Z`);
 }
 
 export function setBatchRetried(id: number, at: number) {
@@ -761,6 +775,41 @@ export function getRunningTries(repoId: number): BatchRow[] {
 	).map(parse);
 }
 
+/** FIFO tries waiting to push their branches and start CI. */
+export function getQueuedTries(repoId: number): BatchRow[] {
+	return (getDb().prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status = 'queued' ORDER BY id`).all(repoId) as RawBatch[]).map(parse);
+}
+
+/** Slots remain reserved while a cancelled try still has an unsettled CI/branch cleanup intent. */
+export function trySlotsInUse(repoId: number): BatchRow[] {
+	return (getDb().prepare(`SELECT * FROM batches b WHERE repo_id = ? AND kind = 'try'
+		AND (status = 'testing' OR (status IN ('cancelled', 'failed') AND EXISTS
+		(SELECT 1 FROM branch_intents i WHERE i.repo_id = b.repo_id AND i.branch = b.branch))) ORDER BY id`).all(repoId) as RawBatch[]).map(parse);
+}
+
+/** Rebuild a waiting try on the current default branch, before its branch can trigger CI. */
+export function prepareQueuedTry(id: number, b: { baseSha: string; baseTree: string; headSha: string; treeSha: string }) {
+	getDb().prepare(`UPDATE batches SET base_sha = ?, base_tree = ?, head_sha = ?, tree_sha = ? WHERE id = ? AND status = 'queued'`)
+		.run(b.baseSha, b.baseTree, b.headSha, b.treeSha, id);
+}
+
+export function tryStarted(id: number, at: number) {
+	const changed = getDb().prepare(`UPDATE batches SET status = 'testing', started_at = ?, queue_position = 0 WHERE id = ? AND status = 'queued'`).run(new Date(at).toISOString(), id);
+	if (changed.changes) {
+		const b = getBatch(id)!;
+		recordBatchStarted(b.repo_id, b.kind, b.members.length, b.express);
+	}
+}
+
+export function tryPositionReported(id: number, position: number) {
+	getDb().prepare(`UPDATE batches SET queue_position = ? WHERE id = ? AND status = 'queued'`).run(position, id);
+}
+
+/** The running report reached GitHub; zero means it still needs retrying after admission. */
+export function tryStartedReported(id: number) {
+	getDb().prepare(`UPDATE batches SET queue_position = NULL WHERE id = ? AND status = 'testing'`).run(id);
+}
+
 /**
  * The latest finished `try` run of `pr` at `headSha` on a default branch with tree `baseTree`, if
  * any: whether its pass may stand in for a run of the queue's own (see `Tick.reusableTry`).
@@ -788,7 +837,7 @@ export function hasTry(repoId: number, pr: number, headSha: string): boolean {
  * Where the try runs of `pr` at any of `heads` stand: one passed, one is running, the latest
  * finished one failed, or none (cancelled ones don't count).
  */
-export function tryStatus(repoId: number, pr: number, heads: string[]): 'passed' | 'running' | 'failed' | 'none' {
+export function tryStatus(repoId: number, pr: number, heads: string[]): 'passed' | 'running' | 'queued' | 'failed' | 'none' {
 	const want = new Set(heads);
 	const rows = (
 		getDb()
@@ -799,6 +848,7 @@ export function tryStatus(repoId: number, pr: number, heads: string[]): 'passed'
 		.filter((r) => want.has(r.heads[pr]));
 	if (rows.some((r) => r.ci_result === 'success')) return 'passed';
 	if (rows.some((r) => r.status === 'testing')) return 'running';
+	if (rows.some((r) => r.status === 'queued')) return 'queued';
 	return rows.length ? 'failed' : 'none';
 }
 
@@ -812,7 +862,7 @@ export function autoTryOutcome(repoId: number, pr: number, headSha: string): Aut
 
 /** A running `try` run of `pr` at `headSha`, if any. */
 export function runningTryOf(repoId: number, pr: number, headSha: string): BatchRow | null {
-	return getRunningTries(repoId).find((t) => t.members.length === 1 && t.members[0] === pr && t.heads[pr] === headSha) ?? null;
+	return [...getRunningTries(repoId), ...getQueuedTries(repoId)].find((t) => t.members.length === 1 && t.members[0] === pr && t.heads[pr] === headSha) ?? null;
 }
 
 // --- automatic tries ---
@@ -831,14 +881,19 @@ export interface AutoTryRow {
 	seenAt: number;
 	outcome: AutoTryOutcome | null;
 	runId: number | null;
+	cooldownReportedUntil: number | null;
 }
 
 export function autoTryRows(repoId: number): AutoTryRow[] {
 	return (
 		getDb()
-			.prepare(`SELECT pr_number, head_sha, seen_at, outcome, run_id FROM auto_tries WHERE repo_id = ? ORDER BY seen_at, pr_number`)
-			.all(repoId) as Array<{ pr_number: number; head_sha: string; seen_at: number; outcome: AutoTryOutcome | null; run_id: number | null }>
-	).map((r) => ({ pr: r.pr_number, headSha: r.head_sha, seenAt: r.seen_at, outcome: r.outcome, runId: r.run_id }));
+			.prepare(`SELECT pr_number, head_sha, seen_at, outcome, run_id, cooldown_reported_until FROM auto_tries WHERE repo_id = ? ORDER BY seen_at, pr_number`)
+			.all(repoId) as Array<{ pr_number: number; head_sha: string; seen_at: number; outcome: AutoTryOutcome | null; run_id: number | null; cooldown_reported_until: number | null }>
+	).map((r) => ({ pr: r.pr_number, headSha: r.head_sha, seenAt: r.seen_at, outcome: r.outcome, runId: r.run_id, cooldownReportedUntil: r.cooldown_reported_until }));
+}
+
+export function cooldownReported(repoId: number, pr: number, headSha: string, until: number | null) {
+	getDb().prepare(`UPDATE auto_tries SET cooldown_reported_until = ? WHERE repo_id = ? AND pr_number = ? AND head_sha = ?`).run(until, repoId, pr, headSha);
 }
 
 /**
@@ -903,7 +958,7 @@ export function queueRanHead(repoId: number, pr: number, headSha: string): boole
 /** Automatic tries still running. */
 export function runningAutoTries(repoId: number): BatchRow[] {
 	const ids = new Set(autoTryRows(repoId).flatMap((r) => (r.outcome === 'started' && r.runId !== null ? [r.runId] : [])));
-	return getRunningTries(repoId).filter((t) => ids.has(t.id));
+	return [...getRunningTries(repoId), ...getQueuedTries(repoId)].filter((t) => ids.has(t.id));
 }
 
 export function autoTriesPrimed(repoId: number): boolean {

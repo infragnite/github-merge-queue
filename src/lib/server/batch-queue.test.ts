@@ -3659,6 +3659,166 @@ describe('both planners, the same queue', () => {
 		});
 });
 
+describe('parallel tries run queue', () => {
+	function open(n: number) {
+		pr(n);
+		db.removeFromQueue(db.getQueueItems(repo.id).find((i) => i.pr_number === n)!.id);
+	}
+	const waiters = () => store.getQueuedTries(repo.id).map((t) => t.members[0]);
+	const checks = (n: number) => world.prChecks.filter((c) => c.sha === git.sha(`pr${n}`) && c.name === 'merge-queue/try');
+
+	test('manual tries wait unpushed in FIFO order, and their GitHub positions advance', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		for (const n of [1, 2, 3]) open(n);
+		const d = world.deps();
+		const pushed: string[] = [];
+		const push = d.github.pushBranch;
+		d.github.pushBranch = async (branch, sha) => { pushed.push(branch); await push(branch, sha); };
+		d.ci.result = async () => 'pending';
+		const first = await startTry(d, 1);
+		const second = await startTry(d, 2);
+		const third = await startTry(d, 3);
+		expect([first.status, second.status, third.status]).toEqual(['testing', 'queued', 'queued']);
+		expect(pushed).toEqual([first.branch]);
+		expect(waiters()).toEqual([2, 3]);
+		expect(checks(2).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('#1') });
+		expect(checks(3).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('#2') });
+		// A new Tick reads the persisted queue; no in-memory admission list is needed.
+		d.ci.result = async (sha) => sha === first.head_sha ? 'success' : 'pending';
+		await tickBatchQueue(d);
+		expect(pushed).toEqual([first.branch, second.branch]);
+		expect(store.getBatch(second.id)!.status).toBe('testing');
+		expect(waiters()).toEqual([3]);
+		expect(checks(3).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('#1') });
+	});
+
+	test('a full try limit does not hold a merge batch or its bisection runs', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1, retryFailed: false, maxBatch: 2 } });
+		open(1);
+		const d = world.deps();
+		const first = await startTry(d, 1);
+		pr(2);
+		pr(3, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		const result = d.ci.result;
+		d.ci.result = async (sha, ...args) => sha === first.head_sha ? 'pending' : result(sha, ...args);
+		for (let i = 0; i < 8; i++) await tickBatchQueue(d);
+		expect(store.getBatch(first.id)!.status).toBe('testing');
+		expect(world.started.some((r) => r.branch.startsWith('mq/batch-') && !r.branch.includes('bisect'))).toBe(true);
+		expect(world.started.some((r) => r.branch.includes('bisect'))).toBe(true);
+	});
+
+	test('a pushed or closed waiting try is cancelled before CI, without consuming a slot', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		for (const n of [1, 2, 3]) open(n);
+		const d = world.deps();
+		d.ci.result = async () => 'pending';
+		await startTry(d, 1);
+		const pushed = await startTry(d, 2);
+		const closed = await startTry(d, 3);
+		git.commit('pr2', 'new head', 'new.txt');
+		git.close(3);
+		await tickBatchQueue(d);
+		expect(store.getBatch(pushed.id)!.status).toBe('cancelled');
+		expect(store.getBatch(closed.id)!.status).toBe('cancelled');
+		expect(world.started.map((r) => r.prs)).toEqual([[1]]);
+	});
+
+	test('changing the limit affects new admissions and does not cancel running tries', async () => {
+		for (const n of [1, 2, 3]) open(n);
+		const d = world.deps();
+		d.ci.result = async () => 'pending';
+		await startTry(d, 1);
+		await startTry(d, 2);
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		const waiting = await startTry(d, 3);
+		expect(waiting.status).toBe('queued');
+		await tickBatchQueue(d);
+		expect(store.getRunningTries(repo.id)).toHaveLength(2);
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 3 } });
+		await tickBatchQueue(d);
+		expect(store.getRunningTries(repo.id)).toHaveLength(3);
+	});
+
+	test('a waiting try is rebuilt on the current default branch and starts its CI clock on admission', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		open(1);
+		open(2);
+		const d = world.deps();
+		d.ci.result = async () => 'pending';
+		const first = await startTry(d, 1);
+		const waiting = await startTry(d, 2);
+		db.getDb().prepare("UPDATE batches SET created_at = datetime('now', '-3 days') WHERE id = ?").run(waiting.id);
+		git.commit('main', 'master moved', 'new-master.txt');
+		store.setMasterHealth(repo.id, { sha: git.sha('main'), tree: git.git('rev-parse', 'main^{tree}'), state: 'green', since: 0 });
+		d.ci.result = async (sha) => sha === first.head_sha ? 'success' : 'pending';
+		await tickBatchQueue(d);
+		const admitted = store.getBatch(waiting.id)!;
+		expect(admitted.base_sha).toBe(git.sha('main'));
+		expect(world.files(admitted.head_sha).has('new-master.txt')).toBe(true);
+		expect(d.now() - store.batchCreatedMs(admitted)).toBeLessThan(10_000);
+		await tickBatchQueue(d);
+		expect(store.getBatch(waiting.id)!.status).toBe('testing');
+	});
+
+	test('a failed queue-position report is retried without starting another run', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		open(1);
+		open(2);
+		const d = world.deps();
+		d.ci.result = async () => 'pending';
+		await startTry(d, 1);
+		const post = d.github.setPRCheck;
+		d.github.setPRCheck = async (sha, report) => { if (report.state === 'queued') throw new Error('GitHub unavailable'); await post(sha, report); };
+		const waiting = await startTry(d, 2);
+		expect(store.getBatch(waiting.id)!.queue_position).toBeNull();
+		d.github.setPRCheck = post;
+		await tickBatchQueue(d);
+		expect(store.getBatch(waiting.id)!.queue_position).toBe(1);
+		expect(checks(2).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('#1') });
+		expect(world.started).toHaveLength(1);
+	});
+
+	test('a fork approval removed while waiting prevents admission', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		open(1);
+		open(2);
+		world.forks.add(2);
+		const d = world.deps();
+		d.ci.result = async () => 'pending';
+		const first = await startTry(d, 1);
+		const waiting = await startTry(d, 2);
+		world.approved.delete(2);
+		d.ci.result = async (sha) => sha === first.head_sha ? 'success' : 'pending';
+		await tickBatchQueue(d);
+		expect(store.getBatch(waiting.id)!.status).toBe('cancelled');
+		expect(world.started.map((r) => r.prs)).toEqual([[1]]);
+		expect(checks(2).at(-1)).toMatchObject({ state: 'action_required' });
+	});
+
+	test('an interrupted cancellation holds its slot until CI cleanup succeeds', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		open(1);
+		open(2);
+		const d = world.deps();
+		d.ci.result = async () => 'pending';
+		const first = await startTry(d, 1);
+		store.intendBranch(repo.id, first.branch, first.head_sha);
+		store.setBatchStatus(first.id, 'cancelled', 'pushed again');
+		const waiting = await startTry(d, 2);
+		const cancel = d.ci.cancel;
+		d.ci.cancel = async () => { throw new Error('Cancellation API unavailable'); };
+		await tickBatchQueue(d);
+		expect(store.trySlotsInUse(repo.id).map((r) => r.id)).toEqual([first.id]);
+		expect(store.getBatch(waiting.id)!.status).toBe('queued');
+		expect(world.started).toHaveLength(1);
+		d.ci.cancel = cancel;
+		await tickBatchQueue(d);
+		expect(store.getBatch(waiting.id)!.status).toBe('testing');
+		expect(store.trySlotsInUse(repo.id).map((r) => r.id)).toEqual([waiting.id]);
+	});
+});
+
 describe('a passed try stands in for a run on the same default branch', () => {
 	/** A PR like `pr`, approved but not queued yet. */
 	function open(n: number, opts: { file?: string; from?: string; base?: string } = {}) {
@@ -4275,7 +4435,7 @@ describe('automatic tries on each push', () => {
 	const DELAY = 2 * 60_000;
 	/** Auto tries on, `max` at once, starting `DELAY` after a push. */
 	function enable(max = 2, delay = DELAY) {
-		store.updateQueueSettings(repo.id, { config: { autoTry: true, autoTryMax: max, autoTryDelayMs: delay } });
+		store.updateQueueSettings(repo.id, { config: { autoTry: true, parallelTries: max, autoTryDelayMs: delay } });
 	}
 	/** A PR with one commit, not queued. */
 	function open(n: number, opts: { file?: string; from?: string; base?: string } = {}) {
@@ -4342,6 +4502,66 @@ describe('automatic tries on each push', () => {
 		expect(t).toMatchObject({ heads: { 1: git.sha('pr1') }, base_sha: git.sha('main'), status: 'testing' });
 		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'in_progress', title: expect.stringContaining(t.branch) });
 		expect(events.lastEventOf(repo.id, 1, ['tried'])?.data).toMatchObject({ status: 'started', auto: true, run: t.id });
+	});
+
+	test('cooldown status acknowledges a push with its deadline once, and resets on the next head', async () => {
+		await enabledNow();
+		open(1);
+		await tick();
+		const old = git.sha('pr1');
+		const row = store.autoTryRows(repo.id).find((r) => r.pr === 1)!;
+		const report = tryChecks(1).at(-1)!;
+		expect(report).toMatchObject({ state: 'queued', title: expect.stringMatching(/^Push received: auto try after .* UTC$/) });
+		expect(report.summary).toContain(old.slice(0, 8));
+		expect(report.summary).toContain('cooldown');
+		expect(row.cooldownReportedUntil).toBe(row.seenAt + DELAY);
+		await run(2);
+		expect(tryChecks(1).filter((r) => r.title.startsWith('Push received'))).toHaveLength(1);
+		later(30_000);
+		git.commit('pr1', 'new push', 'new-push.txt');
+		await tick();
+		expect(tryChecks(1, old).at(-1)).toMatchObject({ state: 'neutral', title: 'Cancelled: a newer commit was pushed' });
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('Push received') });
+		expect(started()).toEqual([]);
+	});
+
+	test('disabling automatic tries finishes an outstanding cooldown status', async () => {
+		await enabledNow();
+		open(1);
+		await tick();
+		store.updateQueueSettings(repo.id, { config: { autoTry: false } });
+		await tick();
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'neutral', title: 'Cancelled: automatic tries were disabled' });
+		expect(started()).toEqual([]);
+	});
+
+	test('new pushes are acknowledged before an older try starts slow git preparation', async () => {
+		await enabledNow();
+		open(1);
+		await tick();
+		later();
+		open(2);
+		const d = world.deps();
+		const build = d.git.build;
+		d.git.build = async (...args) => {
+			expect(tryChecks(2).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('Push received') });
+			return build(...args);
+		};
+		await tickBatchQueue(d);
+		expect(started()).toEqual([1]);
+	});
+
+	test('a failed cooldown report is retried on the next tick', async () => {
+		await enabledNow();
+		open(1);
+		const d = world.deps();
+		const post = d.github.setPRCheck;
+		d.github.setPRCheck = async () => { throw new Error('GitHub unavailable'); };
+		await tickBatchQueue(d);
+		expect(store.autoTryRows(repo.id).find((r) => r.pr === 1)!.cooldownReportedUntil).toBeNull();
+		d.github.setPRCheck = post;
+		await tickBatchQueue(d);
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'queued', title: expect.stringContaining('Push received') });
 	});
 
 	test('its result lands on the PR as a /try check, and the PR is not tried again', async () => {
@@ -4687,7 +4907,7 @@ describe('automatic tries on each push', () => {
 		later();
 		await tick();
 		expect(running()).toEqual([1, 2, 3]);
-		store.updateQueueSettings(repo.id, { config: { autoTryMax: 1 } });
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
 		open(4);
 		await tick();
 		later();
@@ -4699,7 +4919,7 @@ describe('automatic tries on each push', () => {
 		expect(running()).toEqual([4]);
 	});
 
-	test('`/mq try` runs are not counted against the limit, and are not cancelled by a push', async () => {
+	test('`/mq try` runs share the limit, and running manual tries are not cancelled by a push', async () => {
 		await enabledNow(1);
 		open(1);
 		open(2);
@@ -4708,7 +4928,8 @@ describe('automatic tries on each push', () => {
 		await tick();
 		later();
 		await tick();
-		expect(running()).toEqual([1, 2]);
+		expect(running()).toEqual([1]);
+		expect(store.getQueuedTries(repo.id).map((t) => t.members[0])).toEqual([2]);
 		git.commit('pr1', 'fix', 'pr1-fix.txt');
 		await tick();
 		expect(store.getBatch(manual.id)!.status).toBe('testing');
@@ -4842,6 +5063,12 @@ describe('automatic tries on each push', () => {
 	});
 
 	test('a GitHub error starting a try is retried next tick, and does not keep the other PRs from starting', async () => {
+		const deps = world.deps.bind(world);
+		world.deps = () => {
+			const d = deps();
+			d.ci.runUrl = async (head) => world.started.some((r) => r.head === head) ? `https://ci.example/${head}` : null;
+			return d;
+		};
 		await enabledNow();
 		open(1);
 		await tick();
@@ -4852,8 +5079,10 @@ describe('automatic tries on each push', () => {
 		world.pushFailures = 1;
 		await tick();
 		expect(started()).toEqual([2]);
+		expect(tryChecks(1).filter((c) => c.state === 'in_progress')).toEqual([]);
 		await tick();
 		expect(started()).toEqual([2, 1]);
+		expect(tryChecks(1).at(-1)).toMatchObject({ state: 'in_progress' });
 	});
 
 	test('turned off: nothing new starts, a push still cancels the running try; turned on again, only later pushes count', async () => {
@@ -5135,7 +5364,7 @@ describe('automatic tries on each push', () => {
 			later();
 			await run(3);
 			expect(running()).toEqual([1]);
-			expect(item(2).error_message).toBe('Waits for its automatic try run');
+			expect(item(2).error_message).toBe('Waits for its try in the runs queue');
 		});
 	});
 

@@ -14,6 +14,7 @@ import { queueBoard, type BoardItem } from './queue-model';
 import { dependencyGraph, type DependencyGraph } from './deps';
 import type { HoldCode } from './batching';
 import type { QueueItem, Repo } from '$lib/types';
+import { runQueue } from './run-queue';
 
 export class ApiError extends Error {
 	constructor(
@@ -291,6 +292,7 @@ export function queueState(repo: Repo, analysis: StackAnalysis | null = null) {
 	return {
 		asOf: new Date().toISOString(),
 		mode: s.mode,
+		runs: runQueue(repo.id),
 		paused: s.pausedReason,
 		/** The default branch as the queue knows it; on 'red' the queue looks for a batch that fixes it. */
 		defaultBranch: store.getMasterHealth(repo.id),
@@ -397,7 +399,8 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 		throw new ApiError(400, visibility === 'private' ? 'A private repository can not have a public queue page' : 'Could not check on GitHub that the repository is public; try again');
 	}
 	const config: Partial<BatchConfig> = {};
-	for (const [k, v] of Object.entries((body.config ?? {}) as Record<string, unknown>)) {
+	for (const [rawKey, v] of Object.entries((body.config ?? {}) as Record<string, unknown>)) {
+		const k = rawKey === 'autoTryMax' ? 'parallelTries' : rawKey;
 		if (!CONFIG_KEYS.includes(k as keyof BatchConfig)) throw new ApiError(400, `Unknown setting ${k}`);
 		const want = typeof DEFAULT_BATCH_CONFIG[k as keyof BatchConfig];
 		if (typeof v !== want) throw new ApiError(400, `${k} must be a ${want}`);
@@ -408,7 +411,7 @@ export function patchConfig(repo: Repo, caller: Caller, body: Record<string, unk
 	if (config.depth !== undefined && config.depth < 1) throw new ApiError(400, 'depth must be >= 1');
 	if (config.comments !== undefined && !COMMENT_MODES.includes(config.comments as CommentMode)) throw new ApiError(400, `comments must be one of ${COMMENT_MODES.join(', ')}`);
 	if (config.bisectRuns !== undefined && (config.bisectRuns < 1 || !Number.isInteger(config.bisectRuns))) throw new ApiError(400, 'bisectRuns must be a whole number >= 1');
-	if (config.autoTryMax !== undefined && (config.autoTryMax < 1 || !Number.isInteger(config.autoTryMax))) throw new ApiError(400, 'autoTryMax must be a whole number >= 1');
+	if (config.parallelTries !== undefined && (config.parallelTries < 1 || !Number.isInteger(config.parallelTries))) throw new ApiError(400, 'parallelTries must be a whole number >= 1');
 	const mode = body.mode;
 	if (mode !== undefined && mode !== 'serial' && mode !== 'batch') throw new ApiError(400, 'mode must be serial or batch');
 	const ci = body.ci as Record<string, unknown> | undefined;
@@ -506,5 +509,10 @@ export async function events(
 }
 
 export function tryRunState(run: store.BatchRow) {
-	return { id: run.id, branch: run.branch, status: run.status, ci: run.ci_result, headSha: run.heads[run.members[0]] };
+	const position = run.status === 'queued' ? store.getQueuedTries(run.repo_id).findIndex((r) => r.id === run.id) + 1 : null;
+	return { id: run.id, branch: run.branch, status: run.status, ci: run.ci_result, headSha: run.heads[run.members[0]], position };
+}
+
+export function runsState(repo: Repo) {
+	return runQueue(repo.id);
 }

@@ -11,10 +11,12 @@ import { activityOf, type ActivityView } from './activity';
 import { batchCard, ciMayStillRun, summarizeJobs, type BatchCard, type CIProgress } from './batch-view';
 import type { StackAnalysis } from './stacks';
 import { log } from './log';
+import { runQueue, type RunQueue } from './run-queue';
 
 type RepoRef = { id: number; owner: string; name: string; default_branch: string };
 
 export interface PipelineView {
+	runs: RunQueue;
 	mode: string;
 	paused: string | null;
 	master: { sha: string; state: string; since: number } | null;
@@ -98,6 +100,7 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
 	const master = store.getMasterHealth(repo.id);
 	return {
 		mode: settings.mode,
+		runs: runQueue(repo.id),
 		paused: settings.pausedReason,
 		master: master ? { sha: master.sha, state: master.state, since: master.since } : null,
 		red: redMasterView(master, getQueueItems(repo.id), repo.default_branch),
@@ -124,6 +127,7 @@ export async function pipelineView(repo: RepoRef, prs: Map<number, { title: stri
  */
 export function publicPipeline(p: PipelineView): PipelineView {
 	return {
+		runs: p.runs,
 		mode: p.mode,
 		paused: p.paused ? 'The queue is paused' : null,
 		master: p.master ? { sha: p.master.sha, state: p.master.state, since: p.master.since } : null,
