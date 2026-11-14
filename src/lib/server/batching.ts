@@ -50,7 +50,7 @@ export interface PRState {
 	 * Its try runs at its head (or at the head a restack replaced): one passed, one is running, the
 	 * latest failed, or none. Unset where not looked up; only `requireTryPass` reads it.
 	 */
-	tried?: 'passed' | 'running' | 'failed' | 'none';
+	tried?: 'passed' | 'running' | 'queued' | 'failed' | 'none';
 	/** Why its latest try failed, when it could not even start (it does not apply). */
 	tryFailure?: string;
 	/** An automatic try will start for it on its own (no `/mq try` needed). */
@@ -123,8 +123,8 @@ export interface BatchConfig {
 	 * and PRs labelled `no-auto-try` are left out.
 	 */
 	autoTry: boolean;
-	/** Automatic tries running at once (`/mq try` runs are not counted); the rest wait, oldest push first. */
-	autoTryMax: number;
+	/** Manual and automatic tries running at once; merge batches and bisects are exempt. */
+	parallelTries: number;
 	/** How long after a push its try starts, so a burst of pushes is tried once. */
 	autoTryDelayMs: number;
 	/** Drafts get automatic tries too. */
@@ -150,7 +150,7 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
 	bisectRuns: 1,
 	comments: 'all',
 	autoTry: false,
-	autoTryMax: 2,
+	parallelTries: 2,
 	autoTryDelayMs: 2 * 60 * 1000,
 	autoTryDrafts: false,
 	requireTryPass: false
@@ -324,6 +324,7 @@ export function admit(state: PRState, analysis: StackAnalysis, config: BatchConf
 	}
 
 	if (config.requireTryPass && state.tried !== undefined && state.tried !== 'passed') {
+		if (state.tried === 'queued') return { ok: false, code: 'try-pending', reason: 'Waits for its try in the runs queue' };
 		if (state.tried === 'running') return { ok: false, code: 'try-pending', reason: 'Waits for its try run to pass' };
 		if (state.tried === 'failed') return { ok: false, code: 'try-failed', reason: state.tryFailure ?? 'Its try run failed' };
 		if (state.autoTried) return { ok: false, code: 'try-pending', reason: 'Waits for its automatic try run' };

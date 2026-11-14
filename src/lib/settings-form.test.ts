@@ -87,15 +87,16 @@ test('urgent batches have no size setting of their own: they follow the batch si
 	expect(SETTING_GROUPS.find((g) => g.id === 'failures')!.fields.map((f) => f.name)).toEqual(['config.bisectRuns', 'config.retryFailed', 'config.stopOnFirstFailure']);
 });
 
-test('automatic tries have their own section: on/off, how many at once, and the delay after a push in minutes', () => {
+test('automatic tries have their own section and the shared try cap belongs to batching', () => {
 	const g = SETTING_GROUPS.find((x) => x.id === 'auto-try')!;
-	expect(g.fields.map((f) => f.name)).toEqual(['config.autoTry', 'config.autoTryMax', 'config.autoTryDelayMs', 'config.autoTryDrafts', 'config.requireTryPass']);
+	expect(g.fields.map((f) => f.name)).toEqual(['config.autoTry', 'config.autoTryDelayMs', 'config.autoTryDrafts', 'config.requireTryPass']);
+	expect(SETTING_GROUPS.find((x) => x.id === 'batching')!.fields.map((f) => f.name)).toContain('config.parallelTries');
 	expect(g.help).toMatch(/no-auto-try/);
-	const max = ALL_FIELDS.find((f) => f.name === 'config.autoTryMax')!;
+	const max = ALL_FIELDS.find((f) => f.name === 'config.parallelTries')!;
 	expect(max).toMatchObject({ kind: 'number', min: 1 });
 	const delay = ALL_FIELDS.find((f) => f.name === 'config.autoTryDelayMs')!;
 	expect(shown(delay, { config: { autoTryDelayMs: 120_000 }, ci: {} })).toBe(2);
-	const body = parseSettingsForm(form({ 'config.autoTry': 'on', 'config.autoTryMax': '3', 'config.autoTryDelayMs': '5' }));
-	expect(body.config).toMatchObject({ autoTry: true, autoTryMax: 3, autoTryDelayMs: 300_000 });
-	expect(() => parseSettingsForm(form({ 'config.autoTryMax': '0' }))).toThrow(/at least 1/);
+	const body = parseSettingsForm(form({ 'config.autoTry': 'on', 'config.parallelTries': '3', 'config.autoTryDelayMs': '5' }));
+	expect(body.config).toMatchObject({ autoTry: true, parallelTries: 3, autoTryDelayMs: 300_000 });
+	expect(() => parseSettingsForm(form({ 'config.parallelTries': '0' }))).toThrow(/at least 1/);
 });

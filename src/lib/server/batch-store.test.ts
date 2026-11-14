@@ -13,6 +13,16 @@ describe('what a batch keeps for later analysis', () => {
 	});
 	const insert = () => store.insertBatch({ repoId, kind: 'batch', branch: `mq/b-${Math.random()}`, baseSha: 'b', headSha: 'h', treeSha: 't', baseTree: 'bt', members: [1], heads: {} });
 
+	test('saved automatic-try limits migrate to the shared parallel-tries limit', () => {
+		db.addRepo('acme', 'legacy-try-limit', 'main', db.upsertUser(1, 'dev', null, null));
+		const id = db.getRepoByOwnerName('acme', 'legacy-try-limit')!.id;
+		db.getDb().prepare(`INSERT INTO queue_settings (repo_id, config) VALUES (?, ?)`).run(id, JSON.stringify({ autoTryMax: 5 }));
+		expect(store.getQueueSettings(id).config.parallelTries).toBe(5);
+		store.updateQueueSettings(id, { config: { maxBatch: 4 } });
+		expect(store.getQueueSettings(id).config.parallelTries).toBe(5);
+		expect(store.getQueueSettings(id).config).not.toHaveProperty('autoTryMax');
+	});
+
 	test('the mode and config it was planned with', () => {
 		store.updateQueueSettings(repoId, { mode: 'batch', config: { maxBatch: 7 } });
 		const b = insert();

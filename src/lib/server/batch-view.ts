@@ -191,7 +191,7 @@ export function batchCard(
 		express: b.express,
 		ci: b.ci_result,
 		headSha: b.head_sha,
-		createdAt: b.created_at,
+		createdAt: b.started_at ?? b.created_at,
 		finishedAt: b.finished_at,
 		context: b.context,
 		landed: b.landed,

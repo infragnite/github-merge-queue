@@ -55,7 +55,7 @@ export interface CommandDeps {
 	pr(n: number): Promise<{ number: number; title: string; html_url: string; state: string; user: { login: string; avatar_url: string } }>;
 	analysis(): Promise<StackAnalysis>;
 	/** Starts a try run (under the repo lock); throws with the queue's reason when it can't. */
-	startTry(n: number): Promise<{ branch: string }>;
+	startTry(n: number): Promise<{ branch: string; status?: string; id?: number; end_reason?: string | null }>;
 	react(commentId: number, content: Reaction): Promise<void>;
 	reply(n: number, body: string): Promise<void>;
 	/** Tells the processor the queue changed. */
@@ -201,13 +201,19 @@ async function perform(repo: Repo, deps: CommandDeps, n: number, caller: Caller,
 		case 'try': {
 			requireRole(caller, 'write', 'Starting a try run');
 			if (store.getQueueSettings(repo.id).mode !== 'batch') throw new Refused('Try runs need the queue in batch mode');
-			let run: { branch: string };
+			let run: Awaited<ReturnType<CommandDeps['startTry']>>;
 			try {
 				run = await deps.startTry(n);
 			} catch (e) {
 				if (e instanceof Error && /is not open|does not apply|comes from a fork|is already being tried/.test(e.message)) throw new Refused(e.message);
 				throw e;
 			}
+			if (run.status === 'queued') {
+				const position = store.getQueuedTries(repo.id).findIndex((r) => r.id === run.id) + 1;
+				deps.wake();
+				return `Try queued at run queue position #${position}. Its CI branch will be pushed when a parallel try slot is free; its /try check shows its position.`;
+			}
+			if (run.status === 'cancelled' || run.status === 'failed') return `The try did not start: ${run.end_reason ?? 'the PR changed while waiting'}. Request another try when it is ready.`;
 			return `Started a try run on top of \`${repo.default_branch}\`, on branch \`${run.branch}\`. Its CI shows on that branch; nothing is merged. If it passes and neither this PR nor \`${repo.default_branch}\` changes, \`/mq queue\` lands it without another run.`;
 		}
 	}
