@@ -10,6 +10,10 @@ const card = (id: number, over: Partial<BatchCard>): BatchCard => ({
 });
 
 describe('what a batch card counts', () => {
+	test('an admitted try uses its ISO start timestamp for elapsed time', () => {
+		expect(batchStats(card(1, { kind: 'try', createdAt: '2026-11-11T10:00:00.000Z' }), Date.parse('2026-11-11T10:02:00Z')).elapsedMs).toBe(120_000);
+	});
+
 	test('a testing batch counts its CI jobs: done, failed, running, waiting for a runner', () => {
 		const s = batchStats(card(1, { prs: [pr(1), pr(2)], progress: progress(20, 1, 8) }), Date.parse('2026-11-11T10:25:00Z'));
 		expect(s).toEqual({ prs: 2, jobs: { done: 20, total: 40, failed: 1, running: 8, waiting: 12 }, runs: null, elapsedMs: 25 * 60_000, running: [] });
