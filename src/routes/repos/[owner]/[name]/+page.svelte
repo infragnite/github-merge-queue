@@ -124,13 +124,8 @@
 		refreshing = false;
 	}
 
-	// Auto-refresh every 10s when queue is active
+	// Tries and new pushes progress independently of merge queue membership.
 	$effect(() => {
-		const hasActive = data.queueItems.some(
-			(i) => !['merged', 'failed', 'cancelled'].includes(i.status)
-		);
-		if (!hasActive) return;
-
 		const id = setInterval(refresh, 10_000);
 		return () => clearInterval(id);
 	});
@@ -444,32 +439,15 @@
 			</p>
 		{/if}
 
-		{#if pipe?.runs}
-			<section aria-labelledby="runs-queue" class="rounded-xl border border-border-subtle bg-surface-raised p-4 space-y-3">
-				<div class="flex flex-wrap items-center justify-between gap-2">
-					<h2 id="runs-queue" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Runs queue</h2>
-					<span class="text-sm text-gray-500">{pipe.runs.running.length}/{pipe.runs.parallelTries} try slots in use{#if pipe.runs.running.some((r) => r.stopping)} ({pipe.runs.running.filter((r) => r.stopping).length} stopping){/if} · merge batches and bisects are exempt</span>
-				</div>
-				{#if pipe.runs.waiting.length}
-					<ol class="divide-y divide-border-subtle">
-						{#each pipe.runs.waiting as run (run.id)}
-							<li class="flex items-center gap-3 py-2 text-sm">
-								<span class="tabular-nums text-gray-500">#{run.position}</span>
-								<a class="font-medium hover:underline" href={`https://github.com/${data.repo.owner}/${data.repo.name}/pull/${run.pr}`}>PR #{run.pr}</a>
-								<span class="text-gray-500">{run.automatic ? 'Automatic try' : 'Manual try'} · waiting for a slot</span>
-							</li>
-						{/each}
-					</ol>
-				{:else}
-					<p class="text-sm text-gray-500">No tries waiting.</p>
-				{/if}
-			</section>
-		{/if}
-
 		<div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
 			<!-- Running work in run order: preparation first, then the runs; cards keep their place. -->
 			<section aria-labelledby="running" class="min-w-0 space-y-3">
-				<h2 id="running" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Running</h2>
+				<div class="flex flex-wrap items-center justify-between gap-2">
+					<h2 id="running" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Running</h2>
+					{#if pipe?.runs.waiting.length}
+						<a href="#runs-queue" class="text-sm text-indigo-600 underline underline-offset-2">{pipe.runs.waiting.length} {pipe.runs.waiting.length === 1 ? 'try' : 'tries'} queued ↓</a>
+					{/if}
+				</div>
 				{#if !pipe}
 					<p class="text-sm text-gray-500">Loading…</p>
 				{:else if work.length === 0}
@@ -482,6 +460,28 @@
 							<PrepCard slot={w.slot} />
 						{/if}
 					{/each}
+				{/if}
+				{#if pipe?.runs}
+					<section aria-labelledby="runs-queue" class="rounded-xl border border-border-subtle bg-surface-raised p-4 space-y-3">
+						<div class="flex flex-wrap items-center justify-between gap-2">
+							<h3 id="runs-queue" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Runs queue</h3>
+							<span class="text-sm text-gray-500">{pipe.runs.running.length}/{pipe.runs.parallelTries} try slots in use{#if pipe.runs.running.some((r) => r.stopping)} ({pipe.runs.running.filter((r) => r.stopping).length} stopping){/if} · merge batches and bisects are exempt</span>
+						</div>
+						{#if pipe.runs.waiting.length}
+							<ol class="divide-y divide-border-subtle">
+								{#each pipe.runs.waiting as run (run.id)}
+									<li class="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-sm">
+										<span class="tabular-nums text-gray-500">Try position {run.position}</span>
+										<a class="font-medium hover:underline" href={`https://github.com/${data.repo.owner}/${data.repo.name}/pull/${run.pr}`}>PR #{run.pr}</a>
+										<span class="text-gray-500">{run.automatic ? 'Automatic try' : 'Manual try'} · {pipe.paused ? 'queue paused' : pipe.runs.running.length >= pipe.runs.parallelTries ? 'waiting for a slot' : 'waiting to start'}</span>
+										<span class="font-mono text-xs text-gray-500">{run.headSha?.slice(0, 7)}</span>
+									</li>
+								{/each}
+							</ol>
+						{:else}
+							<p class="text-sm text-gray-500">No tries queued for a slot.</p>
+						{/if}
+					</section>
 				{/if}
 			</section>
 

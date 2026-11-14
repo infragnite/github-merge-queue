@@ -12,7 +12,7 @@ export interface BatchStats {
 	running: BatchCard[];
 }
 
-const sqlTime = (t: string) => Date.parse(t.replace(' ', 'T') + 'Z');
+const sqlTime = (t: string) => Date.parse(t.includes('T') ? t : t.replace(' ', 'T') + 'Z');
 
 /** A run still going: its CI is pending, or it failed and its other jobs go on for the log. */
 export function stillGoing(r: BatchCard): boolean {
