@@ -448,7 +448,7 @@
 			<section aria-labelledby="runs-queue" class="rounded-xl border border-border-subtle bg-surface-raised p-4 space-y-3">
 				<div class="flex flex-wrap items-center justify-between gap-2">
 					<h2 id="runs-queue" class="text-xs font-semibold uppercase tracking-wide text-gray-500">Runs queue</h2>
-					<span class="text-sm text-gray-500">{pipe.runs.running.length}/{pipe.runs.parallelTries} tries running · merge batches and bisects are exempt</span>
+					<span class="text-sm text-gray-500">{pipe.runs.running.length}/{pipe.runs.parallelTries} try slots in use{#if pipe.runs.running.some((r) => r.stopping)} ({pipe.runs.running.filter((r) => r.stopping).length} stopping){/if} · merge batches and bisects are exempt</span>
 				</div>
 				{#if pipe.runs.waiting.length}
 					<ol class="divide-y divide-border-subtle">

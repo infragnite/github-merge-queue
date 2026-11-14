@@ -1951,7 +1951,7 @@ class Tick {
 			const n = queued.members[0];
 			let p: LivePR;
 			try {
-				p = await this.pr(n, !this.settings().pausedReason && store.getRunningTries(this.repoId).length < limit);
+				p = await this.pr(n, !this.settings().pausedReason && store.trySlotsInUse(this.repoId).length < limit);
 			} catch (e) {
 				if (e instanceof RateLimitedError) throw e;
 				if ((e as { status?: number }).status === 404) store.setBatchStatus(queued.id, 'cancelled', 'PR no longer exists');
@@ -1967,7 +1967,7 @@ class Tick {
 				this.event(n, 'tried', { status: 'cancelled', run: queued.id, reason, auto: automatic });
 				continue;
 			}
-			if (this.settings().pausedReason || store.getRunningTries(this.repoId).length >= limit) continue;
+			if (this.settings().pausedReason || store.trySlotsInUse(this.repoId).length >= limit) continue;
 			if (!p.sameRepo && !(await this.state(n, true)).approvedShas.includes(p.headSha)) {
 				store.setBatchStatus(queued.id, 'cancelled', 'Fork approval was removed while waiting');
 				await this.d.github.setPRCheck(p.headSha, { state: 'action_required', title: 'A writer must approve this fork head before trying it', suffix: '/try' }).catch(this.bestEffort('github.setPRCheck'));
@@ -2055,7 +2055,7 @@ class Tick {
 			// Recorded first: a crash after it leaves only a branch and a run, which the intent has swept next tick.
 			store.intendBranch(this.repoId, t.branch, t.head_sha);
 			store.cancelAutoTryRow(t, reason);
-			await this.d.ci.cancel(t.head_sha).catch(this.bestEffort('ci.cancel'));
+			await this.d.ci.cancel(t.head_sha);
 			// Left to the sweep of the intent next tick when the deletion fails.
 			const deleted = await this.d.github.deleteBranch(t.branch).then(
 				() => true,
@@ -2163,7 +2163,12 @@ class Tick {
 			let r = await this.d.ci.result(t.head_sha);
 			if (r === 'pending' && !this.timedOut(t)) continue;
 			if (r === 'pending') {
-				await this.d.ci.cancel(t.head_sha).catch(this.bestEffort('ci.cancel'));
+				try {
+					await this.d.ci.cancel(t.head_sha);
+				} catch (e) {
+					store.intendBranch(this.repoId, t.branch, t.head_sha);
+					this.bestEffort('ci.cancel')(e);
+				}
 				r = 'failure';
 			}
 			store.setBatchCI(t.id, r);
@@ -2199,7 +2204,8 @@ class Tick {
 					if ((await this.d.ci.runUrl(row.head_sha)) === null) await this.d.ci.start(branch, row.base_sha, row.head_sha, [...row.context, ...row.members]);
 				} else {
 					this.log(`removing ${branch}: left behind by an interrupted start`);
-					await this.d.ci.cancel(sha).catch(this.bestEffort('ci.cancel'));
+					if (row?.kind === 'try') await this.d.ci.cancel(sha);
+					else await this.d.ci.cancel(sha).catch(this.bestEffort('ci.cancel'));
 					await this.d.github.deleteBranch(branch).catch(this.bestEffort('github.deleteBranch'));
 				}
 				store.branchPushed(this.repoId, branch);

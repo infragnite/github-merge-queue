@@ -3795,6 +3795,28 @@ describe('parallel tries run queue', () => {
 		expect(world.started.map((r) => r.prs)).toEqual([[1]]);
 		expect(checks(2).at(-1)).toMatchObject({ state: 'action_required' });
 	});
+
+	test('an interrupted cancellation holds its slot until CI cleanup succeeds', async () => {
+		store.updateQueueSettings(repo.id, { config: { parallelTries: 1 } });
+		open(1);
+		open(2);
+		const d = world.deps();
+		d.ci.result = async () => 'pending';
+		const first = await startTry(d, 1);
+		store.intendBranch(repo.id, first.branch, first.head_sha);
+		store.setBatchStatus(first.id, 'cancelled', 'pushed again');
+		const waiting = await startTry(d, 2);
+		const cancel = d.ci.cancel;
+		d.ci.cancel = async () => { throw new Error('Cancellation API unavailable'); };
+		await tickBatchQueue(d);
+		expect(store.trySlotsInUse(repo.id).map((r) => r.id)).toEqual([first.id]);
+		expect(store.getBatch(waiting.id)!.status).toBe('queued');
+		expect(world.started).toHaveLength(1);
+		d.ci.cancel = cancel;
+		await tickBatchQueue(d);
+		expect(store.getBatch(waiting.id)!.status).toBe('testing');
+		expect(store.trySlotsInUse(repo.id).map((r) => r.id)).toEqual([waiting.id]);
+	});
 });
 
 describe('a passed try stands in for a run on the same default branch', () => {

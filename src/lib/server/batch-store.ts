@@ -778,6 +778,13 @@ export function getQueuedTries(repoId: number): BatchRow[] {
 	return (getDb().prepare(`SELECT * FROM batches WHERE repo_id = ? AND kind = 'try' AND status = 'queued' ORDER BY id`).all(repoId) as RawBatch[]).map(parse);
 }
 
+/** Slots remain reserved while a cancelled try still has an unsettled CI/branch cleanup intent. */
+export function trySlotsInUse(repoId: number): BatchRow[] {
+	return (getDb().prepare(`SELECT * FROM batches b WHERE repo_id = ? AND kind = 'try'
+		AND (status = 'testing' OR (status IN ('cancelled', 'failed') AND EXISTS
+		(SELECT 1 FROM branch_intents i WHERE i.repo_id = b.repo_id AND i.branch = b.branch))) ORDER BY id`).all(repoId) as RawBatch[]).map(parse);
+}
+
 /** Rebuild a waiting try on the current default branch, before its branch can trigger CI. */
 export function prepareQueuedTry(id: number, b: { baseSha: string; baseTree: string; headSha: string; treeSha: string }) {
 	getDb().prepare(`UPDATE batches SET base_sha = ?, base_tree = ?, head_sha = ?, tree_sha = ? WHERE id = ? AND status = 'queued'`)

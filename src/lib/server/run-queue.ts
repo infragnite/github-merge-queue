@@ -9,7 +9,7 @@ export function runQueue(repoId: number) {
 	});
 	return {
 		parallelTries: store.getQueueSettings(repoId).config.parallelTries,
-		running: store.getRunningTries(repoId).map(view),
+		running: store.trySlotsInUse(repoId).map((r) => ({ ...view(r), stopping: r.status !== 'testing' })),
 		waiting: store.getQueuedTries(repoId).map((r, i) => ({ ...view(r), position: i + 1 }))
 	};
 }
