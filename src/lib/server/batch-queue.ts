@@ -44,7 +44,7 @@ import type { QueueItem } from '$lib/types';
 import { RateLimitedError } from './rate-limit';
 import { HeadMovedError } from './head-moved';
 import { failureAction } from './activity';
-import { emitEvent, heldPRs, lastRepoEvent, type QueueEventKind } from './events';
+import { emitEvent, heldPRs, unreportedDequeues, lastRepoEvent, type QueueEventKind } from './events';
 import { log } from './log';
 
 /** The error, and what to do about it: a pause reason always says what to do. */
@@ -2438,11 +2438,27 @@ class Tick {
 			store.setHold(it.id, { code, reason, told, head: head ?? undefined, ...(told ? {} : { quiet: true }) });
 			this.event(it.pr_number, 'held', { code, reason });
 		}
-		// Told it needs attention, then taken out of the queue (dequeued, closed, merged elsewhere).
+	}
+
+	/** Finish reports for removed PRs even if they never had a hold, or the queue is paused. */
+	async clearDepartedReports() {
 		const live = new Set(this.items().map((i) => i.pr_number));
-		for (const n of heldPRs(this.repoId)) {
+		for (const n of new Set([...heldPRs(this.repoId), ...unreportedDequeues(this.repoId)])) {
 			if (live.has(n)) continue;
-			if ((await tell(n, () => ({ state: 'queued', title: 'Not in the merge queue' }))) !== false) this.event(n, 'released', { reason: 'left the queue' });
+			try {
+				const p = await this.pr(n);
+				if (this.item(n)) continue; // requeued while GitHub was being read
+				// Do not overwrite the successful report of a PR that landed meanwhile.
+				if (!p.merged) await this.d.github.setPRCheck(p.headSha, {
+					state: 'action_required', title: 'Not in the merge queue',
+					summary: 'This PR was removed from the merge queue. Queue it again with `/mq queue` when it is ready.'
+				});
+				this.event(n, 'released', { reason: 'left the queue' });
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				// No acknowledgement: retry the read or report on the next tick.
+				this.bestEffort('clearDepartedReports')(e);
+			}
 		}
 	}
 
@@ -2622,6 +2638,7 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 	const t = new Tick(deps);
 	const settings = store.getQueueSettings(deps.repo.id);
 	await t.recoverInterrupted();
+	await t.clearDepartedReports();
 	if (settings.pausedReason) return;
 	await t.reconcile();
 	await t.advanceTries();

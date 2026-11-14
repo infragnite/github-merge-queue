@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 
 process.env.DATABASE_PATH = ':memory:';
 const db = await import('./db');
-const { emitEvent, waitForEvents } = await import('./events');
+const { emitEvent, waitForEvents, unreportedDequeues } = await import('./events');
 
 function repo() {
 	const user = db.upsertUser(1, 'dev', null, null);
@@ -12,6 +12,24 @@ function repo() {
 }
 
 describe('queue events', () => {
+	test('a dequeue stays pending until reported, and another queue lifecycle supersedes it', () => {
+		const r = repo();
+		const other = repo();
+		emitEvent(other, 9, 'dequeued');
+		emitEvent(r, 1, 'dequeued');
+		expect(unreportedDequeues(r)).toEqual([1]);
+		emitEvent(r, 1, 'released', { reason: 'left the queue' });
+		expect(unreportedDequeues(r)).toEqual([]);
+		for (const kind of ['queued', 'merged', 'ejected'] as const) {
+			emitEvent(r, 1, 'dequeued');
+			emitEvent(r, 1, kind);
+			expect(unreportedDequeues(r)).toEqual([]);
+		}
+		emitEvent(r, 1, 'dequeued');
+		emitEvent(r, 1, 'dequeued');
+		expect(unreportedDequeues(r)).toEqual([1]);
+	});
+
 	test('without a cursor: recent events and a cursor, right away', async () => {
 		const r = repo();
 		emitEvent(r, 1, 'queued');
