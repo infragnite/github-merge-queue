@@ -5,7 +5,7 @@ import type { BatchCard, BatchPR } from './server/batch-view';
 const pr = (n: number, extra: Partial<BatchPR> = {}): BatchPR => ({ pr: n, title: '', url: '', depth: 0, parent: null, link: null, ...extra });
 const progress = (done: number, failed: number, running: number, total = 40) => ({ total, done, failed, running, url: null, failedJobs: ['lint'] });
 const card = (id: number, over: Partial<BatchCard>): BatchCard => ({
-	id, number: id, kind: 'batch', branch: `mq/${id}`, status: 'testing', express: false, ci: 'pending', headSha: `h${id}`,
+	id, number: id, kind: 'batch', branch: `mq/${id}`, runUrl: null, status: 'testing', express: false, ci: 'pending', headSha: `h${id}`,
 	createdAt: '2026-11-11 10:00:00', finishedAt: null, context: [], landed: [], prs: [], bisection: [], progress: null, ...over
 });
 

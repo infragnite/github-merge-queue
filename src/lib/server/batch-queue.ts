@@ -266,7 +266,19 @@ class Tick {
 	/** PRs pushed to while this tick restacked them: what it read of them is out of date, so it tells them nothing. */
 	private readonly movedThisTick = new Set<number>();
 
-	constructor(private readonly d: QueueDeps) {}
+	private readonly d: QueueDeps;
+	private readonly postLinkedCheck: QueueDeps['github']['setPRCheck'];
+
+	constructor(deps: QueueDeps) {
+		const repoId = deps.repo.id;
+		this.postLinkedCheck = deps.github.setPRCheck;
+		// A check replaces the one sent before it for the same commit: whatever that one waited for goes.
+		const setPRCheck = async (sha: string, c: PRCheck) => {
+			store.setRunLinkWait(repoId, { sha, suffix: c.suffix ?? '' });
+			await deps.github.setPRCheck(sha, c);
+		};
+		this.d = { ...deps, github: { ...deps.github, setPRCheck } };
+	}
 
 	get repoId() {
 		return this.d.repo.id;
@@ -416,9 +428,58 @@ class Tick {
 		return `https://github.com/${this.d.repo.owner}/${this.d.repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`;
 	}
 
-	/** The run that tested `run`'s commit, falling back to its branch's runs. */
-	async runLink(run: Pick<BatchRow, 'head_sha' | 'branch'>): Promise<string> {
-		return (await this.d.ci.runUrl(run.head_sha).catch(() => null)) ?? this.branchRuns(run.branch);
+	/** The run that tested `run`'s commit, falling back to the run it was linked to, then its branch's runs. */
+	async runLink(run: Pick<BatchRow, 'head_sha' | 'branch' | 'run_url'>): Promise<string> {
+		return (await this.d.ci.runUrl(run.head_sha).catch(() => null)) ?? run.run_url ?? this.branchRuns(run.branch);
+	}
+
+	/**
+	 * Sends `sha`'s check linking `branch`'s runs, which is all there is right after the push: CI
+	 * creates its run a moment later. `linkRuns` points it at that run once it is listed.
+	 */
+	async checkAwaitingRun(sha: string, check: PRCheck & { url?: undefined }, branch: string) {
+		await this.d.github.setPRCheck(sha, { ...check, url: this.branchRuns(branch) }).catch(this.bestEffort('github.setPRCheck'));
+		store.setRunLinkWait(this.repoId, { sha, suffix: check.suffix ?? '', branch, title: check.title });
+	}
+
+	/** Checks that link a branch's runs are sent again, with the same title, linking the run itself once CI lists it. */
+	async linkRuns() {
+		// Cards also need links for baselines and work already running before link waits existed.
+		const active = store.getActiveBatches(this.repoId);
+		const runs = [...active, ...active.flatMap((b) => store.getBisectRuns(b.id)), ...store.getRunningTries(this.repoId)];
+		const baseline = store.getRunningBaseline(this.repoId);
+		if (baseline) runs.push(baseline);
+		for (const run of runs) {
+			if (run.run_url || !['testing', 'retrying'].includes(run.status)) continue;
+			try {
+				const url = await this.d.ci.runUrl(run.head_sha);
+				if (url) store.setBatchRunUrl(run.id, url);
+			} catch (e) {
+				if (e instanceof RateLimitedError) throw e;
+				this.bestEffort('ci.runUrl')(e);
+			}
+		}
+		const waits = store.runLinkWaits(this.repoId);
+		for (const branch of new Set(waits.map((w) => w.branch))) {
+			const run = store.getBatchByBranch(this.repoId, branch);
+			// Finished: the check moved on with its result, which links the run.
+			if (!run || !['testing', 'retrying'].includes(run.status)) {
+				store.clearRunLinkWaits(this.repoId, branch);
+				continue;
+			}
+			const url = run.run_url;
+			if (!url) continue;
+			store.setBatchRunUrl(run.id, url);
+			for (const w of store.runLinkWaits(this.repoId).filter((w) => w.branch === branch)) {
+				try {
+					await this.postLinkedCheck(w.sha, { state: 'in_progress', title: w.title, ...(w.suffix ? { suffix: w.suffix } : {}), url });
+					store.setRunLinkWait(this.repoId, { sha: w.sha, suffix: w.suffix });
+				} catch (e) {
+					if (e instanceof RateLimitedError) throw e;
+					this.bestEffort('github.setPRCheck')(e);
+				}
+			}
+		}
 	}
 
 	/** The batch being landed: a pause while it lands is that batch's, and cancelling it ends the pause. */
@@ -812,13 +873,14 @@ class Tick {
 		const title = reuse
 			? `Passed in ${branch} on this ${this.d.repo.default_branch}; lands without a new run`
 			: `Testing in ${branch} with ${prs.length - 1} other PR(s)`;
-		const url = reuse ? await this.runLink(reuse) : this.branchRuns(branch);
+		const url = reuse ? await this.runLink(reuse) : null;
 		for (const n of prs) {
 			const it = this.item(n);
 			if (it) {
 				db.updateQueueItemStatus(it.id, 'checking');
 				this.event(n, 'batched', { batch: batch.id, branch, prs, ...(reuse ? { reusedTry: reuse.id } : {}) });
-				await this.d.github.setPRCheck(batch.heads[n], { state: 'in_progress', title: short(title), url }).catch(this.bestEffort('github.setPRCheck'));
+				if (url) await this.d.github.setPRCheck(batch.heads[n], { state: 'in_progress', title: short(title), url }).catch(this.bestEffort('github.setPRCheck'));
+				else await this.checkAwaitingRun(batch.heads[n], { state: 'in_progress', title: short(title) }, branch);
 			}
 		}
 		this.log(`batch ${batch.number} ${reuse ? `passed on try ${branch}` : 'started'}: ${prs.map((n) => `#${n}`).join(' ')}${express ? ' (express)' : ''}`);
@@ -1889,15 +1951,12 @@ class Tick {
 			this.pause(`Could not start bisection run ${branch}: ${e instanceof Error ? e.message : e}. Resume to try again.`);
 			return;
 		}
-		const link = this.branchRuns(branch);
 		for (const n of g.members) {
-			await this.d.github
-				.setPRCheck(batch.heads[n], {
-					state: 'in_progress',
-					title: short(`Batch ${batch.number} failed; testing ${g.members.length === 1 ? `#${n} alone` : `${g.members.length} of its PRs`} in ${branch}`),
-					url: link
-				})
-				.catch(this.bestEffort('github.setPRCheck'));
+			await this.checkAwaitingRun(
+				batch.heads[n],
+				{ state: 'in_progress', title: short(`Batch ${batch.number} failed; testing ${g.members.length === 1 ? `#${n} alone` : `${g.members.length} of its PRs`} in ${branch}`) },
+				branch
+			);
 		}
 	}
 
@@ -2000,7 +2059,7 @@ class Tick {
 			if (starting.has(run.branch) || (run.queue_position !== 0 && run.reported_run_url)) continue;
 			const automatic = store.runningAutoTries(this.repoId).some((r) => r.id === run.id);
 			try {
-				const url = await this.d.ci.runUrl(run.head_sha);
+				const url = run.run_url ?? await this.d.ci.runUrl(run.head_sha);
 				// Report admission immediately, then update once Actions has created its run.
 				if (run.queue_position !== 0 && !url) continue;
 				await this.d.github.setPRCheck(run.heads[run.members[0]], {
@@ -2071,7 +2130,7 @@ class Tick {
 			if (deleted) store.branchPushed(this.repoId, t.branch);
 		}
 		await this.d.github
-			.setPRCheck(head, { state: 'neutral', title: short(`Cancelled: ${reason}`), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.reported_run_url ?? undefined })
+			.setPRCheck(head, { state: 'neutral', title: short(`Cancelled: ${reason}`), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.run_url ?? undefined })
 			.catch(this.bestEffort('github.setPRCheck'));
 		this.event(n, 'tried', { status: 'cancelled', branch: t.branch, run: t.id, headSha: head, auto: true, reason });
 		this.log(`automatic try of #${n} cancelled: ${reason}`);
@@ -2232,7 +2291,7 @@ class Tick {
 			const summary =
 				r === 'success' ? `${desc}. \`/mq queue\` lands it ahead of every PR but urgent ones, without another run, while neither it nor \`${def}\` changes.` : undefined;
 			await this.d.github
-				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.reported_run_url ?? undefined })
+				.setPRCheck(t.heads[n], { state: r, title: short(desc), ...(summary ? { summary } : {}), suffix: '/try', url: (await this.d.ci.runUrl(t.head_sha).catch(() => null)) ?? t.run_url ?? undefined })
 				.catch(this.bestEffort('github.setPRCheck'));
 			await this.d.github.deleteBranch(t.branch).catch(this.bestEffort('github.deleteBranch'));
 			this.event(n, 'tried', { status: r, branch: t.branch, run: t.id, headSha: t.heads[n] });
@@ -2774,6 +2833,7 @@ export async function tickBatchQueue(deps: QueueDeps): Promise<void> {
 		return;
 	}
 	await t.reconcile();
+	await t.linkRuns();
 	await t.advanceTries();
 	await t.advanceMaster();
 	try {

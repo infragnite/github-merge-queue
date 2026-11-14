@@ -106,6 +106,10 @@ class World {
 	hold: (prs: number[]) => boolean = () => false;
 	/** Failing runs keep going a few reads after their first failed job, which a fail-fast read sees at once. */
 	slowFailures = false;
+	/** GitHub lists a commit's CI run only once it was created; until then `runUrl` finds none. */
+	runsListed = true;
+	/** Heads `runUrl` was asked about, in order. */
+	runUrlReads: string[] = [];
 	slowReads = new Map<string, number>();
 	/** Each result read: the head and whether it asked to fail fast. */
 	resultReads: { head: string; failFast: boolean }[] = [];
@@ -201,7 +205,10 @@ class World {
 				refreshCaches: async () => {
 					this.cacheRefreshes++;
 				},
-				runUrl: async (head) => `https://ci.example/${head}`,
+				runUrl: async (head) => {
+					this.runUrlReads.push(head);
+					return this.runsListed ? `https://ci.example/${head}` : null;
+				},
 				rerunFailed: async (head) => {
 					if (this.rerunWaits > 0) {
 						this.rerunWaits--;
@@ -728,9 +735,12 @@ describe('batch queue runtime', () => {
 		const of = (ref: string) => world.prChecks.filter((x) => x.sha === git.sha(ref) && x.name === 'merge-queue');
 		const branch = world.started[0].branch;
 		expect(of('pr2').map((x) => [x.state, x.title.split(';')[0].split(':')[0], x.url])).toEqual([
+			// Testing links the branch's runs until CI lists the run, then the run itself.
 			['in_progress', `Testing in ${branch} with 1 other PR(s)`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`],
+			['in_progress', `Testing in ${branch} with 1 other PR(s)`, `https://ci.example/${world.started[0].head}`],
 			['in_progress', `${branch} failed`, `https://ci.example/${world.started[0].head}`],
 			['in_progress', `Batch ${store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!.number} failed`, `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${world.started[2].branch}`)}`],
+			['in_progress', `Batch ${store.getRecentBatches(repo.id).find((b) => b.kind === 'batch')!.number} failed`, `https://ci.example/${world.started[2].head}`],
 			['failure', 'Left the queue', `https://ci.example/${world.started[2].head}`]
 		]);
 		expect(of('pr1').at(-1)).toMatchObject({ state: 'success', url: expect.stringMatching(/^https:\/\/ci\.example\//) });
@@ -1730,7 +1740,8 @@ describe('batch queue runtime', () => {
 		pr(1);
 		const head = git.sha('pr1');
 		await run();
-		expect(world.prChecks.filter((x) => x.sha === head).map((x) => x.state)).toEqual(['in_progress', 'success']);
+		// Testing twice: linking the branch's runs, then the run once CI lists it.
+		expect(world.prChecks.filter((x) => x.sha === head).map((x) => x.state)).toEqual(['in_progress', 'in_progress', 'success']);
 	});
 
 	test('without PR checks required, a PR with red own checks is still batched', async () => {
@@ -2211,8 +2222,8 @@ describe('batch queue runtime', () => {
 		await run();
 		expect(world.merged).toEqual([1, 2]);
 		const states = (ref: string) => world.prChecks.filter((x) => x.sha === git.sha(ref) && x.name === 'merge-queue').map((x) => x.state);
-		expect(states('pr1')).toEqual(['in_progress', 'success']);
-		expect(states('pr2')).toEqual(['action_required', 'queued', 'in_progress', 'success']);
+		expect(states('pr1')).toEqual(['in_progress', 'in_progress', 'success']);
+		expect(states('pr2')).toEqual(['action_required', 'queued', 'in_progress', 'in_progress', 'success']);
 		expect(world.prChecks.find((x) => x.sha === git.sha('pr2') && x.state === 'queued')?.title).toBe('In line in the merge queue');
 	});
 
@@ -4431,6 +4442,128 @@ describe('declared dependencies (Depends-On) at runtime', () => {
 	});
 });
 
+describe('links to the exact CI run', () => {
+	const search = (branch: string) => `https://github.com/${repo.owner}/${repo.name}/actions?query=${encodeURIComponent(`branch:${branch}`)}`;
+	const checksOf = (ref: string, name = 'merge-queue') => world.prChecks.filter((x) => x.sha === git.sha(ref) && x.name === name);
+
+	test('a testing check moves from the branch search to the run once CI lists it, with the same title', async () => {
+		pr(1);
+		pr(2);
+		world.hold = () => true;
+		world.runsListed = false;
+		await run(3);
+		const [{ branch, head }] = world.started;
+		expect(checksOf('pr1').map((x) => x.url)).toEqual([search(branch)]);
+		world.runsListed = true;
+		await run(1);
+		const checks = checksOf('pr1');
+		expect(checks).toHaveLength(2);
+		expect(checks[1]).toEqual({ ...checks[0], url: `https://ci.example/${head}` });
+		expect(checksOf('pr2').at(-1)!.url).toBe(`https://ci.example/${head}`);
+		expect(store.getBatchByBranch(repo.id, branch)!.run_url).toBe(`https://ci.example/${head}`);
+	});
+
+	test('the run is looked up until it is found, then not again while CI runs', async () => {
+		pr(1);
+		world.hold = () => true;
+		world.runsListed = false;
+		await run(3);
+		const { head } = world.started[0];
+		const before = world.runUrlReads.filter((h) => h === head).length;
+		expect(before).toBeGreaterThan(0);
+		world.runsListed = true;
+		await run(5);
+		expect(world.runUrlReads.filter((h) => h === head).length).toBe(before + 1);
+	});
+
+	test('a check that moved on is not sent back to testing', async () => {
+		pr(1);
+		world.runsListed = false;
+		await run(10);
+		expect(world.merged).toEqual([1]);
+		world.runsListed = true;
+		await run(5);
+		expect(world.prChecks.filter((x) => x.state === 'in_progress').map((x) => x.url)).toEqual([search(world.started[0].branch)]);
+		expect(world.prChecks.at(-1)!.state).toBe('success');
+	});
+
+	test('a bisection step check links its run once it is listed', async () => {
+		store.updateQueueSettings(repo.id, { config: { retryFailed: false } });
+		pr(1);
+		pr(2, { file: 'x-breaks-master.txt' });
+		world.breakingFiles.add('x-breaks-master.txt');
+		world.hold = (prs) => prs.length === 1;
+		world.runsListed = false;
+		for (let i = 0; i < 30 && !world.started.some((x) => x.branch.includes('-bisect-')); i++) await tickBatchQueue(world.deps());
+		await run(1);
+		const step = world.started.find((x) => x.branch.includes('-bisect-'))!;
+		const n = step.prs[0];
+		expect(checksOf(`pr${n}`).at(-1)!.url).toBe(search(step.branch));
+		world.runsListed = true;
+		await run(1);
+		expect(checksOf(`pr${n}`).at(-1)).toMatchObject({ state: 'in_progress', url: `https://ci.example/${step.head}` });
+	});
+
+	test('a failed link update keeps its wait and is retried', async () => {
+		pr(1);
+		world.hold = () => true;
+		world.runsListed = false;
+		await run(3);
+		world.runsListed = true;
+		const deps = world.deps();
+		const post = deps.github.setPRCheck;
+		deps.github.setPRCheck = async () => { throw new Error('GitHub unavailable'); };
+		await tickBatchQueue(deps);
+		expect(store.runLinkWaits(repo.id)).toHaveLength(1);
+		deps.github.setPRCheck = post;
+		await tickBatchQueue(deps);
+		expect(store.runLinkWaits(repo.id)).toHaveLength(0);
+		expect(checksOf('pr1').at(-1)!.url).toBe(`https://ci.example/${world.started[0].head}`);
+	});
+
+	test('running cards discover URLs even without a PR link wait', async () => {
+		pr(1);
+		world.hold = () => true;
+		world.runsListed = false;
+		await run(3);
+		const { branch, head } = world.started[0];
+		store.clearRunLinkWaits(repo.id, branch);
+		const baseline = store.insertBatch({ repoId: repo.id, kind: 'baseline', branch: 'mq/base-card', baseSha: git.sha('main'), headSha: git.sha('main'), treeSha: git.git('rev-parse', 'main^{tree}'), baseTree: git.git('rev-parse', 'main^{tree}'), members: [], heads: {} });
+		world.runsListed = true;
+		await run(1);
+		expect(store.getBatchByBranch(repo.id, branch)!.run_url).toBe(`https://ci.example/${head}`);
+		expect(store.getBatch(baseline.id)!.run_url).toBe(`https://ci.example/${baseline.head_sha}`);
+	});
+
+	test('a try check links its run once it is listed', async () => {
+		git.branch('pr1', 'main');
+		git.commit('pr1', 'pr1', 'pr1.txt');
+		git.openPR(1, 'pr1', 'main');
+		world.approved.add(1);
+		world.runsListed = false;
+		world.hold = () => true;
+		const t = await startTry(world.deps(), 1);
+		await run(2);
+		expect(checksOf('pr1', 'merge-queue/try').map((x) => x.url)).toEqual([undefined]);
+		world.runsListed = true;
+		await run(1);
+		expect(checksOf('pr1', 'merge-queue/try').at(-1)).toMatchObject({ state: 'in_progress', title: `Trying on main in ${t.branch}`, url: `https://ci.example/${t.head_sha}` });
+	});
+
+	test('a finished run without a CI link falls back to the run it was linked to', async () => {
+		pr(1);
+		world.hold = () => true;
+		await run(3);
+		const { branch, head } = world.started[0];
+		expect(store.getBatchByBranch(repo.id, branch)!.run_url).toBe(`https://ci.example/${head}`);
+		world.runsListed = false;
+		world.hold = () => false;
+		await run(10);
+		expect(world.merged).toEqual([1]);
+		expect(checksOf('pr1').at(-1)).toMatchObject({ state: 'success', url: `https://ci.example/${head}` });
+	});
+});
+
 describe('automatic tries on each push', () => {
 	const DELAY = 2 * 60_000;
 	/** Auto tries on, `max` at once, starting `DELAY` after a push. */
@@ -5084,7 +5217,7 @@ describe('automatic tries on each push', () => {
 		url = 'https://github.com/o/r/actions/runs/123';
 		await tick();
 		expect(tryChecks(1).at(-1)!.url).toBe(url);
-		expect(store.getBatch(tries(1).at(-1)!.id)!.reported_run_url).toBe(url);
+		expect(store.getBatch(tries(1).at(-1)!.id)!.run_url).toBe(url);
 		await tick();
 		expect(tryChecks(1)).toHaveLength(before + 1);
 		// A final API failure must not discard the specific URL already published.

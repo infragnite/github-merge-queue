@@ -23,6 +23,13 @@ describe('what a batch keeps for later analysis', () => {
 		expect(store.getQueueSettings(id).config).not.toHaveProperty('autoTryMax');
 	});
 
+	test('shared run links preserve the earlier try-only URL during migration', () => {
+		const b = insert();
+		db.getDb().prepare('UPDATE batches SET reported_run_url = ?, run_url = NULL WHERE id = ?').run('https://ci.example/run/42', b.id);
+		store.migrateBatches(db.getDb());
+		expect(store.getBatch(b.id)!.run_url).toBe('https://ci.example/run/42');
+	});
+
 	test('the mode and config it was planned with', () => {
 		store.updateQueueSettings(repoId, { mode: 'batch', config: { maxBatch: 7 } });
 		const b = insert();
